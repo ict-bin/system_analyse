@@ -29,15 +29,14 @@ class RoleConfig(BaseModel):
     agents: list[AgentInstanceConfig] = Field(default_factory=list)
 
 
-# ─── 服务配置（由管理员一次性配置，长期不变）─────────────────────────────────
+# ─── 服务配置 ─────────────────────────────────────────────────────────────────
 
 class ServiceConfig(BaseModel):
-    """config.json — 服务提供者配置，不含任务信息"""
     max_rounds: int = Field(default=3, ge=1, le=10)
-    min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
+    min_rounds: int = Field(default=2, ge=1, le=10)
     pass_threshold: Optional[int] = Field(default=None)
-    agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
-    agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
+    agent_max_retries: int = Field(default=100)
+    agent_retry_delay: float = Field(default=30.0)
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -46,21 +45,19 @@ class ServiceConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
-    context: str = Field(default="", description="全局额外上下文（所有任务共用）")
-    criteria: str = Field(default="", description="全局评判标准（所有任务共用）")
+    context: str = Field(default="")
+    criteria: str = Field(default="")
 
 
-# ─── 运行时任务（由 ServiceConfig + 用户输入合成）─────────────────────────────
+# ─── 运行时任务 ───────────────────────────────────────────────────────────────
 
 class TaskConfig(BaseModel):
-    """运行时完整配置 = 服务配置 + 用户输入"""
-    # 用户输入部分
     task: str = Field(..., description="用户的一句话 prompt")
-    source_file: str = Field(default="", description="从 prompt 解析出的文件名")
-    function_name: str = Field(default="", description="从 prompt 解析出的函数名")
-    cwd: str = Field(default="/data/target", description="待分析文件所在目录")
+    target_dir: str = Field(default="/data/target", description="解包目录路径")
+    source_file: str = Field(default="", description="兼容字段：用于归档命名")
+    function_name: str = Field(default="", description="兼容字段：用于归档命名")
+    cwd: str = Field(default="/data/target")
 
-    # 服务配置部分（从 ServiceConfig 合并）
     max_rounds: int = Field(default=3)
     min_rounds: int = Field(default=2)
     pass_threshold: Optional[int] = Field(default=None)
@@ -101,7 +98,7 @@ class TokenUsage(BaseModel):
         return self
 
 
-# ─── 执行结果 ─────────────────────────────────────────────────────────────────
+# ─── Worker 结果 ──────────────────────────────────────────────────────────────
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -114,18 +111,32 @@ class TaskStatus(str, Enum):
 class WorkerResult(BaseModel):
     worker_id: str
     model: str = ""
-    output: str = ""
-    dataflow_file: str = ""  # Worker 写入的 dataflow-*.md 路径
+    output: str = ""                        # Phase A 的 <result> 摘要
+    output_dir: str = ""                    # Worker 输出目录（含模块子文件夹）
+    modules: list[str] = Field(default_factory=list)  # 发现的模块名列表
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     error: Optional[str] = None
 
 
-class WorkerEvaluation(BaseModel):
-    worker_id: str
+# ─── Judge 结果 ──────────────────────────────────────────────────────────────
+
+class ModuleEvaluation(BaseModel):
+    """Judge 对单个模块的评价"""
+    module_name: str
     passed: bool = False
     score: int = 0
     feedback: str = ""
-    refinement: str = ""
+
+
+class WorkerEvaluation(BaseModel):
+    """Judge 对单个 Worker 的完整评价"""
+    worker_id: str
+    classification_ok: bool = False         # Step 1: 文件分类完整性
+    classification_feedback: str = ""
+    module_evals: list[ModuleEvaluation] = Field(default_factory=list)  # Step 2
+    overall_passed: bool = False            # Step 3: 综合评分
+    overall_score: int = 0
+    overall_feedback: str = ""
 
 
 class JudgeSummary(BaseModel):
@@ -141,6 +152,8 @@ class JudgeRoundResult(BaseModel):
     summary: Optional[JudgeSummary] = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
 
+
+# ─── 轮次和任务结果 ──────────────────────────────────────────────────────────
 
 class RoundResult(BaseModel):
     round: int

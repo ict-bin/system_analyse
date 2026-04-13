@@ -38,8 +38,23 @@ def render_event(event: SwarmEvent, quiet: bool = False):
     elif t == "worker_start":
         print(f"  🔧 {d.get('worker_id')} ({d.get('model', '')}) starting...")
     elif t == "worker_done":
-        df = " [dataflow ✓]" if d.get("dataflow_found") else ""
-        print(f"  ✅ {d.get('worker_id')} done{df}")
+        mc = d.get('module_count', 0)
+        mods = d.get('modules', [])
+        print(f"  ✅ {d.get('worker_id')} done [{mc} modules: {', '.join(mods[:5])}{'...' if mc > 5 else ''}]")
+    elif t == "worker_phase":
+        phase = d.get('phase', '?')
+        if phase == 'A':
+            print(f"     Phase A done: {d.get('module_count', 0)} modules found")
+        else:
+            print(f"     Phase B: {d.get('module', '?')} analyzed")
+    elif t == "judge_step":
+        step = d.get('step')
+        icon = "✅" if d.get('passed') else "❌"
+        if step == 1:
+            print(f"     {icon} {d.get('judge_id')}→{d.get('worker_id')} Step1: classification")
+        elif step == 2:
+            print(f"     {icon} {d.get('judge_id')}→{d.get('worker_id')} "
+                  f"Step2: {d.get('module', '?')} ({d.get('score')}/100)")
     elif t == "judge_start":
         print(f"  ⚖️  {d.get('judge_id')} ({d.get('model', '')}) evaluating...")
     elif t == "judge_eval":

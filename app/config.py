@@ -14,7 +14,6 @@ from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
 
 
 def load_service_config(config_path: str) -> ServiceConfig:
-    """加载服务配置（管理员配置的长期文件）。"""
     p = Path(config_path)
     if not p.is_file():
         raise FileNotFoundError(f"服务配置文件不存在: {config_path}")
@@ -23,20 +22,15 @@ def load_service_config(config_path: str) -> ServiceConfig:
 
 
 def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "/data/target") -> TaskConfig:
-    """
-    从服务配置 + 用户一句话 prompt 构造运行时 TaskConfig。
-
-    prompt 示例：
-      "对 vfpfwd_board.c 的 VFP_ReceivePktFromNpByPcie 函数完成威胁分析"
-      "分析 firmware.c 中 parse_packet 的外部输入威胁分析"
-    """
-    source_file, function_name = parse_prompt(prompt)
+    """从服务配置 + 用户 prompt 构造运行时 TaskConfig。"""
+    target_dir = parse_target_dir(prompt) or cwd
 
     cfg = TaskConfig(
         task=prompt,
-        source_file=source_file,
-        function_name=function_name,
-        cwd=cwd,
+        target_dir=target_dir,
+        cwd=target_dir,
+        source_file=os.path.basename(target_dir.rstrip("/")),
+        function_name="analyse",
         max_rounds=svc.max_rounds,
         min_rounds=svc.min_rounds,
         pass_threshold=svc.pass_threshold,
@@ -60,49 +54,27 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "/data/target"
     return cfg
 
 
-def parse_prompt(prompt: str) -> tuple[str, str]:
+def parse_target_dir(prompt: str) -> str:
     """
-    从用户的一句话 prompt 中提取文件名和函数名。
+    从用户 prompt 中提取解包路径。
 
-    支持的格式（中英文均可）：
-      "对 xxx.c 的 yyy 函数完成威胁分析"
-      "分析 xxx.c 中 yyy 的外部输入"
-      "分析文件 xxx.c 中函数 yyy 的威胁分析"
-      "analyze xxx.c function yyy"
+    支持的格式：
+      "软件包解包路径在 /data/target/firmware，对解包后的所有文件进行威胁分析"
+      "解包目录 /tmp/unpacked 的威胁分析"
+      "分析 /data/target 下的所有文件"
     """
-    source_file = ""
-    function_name = ""
-
-    # 尝试匹配文件名（含路径，如 src/foo.c）
-    file_patterns = [
-        r'(?:文件|file|对|分析)\s+([\w./-]+\.\w+)',          # "对 xxx.c" / "文件 xxx.c"
-        r'([\w./-]+\.(?:c|h|cpp|cc|cxx|py|java|go|rs))\b',  # 任何 xxx.c 格式
+    patterns = [
+        r'(?:路径[在为是]|目录[在为是]?|解包到|位于)\s*([/\w._-]+)',
+        r'(?:分析|扫描)\s+([/\w._-]+)\s*(?:下|中|的)',
+        r'(/(?:data|tmp|home|opt)[/\w._-]+)',
     ]
-    for pat in file_patterns:
-        m = re.search(pat, prompt, re.IGNORECASE)
+    for pat in patterns:
+        m = re.search(pat, prompt)
         if m:
-            source_file = m.group(1)
-            break
-
-    # 尝试匹配函数名/模块名
-    func_patterns = [
-        r'(?:函数|模块|function|module|的)\s+(\w+)',        # "函数 xxx" / "模块 xxx"
-        r'(?:中|的)\s+(\w+)\s*(?:函数|模块|的|$)',    # "中 xxx 模块"
-        r'(\w+)\s+(?:函数|模块|function|module)',            # "xxx 模块"
-    ]
-    for pat in func_patterns:
-        m = re.search(pat, prompt, re.IGNORECASE)
-        if m:
-            candidate = m.group(1)
-            # 排除常见非函数名词
-            if candidate not in ("威胁分析", "威胁", "安全", "模块", "系统",
-                                 "外部", "输入", "完成", "分析", "进行",
-                                 "data", "flow", "analysis", "the", "input",
-                                 "threat", "security", "module", "system"):
-                function_name = candidate
-                break
-
-    return source_file, function_name
+            path = m.group(1)
+            if '/' in path:
+                return path
+    return ""
 
 
 def _backfill_role(role: RoleConfig) -> None:
@@ -116,7 +88,6 @@ def _backfill_role(role: RoleConfig) -> None:
 
 
 def load_system_prompts(prompt_dir: str, count: int) -> list[str]:
-    """从文件夹加载 system prompt。"""
     prompt_dir = os.path.abspath(prompt_dir)
     prompts: list[str] = [""] * count
 
