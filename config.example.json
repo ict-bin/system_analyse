@@ -1,0 +1,34 @@
+{
+    "max_rounds": 3,
+    "min_rounds": 2,
+    "pass_threshold": 2,
+    "agent_max_retries": 100,
+    "agent_retry_delay": 30,
+
+    "workers": {
+        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
+        "system_prompt_dir": "/opt/system_analyse/prompts/workers",
+        "default_thinking_level": "off",
+        "agents": [
+            { "model": "vllm/zai-org/GLM-5" },
+            { "model": "vllm/zai-org/GLM-5" }
+        ]
+    },
+
+    "judges": {
+        "default_tools": ["read", "bash", "grep", "find"],
+        "system_prompt_dir": "/opt/system_analyse/prompts/judges",
+        "default_thinking_level": "off",
+        "agents": [
+            { "model": "vllm/zai-org/GLM-5" },
+            { "model": "vllm/zai-org/GLM-5" }
+        ]
+    },
+
+    "output_dir": "/data/output",
+    "archive_dir": "/data/output",
+    "result_dir": "/data/output",
+
+    "context": "",
+    "criteria": "重点：攻击面识别完整性、STRIDE 威胁覆盖度、分析深度（行号引用、触发条件）、修复建议可操作性"
+}
