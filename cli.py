@@ -2,10 +2,8 @@
 """
 system_analyse CLI
 
-用户使用方式：
-  python3 cli.py "对 vfpfwd_board.c 的 VFP_ReceivePktFromNpByPcie 函数完成威胁分析"
-
-服务配置由 /data/config/config.json 或 /opt/system_analyse/config.example.json 提供。
+解包文件挂载到 /data/target（只读），配置挂载到 /data/config，输出挂载到 /data/output。
+用户只需提供一句话任务描述。
 """
 
 from __future__ import annotations
@@ -37,16 +35,19 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         print(f"\n{'━' * 60}\n  Round {d.get('round')}\n{'━' * 60}")
     elif t == "worker_start":
         print(f"  🔧 {d.get('worker_id')} ({d.get('model', '')}) starting...")
-    elif t == "worker_done":
-        mc = d.get('module_count', 0)
-        mods = d.get('modules', [])
-        print(f"  ✅ {d.get('worker_id')} done [{mc} modules: {', '.join(mods[:5])}{'...' if mc > 5 else ''}]")
     elif t == "worker_phase":
         phase = d.get('phase', '?')
         if phase == 'A':
             print(f"     Phase A done: {d.get('module_count', 0)} modules found")
         else:
             print(f"     Phase B: {d.get('module', '?')} analyzed")
+    elif t == "worker_done":
+        mc = d.get('module_count', 0)
+        mods = d.get('modules', [])
+        suffix = ', '.join(mods[:5]) + ('...' if mc > 5 else '')
+        print(f"  ✅ {d.get('worker_id')} done [{mc} modules: {suffix}]")
+    elif t == "judge_start":
+        print(f"  ⚖️  {d.get('judge_id')} ({d.get('model', '')}) evaluating...")
     elif t == "judge_step":
         step = d.get('step')
         icon = "✅" if d.get('passed') else "❌"
@@ -55,15 +56,10 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         elif step == 2:
             print(f"     {icon} {d.get('judge_id')}→{d.get('worker_id')} "
                   f"Step2: {d.get('module', '?')} ({d.get('score')}/100)")
-    elif t == "judge_start":
-        print(f"  ⚖️  {d.get('judge_id')} ({d.get('model', '')}) evaluating...")
     elif t == "judge_eval":
         icon = "✅" if d.get("passed") else "❌"
         print(f"     {icon} {d.get('judge_id')}→{d.get('worker_id')}: "
               f"{'PASS' if d.get('passed') else 'FAIL'} ({d.get('score')}/100)")
-        fb = d.get("feedback", "")
-        if fb:
-            print(f"       {fb[:150]}")
     elif t == "judge_summary":
         print(f"     📊 {d.get('judge_id', '?')}: best={d.get('best')}, "
               f"passed={d.get('overall_passed')}")
@@ -84,8 +80,6 @@ def render_event(event: SwarmEvent, quiet: bool = False):
     elif t == "error":
         print(f"\n❗ Error: {d.get('error')}", file=sys.stderr)
 
-
-# ─── 查找服务配置文件 ─────────────────────────────────────────────────────────
 
 CONFIG_SEARCH_PATHS = [
     "/data/config/config.json",
@@ -108,17 +102,16 @@ def find_service_config() -> str:
 async def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("""用法:
-  python3 cli.py "对 xxx.c 的 yyy 函数完成威胁分析"
-  python3 cli.py "分析 firmware.c 中 parse_packet 的外部输入威胁分析"
+  python3 cli.py "对解包后的所有文件进行威胁分析与模块分析"
+
+解包文件挂载到 /data/target（只读），配置挂载到 /data/config，输出到 /data/output。
 
 选项:
   --config <path>    指定服务配置文件（默认自动搜索）
   --quiet            安静模式
-  --cwd <path>       指定待分析文件所在目录（默认 /data/target）
 """)
         sys.exit(0)
 
-    # 解析参数
     quiet = "--quiet" in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     prompt = args[0] if args else ""
@@ -128,26 +121,21 @@ async def main():
         sys.exit(1)
 
     config_path = None
-    cwd = "/data/target"
     for i, a in enumerate(sys.argv):
         if a == "--config" and i + 1 < len(sys.argv):
             config_path = sys.argv[i + 1]
-        if a == "--cwd" and i + 1 < len(sys.argv):
-            cwd = sys.argv[i + 1]
 
-    # 加载服务配置
     if not config_path:
         config_path = find_service_config()
 
     svc = load_service_config(config_path)
-    cfg = build_task_config(svc, prompt, cwd=cwd)
+    cfg = build_task_config(svc, prompt)
 
     print(f"""
 ╔═══════════════════════════════════════════════════════════╗
-║              system_analyse                            ║
+║              system_analyse                               ║
 ╠═══════════════════════════════════════════════════════════╣
-║  File:    {cfg.source_file or '(auto)' :<46} ║
-║  Func:    {cfg.function_name or '(auto)' :<46} ║
+║  Target:  /data/target                                    ║
 ║  Workers: {cfg.worker_count:<5}  Judges: {cfg.judge_count:<33} ║
 ║  Rounds:  {cfg.min_rounds}~{cfg.max_rounds:<44} ║
 ╚═══════════════════════════════════════════════════════════╝""")

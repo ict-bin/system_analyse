@@ -231,19 +231,11 @@ class Orchestrator:
         # Worker session 文件（Phase A 跨轮保持）
         worker_sessions_a = [str(sess_dir / f"worker-{i}-phaseA.jsonl") for i in range(cfg.worker_count)]
 
-        # Worker 输出目录（模块子文件夹在这里）
+        # Worker 输出目录
         worker_out_dirs = []
         for i in range(cfg.worker_count):
             wdir = out_dir / f"workspace-worker-{i}"
             wdir.mkdir(exist_ok=True)
-            # 符号链接 target 文件到 workspace
-            if os.path.isdir(target_dir):
-                link = wdir / "target"
-                if not link.exists():
-                    try:
-                        os.symlink(target_dir, str(link))
-                    except OSError:
-                        pass
             worker_out_dirs.append(str(wdir))
 
         result = TaskResult(task_id=task_id, status=TaskStatus.RUNNING,
@@ -271,6 +263,19 @@ class Orchestrator:
                 # 1. Workers 并行（两阶段）
                 # ═══════════════════════════════════════════════════════
 
+                # 准备跨 Worker 分类参考（上一轮的结果）
+                prev_classifications = ""
+                prev_judges = None
+                if rnd_num > 1 and result.rounds:
+                    prev_rnd = result.rounds[-1]
+                    cls_parts = []
+                    for pw in prev_rnd.worker_results:
+                        cls_parts.append(
+                            f"**{pw.worker_id}** ({len(pw.modules)} 模块): "
+                            f"{', '.join(pw.modules)}")
+                    prev_classifications = "\n".join(cls_parts)
+                    prev_judges = prev_rnd.judge_results
+
                 w_tasks = []
                 for i, acfg in enumerate(cfg.workers.agents):
                     wid = f"worker-{i}"
@@ -287,6 +292,8 @@ class Orchestrator:
                         session_a_file=worker_sessions_a[i],
                         sess_dir=sess_dir,
                         feedback=feedback_for_workers,
+                        other_classifications=prev_classifications,
+                        prev_round_judges=prev_judges,
                     ))
 
                 worker_results_raw = await asyncio.gather(*w_tasks)
@@ -327,23 +334,36 @@ class Orchestrator:
                 round_judges = await asyncio.gather(*judge_tasks)
 
                 # ═══════════════════════════════════════════════════════
-                # 3. 投票
+                # 3. 投票——基于实际 eval 结果，不依赖 summary 声明
                 # ═══════════════════════════════════════════════════════
 
-                pass_count = sum(1 for j in round_judges
-                                 if j.summary and j.summary.overall_passed)
-                if cfg.worker_count == 1:
-                    pass_count = sum(
-                        1 for j in round_judges
-                        if j.evaluations and j.evaluations[0].overall_passed)
+                # 每个 Judge 对每个 Worker 的实际结果：找到每个 Judge 认为通过的 best worker
+                pass_count = 0
+                best_votes: Counter[str] = Counter()
+                best_scores: Counter[str] = Counter()
+
+                for j in round_judges:
+                    # 找该 Judge 下通过的 worker 中得分最高的
+                    passed_evals = [e for e in j.evaluations if e.overall_passed]
+                    if passed_evals:
+                        pass_count += 1
+                        best_ev = max(passed_evals, key=lambda e: e.overall_score)
+                        best_votes[best_ev.worker_id] += 1
+                        best_scores[best_ev.worker_id] += best_ev.overall_score
 
                 is_passed = pass_count >= threshold
-
-                best_votes: Counter[str] = Counter()
-                for j in round_judges:
-                    if j.summary and j.summary.best_worker_id:
-                        best_votes[j.summary.best_worker_id] += 1
-                best_wid = best_votes.most_common(1)[0][0] if best_votes else "worker-0"
+                # best worker = 最多票，同票取总分高
+                if best_votes:
+                    max_vote = best_votes.most_common(1)[0][1]
+                    top = [w for w, v in best_votes.items() if v == max_vote]
+                    best_wid = max(top, key=lambda w: best_scores[w])
+                else:
+                    # 无人通过，按总分选最佳
+                    all_scores: Counter[str] = Counter()
+                    for j in round_judges:
+                        for e in j.evaluations:
+                            all_scores[e.worker_id] += e.overall_score
+                    best_wid = all_scores.most_common(1)[0][0] if all_scores else "worker-0"
 
                 feedback_md = self._build_feedback_md(round_workers, round_judges, best_wid, rnd_num)
                 (rnd_dir / "feedback.md").write_text(feedback_md, encoding="utf-8")
@@ -451,6 +471,8 @@ class Orchestrator:
         session_a_file: str,
         sess_dir: Path,
         feedback: str,
+        other_classifications: str = "",
+        prev_round_judges: list | None = None,
     ) -> WorkerResult:
         cfg = self.cfg
         wid = f"worker-{worker_idx}"
@@ -468,7 +490,9 @@ class Orchestrator:
         }
 
         # ── Phase A: 文件分类 ─────────────────────────────────
-        phase_a_prompt = self._build_phase_a_prompt(cfg.task, target_dir, rnd_num, feedback)
+        phase_a_prompt = self._build_phase_a_prompt(
+            cfg.task, target_dir, rnd_num, feedback,
+            worker_id=wid, other_classifications=other_classifications)
         ar = await run_agent(
             prompt=phase_a_prompt, **base_kwargs,
             session_file=session_a_file,
@@ -496,7 +520,35 @@ class Orchestrator:
             except OSError:
                 pass
 
-            mod_prompt = self._build_phase_b_prompt(mod_name, worker_out_dir)
+            # 获取上轮该模块的报告和 Judge 反馈
+            prev_report = ""
+            judge_feedback_for_mod = ""
+            if rnd_num > 1:
+                report_path = Path(worker_out_dir) / mod_name / "module_report.md"
+                if report_path.exists():
+                    try:
+                        prev_report = report_path.read_text(encoding="utf-8")[:3000]
+                    except OSError:
+                        pass
+                # 从上轮 Judge 结果中提取该模块的反馈
+                if prev_round_judges:
+                    fb_parts = []
+                    for j in prev_round_judges:
+                        for ev in j.evaluations:
+                            if ev.worker_id == wid:
+                                for me in ev.module_evals:
+                                    if me.module_name == mod_name:
+                                        fb_parts.append(
+                                            f"{j.judge_id}: {'PASS' if me.passed else 'FAIL'} "
+                                            f"({me.score}/100) {me.feedback[:500]}")
+                    judge_feedback_for_mod = "\n\n".join(fb_parts)
+
+            mod_prompt = self._build_phase_b_prompt(
+                mod_name, worker_out_dir,
+                worker_id=wid,
+                prev_report=prev_report,
+                judge_feedback=judge_feedback_for_mod,
+            )
             ar = await run_agent(
                 prompt=mod_prompt, **base_kwargs,
                 session_file=mod_session,
@@ -605,8 +657,15 @@ class Orchestrator:
             j_result.token_usage += ar.token_usage
 
             parsed = _parse_eval_md(ar.output)
-            weval.overall_passed = parsed["pass"] and weval.classification_ok and all_modules_pass
-            weval.overall_score = parsed["score"]
+            # overall_passed 必须同时满足：分类完整 + 所有模块通过 + Step3 综合评分通过
+            # 如果 Step3 解析失败(score=0)，用实际模块评分均值作为兑底
+            step3_score = parsed["score"]
+            if step3_score == 0 and weval.module_evals:
+                step3_score = sum(m.score for m in weval.module_evals) // len(weval.module_evals)
+            step3_passed = step3_score >= 70 if parsed["score"] == 0 else parsed["pass"]
+
+            weval.overall_passed = step3_passed and weval.classification_ok and all_modules_pass
+            weval.overall_score = step3_score
             weval.overall_feedback = parsed["feedback"]
 
             (w_j_dir / "step3-overall.md").write_text(
@@ -649,41 +708,59 @@ class Orchestrator:
     # Prompt 构建
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _build_phase_a_prompt(self, task, target_dir, rnd, feedback):
+    def _build_phase_a_prompt(self, task, target_dir, rnd, feedback,
+                              worker_id: str = "", other_classifications: str = ""):
         parts = [
-            f"# Phase A: 文件分析与模块分类\n\n{task}",
-            f"解包目录: `target/` (符号链接指向 `{target_dir}`)",
+            f"# Phase A: 文件分析与模块分类\n\n你是 **{worker_id}**。\n\n{task}",
+            "解包文件位于固定路径: `/data/target`",
             "请完成以下工作：\n"
-            "1. 使用 `bash` 和 `read` 工具遍历 `target/` 下所有文件\n"
+            "1. 使用 `bash` 和 `read` 工具遍历 `/data/target` 下所有文件\n"
             "2. 分析每个文件的功能、类型（配置/二进制/脚本/库/服务等）\n"
             "3. 按功能将文件划分为模块（如 network、crypto、init、web 等）\n"
             "4. 为每个模块创建子目录，并在其中创建 `files.list` 文件，\n"
-            "   每行写入一个属于该模块的文件的相对路径（相对于 target/ 目录）：\n"
+            "   每行写入一个属于该模块的文件的绝对路径：\n"
             "   ```bash\n"
             "   mkdir -p <模块名>\n"
-            "   echo 'path/to/file1' >> <模块名>/files.list\n"
-            "   echo 'path/to/file2' >> <模块名>/files.list\n"
+            "   echo '/data/target/path/to/file1' >> <模块名>/files.list\n"
             "   ```\n"
-            "   **注意：不要拷贝文件，只记录相对路径到 files.list 中。**\n"
+            "   **注意：不要拷贝文件，只记录绝对路径到 files.list 中。**\n"
             "5. 一个文件只能属于一个模块，不要遗漏任何文件\n\n"
             "完成后用 `<result>...</result>` 包裹你的分类摘要。",
         ]
         if rnd > 1 and feedback:
             parts.insert(1,
-                f"# 上一轮反馈\n\n{feedback}\n\n"
+                f"# 上一轮反馈（请注意你是 {worker_id}）\n\n{feedback}\n\n"
                 "请根据反馈改进你的分类和分析。")
+        if rnd > 1 and other_classifications:
+            parts.insert(2 if rnd > 1 and feedback else 1,
+                f"# 其他 Worker 的分类结果（供参考）\n\n{other_classifications}")
         return "\n\n".join(parts)
 
-    def _build_phase_b_prompt(self, module_name, worker_out_dir):
-        return (
+    def _build_phase_b_prompt(self, module_name, worker_out_dir,
+                              worker_id: str = "",
+                              prev_report: str = "", judge_feedback: str = ""):
+        parts = [
             f"# Phase B: 模块分析 — {module_name}\n\n"
+            f"你是 **{worker_id}**。\n\n"
             f"模块目录: `{module_name}/`\n"
-            f"文件列表: `{module_name}/files.list`\n"
-            f"源文件位置: `target/<相对路径>`\n\n"
+            f"文件列表: `{module_name}/files.list`（内含绝对路径，可直接用 read 读取）\n\n"
             "请完成以下工作：\n\n"
             f"1. 使用 `read` 读取 `{module_name}/files.list` 获取该模块的文件列表\n"
-            "2. 使用 `read` 工具从 `target/` 目录中逐个读取每个文件\n"
-            f"3. 将分析结果写入 `{module_name}/module_report.md`\n\n"
+            "2. 使用 `read` 工具按 files.list 中的绝对路径逐个读取每个文件\n"
+            f"3. 将分析结果写入 `{module_name}/module_report.md`"
+        ]
+
+        if prev_report:
+            parts.append(
+                f"\n## 上一轮该模块的分析报告\n\n"
+                f"<details>\n<summary>展开上轮报告</summary>\n\n{prev_report}\n\n</details>")
+
+        if judge_feedback:
+            parts.append(
+                f"\n## Judge 对该模块的评审反馈\n\n{judge_feedback}\n\n"
+                f"请重点关注 Judge 指出的问题并改进。")
+
+        parts.append(
             "module_report.md 必须包含：\n\n"
             "## 1. 模块功能分析\n"
             "- 该模块包含哪些文件，每个文件的作用\n"
@@ -698,16 +775,17 @@ class Orchestrator:
             "- 网络端口、文件路径、IPC 通道等\n"
             "- 综合风险评分 (0-100)"
         )
+        return "\n\n".join(parts)
 
     def _build_judge_step1_prompt(self, target_dir, worker_out_dir, modules):
         return (
             f"# Step 1: 文件分类完整性检查\n\n"
-            f"原始解包目录: `target/`\n"
+            f"原始解包目录: `/data/target`\n"
             f"Worker 创建的模块目录: {', '.join(modules)}\n\n"
             "请完成以下检查：\n"
-            "1. 使用 `bash` 列出 `target/` 下所有文件\n"
-            "2. 检查每个文件是否都被分类到了某个模块子目录中\n"
-            "3. 检查是否有遗漏的文件\n"
+            "1. 使用 `bash` 列出 `/data/target` 下所有文件\n"
+            "2. 读取每个模块的 `files.list`，汇总所有已分类文件\n"
+            "3. 检查是否有遗漏的文件（在 /data/target 中但不在任何 files.list 中）\n"
             "4. 检查是否有文件被重复分类\n\n"
             "按以下格式输出：\n\n"
             "## 评分: <0-100>\n"
@@ -721,8 +799,8 @@ class Orchestrator:
             f"# Step 2: 模块评审 — {module_name}\n\n"
             f"模块目录: 当前工作目录\n\n"
             "请检查：\n"
-            "1. 使用 `read` 读取 `files.list` 获取文件列表\n"
-            "2. 使用 `read` 从 `../target/<相对路径>` 逐个读取源文件\n"
+            "1. 使用 `read` 读取 `files.list` 获取文件列表（内含绝对路径）\n"
+            "2. 使用 `read` 按绝对路径逐个读取源文件\n"
             "3. 使用 `read` 读取 `module_report.md`（如存在）\n"
             "4. 验证：\n"
             "   a. 文件划分是否合理（files.list 中的文件确实属于同一模块吗）\n"

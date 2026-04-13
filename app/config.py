@@ -1,5 +1,5 @@
 """
-system_analyse — 配置加载 + prompt 解析
+system_analyse — 配置加载
 """
 
 from __future__ import annotations
@@ -7,10 +7,12 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 from pathlib import Path
 
 from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
+
+# 容器内固定挂载路径
+TARGET_DIR = "/data/target"
 
 
 def load_service_config(config_path: str) -> ServiceConfig:
@@ -21,15 +23,13 @@ def load_service_config(config_path: str) -> ServiceConfig:
     return ServiceConfig(**raw)
 
 
-def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "/data/target") -> TaskConfig:
+def build_task_config(svc: ServiceConfig, prompt: str) -> TaskConfig:
     """从服务配置 + 用户 prompt 构造运行时 TaskConfig。"""
-    target_dir = parse_target_dir(prompt) or cwd
-
     cfg = TaskConfig(
         task=prompt,
-        target_dir=target_dir,
-        cwd=target_dir,
-        source_file=os.path.basename(target_dir.rstrip("/")),
+        target_dir=TARGET_DIR,
+        cwd=TARGET_DIR,
+        source_file="firmware",
         function_name="analyse",
         max_rounds=svc.max_rounds,
         min_rounds=svc.min_rounds,
@@ -54,29 +54,6 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "/data/target"
     return cfg
 
 
-def parse_target_dir(prompt: str) -> str:
-    """
-    从用户 prompt 中提取解包路径。
-
-    支持的格式：
-      "软件包解包路径在 /data/target/firmware，对解包后的所有文件进行威胁分析"
-      "解包目录 /tmp/unpacked 的威胁分析"
-      "分析 /data/target 下的所有文件"
-    """
-    patterns = [
-        r'(?:路径[在为是]|目录[在为是]?|解包到|位于)\s*([/\w._-]+)',
-        r'(?:分析|扫描)\s+([/\w._-]+)\s*(?:下|中|的)',
-        r'(/(?:data|tmp|home|opt)[/\w._-]+)',
-    ]
-    for pat in patterns:
-        m = re.search(pat, prompt)
-        if m:
-            path = m.group(1)
-            if '/' in path:
-                return path
-    return ""
-
-
 def _backfill_role(role: RoleConfig) -> None:
     for agent in role.agents:
         if not agent.model:
@@ -90,23 +67,18 @@ def _backfill_role(role: RoleConfig) -> None:
 def load_system_prompts(prompt_dir: str, count: int) -> list[str]:
     prompt_dir = os.path.abspath(prompt_dir)
     prompts: list[str] = [""] * count
-
     if not os.path.isdir(prompt_dir):
         return prompts
-
     files: dict[str, str] = {}
     for f in sorted(Path(prompt_dir).glob("*.md")):
         files[f.stem] = f.read_text(encoding="utf-8").strip()
-
     default_text = files.get("default", "")
     prompts = [default_text] * count
-
     for i in range(count):
         for prefix in [f"worker-{i}", f"judge-{i}", f"{i}"]:
             if prefix in files:
                 prompts[i] = files[prefix]
                 break
-
     return prompts
 
 
