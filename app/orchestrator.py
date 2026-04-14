@@ -244,6 +244,7 @@ class Orchestrator:
 
         result = TaskResult(task_id=task_id, status=TaskStatus.RUNNING,
                             task=cfg.task, config_snapshot=cfg.model_dump())
+        fi = cfg.fault_inject
         self._emit("task_start", task_id, task=cfg.task)
         if fi.enabled:
             self._emit("fault_inject", task_id, config=fi.model_dump())
@@ -253,7 +254,6 @@ class Orchestrator:
         w_prompt_dir = cfg.workers.system_prompt_dir
         j_cfgs = cfg.judges.agents
         j_count = len(j_cfgs)
-        fi = cfg.fault_inject
 
         w_base = {
             "model": w_cfg.model,
