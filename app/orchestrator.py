@@ -24,6 +24,7 @@ from typing import Callable
 
 from .models import (
     AgentInstanceConfig,
+    FaultInjectConfig,
     StageLoopConfig,
     SwarmEvent,
     TaskConfig,
@@ -163,6 +164,40 @@ def _check_voting(results: list[dict], pass_mode: str, judge_count: int) -> bool
         return pass_count > judge_count / 2
 
 
+def _apply_fault(fi: FaultInjectConfig, stage: int, attempt: int,
+                 module: str, judge_results: list[dict]) -> list[dict]:
+    """故障注入：覆盖 judge 结果。返回修改后的 results。"""
+    if not fi.enabled:
+        return judge_results
+
+    if stage == 1 and fi.stage_1_fail_until > 0 and attempt < fi.stage_1_fail_until:
+        return [{"pass": False, "score": 10,
+                 "feedback": f"[FAULT INJECT] Stage 1 forced fail (attempt {attempt+1}/{fi.stage_1_fail_until})"
+                }] * len(judge_results)
+
+    if stage == 2 and fi.stage_2_fail_module and module == fi.stage_2_fail_module:
+        return [{"pass": False, "score": 15,
+                 "feedback": f"[FAULT INJECT] Stage 2 forced fail for {module}"
+                }] * len(judge_results)
+
+    if stage == 3 and fi.stage_3_force_reclassify and module == fi.stage_3_force_reclassify:
+        return [{"pass": True, "score": 80,
+                 "feedback": f"[FAULT INJECT] [需要重新分类] {module} 应拆分"
+                }] * len(judge_results)
+
+    if stage == 3 and fi.stage_3_fail_module and module == fi.stage_3_fail_module:
+        return [{"pass": False, "score": 20,
+                 "feedback": f"[FAULT INJECT] Stage 3 forced fail for {module}"
+                }] * len(judge_results)
+
+    if stage == 4 and fi.stage_4_fail:
+        return [{"pass": False, "score": 5,
+                 "feedback": "[FAULT INJECT] Stage 4 final check forced fail"
+                }] * len(judge_results)
+
+    return judge_results
+
+
 # ─── 编排器 ───────────────────────────────────────────────────────────────────
 
 class Orchestrator:
@@ -210,12 +245,15 @@ class Orchestrator:
         result = TaskResult(task_id=task_id, status=TaskStatus.RUNNING,
                             task=cfg.task, config_snapshot=cfg.model_dump())
         self._emit("task_start", task_id, task=cfg.task)
+        if fi.enabled:
+            self._emit("fault_inject", task_id, config=fi.model_dump())
 
         # Worker/Judge 配置
         w_cfg = cfg.workers.agents[0] if cfg.workers.agents else AgentInstanceConfig(model="")
         w_prompt_dir = cfg.workers.system_prompt_dir
         j_cfgs = cfg.judges.agents
         j_count = len(j_cfgs)
+        fi = cfg.fault_inject
 
         w_base = {
             "model": w_cfg.model,
@@ -294,6 +332,7 @@ class Orchestrator:
                         f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                         f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
+                judge_results = _apply_fault(fi, 1, attempt, "", judge_results)
                 voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                 if voted_pass:
@@ -385,6 +424,7 @@ class Orchestrator:
                             f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                             f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
+                    judge_results = _apply_fault(fi, 2, attempt, mod_name, judge_results)
                     voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                     if voted_pass:
@@ -487,6 +527,7 @@ class Orchestrator:
                             modules_needing_reclassify.append(mod_name)
                             break  # 跳出 attempt 循环，后面统一处理
 
+                    judge_results = _apply_fault(fi, 3, attempt, mod_name, judge_results)
                     voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                     if voted_pass:
@@ -556,7 +597,9 @@ class Orchestrator:
                                        judge_id=f"judge-{j_idx}", module=mod_name,
                                        passed=parsed["pass"], score=parsed["score"])
 
-                        voted_pass = _check_voting(judge_results, s_cfg_redo.pass_mode, j_count)
+                        voted_pass = _check_voting(
+                            _apply_fault(fi, 2, attempt, mod_name, judge_results),
+                            s_cfg_redo.pass_mode, j_count)
                         if voted_pass:
                             passed_count += 1
                             if passed_count >= s_cfg_redo.min_rounds:
@@ -617,7 +660,9 @@ class Orchestrator:
                                            judge_id=f"judge-{j_idx}", module=mod_name,
                                            passed=parsed["pass"], score=parsed["score"])
 
-                            voted_pass = _check_voting(judge_results, s_cfg_a.pass_mode, j_count)
+                            voted_pass = _check_voting(
+                                _apply_fault(fi, 3, attempt, mod_name, judge_results),
+                                s_cfg_a.pass_mode, j_count)
                             if voted_pass:
                                 passed_count += 1
                                 if passed_count >= s_cfg_a.min_rounds:
@@ -662,6 +707,7 @@ class Orchestrator:
                     f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                     f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
+            judge_results = _apply_fault(fi, 4, 0, "", judge_results)
             s5_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
             if not s5_pass:
                 raise StageError("Stage 4 最终检查未通过")
