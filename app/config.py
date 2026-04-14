@@ -33,7 +33,6 @@ def build_task_config(svc: ServiceConfig, prompt: str) -> TaskConfig:
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
         stages=svc.stages.model_copy(deep=True),
-        fault_inject=svc.fault_inject.model_copy(deep=True),
         workers=svc.workers.model_copy(deep=True),
         judges=svc.judges.model_copy(deep=True),
         output_dir=svc.output_dir,

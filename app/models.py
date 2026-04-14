@@ -45,23 +45,11 @@ class StagesConfig(BaseModel):
     final_check: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=1))
 
 
-class FaultInjectConfig(BaseModel):
-    """故障注入配置 — 仅用于测试失败分支"""
-    enabled: bool = Field(default=False, description="总开关")
-    dry_run: bool = Field(default=False, description="跳过推理，Worker创建mock文件，Judge返回预设结果")
-    stage_1_fail_until: int = Field(default=0, description="Stage 1 前N次Judge强制FAIL")
-    stage_2_fail_module: str = Field(default="", description="Stage 2 对该模块Judge强制FAIL")
-    stage_3_force_reclassify: str = Field(default="", description="Stage 3 对该模块注入[需要重新分类]")
-    stage_3_fail_module: str = Field(default="", description="Stage 3 对该模块Judge强制FAIL")
-    stage_4_fail: bool = Field(default=False, description="Stage 4 最终检查强制FAIL")
-
-
 class ServiceConfig(BaseModel):
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
 
     stages: StagesConfig = Field(default_factory=StagesConfig)
-    fault_inject: FaultInjectConfig = Field(default_factory=FaultInjectConfig)
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -83,7 +71,6 @@ class TaskConfig(BaseModel):
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
     stages: StagesConfig = Field(default_factory=StagesConfig)
-    fault_inject: FaultInjectConfig = Field(default_factory=FaultInjectConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
     output_dir: str = Field(default="/data/output")

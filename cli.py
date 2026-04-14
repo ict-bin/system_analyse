@@ -20,8 +20,6 @@ def render_event(event: SwarmEvent, quiet: bool = False):
     if t == "task_start":
         print(f"\n🚀 Task: {event.task_id}")
         print(f"   {d.get('task', '')[:120]}")
-    elif t == "fault_inject":
-        print(f"  ⚠️  FAULT INJECTION ENABLED: {d.get('config', {})}")
     elif t == "stage":
         stage = d.get('stage')
         mod = d.get('module', '')

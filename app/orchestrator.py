@@ -24,7 +24,6 @@ from typing import Callable
 
 from .models import (
     AgentInstanceConfig,
-    FaultInjectConfig,
     StageLoopConfig,
     SwarmEvent,
     TaskConfig,
@@ -40,34 +39,6 @@ from .runner import run_agent
 
 class StageError(Exception):
     pass
-
-
-# ─── Dry-run mock ─────────────────────────────────────────────────────────────
-
-def _mock_classify(workspace: str, target_dir: str):
-    ws = Path(workspace)
-    files = sorted(str(f) for f in Path(target_dir).rglob('*') if f.is_file())
-    mod_names = ['mod_a', 'mod_b', 'mod_c', 'mod_d', 'mod_e']
-    for i, fpath in enumerate(files):
-        mod = mod_names[i % len(mod_names)]
-        (ws / mod).mkdir(exist_ok=True)
-        with open(ws / mod / 'files.list', 'a') as fh:
-            fh.write(fpath + '\n')
-
-
-def _mock_analyse(workspace: str, mod_name: str):
-    report = Path(workspace) / mod_name / 'module_report.md'
-    report.write_text(
-        f"# {mod_name}\n## 1. 文件清单\nMock.\n## 2. 模块功能\nMock.\n"
-        f"## 3. 分类自检\n[分类合理]\n## 4. STRIDE\nNone.\n## 5. 暴露面\n风险评分: 10\n",
-        encoding='utf-8')
-
-
-class _MockAR:
-    def __init__(self, output=''):
-        self.output = output
-        self.error = None
-        self.token_usage = TokenUsage()
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -190,41 +161,6 @@ def _check_voting(results: list[dict], pass_mode: str, judge_count: int) -> bool
     else:  # majority
         return pass_count > judge_count / 2
 
-
-def _apply_fault(fi: FaultInjectConfig, stage: int, attempt: int,
-                 module: str, judge_results: list[dict]) -> list[dict]:
-    """故障注入：覆盖 judge 结果。返回修改后的 results。"""
-    if not fi.enabled:
-        return judge_results
-
-    if stage == 1 and fi.stage_1_fail_until > 0 and attempt < fi.stage_1_fail_until:
-        return [{"pass": False, "score": 10,
-                 "feedback": f"[FAULT INJECT] Stage 1 forced fail (attempt {attempt+1}/{fi.stage_1_fail_until})"
-                }] * len(judge_results)
-
-    if stage == 2 and fi.stage_2_fail_module and module == fi.stage_2_fail_module:
-        return [{"pass": False, "score": 15,
-                 "feedback": f"[FAULT INJECT] Stage 2 forced fail for {module}"
-                }] * len(judge_results)
-
-    if stage == 3 and fi.stage_3_force_reclassify and module == fi.stage_3_force_reclassify:
-        return [{"pass": True, "score": 80,
-                 "feedback": f"[FAULT INJECT] [需要重新分类] {module} 应拆分"
-                }] * len(judge_results)
-
-    if stage == 3 and fi.stage_3_fail_module and module == fi.stage_3_fail_module:
-        return [{"pass": False, "score": 20,
-                 "feedback": f"[FAULT INJECT] Stage 3 forced fail for {module}"
-                }] * len(judge_results)
-
-    if stage == 4 and fi.stage_4_fail:
-        return [{"pass": False, "score": 5,
-                 "feedback": "[FAULT INJECT] Stage 4 final check forced fail"
-                }] * len(judge_results)
-
-    return judge_results
-
-
 # ─── 编排器 ───────────────────────────────────────────────────────────────────
 
 class Orchestrator:
@@ -271,10 +207,7 @@ class Orchestrator:
 
         result = TaskResult(task_id=task_id, status=TaskStatus.RUNNING,
                             task=cfg.task, config_snapshot=cfg.model_dump())
-        fi = cfg.fault_inject
         self._emit("task_start", task_id, task=cfg.task)
-        if fi.enabled:
-            self._emit("fault_inject", task_id, config=fi.model_dump())
 
         # Worker/Judge 配置
         w_cfg = cfg.workers.agents[0] if cfg.workers.agents else AgentInstanceConfig(model="")
@@ -322,7 +255,7 @@ class Orchestrator:
                 prompt_parts = [cfg.task]
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
-                ar = await self._run(
+                ar = await run_agent(
                     prompt="\n".join(prompt_parts),
                     system_prompt=w_sys_prompt,
                     session_file=classify_session,
@@ -330,8 +263,6 @@ class Orchestrator:
                 )
                 tokens += ar.token_usage
                 result.final_output = _extract_result(ar.output)
-                if fi.dry_run and not _discover_modules(str(workspace)):
-                    _mock_classify(str(workspace), cfg.target_dir)
 
                 modules = _discover_modules(str(workspace))
                 self._emit("stage_result", task_id, stage=1,
@@ -340,7 +271,7 @@ class Orchestrator:
                 # Judge 检查
                 judge_results = []
                 for j_idx, j_cfg_item in enumerate(j_cfgs):
-                    ar = await self._run(
+                    ar = await run_agent(
                         prompt="请运行检查脚本验证分类完整性。",
                         model=j_cfg_item.model,
                         system_prompt=j_sys_prompt,
@@ -361,11 +292,7 @@ class Orchestrator:
                         f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                         f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
-                judge_results = _apply_fault(fi, 1, attempt, "", judge_results)
                 voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
-                if fi.enabled and fi.stage_1_fail_until > attempt:
-                    self._emit("fault_applied", task_id, stage=1, attempt=attempt + 1,
-                               voted_pass=voted_pass)
 
                 if voted_pass:
                     passed_count += 1
@@ -415,7 +342,7 @@ class Orchestrator:
                     prompt_parts = [f"检查模块 `{mod_name}` 是否需要细分。"]
                     if feedback:
                         prompt_parts.append(f"\n\n{feedback}")
-                    ar = await self._run(
+                    ar = await run_agent(
                         prompt="\n".join(prompt_parts),
                         system_prompt=w_sys_prompt,
                         session_file=refine_session,
@@ -435,7 +362,7 @@ class Orchestrator:
                     eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
 
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
-                        ar = await self._run(
+                        ar = await run_agent(
                             prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
                             model=j_cfg_item.model,
                             system_prompt=j_sys_prompt,
@@ -456,7 +383,6 @@ class Orchestrator:
                             f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                             f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
-                    judge_results = _apply_fault(fi, 2, attempt, mod_name, judge_results)
                     voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                     if voted_pass:
@@ -508,7 +434,7 @@ class Orchestrator:
                     prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
                     if feedback:
                         prompt_parts.append(f"\n\n{feedback}")
-                    ar = await self._run(
+                    ar = await run_agent(
                         prompt="\n".join(prompt_parts),
                         system_prompt=w_sys_prompt,
                         session_file=analyse_session,
@@ -516,14 +442,12 @@ class Orchestrator:
                     )
                     tokens += ar.token_usage
                     self._emit("stage_result", task_id, stage=3, module=mod_name)
-                    if fi.dry_run:
-                        _mock_analyse(str(workspace), mod_name)
 
                     # Judge 评审
                     judge_results = []
 
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
-                        ar = await self._run(
+                        ar = await run_agent(
                             prompt=f"评审模块 `{mod_name}` 的分析报告。",
                             model=j_cfg_item.model,
                             system_prompt=j_sys_prompt,
@@ -545,7 +469,6 @@ class Orchestrator:
                             f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
                     # 故障注入（必须在 reclassify 检测前）
-                    judge_results = _apply_fault(fi, 3, attempt, mod_name, judge_results)
 
                     # 分类问题 → 投票确认是否真需要重分类
                     has_reclassify = any("[需要重新分类]" in r.get("feedback", "")
@@ -604,7 +527,7 @@ class Orchestrator:
                         self._emit("stage", task_id, stage="2-redo",
                                    module=mod_name, attempt=attempt + 1)
 
-                        ar = await self._run(
+                        ar = await run_agent(
                             prompt=f"重新检查模块 `{mod_name}` 并细分。\n\n{feedback}",
                             system_prompt=w_sys_refine,
                             session_file=refine_session,
@@ -615,7 +538,7 @@ class Orchestrator:
                         judge_results = []
                         eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
-                            ar = await self._run(
+                            ar = await run_agent(
                                 prompt=f"评审模块 `{mod_name}` 的重新细分。",
                                 model=j_cfg_item.model,
                                 system_prompt=j_sys_refine,
@@ -631,7 +554,6 @@ class Orchestrator:
                                        passed=parsed["pass"], score=parsed["score"])
 
                         voted_pass = _check_voting(
-                            _apply_fault(fi, 2, attempt, mod_name, judge_results),
                             s_cfg_redo.pass_mode, j_count)
                         if voted_pass:
                             passed_count += 1
@@ -668,7 +590,7 @@ class Orchestrator:
                             prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
                             if feedback:
                                 prompt_parts.append(f"\n\n{feedback}")
-                            ar = await self._run(
+                            ar = await run_agent(
                                 prompt="\n".join(prompt_parts),
                                 system_prompt=w_sys_analyse,
                                 session_file=analyse_session,
@@ -678,7 +600,7 @@ class Orchestrator:
 
                             judge_results = []
                             for j_idx, j_cfg_item in enumerate(j_cfgs):
-                                ar = await self._run(
+                                ar = await run_agent(
                                     prompt=f"评审模块 `{mod_name}` 的分析报告。",
                                     model=j_cfg_item.model,
                                     system_prompt=j_sys_analyse,
@@ -694,7 +616,6 @@ class Orchestrator:
                                            passed=parsed["pass"], score=parsed["score"])
 
                             voted_pass = _check_voting(
-                                _apply_fault(fi, 3, attempt, mod_name, judge_results),
                                 s_cfg_a.pass_mode, j_count)
                             if voted_pass:
                                 passed_count += 1
@@ -719,7 +640,7 @@ class Orchestrator:
             self._emit("stage", task_id, stage=4)
             judge_results = []
             for j_idx, j_cfg_item in enumerate(j_cfgs):
-                ar = await self._run(
+                ar = await run_agent(
                     prompt="运行最终检查脚本，验证所有模块输出完整性。",
                     model=j_cfg_item.model,
                     system_prompt=j_sys_prompt,
@@ -740,7 +661,6 @@ class Orchestrator:
                     f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                     f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
-            judge_results = _apply_fault(fi, 4, 0, "", judge_results)
             s5_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
             if not s5_pass:
                 raise StageError("Stage 4 最终检查未通过")
@@ -800,11 +720,6 @@ class Orchestrator:
     # 工具方法
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _run(self, dry_output: str = "## 评分: 90\n## 通过: 是\n## 评审意见\n[dry-run] OK", **kwargs):
-        """dry_run 时返回 mock，否则调用真实 run_agent"""
-        if self.cfg.fault_inject.dry_run:
-            return _MockAR(dry_output)
-        return await run_agent(**kwargs)
 
     def _load_prompt(self, prompt_dir: str, name: str) -> str:
         for ext in [".md", ".txt", ""]:
