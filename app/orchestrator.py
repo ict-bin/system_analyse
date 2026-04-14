@@ -214,13 +214,19 @@ class Orchestrator:
             judge_classify_prompt = self._load_prompt(cfg.judges.system_prompt_dir, "step2_check_classify")
 
             reflect_classify_text = self._load_prompt(w_prompt_dir, "reflect_classify")
+            stage2_feedback = ""
+            s12_did_reflect = False
 
-            for attempt in range(MAX_RETRIES):
+            for attempt in range(MAX_RETRIES + 1):  # +1 给反思留位
                 self._emit("stage", task_id, stage=1, attempt=attempt + 1)
 
-                # Stage 1: Worker 分类
+                # Stage 1: Worker 工作
                 feedback_part = ""
-                if attempt > 0:
+                if s12_did_reflect:
+                    # 反思轮：用反思 prompt 当 feedback
+                    feedback_part = f"\n\n# 自查要求\n\n{reflect_classify_text}"
+                    s12_did_reflect = False  # reset
+                elif attempt > 0:
                     feedback_part = f"\n\n# 上一次的评审意见\n\n{stage2_feedback}\n\n请根据评审意见修正分类。"
 
                 ar = await run_agent(
@@ -261,23 +267,19 @@ class Orchestrator:
                     else:
                         stage2_feedback += f"\njudge-{j_idx}: {parsed['feedback'][:500]}"
 
-                    # 归档
                     (out_dir / f"stage2-attempt{attempt+1}-judge{j_idx}.md").write_text(
                         f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                         f"{parsed['feedback']}\n\n---\nRaw: {ar.output[:2000]}",
                         encoding="utf-8")
 
                 if stage2_passed:
-                    # 强制反思：通过后 Worker 自查确认
-                    self._emit("reflect", task_id, stage=1)
-                    ar = await run_agent(
-                        prompt=reflect_classify_text,
-                        system_prompt=classify_prompt_text,
-                        session_file=classify_session,
-                        **w_base,
-                    )
-                    tokens += ar.token_usage
-                    break
+                    if not s12_did_reflect and attempt == 0:
+                        # 首次通过 → 触发反思轮
+                        self._emit("reflect", task_id, stage=1)
+                        s12_did_reflect = True
+                        continue  # → 回循环：Worker(反思prompt) → Judge 重新验证
+                    else:
+                        break  # 反思后通过 / 重试后通过 → 完成
             else:
                 self._emit("stage_fail", task_id, stage=2,
                            message="分类完整性检查未通过，已达最大重试次数")
@@ -300,15 +302,20 @@ class Orchestrator:
                     continue
 
                 reflect_refine_text = self._load_prompt(w_prompt_dir, "reflect_refine")
+                s3_feedback = ""
+                s3_did_reflect = False
+                refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
 
-                for attempt in range(MAX_RETRIES):
+                for attempt in range(MAX_RETRIES + 1):
                     self._emit("stage", task_id, stage=3,
                                module=mod_name, attempt=attempt + 1)
 
                     # 3.1 Worker 细分
-                    refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                     feedback_part = ""
-                    if attempt > 0:
+                    if s3_did_reflect:
+                        feedback_part = f"\n\n# 自查要求\n\n{reflect_refine_text}"
+                        s3_did_reflect = False
+                    elif attempt > 0:
                         feedback_part = f"\n\n# 评审意见\n\n{s3_feedback}\n\n请根据意见修正。"
 
                     ar = await run_agent(
@@ -359,24 +366,20 @@ class Orchestrator:
                             s3_feedback += f"\njudge-{j_idx}: {parsed['feedback'][:500]}"
 
                     if s3_passed:
-                        # 强制反思：通过后 Worker 自查确认
-                        self._emit("reflect", task_id, stage=3, module=mod_name)
-                        ar = await run_agent(
-                            prompt=reflect_refine_text,
-                            system_prompt=refine_prompt_text,
-                            session_file=refine_session,
-                            **w_base,
-                        )
-                        tokens += ar.token_usage
-
-                        # 如果模块被拆分了，新模块加入待处理队列
-                        post_reflect_mods = _discover_modules(str(workspace))
-                        if mod_name not in post_reflect_mods:
-                            for nm in post_reflect_mods:
-                                if nm not in refined_modules:
-                                    modules_to_refine.append(nm)
-                        refined_modules.add(mod_name)
-                        break
+                        if not s3_did_reflect and attempt == 0:
+                            # 首次通过 → 触发反思轮
+                            self._emit("reflect", task_id, stage=3, module=mod_name)
+                            s3_did_reflect = True
+                            continue  # → 回循环：Worker(反思prompt) → Judge
+                        else:
+                            # 反思后通过 / 重试后通过 → 完成
+                            post_mods = _discover_modules(str(workspace))
+                            if mod_name not in post_mods:
+                                for nm in post_mods:
+                                    if nm not in refined_modules:
+                                        modules_to_refine.append(nm)
+                            refined_modules.add(mod_name)
+                            break
                 else:
                     refined_modules.add(mod_name)  # 达到最大重试，跳过
 
@@ -393,15 +396,20 @@ class Orchestrator:
 
             for mod_name in final_modules:
                 mod_dir = workspace / mod_name
+                s4_feedback = ""
+                s4_did_reflect = False
+                analyse_session = str(sess_dir / f"analyse-{mod_name}.jsonl")
 
-                for attempt in range(MAX_RETRIES):
+                for attempt in range(MAX_RETRIES + 1):
                     self._emit("stage", task_id, stage=4,
                                module=mod_name, attempt=attempt + 1)
 
                     # 4.1 Worker 分析
-                    analyse_session = str(sess_dir / f"analyse-{mod_name}.jsonl")
                     feedback_part = ""
-                    if attempt > 0:
+                    if s4_did_reflect:
+                        feedback_part = f"\n\n# 自查要求\n\n{reflect_analyse_text}"
+                        s4_did_reflect = False
+                    elif attempt > 0:
                         feedback_part = f"\n\n# 评审意见\n\n{s4_feedback}\n\n请根据意见修正分析。"
 
                     ar = await run_agent(
@@ -453,17 +461,14 @@ class Orchestrator:
                         modules_needing_reclassify.append(mod_name)
                         break
 
-                    # 4.4 通过 → 强制反思后进入下一模块
+                    # 4.4 通过判断
                     if s4_passed:
-                        self._emit("reflect", task_id, stage=4, module=mod_name)
-                        ar = await run_agent(
-                            prompt=reflect_analyse_text,
-                            system_prompt=analyse_prompt_text,
-                            session_file=analyse_session,
-                            **w_base,
-                        )
-                        tokens += ar.token_usage
-                        break
+                        if not s4_did_reflect and attempt == 0:
+                            self._emit("reflect", task_id, stage=4, module=mod_name)
+                            s4_did_reflect = True
+                            continue  # → 回循环：Worker(反思prompt) → Judge
+                        else:
+                            break  # 反思后通过 / 重试后通过 → 完成
 
             # 如果有模块需要重新分类，回 Stage 3 处理
             if modules_needing_reclassify:
