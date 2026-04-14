@@ -521,6 +521,46 @@ class Orchestrator:
         self._emit("worker_phase", task_id, worker_id=wid,
                     phase="A", modules=modules, module_count=len(modules))
 
+        # ── Phase A-Refine: 递归细分模块 ───────────────
+        MAX_REFINE_ITERS = 5
+        for refine_iter in range(MAX_REFINE_ITERS):
+            any_split = False
+            current_modules = _discover_modules(worker_out_dir)
+
+            for mod_name in current_modules:
+                files_list = Path(worker_out_dir) / mod_name / "files.list"
+                if not files_list.exists():
+                    continue
+                file_count = sum(1 for line in files_list.read_text(encoding="utf-8").splitlines() if line.strip())
+                # 文件数少于等于 5 的模块不需要细分
+                if file_count <= 5:
+                    continue
+
+                refine_prompt = self._build_refine_prompt(mod_name, file_count)
+                ar = await run_agent(
+                    prompt=refine_prompt, **base_kwargs,
+                    session_file=None,  # 全新上下文
+                )
+                wr.token_usage += ar.token_usage
+
+                # 检查是否产生了新子目录
+                new_modules = _discover_modules(worker_out_dir)
+                new_in_this_round = set(new_modules) - set(current_modules)
+                if new_in_this_round:
+                    any_split = True
+                    self._emit("worker_phase", task_id, worker_id=wid,
+                                phase="refine", module=mod_name,
+                                split_into=list(new_in_this_round))
+
+            if not any_split:
+                break
+
+        # 更新最终模块列表
+        modules = _discover_modules(worker_out_dir)
+        wr.modules = modules
+        self._emit("worker_phase", task_id, worker_id=wid,
+                    phase="refine_done", modules=modules, module_count=len(modules))
+
         # ── Phase B: 逐模块分析（每次 fork Phase A 上下文）──────
         for mod_name in modules:
             # 复制 Phase A session 作为本模块的起点
@@ -756,6 +796,30 @@ class Orchestrator:
             parts.insert(2 if rnd > 1 and feedback else 1,
                 f"# 其他 Worker 的分类结果（供参考）\n\n{other_classifications}")
         return "\n\n".join(parts)
+
+    def _build_refine_prompt(self, module_name, file_count):
+        return (
+            f"# 模块细分检查 — {module_name} ({file_count} 个文件)\n\n"
+            f"当前模块 `{module_name}/` 包含 {file_count} 个文件。\n\n"
+            "请判断这些文件是否可以按协议/服务/功能进一步拆分为更细的子模块。\n\n"
+            "步骤：\n"
+            f"1. 使用 `read` 读取 `{module_name}/files.list`\n"
+            "2. 根据文件名和路径分析这些文件是否属于不同的协议/服务/功能\n"
+            "3. 如果可以拆分，则：\n"
+            "   a. 为每个子模块创建新目录和新的 `files.list`\n"
+            f"   b. 删除原始的 `{module_name}/` 目录\n"
+            "   ```bash\n"
+            "   mkdir -p <新模块名>\n"
+            "   echo '/data/target/path/to/file' >> <新模块名>/files.list\n"
+            f"   rm -rf {module_name}\n"
+            "   ```\n"
+            "4. 如果不需要拆分（文件确实属于同一功能），直接说明原因，不做任何操作\n\n"
+            "拆分标准：\n"
+            "- 包含多个不同协议的文件（如 BGP + OSPF）→ 必须拆分\n"
+            "- 包含不同服务的文件（如 SSH + Telnet）→ 必须拆分\n"
+            "- 同一协议的不同组件（如 bgpd + bgp.conf）→ 不拆分\n"
+            "- 统一功能的多个文件（如多个 config 文件）→ 不拆分"
+        )
 
     def _build_phase_b_prompt(self, module_name, worker_out_dir,
                               worker_id: str = "",

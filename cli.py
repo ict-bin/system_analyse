@@ -39,8 +39,15 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         phase = d.get('phase', '?')
         if phase == 'A':
             print(f"     Phase A done: {d.get('module_count', 0)} modules found")
-        else:
+        elif phase == 'refine':
+            splits = d.get('split_into', [])
+            print(f"     Refine: {d.get('module', '?')} → {', '.join(splits)}")
+        elif phase == 'refine_done':
+            print(f"     Refine done: {d.get('module_count', 0)} final modules")
+        elif phase == 'B':
             print(f"     Phase B: {d.get('module', '?')} analyzed")
+        else:
+            print(f"     Phase {phase}: {d.get('module', '')}")
     elif t == "worker_done":
         mc = d.get('module_count', 0)
         mods = d.get('modules', [])
