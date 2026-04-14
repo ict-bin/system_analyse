@@ -213,6 +213,8 @@ class Orchestrator:
             classify_prompt_text = self._load_prompt(w_prompt_dir, "step1_classify")
             judge_classify_prompt = self._load_prompt(cfg.judges.system_prompt_dir, "step2_check_classify")
 
+            reflect_classify_text = self._load_prompt(w_prompt_dir, "reflect_classify")
+
             for attempt in range(MAX_RETRIES):
                 self._emit("stage", task_id, stage=1, attempt=attempt + 1)
 
@@ -266,6 +268,15 @@ class Orchestrator:
                         encoding="utf-8")
 
                 if stage2_passed:
+                    # 强制反思：通过后 Worker 自查确认
+                    self._emit("reflect", task_id, stage=1)
+                    ar = await run_agent(
+                        prompt=reflect_classify_text,
+                        system_prompt=classify_prompt_text,
+                        session_file=classify_session,
+                        **w_base,
+                    )
+                    tokens += ar.token_usage
                     break
             else:
                 self._emit("stage_fail", task_id, stage=2,
@@ -287,6 +298,8 @@ class Orchestrator:
                 mod_dir = workspace / mod_name
                 if not (mod_dir / "files.list").exists():
                     continue
+
+                reflect_refine_text = self._load_prompt(w_prompt_dir, "reflect_refine")
 
                 for attempt in range(MAX_RETRIES):
                     self._emit("stage", task_id, stage=3,
@@ -346,9 +359,20 @@ class Orchestrator:
                             s3_feedback += f"\njudge-{j_idx}: {parsed['feedback'][:500]}"
 
                     if s3_passed:
+                        # 强制反思：通过后 Worker 自查确认
+                        self._emit("reflect", task_id, stage=3, module=mod_name)
+                        ar = await run_agent(
+                            prompt=reflect_refine_text,
+                            system_prompt=refine_prompt_text,
+                            session_file=refine_session,
+                            **w_base,
+                        )
+                        tokens += ar.token_usage
+
                         # 如果模块被拆分了，新模块加入待处理队列
-                        if mod_name not in _discover_modules(str(workspace)):
-                            for nm in new_ones:
+                        post_reflect_mods = _discover_modules(str(workspace))
+                        if mod_name not in post_reflect_mods:
+                            for nm in post_reflect_mods:
                                 if nm not in refined_modules:
                                     modules_to_refine.append(nm)
                         refined_modules.add(mod_name)
@@ -364,6 +388,8 @@ class Orchestrator:
 
             final_modules = _discover_modules(str(workspace))
             modules_needing_reclassify: list[str] = []
+
+            reflect_analyse_text = self._load_prompt(w_prompt_dir, "reflect_analyse")
 
             for mod_name in final_modules:
                 mod_dir = workspace / mod_name
@@ -427,8 +453,16 @@ class Orchestrator:
                         modules_needing_reclassify.append(mod_name)
                         break
 
-                    # 4.4 通过或达到最大重试
+                    # 4.4 通过 → 强制反思后进入下一模块
                     if s4_passed:
+                        self._emit("reflect", task_id, stage=4, module=mod_name)
+                        ar = await run_agent(
+                            prompt=reflect_analyse_text,
+                            system_prompt=analyse_prompt_text,
+                            session_file=analyse_session,
+                            **w_base,
+                        )
+                        tokens += ar.token_usage
                         break
 
             # 如果有模块需要重新分类，回 Stage 3 处理

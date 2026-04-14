@@ -47,6 +47,9 @@ def render_event(event: SwarmEvent, quiet: bool = False):
               f"{d.get('score', 0)}/100")
     elif t == "reclassify":
         print(f"  🔄 Reclassify needed: {d.get('module', '?')}")
+    elif t == "reflect":
+        mod = f" [{d.get('module')}]" if d.get('module') else ""
+        print(f"    🔍 Reflect S{d.get('stage', '?')}{mod}")
     elif t == "task_end":
         print(f"\n{'═' * 60}")
         print(f"📋 {event.task_id}: {d.get('status', '').upper()}")
