@@ -521,7 +521,6 @@ class Orchestrator:
 
                     # Judge 评审
                     judge_results = []
-                    has_reclassify = False
 
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
                         ar = await self._run(
@@ -536,20 +535,21 @@ class Orchestrator:
                         parsed = _parse_eval_md(ar.output)
                         judge_results.append(parsed)
 
-                        if "[需要重新分类]" in ar.output or "[需要重新分类]" in parsed["feedback"]:
-                            has_reclassify = True
-
                         self._emit("judge_eval", task_id, stage=3,
                                    judge_id=f"judge-{j_idx}", module=mod_name,
                                    passed=parsed["pass"], score=parsed["score"])
 
                         self._archive(out_dir,
                             f"s3-{mod_name}-a{attempt+1}-j{j_idx}.md",
-                            f"Score: {parsed['score']}\nPass: {parsed['pass']}\n"
-                            f"Reclassify: {has_reclassify}\n\n"
+                            f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                             f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
+                    # 故障注入（必须在 reclassify 检测前）
+                    judge_results = _apply_fault(fi, 3, attempt, mod_name, judge_results)
+
                     # 分类问题 → 投票确认是否真需要重分类
+                    has_reclassify = any("[需要重新分类]" in r.get("feedback", "")
+                                        for r in judge_results)
                     if has_reclassify:
                         reclass_votes = sum(1 for r in judge_results
                                            if "[需要重新分类]" in r.get("feedback", ""))
@@ -561,7 +561,6 @@ class Orchestrator:
                             modules_needing_reclassify.append(mod_name)
                             break  # 跳出 attempt 循环，后面统一处理
 
-                    judge_results = _apply_fault(fi, 3, attempt, mod_name, judge_results)
                     voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                     if voted_pass:
