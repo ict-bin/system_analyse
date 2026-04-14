@@ -1,20 +1,20 @@
 {
-    "max_rounds": 3,
-    "min_rounds": 2,
-    "pass_threshold": 2,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
-
+    "stages": {
+        "classify": {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
+        "refine":   {"min_rounds": 2, "max_rounds": 3, "pass_mode": "majority"},
+        "analyse":  {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
+        "final_check": {"min_rounds": 1, "max_rounds": 1, "pass_mode": "all"}
+    },
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
         "system_prompt_dir": "/opt/system_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            { "model": "vllm/zai-org/GLM-5" },
             { "model": "vllm/zai-org/GLM-5" }
         ]
     },
-
     "judges": {
         "default_tools": ["read", "bash", "grep", "find"],
         "system_prompt_dir": "/opt/system_analyse/prompts/judges",
@@ -24,11 +24,9 @@
             { "model": "vllm/zai-org/GLM-5" }
         ]
     },
-
     "output_dir": "/data/output",
     "archive_dir": "/data/output",
     "result_dir": "/data/output",
-
-    "context": "",
-    "criteria": "重点：攻击面识别完整性、STRIDE 威胁覆盖度、分析深度（行号引用、触发条件）、修复建议可操作性"
+    "context": "华为NE8000路由器固件解包文件",
+    "criteria": "文件分类完整性、模块划分合理性、STRIDE威胁覆盖度"
 }

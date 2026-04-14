@@ -31,12 +31,25 @@ class RoleConfig(BaseModel):
 
 # ─── 服务配置 ─────────────────────────────────────────────────────────────────
 
+class StageLoopConfig(BaseModel):
+    """单个阶段的循环控制"""
+    min_rounds: int = Field(default=2, description="最少运行轮数（强制反思）")
+    max_rounds: int = Field(default=5, description="最多迭代轮数，-1=无限")
+    pass_mode: str = Field(default="majority", description="majority=半数以上, all=全部judge通过")
+
+
+class StagesConfig(BaseModel):
+    classify: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=5))
+    refine: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=3))
+    analyse: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=5))
+    final_check: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=1))
+
+
 class ServiceConfig(BaseModel):
-    max_rounds: int = Field(default=3, ge=1, le=10)
-    min_rounds: int = Field(default=2, ge=1, le=10)
-    pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
+
+    stages: StagesConfig = Field(default_factory=StagesConfig)
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -58,11 +71,9 @@ class TaskConfig(BaseModel):
     function_name: str = Field(default="", description="兼容字段：用于归档命名")
     cwd: str = Field(default="/data/target")
 
-    max_rounds: int = Field(default=3)
-    min_rounds: int = Field(default=2)
-    pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
+    stages: StagesConfig = Field(default_factory=StagesConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
     output_dir: str = Field(default="/data/output")

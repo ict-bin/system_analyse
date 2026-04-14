@@ -5,7 +5,6 @@ system_analyse — 配置加载
 from __future__ import annotations
 
 import json
-import math
 import os
 from pathlib import Path
 
@@ -31,11 +30,9 @@ def build_task_config(svc: ServiceConfig, prompt: str) -> TaskConfig:
         cwd=TARGET_DIR,
         source_file="firmware",
         function_name="analyse",
-        max_rounds=svc.max_rounds,
-        min_rounds=svc.min_rounds,
-        pass_threshold=svc.pass_threshold,
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
+        stages=svc.stages.model_copy(deep=True),
         workers=svc.workers.model_copy(deep=True),
         judges=svc.judges.model_copy(deep=True),
         output_dir=svc.output_dir,
@@ -47,10 +44,6 @@ def build_task_config(svc: ServiceConfig, prompt: str) -> TaskConfig:
 
     _backfill_role(cfg.workers)
     _backfill_role(cfg.judges)
-
-    if cfg.pass_threshold is None:
-        cfg.pass_threshold = math.ceil(cfg.judge_count / 2)
-
     return cfg
 
 

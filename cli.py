@@ -39,7 +39,7 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         elif stage == 4:
             print(f"    → Analyzed: {d.get('module', '?')}")
     elif t == "stage_fail":
-        print(f"  ❗ Stage {d.get('stage')} failed: {d.get('message', '')}")
+        print(f"\n  ❗ FAILED: {d.get('error', d.get('message', ''))}", file=sys.stderr)
     elif t == "judge_eval":
         icon = "✅" if d.get("passed") else "❌"
         mod = f" [{d.get('module')}]" if d.get('module') else ""
@@ -49,7 +49,9 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         print(f"  🔄 Reclassify needed: {d.get('module', '?')}")
     elif t == "reflect":
         mod = f" [{d.get('module')}]" if d.get('module') else ""
-        print(f"    🔍 Reflect S{d.get('stage', '?')}{mod}")
+        rnd = d.get('round', 1)
+        mn = d.get('min_rounds', '?')
+        print(f"    🔍 Reflect S{d.get('stage', '?')}{mod} ({rnd}/{mn})")
     elif t == "task_end":
         print(f"\n{'═' * 60}")
         print(f"📋 {event.task_id}: {d.get('status', '').upper()}")
