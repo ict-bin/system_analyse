@@ -58,9 +58,6 @@ class ServiceConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
-    context: str = Field(default="")
-    criteria: str = Field(default="")
-
 
 # ─── 运行时任务 ───────────────────────────────────────────────────────────────
 
@@ -79,8 +76,6 @@ class TaskConfig(BaseModel):
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
-    context: str = Field(default="")
-    criteria: str = Field(default="")
 
     @property
     def worker_count(self) -> int:

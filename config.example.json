@@ -26,7 +26,5 @@
     },
     "output_dir": "/data/output",
     "archive_dir": "/data/output",
-    "result_dir": "/data/output",
-    "context": "华为NE8000路由器固件解包文件",
-    "criteria": "文件分类完整性、模块划分合理性、STRIDE威胁覆盖度"
+    "result_dir": "/data/output"
 }

@@ -101,7 +101,9 @@ async def main():
 ╠═══════════════════════════════════════════════════════════╣
 ║  Target:  /data/target                                    ║
 ║  Workers: {cfg.worker_count:<5}  Judges: {cfg.judge_count:<33} ║
-║  Max retries per stage: {cfg.max_rounds:<34} ║
+║  Classify: min={cfg.stages.classify.min_rounds} max={cfg.stages.classify.max_rounds} mode={cfg.stages.classify.pass_mode:<15} ║
+║  Refine:   min={cfg.stages.refine.min_rounds} max={cfg.stages.refine.max_rounds} mode={cfg.stages.refine.pass_mode:<15} ║
+║  Analyse:  min={cfg.stages.analyse.min_rounds} max={cfg.stages.analyse.max_rounds} mode={cfg.stages.analyse.pass_mode:<15} ║
 ╚═══════════════════════════════════════════════════════════╝""")
 
     orch = Orchestrator(config=cfg, on_event=lambda e: render_event(e, quiet=quiet))
