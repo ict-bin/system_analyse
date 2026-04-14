@@ -728,7 +728,15 @@ class Orchestrator:
             "请完成以下工作：\n"
             "1. 使用 `bash` 和 `read` 工具遍历 `/data/target` 下所有文件\n"
             "2. 分析每个文件的功能、类型（配置/二进制/脚本/库/服务等）\n"
-            "3. 按功能将文件划分为模块（如 network、crypto、init、web 等）\n"
+            "3. **细粒度分类**：按具体协议/服务/功能划分模块，而非笼统分类。例如：\n"
+            "   - ✗ 错误: `network/` (太笼统)\n"
+            "   - ✓ 正确: `bgp/`, `ospf/`, `ike/`, `ipsec/`, `ssh/`, `snmp/`, `http_server/` 等\n"
+            "   - ✗ 错误: `monitor/` (太笼统)\n"
+            "   - ✓ 正确: `bgp_monitor/`, `interface_monitor/`, `health_check/` 等\n"
+            "   - ✗ 错误: `crypto/` (太笼统)\n"
+            "   - ✓ 正确: `tls/`, `ike/`, `pki/` 等\n"
+            "   - 共享库/通用工具可归入 `common/` 或 `platform/`\n"
+            "   - 无法确定功能的文件归入 `unknown/`\n"
             "4. 为每个模块创建子目录，并在其中创建 `files.list` 文件，\n"
             "   每行写入一个属于该模块的文件的绝对路径：\n"
             "   ```bash\n"
@@ -736,7 +744,8 @@ class Orchestrator:
             "   echo '/data/target/path/to/file1' >> <模块名>/files.list\n"
             "   ```\n"
             "   **注意：不要拷贝文件，只记录绝对路径到 files.list 中。**\n"
-            "5. 一个文件只能属于一个模块，不要遗漏任何文件\n\n"
+            "5. 一个文件只能属于一个模块，不要遗漏任何文件\n"
+            "6. 模块命名使用小写英文+下划线，如 `bgp`, `ike_vpn`, `web_server`\n\n"
             "完成后用 `<result>...</result>` 包裹你的分类摘要。",
         ]
         if rnd > 1 and feedback:
