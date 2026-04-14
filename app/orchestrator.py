@@ -120,12 +120,22 @@ def _parse_eval_md(output: str) -> dict:
     m = re.search(r'##\s*评分[::=：]\s*(\d+)', output)
     if not m:
         m = re.search(r'##\s*[Ss]core[::=：]\s*(\d+)', output)
+    if not m:
+        # 匹配 "**评分**: 85" 或 "评分：85" 等变体
+        m = re.search(r'\*{0,2}评分\*{0,2}[::=：]\s*(\d+)', output)
+    if not m:
+        # 匹配 "Score: 85" 无 ## 前缀
+        m = re.search(r'[Ss]core[::=：]\s*(\d+)', output)
     if m:
         score = min(int(m.group(1)), 100)
 
     m = re.search(r'##\s*通过[::=：]\s*(是|否|true|false|yes|no|pass|fail)', output, re.IGNORECASE)
     if not m:
         m = re.search(r'##\s*[Pp]ass[::=：]\s*(是|否|true|false|yes|no)', output, re.IGNORECASE)
+    if not m:
+        m = re.search(r'\*{0,2}通过\*{0,2}[::=：]\s*(是|否|true|false)', output, re.IGNORECASE)
+    if not m:
+        m = re.search(r'[Pp]ass[::=：]\s*(是|否|true|false|yes|no)', output, re.IGNORECASE)
     if m:
         passed = m.group(1).lower() in ('是', 'true', 'yes', 'pass')
     elif score >= 70:
@@ -611,7 +621,8 @@ class Orchestrator:
             weval.classification_feedback = parsed["feedback"]
             (w_j_dir / "step1-classification.md").write_text(
                 f"# {jid} → {w.worker_id} Step 1: Classification\n\n"
-                f"Pass: {parsed['pass']}\nScore: {parsed['score']}\n\n{parsed['feedback']}",
+                f"Pass: {parsed['pass']}\nScore: {parsed['score']}\n\n{parsed['feedback']}\n\n"
+                f"---\n## Raw Output\n\n{ar.output[:2000]}",
                 encoding="utf-8")
 
             self._emit("judge_step", task_id, judge_id=jid,
@@ -640,7 +651,8 @@ class Orchestrator:
 
                 (w_j_dir / f"step2-module-{mod_name}.md").write_text(
                     f"# {jid} → {w.worker_id} → {mod_name}\n\n"
-                    f"Pass: {parsed['pass']}\nScore: {parsed['score']}\n\n{parsed['feedback']}",
+                    f"Pass: {parsed['pass']}\nScore: {parsed['score']}\n\n{parsed['feedback']}\n\n"
+                    f"---\n## Raw Output\n\n{ar.output[:3000]}",
                     encoding="utf-8")
 
                 self._emit("judge_step", task_id, judge_id=jid,
@@ -787,7 +799,7 @@ class Orchestrator:
             "2. 读取每个模块的 `files.list`，汇总所有已分类文件\n"
             "3. 检查是否有遗漏的文件（在 /data/target 中但不在任何 files.list 中）\n"
             "4. 检查是否有文件被重复分类\n\n"
-            "按以下格式输出：\n\n"
+            "⚠️ **你必须在回复末尾输出以下格式，不可省略：**\n\n"
             "## 评分: <0-100>\n"
             "## 通过: <是/否>\n"
             "## 评审意见\n"
@@ -800,14 +812,15 @@ class Orchestrator:
             f"模块目录: 当前工作目录\n\n"
             "请检查：\n"
             "1. 使用 `read` 读取 `files.list` 获取文件列表（内含绝对路径）\n"
-            "2. 使用 `read` 按绝对路径逐个读取源文件\n"
+            "2. 使用 `read` 按绝对路径逐个读取源文件（二进制文件无法读取时跳过，根据文件名推断即可）\n"
             "3. 使用 `read` 读取 `module_report.md`（如存在）\n"
             "4. 验证：\n"
             "   a. 文件划分是否合理（files.list 中的文件确实属于同一模块吗）\n"
             "   b. module_report.md 的功能描述是否准确\n"
             "   c. 威胁分析是否正确（威胁是否真实、有无遗漏关键威胁）\n"
             "   d. 风险评分是否合理\n\n"
-            "按以下格式输出：\n\n"
+            "如果 module_report.md 不存在或为空，直接给 30 分并判定不通过。\n\n"
+            "⚠️ **你必须在回复末尾输出以下格式，不可省略：**\n\n"
             "## 评分: <0-100>\n"
             "## 通过: <是/否>\n"
             "## 评审意见\n"
@@ -828,6 +841,7 @@ class Orchestrator:
             f"\n详细评审文件: {', '.join(eval_files)}\n"
             "请使用 `read` 工具读取上述评审文件，然后给出综合评分。\n\n"
             "**判定规则：所有模块必须通过且文件分类完整，才能投通过票。**\n\n"
+            "⚠️ **你必须在回复末尾输出以下格式，不可省略：**\n\n"
             "## 评分: <0-100>\n"
             "## 通过: <是/否>\n"
             "## 评审意见\n"
