@@ -1,23 +1,24 @@
-你已完成文件分类，现在请进行自我审查。
+你已完成粗分类，现在请快速自查**覆盖率**。
 
-# 自查清单
+# 自查（只检查覆盖率，不检查精度）
 
-请逐项确认，发现问题**立即修正**：
+```bash
+# 1. 总文件数
+find /data/target -type f | wc -l
 
-1. **完整性**：是否遍历了 `/data/target` 下所有子目录和文件？
-   - 运行 `find /data/target -type f | wc -l` 统计总数
-   - 逐个检查每个模块的 `files.list` 行数之和是否等于总数
-   - 如有遗漏，立即补充到正确模块的 `files.list`
+# 2. 已分类文件数（去重）
+cat */files.list 2>/dev/null | sort -u | wc -l
 
-2. **唯一性**：是否有文件被重复分类到多个模块？
-   - 如有重复，只保留最合理的归属
+# 3. 未分类文件
+cat */files.list 2>/dev/null | sort -u > /tmp/classified.txt
+find /data/target -type f | sort > /tmp/all.txt
+comm -23 /tmp/all.txt /tmp/classified.txt > /tmp/missing.txt
+wc -l /tmp/missing.txt
+head -50 /tmp/missing.txt
+```
 
-3. **粒度**：是否存在"大杂烩"模块（单模块包含多种不相关协议/服务的文件）？
-   - 如有，拆分为更细的模块
+- 如有遗漏文件，按路径关键词归入已有模块或创建新模块
+- 如有重复分类，用 `sort files.list | uniq > files.list.tmp && mv files.list.tmp files.list` 去重
+- **不要读取文件内容**，只看路径
 
-4. **路径正确性**：`files.list` 中的路径是否都是 `/data/target/...` 开头的绝对路径？
-   - 路径对应的文件是否真实存在？
-
-**如果一切正确，说明确认结论。如果发现问题，修正后说明修改内容。**
-
-用 `<result>自查结论</result>` 包裹结果。
+用 `<result>自查结论（覆盖率）</result>` 结束。
