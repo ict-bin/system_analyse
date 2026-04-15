@@ -55,10 +55,12 @@ def render_event(event: SwarmEvent, quiet: bool = False):
     elif t == "task_end":
         print(f"\n{'═' * 60}")
         print(f"📋 {event.task_id}: {d.get('status', '').upper()}")
+        if d.get("report"):
+            print(f"   📄 Report:  {d.get('report')}")
+        if d.get("modules"):
+            print(f"   📂 Modules: {d.get('modules')}")
         if d.get("archive"):
             print(f"   📦 Archive: {d.get('archive')}")
-        if d.get("result_file"):
-            print(f"   📄 Result:  {d.get('result_file')}")
     elif t == "error":
         print(f"\n❗ Error: {d.get('error')}", file=sys.stderr)
 

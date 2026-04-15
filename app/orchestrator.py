@@ -4,7 +4,7 @@ system_analyse — 四阶段流水线编排器 v2
 Stage 1: Worker 全局分类 + Judge 脚本检查
 Stage 2: 遍历子文件夹 — Worker 细分 + Judge 评审
 Stage 3: 遍历子文件夹 — Worker 分析 + Judge 评审
-Stage 4: Judge 脚本最终检查
+Stage 4: Judge 完整性检查(缺失回 Stage 2) + Worker 生成报告 + Judge 评审报告
 
 每个 stage 有独立 min_rounds / max_rounds / pass_mode
 投票: majority(>50% judge 通过) 或 all(全部通过)
@@ -631,19 +631,22 @@ class Orchestrator:
                             raise StageError(
                                 f"Stage 3-redo 模块 {mod_name} 分析未通过")
 
-            # ═══════════════════════════════════════════════════
-            # Stage 4: 最终检查
-            # ═══════════════════════════════════════════════════
-            s_cfg = cfg.stages.final_check
-            j_sys_prompt = self._load_prompt(cfg.judges.system_prompt_dir, "step4_final_check")
 
-            self._emit("stage", task_id, stage=4)
+
+            # ═══════════════════════════════════════════════════
+            # Stage 4a: Judge 完整性检查（缺失模块回 Stage 2+3）
+            # ═══════════════════════════════════════════════════
+            j_completeness_prompt = self._load_prompt(
+                cfg.judges.system_prompt_dir, "step4_check_completeness")
+
+            self._emit("stage", task_id, stage="4a")
             judge_results = []
+            missing_modules = []
             for j_idx, j_cfg_item in enumerate(j_cfgs):
                 ar = await run_agent(
-                    prompt="运行最终检查脚本，验证所有模块输出完整性。",
+                    prompt="运行 check_outputs.sh 检查所有模块是否都有 module_report.md。",
                     model=j_cfg_item.model,
-                    system_prompt=j_sys_prompt,
+                    system_prompt=j_completeness_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
                     **j_base_kw,
@@ -652,26 +655,179 @@ class Orchestrator:
                 parsed = _parse_eval_md(ar.output)
                 judge_results.append(parsed)
 
-                self._emit("judge_eval", task_id, stage=4,
+                self._emit("judge_eval", task_id, stage="4a",
                            judge_id=f"judge-{j_idx}",
                            passed=parsed["pass"], score=parsed["score"])
 
                 self._archive(out_dir,
-                    f"s4-j{j_idx}.md",
+                    f"s4a-j{j_idx}.md",
                     f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                     f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
-            s5_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
-            if not s5_pass:
-                raise StageError("Stage 4 最终检查未通过")
+                # 从脚本输出提取缺失模块名（❌ module_name）
+                if not parsed["pass"]:
+                    for m in re.findall(r'\u274c\s+(\S+)', ar.output):
+                        if m not in missing_modules:
+                            missing_modules.append(m)
+
+            s4a_pass = _check_voting(judge_results, "all", j_count)
+
+            # 有缺失模块 → 回 Stage 2+3 补做
+            if not s4a_pass and missing_modules:
+                self._emit("stage", task_id, stage="2-redo-s4",
+                           modules=missing_modules)
+
+                s_cfg_redo = cfg.stages.refine
+                w_sys_refine = self._load_prompt(w_prompt_dir, "step2_refine")
+                j_sys_refine = self._load_prompt(
+                    cfg.judges.system_prompt_dir, "step2_check_refine")
+                w_sys_analyse = self._load_prompt(w_prompt_dir, "step3_analyse")
+                j_sys_analyse = self._load_prompt(
+                    cfg.judges.system_prompt_dir, "step3_check_analyse")
+                s_cfg_a = cfg.stages.analyse
+
+                for mod_name in missing_modules:
+                    mod_dir = workspace / mod_name
+                    if not mod_dir.exists() or not (mod_dir / "files.list").exists():
+                        continue
+
+                    # Stage 2 补做
+                    refine_session = str(sess_dir / f"refine-s4-{mod_name}.jsonl")
+                    ar = await run_agent(
+                        prompt=f"检查模块 `{mod_name}` 是否需要细分。",
+                        system_prompt=w_sys_refine,
+                        session_file=refine_session,
+                        **w_base,
+                    )
+                    tokens += ar.token_usage
+
+                    # Stage 3 补做
+                    analyse_session = str(sess_dir / f"analyse-s4-{mod_name}.jsonl")
+                    feedback = ""
+                    for attempt in range(self._max_iter(s_cfg_a)):
+                        prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
+                        if feedback:
+                            prompt_parts.append(f"\n\n{feedback}")
+                        ar = await run_agent(
+                            prompt="\n".join(prompt_parts),
+                            system_prompt=w_sys_analyse,
+                            session_file=analyse_session,
+                            **w_base,
+                        )
+                        tokens += ar.token_usage
+
+                        judge_results = []
+                        for j_idx, j_cfg_item in enumerate(j_cfgs):
+                            ar = await run_agent(
+                                prompt=f"评审模块 `{mod_name}` 的分析报告。",
+                                model=j_cfg_item.model,
+                                system_prompt=j_sys_analyse,
+                                tools=cfg.judges.default_tools,
+                                cwd=str(mod_dir),
+                                **j_base_kw,
+                            )
+                            tokens += ar.token_usage
+                            parsed = _parse_eval_md(ar.output)
+                            judge_results.append(parsed)
+                            self._emit("judge_eval", task_id, stage="3-redo-s4",
+                                       judge_id=f"judge-{j_idx}", module=mod_name,
+                                       passed=parsed["pass"], score=parsed["score"])
+
+                        if _check_voting(judge_results, s_cfg_a.pass_mode, j_count):
+                            break
+                        fail_fb = "\n".join(
+                            f"judge-{i}: {r['feedback'][:500]}"
+                            for i, r in enumerate(judge_results) if not r["pass"])
+                        feedback = f"# 评审意见\n\n{fail_fb}"
+                    else:
+                        raise StageError(
+                            f"Stage 4a 补做模块 {mod_name} 分析未通过")
+
+            # ═══════════════════════════════════════════════════
+            # Stage 4b: Worker 生成最终报告 + Judge 评审
+            # ═══════════════════════════════════════════════════
+            s_cfg = cfg.stages.final_check
+            report_sys_prompt = self._load_prompt(w_prompt_dir, "step4_final_report")
+            j_report_prompt = self._load_prompt(
+                cfg.judges.system_prompt_dir, "step4_check_report")
+            reflect_report = self._load_prompt(w_prompt_dir, "reflect_report")
+            report_session = str(sess_dir / "final_report.jsonl")
+
+            feedback = ""
+            passed_count = 0
+
+            for attempt in range(self._max_iter(s_cfg)):
+                self._emit("stage", task_id, stage="4b", attempt=attempt + 1)
+
+                # Worker 生成报告
+                prompt_parts = [
+                    "读取所有模块的 module_report.md，生成最终分析总报告 final_report.md。"]
+                if feedback:
+                    prompt_parts.append(f"\n\n{feedback}")
+                ar = await run_agent(
+                    prompt="\n".join(prompt_parts),
+                    system_prompt=report_sys_prompt,
+                    session_file=report_session,
+                    **w_base,
+                )
+                tokens += ar.token_usage
+
+                has_report = (workspace / "final_report.md").exists()
+                self._emit("stage_result", task_id, stage="4b",
+                           has_report=has_report)
+
+                # Judge 评审报告
+                judge_results = []
+                for j_idx, j_cfg_item in enumerate(j_cfgs):
+                    ar = await run_agent(
+                        prompt="评审 final_report.md 的质量和完整性。",
+                        model=j_cfg_item.model,
+                        system_prompt=j_report_prompt,
+                        tools=cfg.judges.default_tools,
+                        cwd=str(workspace),
+                        **j_base_kw,
+                    )
+                    tokens += ar.token_usage
+                    parsed = _parse_eval_md(ar.output)
+                    judge_results.append(parsed)
+
+                    self._emit("judge_eval", task_id, stage="4b",
+                               judge_id=f"judge-{j_idx}",
+                               passed=parsed["pass"], score=parsed["score"])
+
+                    self._archive(out_dir,
+                        f"s4b-a{attempt+1}-j{j_idx}.md",
+                        f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
+                        f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
+
+                voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
+
+                if voted_pass:
+                    passed_count += 1
+                    if passed_count >= s_cfg.min_rounds:
+                        break
+                    else:
+                        self._emit("reflect", task_id, stage="4b",
+                                   round=passed_count, min_rounds=s_cfg.min_rounds)
+                        feedback = (f"# 自查要求（第 {passed_count} 次通过，"
+                                    f"需至少 {s_cfg.min_rounds} 次）\n\n{reflect_report}")
+                else:
+                    passed_count = 0
+                    fail_fb = "\n".join(
+                        f"judge-{i}: {r['feedback'][:500]}"
+                        for i, r in enumerate(judge_results) if not r["pass"])
+                    feedback = (f"# 评审意见（未通过）\n\n{fail_fb}"
+                                f"\n\n请根据意见修正 final_report.md。")
+            else:
+                raise StageError(
+                    f"Stage 4b 最终报告未通过，已达最大轮数 {s_cfg.max_rounds}")
+
 
             # ═══════════════════════════════════════════════════
             # 完成
             # ═══════════════════════════════════════════════════
             result.status = TaskStatus.PASSED
             result.total_tokens = tokens
-            final_mods = _discover_modules(str(workspace))
-            result.final_output = self._build_final_summary(str(workspace), final_mods)
 
         except StageError as e:
             result.status = TaskStatus.FAILED
@@ -687,27 +843,38 @@ class Orchestrator:
 
         result.total_duration_ms = (time.time() - start) * 1000
 
-        # 归档
-        final_mods = _discover_modules(str(workspace))
-        (out_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
-
+        # ── 组装输出目录 ─────────────────────────────────────
         result_dir = Path(os.path.abspath(cfg.result_dir))
         result_dir.mkdir(parents=True, exist_ok=True)
-        fname = f"{cfg.source_file}_{cfg.function_name}"
+        final_mods = _discover_modules(str(workspace))
 
-        result_md = result_dir / f"{fname}.md"
-        result_md.write_text(
-            f"---\ntask_id: {task_id}\nstatus: {result.status.value}\n"
-            f"modules: {final_mods}\n"
-            f"duration: {result.total_duration_ms / 1000:.1f}s\n---\n\n"
-            f"{result.final_output or result.error or ''}",
-            encoding="utf-8")
+        # 1) modules/ — 分类后的模块文件夹 (files.list + module_report.md)
+        modules_out = result_dir / "modules"
+        if modules_out.exists():
+            shutil.rmtree(str(modules_out))
+        modules_out.mkdir(parents=True, exist_ok=True)
+        for mod in final_mods:
+            src = workspace / mod
+            dst = modules_out / mod
+            if src.is_dir():
+                shutil.copytree(str(src), str(dst))
 
-        archive_path = str(result_dir / f"{fname}_log")
+        # 2) final_report.md — 最终分析报告
+        report_src = workspace / "final_report.md"
+        report_dst = result_dir / "final_report.md"
+        if report_src.exists():
+            shutil.copy2(str(report_src), str(report_dst))
+
+        # 3) archive.zip — 所有中间件 (judge评审、session、原始workspace)
+        (out_dir / "result.json").write_text(
+            result.model_dump_json(indent=2), encoding="utf-8")
+        archive_path = str(result_dir / "archive")
         shutil.make_archive(archive_path, "zip", str(out_dir.parent), out_dir.name)
 
         self._emit("task_end", task_id, status=result.status.value,
-                    archive=f"{archive_path}.zip", result_file=str(result_md))
+                    report=str(report_dst),
+                    modules=str(modules_out),
+                    archive=f"{archive_path}.zip")
 
         try:
             shutil.rmtree(str(out_dir))
@@ -715,6 +882,7 @@ class Orchestrator:
             pass
 
         return result
+
 
     # ═══════════════════════════════════════════════════════════════════════
     # 工具方法
