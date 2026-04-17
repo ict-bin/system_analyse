@@ -1,8 +1,7 @@
 #!/bin/bash
 # filter_files.sh — 按分析类型过滤目标文件
 # 用法: bash filter_files.sh <target_dir> <output_file> <types...>
-# 示例: bash filter_files.sh /data/target /workspace/filtered_files.txt binary script
-#       bash filter_files.sh /data/target /workspace/filtered_files.txt all
+# 输出: 相对路径（不含 target_dir 前缀）
 
 set -e
 TARGET_DIR="${1:-/data/target}"
@@ -12,7 +11,7 @@ TYPES="$@"
 
 # all = 不过滤
 if echo "$TYPES" | grep -qw "all"; then
-    find "$TARGET_DIR" -type f | sort > "$OUTPUT_FILE"
+    find "$TARGET_DIR" -type f | sed "s|^${TARGET_DIR}/||" | sort > "$OUTPUT_FILE"
     TOTAL=$(wc -l < "$OUTPUT_FILE")
     echo "类型: all → $TOTAL 个文件（不过滤）"
     exit 0
@@ -70,40 +69,36 @@ for t in $TYPES; do
     esac
 done
 
-# 去重
 EXT_PATTERNS=$(echo $EXT_PATTERNS | tr ' ' '\n' | sort -u | tr '\n' ' ')
 echo "扩展名: $EXT_PATTERNS"
 
-# ── 第一轮：按扩展名匹配 ──
+# ── 第一轮：按扩展名匹配（输出相对路径）──
 > "$OUTPUT_FILE"
 for ext in $EXT_PATTERNS; do
-    find "$TARGET_DIR" -type f -iname "*${ext}" >> "$OUTPUT_FILE" 2>/dev/null || true
+    find "$TARGET_DIR" -type f -iname "*${ext}" | sed "s|^${TARGET_DIR}/||" >> "$OUTPUT_FILE" 2>/dev/null || true
 done
 
-# ── 第二轮：按 magic 匹配（扩展名未匹配到的文件）──
+# ── 第二轮：按 magic 匹配 ──
 if [ -n "$MAGIC_PATTERNS" ]; then
-    # 构造所有已匹配的文件集合
     sort -u "$OUTPUT_FILE" -o "$OUTPUT_FILE"
     MATCHED_COUNT=$(wc -l < "$OUTPUT_FILE")
 
-    # 对剩余文件用 file 命令检测
-    find "$TARGET_DIR" -type f | sort > /tmp/all_target_files.txt
-    comm -23 /tmp/all_target_files.txt "$OUTPUT_FILE" > /tmp/remaining_files.txt
-    REMAINING=$(wc -l < /tmp/remaining_files.txt)
+    find "$TARGET_DIR" -type f | sed "s|^${TARGET_DIR}/||" | sort > /tmp/all_target_rel.txt
+    comm -23 /tmp/all_target_rel.txt "$OUTPUT_FILE" > /tmp/remaining_rel.txt
+    REMAINING=$(wc -l < /tmp/remaining_rel.txt)
 
     if [ "$REMAINING" -gt 0 ]; then
         echo "扩展名匹配: $MATCHED_COUNT，剩余 $REMAINING 个用 magic 检测..."
-        # 用 file 命令批量检测（限制数量避免太慢）
         MAGIC_REGEX=$(echo $MAGIC_PATTERNS | tr ' ' '|' | sed 's/_/ /g')
-        while IFS= read -r f; do
-            ftype=$(file -b "$f" 2>/dev/null)
+        while IFS= read -r rel; do
+            ftype=$(file -b "$TARGET_DIR/$rel" 2>/dev/null)
             if echo "$ftype" | grep -qiE "$MAGIC_REGEX"; then
-                echo "$f" >> "$OUTPUT_FILE"
+                echo "$rel" >> "$OUTPUT_FILE"
             fi
-        done < /tmp/remaining_files.txt
+        done < /tmp/remaining_rel.txt
     fi
 
-    rm -f /tmp/all_target_files.txt /tmp/remaining_files.txt
+    rm -f /tmp/all_target_rel.txt /tmp/remaining_rel.txt
 fi
 
 sort -u "$OUTPUT_FILE" -o "$OUTPUT_FILE"

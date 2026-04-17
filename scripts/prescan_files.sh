@@ -69,10 +69,13 @@ find "$TARGET_DIR" -type f | while IFS= read -r filepath; do
         fi
     fi
 
+    # 输出相对路径（去掉 TARGET_DIR 前缀）
+    relpath=$(echo "$filepath" | sed "s|^${TARGET_DIR}/||")
+
     if [ -n "$kw" ]; then
-        echo "$filepath" >> "$WORKSPACE/prescan/$kw.list"
+        echo "$relpath" >> "$WORKSPACE/prescan/$kw.list"
     else
-        echo "$filepath" >> "$WORKSPACE/prescan/unknown.list"
+        echo "$relpath" >> "$WORKSPACE/prescan/unknown.list"
     fi
 done
 

@@ -9,7 +9,8 @@ COPY cli.py main.py     ./
 COPY prompts/           ./prompts/
 COPY scripts/           ./scripts/
 COPY config.example.json .env.example ./
-RUN chmod +x scripts/*.sh 2>/dev/null || true
+# 修复 Windows CRLF + 添加执行权限
+RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true
 
 # ═══ pi 配置目录 ══════════════════════════════════════════════════════════════
 # pi 的全局配置目录，models.json 放这里才能被 pi 识别
@@ -40,7 +41,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 # ═══ 入口脚本 ═════════════════════════════════════════════════════════════════
 # 启动前自动链接 models.json（如果挂载了的话）
 COPY scripts/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
 # 默认 REST API，覆盖: python3 cli.py /data/config/config.json

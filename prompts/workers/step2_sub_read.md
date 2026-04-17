@@ -2,27 +2,27 @@
 
 # 输入
 
-你会收到一批文件的绝对路径列表。
+你会收到一批文件的**相对路径**列表。读取文件时在前面加 `/data/target/` 前缀。
 
 # 步骤
 
 对列表中的**每个文件**：
-1. 使用 `read` 读取文件内容（二进制文件用 `file <path>` 和 `strings <path> | head -30` 代替）
+1. 使用 `read` 读取 `/data/target/<相对路径>`（二进制文件用 `file` 和 `strings` 代替）
 2. 判断文件类型和功能
 
 # 输出格式
 
-每个文件一行，严格使用 `|` 分隔：
+每个文件一行，严格使用 `|` 分隔（使用**相对路径**）：
 
 ```
-<文件路径> | <文件类型> | <功能关键词>
+<相对路径> | <文件类型> | <功能关键词>
 ```
 
 示例：
 ```
-/data/target/scripts/bgp_init.sh | shell script | BGP 路由初始化
-/data/target/lib/libcrypto.so | ELF shared library | OpenSSL 加密库
-/data/target/conf/sshd_config | config file | SSH 服务端配置
+scripts/bgp_init.sh | shell script | BGP 路由初始化
+lib/libcrypto.so | ELF shared library | OpenSSL 加密库
+conf/sshd_config | config file | SSH 服务端配置
 ```
 
 # 注意
