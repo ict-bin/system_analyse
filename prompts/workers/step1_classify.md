@@ -2,16 +2,54 @@
 
 # 任务
 
-对 `/data/target` 下所有文件按路径和文件名快速归类到功能模块。
+对 `/data/target` 下所有文件按功能归类到模块。
 
 ⚠️ **目标是全覆盖、零遗漏。不要求精确，后续阶段会精细化。**
 
 # 核心原则
 
 1. **善用脚本**：**必须**编写 bash 脚本批量处理，**禁止**手动逐文件操作
-2. **不读文件内容**：只根据路径、文件名、扩展名分类。可以用 `file` 命令判断类型，但不要 `cat`/`read` 文件内容
-3. **一次性处理**：写一个完整的分类脚本一次执行完，不要分多轮交互
-4. **每个文件只归入一个模块**，用 `files.list` 记录绝对路径
+2. **一次性处理**：写一个完整的分类脚本一次执行完，不要分多轮交互
+3. **每个文件只归入一个模块**，用 `files.list` 记录绝对路径
+4. **按功能命名模块**，不要按文件名前缀/编号命名
+
+# 分类策略（按优先级）
+
+## 策略 1：目录结构清晰时
+
+如果 `/data/target` 下有子目录且目录名有语义（如 `bgp/`、`configs/`），直接按子目录映射为模块。
+
+## 策略 2：扁平目录或文件名无语义时
+
+当文件都在同一目录下，且文件名是 hash/编号/无意义前缀（如 `entry_02_xxx.bin`、`file_0x1234.so`）时：
+
+**必须扫描文件内容关键词来分类！** 用脚本批量提取：
+
+```bash
+#!/bin/bash
+cd <工作目录>
+KEYWORDS="bgp ospf dhcp ipsec snmp ntp ssh evpn mpls vxlan lacp bfd acl ztp upgrade patch kernel driver"
+
+# 对每个文件提取关键词
+while IFS= read -r f; do
+    # 文本文件：扫描前 50 行
+    kw=$(head -50 "$f" 2>/dev/null | grep -oiE "$(echo $KEYWORDS | tr ' ' '|')" | head -1 | tr '[:upper:]' '[:lower:]')
+    # 二进制文件：用 strings
+    [ -z "$kw" ] && kw=$(strings "$f" 2>/dev/null | head -100 | grep -oiE "$(echo $KEYWORDS | tr ' ' '|')" | head -1 | tr '[:upper:]' '[:lower:]')
+    # 兜底
+    [ -z "$kw" ] && kw="unknown"
+    
+    mkdir -p "$kw"
+    echo "$f" >> "$kw/files.list"
+done < <(find /data/target -type f)
+
+# 去重
+for f in */files.list; do sort -u "$f" -o "$f"; done
+```
+
+## 策略 3：混合策略
+
+实际情况可能需要组合：先按目录分，再对大目录内的文件按内容关键词细分。
 
 # 建议流程
 
@@ -20,53 +58,21 @@
 ```bash
 echo "=== 文件总数 ==="
 find /data/target -type f | wc -l
-echo "=== 顶层目录结构 ==="
+echo "=== 目录结构 ==="
 find /data/target -maxdepth 2 -type d | head -40
-echo "=== 按顶层子目录统计 ==="
-find /data/target -type f | awk -F/ '{print $4}' | sort | uniq -c | sort -rn | head -30
+echo "=== 文件名模式（判断是否有语义）==="
+find /data/target -type f | head -20
 echo "=== 扩展名分布 ==="
-find /data/target -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -30
+find /data/target -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -20
 ```
 
-## 2. 编写一个完整的分类脚本
+**关键判断**：文件名是否有功能语义？
+- `bgp_init.sh`、`libcrypto.so` → 有语义，按文件名分类
+- `entry_02_type_ffff_id_000e.bin_lzma_148b1d5.py` → 无语义，必须扫描内容
 
-⚠️ **必须写成一个脚本一次执行，不要逐文件手动分类！**
+## 2. 编写分类脚本并执行
 
-针对大目录（1000+ 文件），推荐策略：
-- **按顶层子目录直接映射**：如果 `/data/target/` 下有清晰的子目录结构，每个子目录即一个模块
-- **按扩展名批量归类**：`.ko` → kernel_modules, `.conf` → configs, `.so` → shared_libraries
-- **按路径关键词 grep**：路径含 `bgp` → bgp, 含 `ospf` → ospf
-- **兜底**：剩余文件全部归入 `unknown` 模块
-
-脚本模板：
-```bash
-#!/bin/bash
-cd <工作目录>
-
-# 方法：按顶层子目录直接映射为模块
-for dir in $(find /data/target -mindepth 1 -maxdepth 1 -type d); do
-    mod=$(basename "$dir" | tr '[:upper:]' '[:lower:]' | tr '-' '_')
-    mkdir -p "$mod"
-    find "$dir" -type f >> "$mod/files.list"
-done
-
-# 顶层散落文件归入 misc
-find /data/target -maxdepth 1 -type f > /tmp/toplevel.txt
-if [ -s /tmp/toplevel.txt ]; then
-    mkdir -p misc
-    cat /tmp/toplevel.txt >> misc/files.list
-fi
-
-# 去重
-for f in */files.list; do sort -u "$f" -o "$f"; done
-
-# 校验
-TOTAL=$(find /data/target -type f | wc -l)
-CLASSIFIED=$(cat */files.list | sort -u | wc -l)
-echo "总文件: $TOTAL  已分类: $CLASSIFIED  覆盖率: $(( CLASSIFIED * 100 / TOTAL ))%"
-```
-
-根据实际目录结构调整策略，但**必须用脚本一次完成**。
+根据探索结果选择策略，写成一个脚本一次完成。
 
 ## 3. 校验覆盖率
 
@@ -81,9 +87,11 @@ echo "遗漏文件: $(wc -l < /tmp/remaining.txt)"
 
 # 模块命名
 
-小写英文 + 下划线，**按具体协议/服务/功能命名**：
-- ✓ `bgp`, `ospf`, `ssh`, `snmp`, `ipsec`, `system_init`, `kernel_modules`
-- ✗ `network`（太笼统）, `misc`（无意义，但可作为临时兜底）
+小写英文 + 下划线，**按实际功能命名**：
+- ✅ `bgp`, `ospf`, `dhcp`, `ipsec`, `system_upgrade`, `kernel_modules`
+- ❌ `entry_02_scripts`（这是包编号不是功能）
+- ❌ `network`（太笼统）
+- ⚠️ `unknown` 可作为兜底，但应尽量减少
 
 # 输出格式
 
