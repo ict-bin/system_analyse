@@ -1106,26 +1106,14 @@ class Orchestrator:
 
     @staticmethod
     def _generate_modules_list(modules_dir: Path, output_path: Path) -> None:
-        """生成 modules.list：按风险等级排序的全模块列表。
-
-        格式:
-            风险等级 | 风险评分 | 模块名 | 文件数
-        """
+        """生成 modules.list：按风险等级排序，每行一个模块名。"""
         RISK_ORDER = {"严重": 0, "高": 1, "中": 2, "低": 3, "信息": 4, "未知": 5}
-        entries: list[tuple[str, int, str, int]] = []
+        entries: list[tuple[str, int, str]] = []
 
         for mod_dir in sorted(modules_dir.iterdir()):
             if not mod_dir.is_dir():
                 continue
             mod_name = mod_dir.name
-
-            # 文件数
-            flist = mod_dir / "files.list"
-            file_count = 0
-            if flist.exists():
-                file_count = sum(1 for l in flist.read_text("utf-8").splitlines() if l.strip())
-
-            # 从 module_report.md 提取风险等级和评分
             risk_level = "未知"
             risk_score = 0
             report = mod_dir / "module_report.md"
@@ -1138,19 +1126,12 @@ class Orchestrator:
                 m = _re.search(r'RISK_SCORE:\s*(\d+)', text)
                 if m:
                     risk_score = min(int(m.group(1)), 100)
-
-            entries.append((risk_level, risk_score, mod_name, file_count))
+            entries.append((risk_level, risk_score, mod_name))
 
         # 按风险等级排序（严重在前），同等级按分数降序
         entries.sort(key=lambda e: (RISK_ORDER.get(e[0], 5), -e[1]))
-
-        lines = ["# 模块风险列表", "", f"共 {len(entries)} 个模块", "",
-                 "风险等级 | 评分 | 模块名 | 文件数",
-                 "--------|------|--------|------"]
-        for level, score, name, fc in entries:
-            lines.append(f"{level} | {score} | {name} | {fc}")
-
-        output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        output_path.write_text(
+            "\n".join(name for _, _, name in entries) + "\n", encoding="utf-8")
 
     @staticmethod
     def _strip_target_prefix(output_dir: Path, target_dir: str) -> None:
