@@ -113,9 +113,9 @@ def _parse_eval_md(output: str) -> dict:
         r'(\d{1,3})\s*/\s*100',
         r'\b(\d{2,3})\s*分',
     ]:
-        m = re.search(pat, output)
-        if m:
-            score = min(int(m.group(1)), 100)
+        _ms = list(re.finditer(pat, output))
+        if _ms:
+            score = min(int(_ms[-1].group(1)), 100)
             break
 
     # ── 提取通过/不通过 ──
@@ -127,9 +127,9 @@ def _parse_eval_md(output: str) -> dict:
         r'[Pp]ass[::=：]\s*(是|否|true|false|yes|no)',
         r'RESULT[::=：]\s*(PASS|FAIL)',
     ]:
-        m = re.search(pat, output, re.IGNORECASE)
-        if m:
-            passed = m.group(1).lower() in ('是', 'true', 'yes', 'pass')
+        _ms = list(re.finditer(pat, output, re.IGNORECASE))
+        if _ms:
+            passed = _ms[-1].group(1).lower() in ('是', 'true', 'yes', 'pass')
             break
     else:
         if score >= 70:
@@ -142,6 +142,11 @@ def _parse_eval_md(output: str) -> dict:
 
     if score > 0:
         return {"pass": passed, "score": score, "feedback": feedback or output[:500]}
+
+    # score=0 且明确"不通过" → 直接返回，不走语义推断
+    _fail_pats = [r'通过[::=：]\s*否', r'[Pp]ass[::=：]\s*(?:no|false|fail)', r'RESULT[::=：]\s*FAIL']
+    if score == 0 and any(re.search(p, output, re.IGNORECASE) for p in _fail_pats):
+        return {"pass": False, "score": 0, "feedback": feedback or output[:500]}
 
     # ── JSON fallback ──
     for i, ch in enumerate(output):
@@ -417,6 +422,8 @@ class Orchestrator:
                         self._emit("reflect", task_id, stage=1,
                                    round=passed_count, min_rounds=s_cfg.min_rounds)
                         feedback = f"# 自查要求（第 {passed_count} 次通过，需至少 {s_cfg.min_rounds} 次）\n\n{reflect_prompt}"
+                        _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                        feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
                 else:
                     passed_count = 0  # 重置连续通过
                     fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
@@ -481,9 +488,9 @@ class Orchestrator:
                     self._emit("stage_result", task_id, stage=2,
                                module=mod_name, split=was_split, new_modules=new_ones)
 
-                    # Judge 评审
+                    # Judge 评审（cwd=workspace，check_classification.sh 需全局 */files.list）
                     judge_results = []
-                    eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
+                    eval_cwd = str(workspace)
 
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
                         ar = await _run_agent_checked(
@@ -523,6 +530,8 @@ class Orchestrator:
                             self._emit("reflect", task_id, stage=2,
                                        module=mod_name, round=passed_count)
                             feedback = f"# 自查要求（第 {passed_count} 次通过，需至少 {s_cfg.min_rounds} 次）\n\n{reflect_prompt}"
+                            _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                            feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
                     else:
                         passed_count = 0
                         fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
@@ -624,6 +633,8 @@ class Orchestrator:
                             self._emit("reflect", task_id, stage=3,
                                        module=mod_name, round=passed_count)
                             feedback = f"# 自查要求（第 {passed_count} 次通过，需至少 {s_cfg.min_rounds} 次）\n\n{reflect_prompt}"
+                            _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                            feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
                     else:
                         passed_count = 0
                         fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
@@ -690,6 +701,8 @@ class Orchestrator:
                             if passed_count >= s_cfg_redo.min_rounds:
                                 break
                             feedback = f"# 自查要求\n\n{reflect_refine}"
+                            _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                            feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
                         else:
                             passed_count = 0
                             fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
@@ -752,6 +765,8 @@ class Orchestrator:
                                 if passed_count >= s_cfg_a.min_rounds:
                                     break
                                 feedback = f"# 自查要求\n\n{reflect_analyse}"
+                                _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                                feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
                             else:
                                 passed_count = 0
                                 fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
