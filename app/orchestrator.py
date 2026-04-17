@@ -32,7 +32,7 @@ from .models import (
     TokenUsage,
     make_id,
 )
-from .runner import run_agent
+from .runner import run_agent, run_agents_parallel, AgentResult
 
 
 # ─── 异常 ────────────────────────────────────────────────────────────────────
@@ -41,20 +41,59 @@ class StageError(Exception):
     pass
 
 
+class PiFatalError(StageError):
+    """pi 进程致命错误（模型未找到、配置错误等不可重试错误）"""
+    pass
+
+
+def _check_agent_result(ar: AgentResult, context: str = "") -> None:
+    """检查 run_agent 返回结果，致命错误立即抛异常。"""
+    if getattr(ar, "fatal", False):
+        msg = f"pi 致命错误"
+        if context:
+            msg += f" [{context}]"
+        msg += f": {ar.error or 'unknown'}"
+        raise PiFatalError(msg)
+
+
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
+
+async def _run_agent_checked(context: str = "", **kwargs) -> AgentResult:
+    """run_agent 的包装：执行后自动检查致命错误。"""
+    ar = await run_agent(**kwargs)
+    _check_agent_result(ar, context)
+    return ar
+
 
 def _extract_result(output: str) -> str:
     m = re.search(r"<result>(.*?)</result>", output, re.DOTALL)
     return m.group(1).strip() if m else output
 
 
-def _discover_modules(workspace: str) -> list[str]:
-    modules = []
+def _get_modules_root(workspace: str) -> Path:
+    """获取模块所在的实际根目录。
+    兼容两种布局:
+      workspace/<module>/files.list          -> 返回 workspace
+      workspace/modules/<module>/files.list  -> 返回 workspace/modules
+    """
     ws = Path(workspace)
-    if ws.is_dir():
-        for d in sorted(ws.iterdir()):
-            if d.is_dir() and not d.name.startswith(".") and (d / "files.list").exists():
-                modules.append(d.name)
+    modules_subdir = ws / "modules"
+    if modules_subdir.is_dir():
+        for d in modules_subdir.iterdir():
+            if d.is_dir() and (d / "files.list").exists():
+                return modules_subdir
+    return ws
+
+
+def _discover_modules(workspace: str) -> list[str]:
+    """发现 workspace 下的模块目录名列表。"""
+    modules = []
+    root = _get_modules_root(workspace)
+    if not root.is_dir():
+        return modules
+    for d in sorted(root.iterdir()):
+        if d.is_dir() and not d.name.startswith(".") and (d / "files.list").exists():
+            modules.append(d.name)
     return modules
 
 
@@ -207,6 +246,13 @@ class Orchestrator:
 
         result = TaskResult(task_id=task_id, status=TaskStatus.RUNNING,
                             task=cfg.task, config_snapshot=cfg.model_dump())
+
+        # flag 文件：立即写 0（失败），只有完全成功才改为 1
+        result_dir = Path(os.path.abspath(cfg.result_dir))
+        result_dir.mkdir(parents=True, exist_ok=True)
+        flag_path = result_dir / "flag"
+        flag_path.write_text("0", encoding="utf-8")
+
         self._emit("task_start", task_id, task=cfg.task)
 
         # Worker/Judge 配置
@@ -223,6 +269,8 @@ class Orchestrator:
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
+            "pi_max_retries": cfg.pi_max_retries,
+            "pi_retry_delay": cfg.pi_retry_delay,
         }
 
         j_base_kw = {
@@ -230,6 +278,8 @@ class Orchestrator:
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
+            "pi_max_retries": cfg.pi_max_retries,
+            "pi_retry_delay": cfg.pi_retry_delay,
             "session_file": None,
         }
 
@@ -255,7 +305,7 @@ class Orchestrator:
                 prompt_parts = [cfg.task]
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
-                ar = await run_agent(
+                ar = await _run_agent_checked(
                     prompt="\n".join(prompt_parts),
                     system_prompt=w_sys_prompt,
                     session_file=classify_session,
@@ -271,7 +321,7 @@ class Orchestrator:
                 # Judge 检查
                 judge_results = []
                 for j_idx, j_cfg_item in enumerate(j_cfgs):
-                    ar = await run_agent(
+                    ar = await _run_agent_checked(
                         prompt="请运行检查脚本验证分类完整性。",
                         model=j_cfg_item.model,
                         system_prompt=j_sys_prompt,
@@ -326,8 +376,19 @@ class Orchestrator:
                 mod_name = modules_to_refine.pop(0)
                 if mod_name in refined_modules:
                     continue
-                mod_dir = workspace / mod_name
+                mod_dir = _get_modules_root(str(workspace)) / mod_name
                 if not (mod_dir / "files.list").exists():
+                    continue
+
+                # 小模块自动跳过（≤5 文件不需要拆分）
+                try:
+                    _fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
+                except OSError:
+                    _fc = 0
+                if _fc <= 5:
+                    self._emit("stage_result", task_id, stage=2,
+                               module=mod_name, split=False, new_modules=[])
+                    refined_modules.add(mod_name)
                     continue
 
                 refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
@@ -338,11 +399,14 @@ class Orchestrator:
                     self._emit("stage", task_id, stage=2,
                                module=mod_name, attempt=attempt + 1)
 
+                    # 记录 Worker 执行前的模块快照
+                    mods_before = set(_discover_modules(str(workspace)))
+
                     # Worker 细分
                     prompt_parts = [f"检查模块 `{mod_name}` 是否需要细分。"]
                     if feedback:
                         prompt_parts.append(f"\n\n{feedback}")
-                    ar = await run_agent(
+                    ar = await _run_agent_checked(
                         prompt="\n".join(prompt_parts),
                         system_prompt=w_sys_prompt,
                         session_file=refine_session,
@@ -350,9 +414,10 @@ class Orchestrator:
                     )
                     tokens += ar.token_usage
 
-                    new_modules = _discover_modules(str(workspace))
-                    new_ones = [m for m in new_modules if m not in refined_modules and m != mod_name]
-                    was_split = mod_name not in new_modules and bool(new_ones)
+                    # 用快照差集计算本次 Worker 真正新增的模块
+                    mods_after = set(_discover_modules(str(workspace)))
+                    new_ones = sorted(mods_after - mods_before)
+                    was_split = mod_name not in mods_after and bool(new_ones)
 
                     self._emit("stage_result", task_id, stage=2,
                                module=mod_name, split=was_split, new_modules=new_ones)
@@ -362,7 +427,7 @@ class Orchestrator:
                     eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
 
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
-                        ar = await run_agent(
+                        ar = await _run_agent_checked(
                             prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
                             model=j_cfg_item.model,
                             system_prompt=j_sys_prompt,
@@ -388,11 +453,10 @@ class Orchestrator:
                     if voted_pass:
                         passed_count += 1
                         if passed_count >= s_cfg.min_rounds:
-                            # 完成：如果模块被拆分，新模块加入队列
-                            post_mods = _discover_modules(str(workspace))
-                            if mod_name not in post_mods:
-                                for nm in post_mods:
-                                    if nm not in refined_modules:
+                            # 完成：如果模块被拆分，将本次新增的模块加入队列
+                            if was_split and new_ones:
+                                for nm in new_ones:
+                                    if nm not in refined_modules and nm not in modules_to_refine:
                                         modules_to_refine.append(nm)
                             refined_modules.add(mod_name)
                             break
@@ -421,7 +485,7 @@ class Orchestrator:
             modules_needing_reclassify: list[str] = []
 
             for mod_name in final_modules:
-                mod_dir = workspace / mod_name
+                mod_dir = _get_modules_root(str(workspace)) / mod_name
                 analyse_session = str(sess_dir / f"analyse-{mod_name}.jsonl")
                 feedback = ""
                 passed_count = 0
@@ -434,7 +498,7 @@ class Orchestrator:
                     prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
                     if feedback:
                         prompt_parts.append(f"\n\n{feedback}")
-                    ar = await run_agent(
+                    ar = await _run_agent_checked(
                         prompt="\n".join(prompt_parts),
                         system_prompt=w_sys_prompt,
                         session_file=analyse_session,
@@ -447,12 +511,12 @@ class Orchestrator:
                     judge_results = []
 
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
-                        ar = await run_agent(
+                        ar = await _run_agent_checked(
                             prompt=f"评审模块 `{mod_name}` 的分析报告。",
                             model=j_cfg_item.model,
                             system_prompt=j_sys_prompt,
                             tools=cfg.judges.default_tools,
-                            cwd=str(mod_dir),
+                            cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
                             **j_base_kw,
                         )
                         tokens += ar.token_usage
@@ -515,7 +579,7 @@ class Orchestrator:
                 reflect_refine = self._load_prompt(w_prompt_dir, "reflect_refine")
 
                 for mod_name in modules_needing_reclassify:
-                    mod_dir = workspace / mod_name
+                    mod_dir = _get_modules_root(str(workspace)) / mod_name
                     if not mod_dir.exists():
                         continue
 
@@ -527,7 +591,7 @@ class Orchestrator:
                         self._emit("stage", task_id, stage="2-redo",
                                    module=mod_name, attempt=attempt + 1)
 
-                        ar = await run_agent(
+                        ar = await _run_agent_checked(
                             prompt=f"重新检查模块 `{mod_name}` 并细分。\n\n{feedback}",
                             system_prompt=w_sys_refine,
                             session_file=refine_session,
@@ -538,7 +602,7 @@ class Orchestrator:
                         judge_results = []
                         eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
-                            ar = await run_agent(
+                            ar = await _run_agent_checked(
                                 prompt=f"评审模块 `{mod_name}` 的重新细分。",
                                 model=j_cfg_item.model,
                                 system_prompt=j_sys_refine,
@@ -580,7 +644,7 @@ class Orchestrator:
                     reflect_analyse = self._load_prompt(w_prompt_dir, "reflect_analyse")
 
                     for mod_name in redo_analyse:
-                        mod_dir = workspace / mod_name
+                        mod_dir = _get_modules_root(str(workspace)) / mod_name
                         analyse_session = str(sess_dir / f"analyse-redo-{mod_name}.jsonl")
                         feedback = ""
                         passed_count = 0
@@ -590,7 +654,7 @@ class Orchestrator:
                             prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
                             if feedback:
                                 prompt_parts.append(f"\n\n{feedback}")
-                            ar = await run_agent(
+                            ar = await _run_agent_checked(
                                 prompt="\n".join(prompt_parts),
                                 system_prompt=w_sys_analyse,
                                 session_file=analyse_session,
@@ -600,12 +664,12 @@ class Orchestrator:
 
                             judge_results = []
                             for j_idx, j_cfg_item in enumerate(j_cfgs):
-                                ar = await run_agent(
+                                ar = await _run_agent_checked(
                                     prompt=f"评审模块 `{mod_name}` 的分析报告。",
                                     model=j_cfg_item.model,
                                     system_prompt=j_sys_analyse,
                                     tools=cfg.judges.default_tools,
-                                    cwd=str(mod_dir),
+                                    cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
                                     **j_base_kw,
                                 )
                                 tokens += ar.token_usage
@@ -643,7 +707,7 @@ class Orchestrator:
             judge_results = []
             missing_modules = []
             for j_idx, j_cfg_item in enumerate(j_cfgs):
-                ar = await run_agent(
+                ar = await _run_agent_checked(
                     prompt="运行 check_outputs.sh 检查所有模块是否都有 module_report.md。",
                     model=j_cfg_item.model,
                     system_prompt=j_completeness_prompt,
@@ -687,13 +751,13 @@ class Orchestrator:
                 s_cfg_a = cfg.stages.analyse
 
                 for mod_name in missing_modules:
-                    mod_dir = workspace / mod_name
+                    mod_dir = _get_modules_root(str(workspace)) / mod_name
                     if not mod_dir.exists() or not (mod_dir / "files.list").exists():
                         continue
 
                     # Stage 2 补做
                     refine_session = str(sess_dir / f"refine-s4-{mod_name}.jsonl")
-                    ar = await run_agent(
+                    ar = await _run_agent_checked(
                         prompt=f"检查模块 `{mod_name}` 是否需要细分。",
                         system_prompt=w_sys_refine,
                         session_file=refine_session,
@@ -708,7 +772,7 @@ class Orchestrator:
                         prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
                         if feedback:
                             prompt_parts.append(f"\n\n{feedback}")
-                        ar = await run_agent(
+                        ar = await _run_agent_checked(
                             prompt="\n".join(prompt_parts),
                             system_prompt=w_sys_analyse,
                             session_file=analyse_session,
@@ -718,12 +782,12 @@ class Orchestrator:
 
                         judge_results = []
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
-                            ar = await run_agent(
+                            ar = await _run_agent_checked(
                                 prompt=f"评审模块 `{mod_name}` 的分析报告。",
                                 model=j_cfg_item.model,
                                 system_prompt=j_sys_analyse,
                                 tools=cfg.judges.default_tools,
-                                cwd=str(mod_dir),
+                                cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
                                 **j_base_kw,
                             )
                             tokens += ar.token_usage
@@ -764,7 +828,7 @@ class Orchestrator:
                     "读取所有模块的 module_report.md，生成最终分析总报告 final_report.md。"]
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
-                ar = await run_agent(
+                ar = await _run_agent_checked(
                     prompt="\n".join(prompt_parts),
                     system_prompt=report_sys_prompt,
                     session_file=report_session,
@@ -779,7 +843,7 @@ class Orchestrator:
                 # Judge 评审报告
                 judge_results = []
                 for j_idx, j_cfg_item in enumerate(j_cfgs):
-                    ar = await run_agent(
+                    ar = await _run_agent_checked(
                         prompt="评审 final_report.md 的质量和完整性。",
                         model=j_cfg_item.model,
                         system_prompt=j_report_prompt,
@@ -844,8 +908,6 @@ class Orchestrator:
         result.total_duration_ms = (time.time() - start) * 1000
 
         # ── 组装输出目录 ─────────────────────────────────────
-        result_dir = Path(os.path.abspath(cfg.result_dir))
-        result_dir.mkdir(parents=True, exist_ok=True)
         final_mods = _discover_modules(str(workspace))
 
         # 1) modules/ — 分类后的模块文件夹 (files.list + module_report.md)
@@ -854,7 +916,7 @@ class Orchestrator:
             shutil.rmtree(str(modules_out))
         modules_out.mkdir(parents=True, exist_ok=True)
         for mod in final_mods:
-            src = workspace / mod
+            src = _get_modules_root(str(workspace)) / mod
             dst = modules_out / mod
             if src.is_dir():
                 shutil.copytree(str(src), str(dst))
@@ -864,12 +926,30 @@ class Orchestrator:
         report_dst = result_dir / "final_report.md"
         if report_src.exists():
             shutil.copy2(str(report_src), str(report_dst))
+        elif result.status in (TaskStatus.FAILED, TaskStatus.ERROR):
+            # 失败/错误时也输出 final_report.md，记录失败原因和已完成的进度
+            self._write_failure_report(
+                report_dst, result, final_mods,
+                str(_get_modules_root(str(workspace))))
 
-        # 3) archive.zip — 所有中间件 (judge评审、session、原始workspace)
+        # 3) 路径清洗 — 去除 /data/target/ 前缀
+        self._strip_target_prefix(modules_out, cfg.target_dir)
+        if report_dst.exists():
+            self._strip_target_prefix(report_dst.parent, cfg.target_dir)
+
+        # 4) archive.zip — 所有中间件 (judge评审、session、原始workspace)
         (out_dir / "result.json").write_text(
             result.model_dump_json(indent=2), encoding="utf-8")
         archive_path = str(result_dir / "archive")
         shutil.make_archive(archive_path, "zip", str(out_dir.parent), out_dir.name)
+
+        # 写最终 flag: 成功=1, 失败/错误=0
+        try:
+            flag_path.write_text(
+                "1" if result.status == TaskStatus.PASSED else "0",
+                encoding="utf-8")
+        except OSError:
+            pass
 
         self._emit("task_end", task_id, status=result.status.value,
                     report=str(report_dst),
@@ -888,6 +968,142 @@ class Orchestrator:
     # 工具方法
     # ═══════════════════════════════════════════════════════════════════════
 
+
+    @staticmethod
+    def _write_failure_report(
+        report_path: Path,
+        result: "TaskResult",
+        modules: list[str],
+        modules_root: str,
+    ) -> None:
+        """任务失败/错误时生成 final_report.md，记录失败原因和已完成进度。"""
+        lines = [
+            "# 固件系统威胁分析总报告",
+            "",
+            f"> ⚠️ **任务状态：{result.status.value.upper()}**",
+            "",
+            "## 失败原因",
+            "",
+            f"```",
+            f"{result.error or 'unknown error'}",
+            f"```",
+            "",
+            f"- 任务ID: {result.task_id}",
+            f"- 耗时: {result.total_duration_ms / 1000:.1f}s",
+            "",
+            "## 已完成的模块",
+            "",
+        ]
+        if modules:
+            lines.append("| 模块 | 文件数 | 报告 |")
+            lines.append("|------|--------|------|")
+            for mod in modules:
+                mod_dir = Path(modules_root) / mod
+                flist = mod_dir / "files.list"
+                report = mod_dir / "module_report.md"
+                fc = 0
+                if flist.exists():
+                    try:
+                        fc = sum(1 for l in flist.read_text("utf-8").splitlines() if l.strip())
+                    except OSError:
+                        pass
+                has_report = "✅" if report.exists() and report.stat().st_size > 100 else "❌"
+                lines.append(f"| {mod} | {fc} | {has_report} |")
+            lines.append("")
+            lines.append(f"**已发现 {len(modules)} 个模块**")
+        else:
+            lines.append("*尚未完成模块分类*")
+        lines.append("")
+
+        try:
+            report_path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _strip_target_prefix(output_dir: Path, target_dir: str) -> None:
+        """将输出文件中的容器绝对路径 /data/target/... 替换为相对路径。
+
+        执行期间 Worker 需要绝对路径来 read 文件，但最终输出应使用相对路径，
+        因为 /data/target/ 是容器内挂载点，对用户无意义。
+        """
+        prefix = target_dir.rstrip("/") + "/"  # e.g. "/data/target/"
+        for p in output_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix not in (".list", ".md", ".txt", ".json"):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+                if prefix in text:
+                    p.write_text(text.replace(prefix, ""), encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                pass
+
+    # ─── 主从模式：子 Worker 并行读文件 ────────────────────────────────────
+
+    SUB_BATCH_SIZE = 20       # 每个子 Worker 处理的文件数
+    SUB_WORKER_THRESHOLD = 20 # 文件数超过此值启用主从模式
+
+    async def _collect_file_summaries(
+        self, task_id: str, mod_name: str, mod_dir: Path,
+        w_base: dict, tokens: "TokenUsage",
+        sub_prompt_template: str,
+    ) -> str:
+        """串行启动子 Worker 逐批读取文件，返回合并后的文件摘要文本。
+
+        每个 batch 完成后立即可用，节省算力（不并行占用多个 GPU slot）。
+        """
+        flist_path = mod_dir / "files.list"
+        files = [l.strip() for l in flist_path.read_text("utf-8").splitlines() if l.strip()]
+
+        # 分 batch
+        batches: list[list[str]] = []
+        for i in range(0, len(files), self.SUB_BATCH_SIZE):
+            batches.append(files[i:i + self.SUB_BATCH_SIZE])
+
+        self._emit("stage", task_id, stage="2-sub",
+                    module=mod_name, batches=len(batches), files=len(files))
+
+        # 串行执行：逐 batch 调用子 Worker
+        summaries = []
+        for idx, batch in enumerate(batches):
+            file_list_text = chr(10).join(batch)
+            prompt = (f"请逐个读取以下 {len(batch)} 个文件并输出摘要："
+                      f"{chr(10)}{chr(10)}{file_list_text}")
+
+            self._emit("stage", task_id, stage="2-sub",
+                        module=mod_name, batch=idx + 1, total=len(batches))
+
+            ar = await _run_agent_checked(
+                prompt=prompt,
+                model=w_base["model"],
+                tools=w_base["tools"],
+                system_prompt=sub_prompt_template,
+                cwd=w_base["cwd"],
+                thinking_level=w_base.get("thinking_level", "off"),
+                session_file=None,
+                cancel_event=w_base.get("cancel_event"),
+                max_retries=w_base.get("max_retries", 3),
+                retry_delay=w_base.get("retry_delay", 10),
+                pi_max_retries=w_base.get("pi_max_retries", -1),
+                pi_retry_delay=w_base.get("pi_retry_delay", 10),
+            )
+            tokens += ar.token_usage
+
+            if ar.output:
+                summaries.append(
+                    f"# Batch {idx+1} ({len(batch)} files){chr(10)}{ar.output}")
+            else:
+                fallback = chr(10).join(
+                    f"{f} | unknown | (读取失败)" for f in batch)
+                summaries.append(
+                    f"# Batch {idx+1} (fallback){chr(10)}{fallback}")
+
+        merged = (chr(10) * 2).join(summaries)
+        self._emit("stage_result", task_id, stage="2-sub",
+                    module=mod_name, summary_lines=merged.count(chr(10)))
+        return merged
 
     def _load_prompt(self, prompt_dir: str, name: str) -> str:
         for ext in [".md", ".txt", ""]:

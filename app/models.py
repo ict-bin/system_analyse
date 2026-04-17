@@ -46,8 +46,10 @@ class StagesConfig(BaseModel):
 
 
 class ServiceConfig(BaseModel):
-    agent_max_retries: int = Field(default=100)
-    agent_retry_delay: float = Field(default=30.0)
+    agent_max_retries: int = Field(default=100, description="API 错误（连接/限流/500）最大重试次数，-1=无限")
+    agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数（指数退避）")
+    pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
+    pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数（指数退避）")
 
     stages: StagesConfig = Field(default_factory=StagesConfig)
 
@@ -68,8 +70,10 @@ class TaskConfig(BaseModel):
     function_name: str = Field(default="", description="兼容字段：用于归档命名")
     cwd: str = Field(default="/data/target")
 
-    agent_max_retries: int = Field(default=100)
-    agent_retry_delay: float = Field(default=30.0)
+    agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
+    agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
+    pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
+    pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
     stages: StagesConfig = Field(default_factory=StagesConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)

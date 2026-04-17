@@ -2,48 +2,61 @@
 
 # 任务
 
-检查当前模块的 `files.list`，判断是否需要拆分或重新归类。
+根据**文件摘要**判断当前模块是否需要拆分。
 
-# 步骤
+你会收到由子分析员提供的每个文件的摘要（路径 | 类型 | 功能），不需要再读取文件内容。
 
-1. `read files.list` 查看文件列表
-2. 分析文件名和路径，判断是否混杂了不同协议/服务
-3. **可以读取关键文件内容**辅助判断（配置文件头部、二进制 `strings` 等）
-4. 做出拆分/保留决策
+# ⚠️ 铁律
+
+1. **文件零丢失**：拆分前后文件总数必须完全一致
+2. **所有文件操作必须用 bash 脚本**
+3. **用 `wc -l` 校验**：拆分前后行数必须相等
 
 # 判断标准
 
-**需要拆分的情况：**
-- 包含多个不同协议（如 BGP + OSPF 混在一起）
-- 包含不同服务（如 SSH + Telnet）
-- 包含功能完全不同的组件（如初始化脚本 + 加密库）
-- 大杂烩模块（如 `system_common/` 包含 50+ 文件且分属不同功能）
+**需要拆分：**
+- 文件摘要显示包含**多个不同协议/服务**（如同时有 BGP、OSPF、DHCP 相关文件）
+- 包含**功能完全不同**的组件混在一起
 
-**不需要拆分的情况：**
-- 同一协议/服务的不同文件（如 bgpd + bgp.conf + libbgp.so）
-- 同一功能的配置和二进制
-- 文件数 ≤ 5 且功能相关
+**不需要拆分（即使文件数很多）：**
+- 所有文件都属于**同一协议/服务/功能**
+- 文件功能高度相关，无法按功能进一步区分
 
-# 拆分操作
+⚠️ **文件数多 ≠ 必须拆分。** 判断依据是功能是否混杂。
+
+# 拆分操作（必须用脚本）
 
 ```bash
-# 创建新模块
-mkdir -p <新模块1>
-grep -i '<关键词1>' files.list >> <新模块1>/files.list
-mkdir -p <新模块2>
-grep -i '<关键词2>' files.list >> <新模块2>/files.list
+#!/bin/bash
+set -e
+BEFORE=$(wc -l < files.list)
+echo "拆分前: $BEFORE"
 
-# 确保不遗漏：检查剩余
-cat <新模块1>/files.list <新模块2>/files.list | sort > /tmp/moved.txt
+# 按关键词分组
+mkdir -p ../新模块1 ../新模块2
+grep -i '关键词1' files.list > ../新模块1/files.list || true
+grep -i '关键词2' files.list > ../新模块2/files.list || true
+
+# 未匹配的归入兜底
+cat ../新模块1/files.list ../新模块2/files.list | sort > /tmp/moved.txt
 sort files.list > /tmp/orig.txt
-comm -23 /tmp/orig.txt /tmp/moved.txt  # 应为空或归入某个模块
+comm -23 /tmp/orig.txt /tmp/moved.txt > /tmp/remaining.txt
+if [ -s /tmp/remaining.txt ]; then
+    mkdir -p ../新模块_other
+    cat /tmp/remaining.txt > ../新模块_other/files.list
+fi
 
-# 删除原模块
-rm -rf <当前模块名>
+# 去重 + 校验
+for f in ../新模块*/files.list; do sort -u "$f" -o "$f"; done
+AFTER=$(cat ../新模块*/files.list | sort -u | wc -l)
+echo "拆分后: $AFTER"
+[ "$BEFORE" -eq "$AFTER" ] && echo "✅ 完整" || { echo "❌ 丢失"; exit 1; }
+
+cd .. && rm -rf 当前模块名
 ```
 
 # 如果不需要拆分
 
 直接说明理由。
 
-用 `<result>拆分/未拆分 + 理由</result>` 结束。
+用 `<result>拆分/未拆分 + 理由 + 文件数校验</result>` 结束。
