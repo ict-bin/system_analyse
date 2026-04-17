@@ -1,38 +1,44 @@
 #!/bin/bash
-# check_classification.sh — Judge 调用：检查所有文件是否都已分类
+# check_classification.sh — 检查所有目标文件是否都已被分类
 # 用法: bash check_classification.sh <target_dir> <workspace_dir>
-# 输出: PASS / FAIL + 详情
+# 如果 workspace_dir/filtered_files.txt 存在，用它作为目标文件列表（按类型过滤后）
+# 否则用 find target_dir 全量
 
 TARGET_DIR="${1:-/data/target}"
 WORKSPACE_DIR="${2:-.}"
 
-# 收集 target 下所有文件（绝对路径）
-ALL_FILES=$(find "$TARGET_DIR" -type f | sort)
-TOTAL=$(echo "$ALL_FILES" | wc -l)
+# 确定目标文件列表
+FILTERED="$WORKSPACE_DIR/filtered_files.txt"
+if [ -f "$FILTERED" ]; then
+    sort "$FILTERED" > /tmp/all_files.txt
+    TOTAL=$(wc -l < /tmp/all_files.txt)
+    echo "使用过滤文件列表: $FILTERED ($TOTAL 个)"
+else
+    find "$TARGET_DIR" -type f | sort > /tmp/all_files.txt
+    TOTAL=$(wc -l < /tmp/all_files.txt)
+fi
 
-# 收集所有 files.list 中的文件
-CLASSIFIED=""
+# 收集所有 files.list（兼容 */files.list 和 modules/*/files.list）
+cat "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list 2>/dev/null \
+    | sed '/^$/d' | sort -u > /tmp/classified_files.txt
+CLASSIFIED_COUNT=$(wc -l < /tmp/classified_files.txt)
+
+# 模块列表
 MODULES=""
-for flist in "$WORKSPACE_DIR"/*/files.list; do
+for flist in "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list; do
     [ -f "$flist" ] || continue
     MOD=$(basename "$(dirname "$flist")")
     MODULES="$MODULES $MOD"
-    while IFS= read -r line; do
-        [ -n "$line" ] && CLASSIFIED="$CLASSIFIED
-$line"
-    done < "$flist"
 done
 
-CLASSIFIED_SORTED=$(echo "$CLASSIFIED" | sed '/^$/d' | sort -u)
-CLASSIFIED_COUNT=$(echo "$CLASSIFIED_SORTED" | wc -l)
+# 未分类
+comm -23 /tmp/all_files.txt /tmp/classified_files.txt > /tmp/missing_files.txt
+MISSING_COUNT=$(wc -l < /tmp/missing_files.txt)
 
-# 找未分类的文件
-MISSING=$(comm -23 <(echo "$ALL_FILES") <(echo "$CLASSIFIED_SORTED"))
-MISSING_COUNT=$(echo "$MISSING" | sed '/^$/d' | wc -l)
-
-# 找重复分类的文件
-DUPLICATES=$(echo "$CLASSIFIED" | sed '/^$/d' | sort | uniq -d)
-DUP_COUNT=$(echo "$DUPLICATES" | sed '/^$/d' | wc -l)
+# 重复分类
+cat "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list 2>/dev/null \
+    | sed '/^$/d' | sort | uniq -d > /tmp/dup_files.txt
+DUP_COUNT=$(wc -l < /tmp/dup_files.txt)
 
 echo "=== Classification Check ==="
 echo "Target files: $TOTAL"
@@ -44,7 +50,7 @@ echo "Duplicate files: $DUP_COUNT"
 if [ "$MISSING_COUNT" -gt 0 ]; then
     echo ""
     echo "=== MISSING FILES ==="
-    echo "$MISSING" | sed '/^$/d' | head -50
+    head -50 /tmp/missing_files.txt
     if [ "$MISSING_COUNT" -gt 50 ]; then
         echo "... and $((MISSING_COUNT - 50)) more"
     fi
@@ -53,7 +59,7 @@ fi
 if [ "$DUP_COUNT" -gt 0 ]; then
     echo ""
     echo "=== DUPLICATE FILES ==="
-    echo "$DUPLICATES" | head -20
+    head -20 /tmp/dup_files.txt
 fi
 
 echo ""
@@ -62,3 +68,5 @@ if [ "$MISSING_COUNT" -eq 0 ] && [ "$DUP_COUNT" -eq 0 ]; then
 else
     echo "RESULT: FAIL"
 fi
+
+rm -f /tmp/all_files.txt /tmp/classified_files.txt /tmp/missing_files.txt /tmp/dup_files.txt

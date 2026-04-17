@@ -18,6 +18,7 @@ _STAGE_NAMES = {
     3: "分析", "3": "分析",
     "explore": "探索目录",
     "prescan": "预扫描",
+    "filter": "文件过滤",
     "2-sub": "读取",
     "2-redo": "重分类",
     "3-redo": "重分析",
@@ -75,6 +76,10 @@ def _flush_pending():
         if count > 6:
             preview += f" (+{count - 6})"
         print(f"    📂 {count} 个模块: {preview}")
+    elif stage == "filter":
+        types = d.get('types', [])
+        fc = d.get('file_count', 0)
+        print(f"    📁 {fc} 个文件 (types: {', '.join(types)})")
     elif stage == 2 or stage == "2-redo" or stage == "2-redo-s4":
         mod = d.get('module', '')
         if d.get('skipped'):

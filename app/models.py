@@ -45,11 +45,97 @@ class StagesConfig(BaseModel):
     final_check: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=1))
 
 
+# ─── 分析目标文件类型 ───────────────────────────────────────────────────
+
+# 支持的分析类型（可组合）
+ANALYSE_TYPES = {
+    "binary": {
+        "desc": "ELF 可执行文件、共享库、内核模块",
+        "extensions": [".so", ".ko", ".o", ".a", ".elf", ".axf"],
+        "magic": ["ELF"],
+    },
+    "script": {
+        "desc": "Shell/Python/Lua 等脚本",
+        "extensions": [".sh", ".bash", ".py", ".lua", ".pl", ".rb", ".tcl", ".awk", ".sed"],
+        "magic": ["shell script", "Python script", "Lua script", "Perl script"],
+    },
+    "config": {
+        "desc": "配置文件",
+        "extensions": [".conf", ".cfg", ".ini", ".json", ".yaml", ".yml",
+                       ".xml", ".toml", ".properties", ".env"],
+        "magic": [],
+    },
+    "firmware": {
+        "desc": "固件/Boot/硬件相关",
+        "extensions": [".bin", ".img", ".dtb", ".dts", ".rom", ".fw",
+                       ".fpga", ".hex", ".srec", ".ubifs", ".cramfs", ".squashfs"],
+        "magic": ["firmware", "boot", "device tree", "U-Boot"],
+    },
+    "crypto": {
+        "desc": "证书/密钥/签名",
+        "extensions": [".pem", ".crt", ".cer", ".key", ".csr", ".p12", ".pfx",
+                       ".sig", ".cms", ".crl"],
+        "magic": ["certificate", "PEM", "private key"],
+    },
+    "database": {
+        "desc": "数据库/Schema",
+        "extensions": [".db", ".sqlite", ".sqlite3", ".sql", ".mdb", ".ldb"],
+        "magic": ["SQLite"],
+    },
+    "web": {
+        "desc": "Web 前端/服务端",
+        "extensions": [".html", ".htm", ".css", ".js", ".jsx", ".ts",
+                       ".php", ".jsp", ".vue", ".svg"],
+        "magic": ["HTML"],
+    },
+    "network_model": {
+        "desc": "网络模型/协议定义",
+        "extensions": [".yang", ".mib", ".asn", ".asn1", ".proto", ".protobuf",
+                       ".xsd", ".wsdl", ".ncf"],
+        "magic": [],
+    },
+    "document": {
+        "desc": "文档/日志",
+        "extensions": [".md", ".txt", ".rst", ".log", ".csv", ".pdf"],
+        "magic": [],
+    },
+    "archive": {
+        "desc": "压缩包/安装包",
+        "extensions": [".tar", ".gz", ".tgz", ".bz2", ".xz", ".zip", ".rar",
+                       ".rpm", ".deb", ".ipk", ".cpio"],
+        "magic": ["gzip", "tar archive", "Zip archive", "RPM", "cpio"],
+    },
+}
+
+
+def get_analyse_filter(types: list[str]) -> dict:
+    """根据分析类型列表生成过滤规则。
+    返回 {"extensions": [".so", ...], "magic": ["ELF", ...], "all": False}
+    """
+    if "all" in types or not types:
+        return {"extensions": [], "magic": [], "all": True}
+
+    exts: list[str] = []
+    magics: list[str] = []
+    for t in types:
+        info = ANALYSE_TYPES.get(t)
+        if info:
+            exts.extend(info["extensions"])
+            magics.extend(info["magic"])
+    return {"extensions": sorted(set(exts)), "magic": sorted(set(magics)), "all": False}
+
+
+# ─── 服务配置 ───────────────────────────────────────────────────────
+
 class ServiceConfig(BaseModel):
-    agent_max_retries: int = Field(default=100, description="API 错误（连接/限流/500）最大重试次数，-1=无限")
-    agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数（指数退避）")
+    analyse_targets: list[str] = Field(
+        default=["all"],
+        description="分析目标文件类型，可组合: binary/script/config/firmware/crypto/database/web/network_model/document/archive/all"
+    )
+    agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
+    agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
-    pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数（指数退避）")
+    pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
 
     stages: StagesConfig = Field(default_factory=StagesConfig)
 
@@ -74,6 +160,7 @@ class TaskConfig(BaseModel):
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
+    analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
     stages: StagesConfig = Field(default_factory=StagesConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)

@@ -287,6 +287,28 @@ class Orchestrator:
 
         try:
             # ═══════════════════════════════════════════════════
+            # Stage 0: 文件类型过滤
+            # ═══════════════════════════════════════════════════
+            filter_script = "/opt/system_analyse/scripts/filter_files.sh"
+            if os.path.isfile(filter_script):
+                types_str = " ".join(cfg.analyse_targets)
+                self._emit("stage", task_id, stage="filter", types=types_str)
+                proc = await asyncio.create_subprocess_exec(
+                    "bash", filter_script, cfg.target_dir,
+                    str(workspace / "filtered_files.txt"), *cfg.analyse_targets,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                filter_count = 0
+                filtered_path = workspace / "filtered_files.txt"
+                if filtered_path.exists():
+                    filter_count = sum(
+                        1 for l in filtered_path.read_text("utf-8").splitlines() if l.strip())
+                self._emit("stage_result", task_id, stage="filter",
+                           types=cfg.analyse_targets, file_count=filter_count)
+
+            # ═══════════════════════════════════════════════════
             # Stage 1: 全局分类 + 完整性检查
             # ═══════════════════════════════════════════════════
             s_cfg = cfg.stages.classify
