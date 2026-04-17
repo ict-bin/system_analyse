@@ -74,7 +74,11 @@ def _flush_pending():
             preview += f" (+{count - 6})"
         print(f"    📂 {count} 个模块: {preview}")
     elif stage == 2 or stage == "2-redo" or stage == "2-redo-s4":
-        if d.get('split'):
+        mod = d.get('module', '')
+        if d.get('skipped'):
+            fc = d.get('file_count', 0)
+            print(f"  ▸ {mod} ({fc} files, 跳过)")
+        elif d.get('split'):
             new = d.get('new_modules', [])
             names = ', '.join(new[:5])
             if len(new) > 5:

@@ -380,16 +380,11 @@ class Orchestrator:
                 if not (mod_dir / "files.list").exists():
                     continue
 
-                # 小模块自动跳过（≤5 文件不需要拆分）
+                # 计算文件数（供主从模式判断用）
                 try:
                     _fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
                 except OSError:
                     _fc = 0
-                if _fc <= 5:
-                    self._emit("stage_result", task_id, stage=2,
-                               module=mod_name, split=False, new_modules=[])
-                    refined_modules.add(mod_name)
-                    continue
 
                 refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                 feedback = ""
@@ -468,7 +463,14 @@ class Orchestrator:
                         passed_count = 0
                         fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
                                             for i, r in enumerate(judge_results) if not r["pass"])
-                        feedback = f"# 评审意见（未通过）\n\n{fail_fb}\n\n请根据意见修正。"
+                        # 区分文件丢失和拆分不合理，给出明确指导
+                        if "missing" in fail_fb.lower() or "丢失" in fail_fb or "遗漏" in fail_fb:
+                            guidance = (
+                                "\n\n⚠️ **文件丢失！** 请修复文件覆盖问题，不要改变拆分策略。"
+                                "\n运行 check_classification.sh 查看遗漏文件，将它们归入合适的模块。")
+                        else:
+                            guidance = "\n\n请根据评审意见调整拆分策略。"
+                        feedback = f"# 评审意见（未通过）\n\n{fail_fb}{guidance}"
                 else:
                     raise StageError(
                         f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
