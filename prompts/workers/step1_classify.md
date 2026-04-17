@@ -15,6 +15,30 @@
 
 # 分类策略（按优先级）
 
+## 策略 0：如果已有预扫描数据
+
+如果你收到了预扫描摘要，`prescan/` 目录下已有按关键词分组的文件列表。直接使用：
+
+```bash
+#!/bin/bash
+cd <工作目录>
+
+# 将预扫描结果移入模块目录
+for listfile in prescan/*.list; do
+    kw=$(basename "$listfile" .list)
+    mkdir -p "$kw"
+    cp "$listfile" "$kw/files.list"
+done
+
+# 可以合并相近的关键词（如 dhcp+dhcpv6 → dhcp）
+# 可以重命名模块使其更准确
+
+# 校验
+TOTAL=$(find /data/target -type f | wc -l)
+CLASSIFIED=$(cat */files.list | sort -u | wc -l)
+echo "总文件: $TOTAL  已分类: $CLASSIFIED"
+```
+
 ## 策略 1：目录结构清晰时
 
 如果 `/data/target` 下有子目录且目录名有语义（如 `bgp/`、`configs/`），直接按子目录映射为模块。

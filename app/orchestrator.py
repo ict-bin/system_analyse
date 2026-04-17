@@ -298,11 +298,53 @@ class Orchestrator:
             feedback = ""
             passed_count = 0  # 连续通过计数（用于 min_rounds）
 
+            # ── Step A: Worker 探索目录生成关键词列表 ──
+            explore_prompt = self._load_prompt(w_prompt_dir, "step1_explore")
+            prescan_summary = ""
+            if explore_prompt:
+                self._emit("stage", task_id, stage="explore")
+                explore_session = str(sess_dir / "explore.jsonl")
+                ar = await _run_agent_checked(
+                    prompt=cfg.task,
+                    system_prompt=explore_prompt,
+                    session_file=explore_session,
+                    **w_base,
+                )
+                tokens += ar.token_usage
+
+                # Step B: 用 Worker 生成的 keywords.txt 跑预扫描脚本
+                keywords_file = workspace / "keywords.txt"
+                prescan_script = "/opt/system_analyse/scripts/prescan_files.sh"
+                if keywords_file.exists() and os.path.isfile(prescan_script):
+                    self._emit("stage", task_id, stage="prescan")
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "bash", prescan_script, cfg.target_dir, str(workspace),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        stdout, stderr = await proc.communicate()
+                        summary_file = workspace / "keyword_summary.txt"
+                        if summary_file.exists():
+                            prescan_summary = summary_file.read_text("utf-8")
+                            self._emit("stage_result", task_id, stage="prescan",
+                                       summary_lines=prescan_summary.count(chr(10)))
+                    except Exception as e:
+                        self._emit("error", task_id, error=f"预扫描失败: {e}")
+
             for attempt in range(self._max_iter(s_cfg)):
                 self._emit("stage", task_id, stage=1, attempt=attempt + 1)
 
                 # Worker 工作
                 prompt_parts = [cfg.task]
+                # 第一轮附带预扫描摘要（如果有）
+                if attempt == 0 and prescan_summary:
+                    prompt_parts.append(
+                        f"\n\n# 预扫描摘要（已自动生成，请基于此分类）\n\n"
+                        f"{prescan_summary}\n\n"
+                        f"预扫描已将文件按关键词分组到 `prescan/` 目录下，"
+                        f"每个 `prescan/<keyword>.list` 包含对应文件列表。\n"
+                        f"你可以直接用脚本将 prescan/*.list 移入模块目录。")
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
                 ar = await _run_agent_checked(
