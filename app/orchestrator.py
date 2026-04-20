@@ -695,7 +695,7 @@ class Orchestrator:
                                        passed=parsed["pass"], score=parsed["score"])
 
                         voted_pass = _check_voting(
-                            s_cfg_redo.pass_mode, j_count)
+                            judge_results, s_cfg_redo.pass_mode, j_count)
                         if voted_pass:
                             passed_count += 1
                             if passed_count >= s_cfg_redo.min_rounds:
@@ -759,7 +759,7 @@ class Orchestrator:
                                            passed=parsed["pass"], score=parsed["score"])
 
                             voted_pass = _check_voting(
-                                s_cfg_a.pass_mode, j_count)
+                                judge_results, s_cfg_a.pass_mode, j_count)
                             if voted_pass:
                                 passed_count += 1
                                 if passed_count >= s_cfg_a.min_rounds:
