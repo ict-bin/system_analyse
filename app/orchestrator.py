@@ -143,6 +143,11 @@ def _parse_eval_md(output: str) -> dict:
     if score > 0:
         return {"pass": passed, "score": score, "feedback": feedback or output[:500]}
 
+    # score=0 但明确提取到了"通过"标记 → 直接返回
+    _pass_pats = [r'通过[::=：]\s*是', r'[Pp]ass[::=：]\s*(?:yes|true)', r'RESULT[::=：]\s*PASS']
+    if score == 0 and any(re.search(p, output, re.IGNORECASE) for p in _pass_pats):
+        return {"pass": True, "score": 100, "feedback": feedback or output[:500]}
+
     # score=0 且明确"不通过" → 直接返回，不走语义推断
     _fail_pats = [r'通过[::=：]\s*否', r'[Pp]ass[::=：]\s*(?:no|false|fail)', r'RESULT[::=：]\s*FAIL']
     if score == 0 and any(re.search(p, output, re.IGNORECASE) for p in _fail_pats):
