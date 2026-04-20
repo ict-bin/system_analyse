@@ -12,9 +12,9 @@ from pathlib import Path
 
 APP_ROOT = Path(os.environ.get("APP_ROOT", "/app")).resolve()
 RUN_ROOT = APP_ROOT / ".run"
-STAGE = "02-system"
-PREV_STAGE = "01-re"
-NEXT_STAGE = "03-entry"
+STAGE = "01-system"
+PREV_STAGE = "00-unpack"
+NEXT_STAGE = "02-re"
 
 
 def now_iso() -> str:
@@ -66,9 +66,6 @@ def has_any_file(root: Path) -> bool:
 
 
 def downstream_source_root() -> Path:
-    recovered = RUN_ROOT / "01-re" / "output" / "recovered"
-    if has_any_file(recovered):
-        return recovered
     unpacked = RUN_ROOT / "00-unpack" / "output" / "unpacked"
     if has_any_file(unpacked):
         return unpacked

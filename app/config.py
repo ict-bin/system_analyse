@@ -10,8 +10,11 @@ from pathlib import Path
 
 from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
 
-# 容器内固定挂载路径
-TARGET_DIR = "/data/target"
+# 容器内固定挂载路径（可通过环境变量覆盖）
+# ENV: TARGET_DIR, CONFIG_DIR, OUTPUT_DIR
+TARGET_DIR = os.environ.get("TARGET_DIR", "/data/target")
+CONFIG_DIR = os.environ.get("CONFIG_DIR", "/data/config")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/data/output")
 
 
 def load_service_config(config_path: str) -> ServiceConfig:

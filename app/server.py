@@ -1,7 +1,7 @@
 """
 system_analyse — REST API 服务器
 
-  POST /analyse           提交分析（body: {"prompt": "对 xxx.c 的 yyy 函数完成威胁分析"}）
+  POST /analyse           提交分析（body: {"prompt": "对解包后的所有文件进行威胁分析与模块分析"}）
   GET  /task/{id}         查询结果
   GET  /task/{id}/stream  SSE 实时事件流
   POST /task/{id}/abort   中止
@@ -29,8 +29,10 @@ from .orchestrator import Orchestrator
 
 load_dotenv()
 
-SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/data/config/config.json")
-TARGET_DIR = os.environ.get("TARGET_DIR", "/data/target")
+# 使用统一的路径配置（优先读取环境变量）
+from .config import CONFIG_DIR, TARGET_DIR
+
+SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", f"{CONFIG_DIR}/config.json")
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 
 
@@ -70,7 +72,7 @@ def _get_svc_config():
 # ─── 请求体 ──────────────────────────────────────────────────────────────────
 
 class AnalyseRequest(BaseModel):
-    prompt: str = Field(..., description="一句话任务描述，如：对 firmware.c 的 parse_packet 函数完成威胁分析")
+    prompt: str = Field(..., description="一句话任务描述，如：对解包后的所有文件进行威胁分析与模块分析")
     cwd: str = Field(default="", description="待分析文件目录，默认 /data/target")
     callback_url: str = Field(default="", description="任务完成后 POST 通知的 URL")
 

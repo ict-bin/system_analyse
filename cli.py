@@ -195,8 +195,14 @@ def render_event(event: SwarmEvent, quiet: bool = False):
 
 # ─── 主入口 ──────────────────────────────────────────────────────────────────
 
-CONFIG_SEARCH = ["/data/config/config.json", "/opt/system_analyse/config.example.json",
-                 "./config.json", "./config.example.json"]
+# 从环境变量读取路径配置
+_CONFIG_DIR = os.environ.get("CONFIG_DIR", "/data/config")
+_CONFIG_SEARCH = [
+    f"{_CONFIG_DIR}/config.json",
+    "/opt/system_analyse/config.example.json",
+    "./config.json",
+    "./config.example.json",
+]
 
 
 async def main():
@@ -216,7 +222,7 @@ async def main():
         if a == "--config" and i + 1 < len(sys.argv):
             config_path = sys.argv[i + 1]
     if not config_path:
-        for p in CONFIG_SEARCH:
+        for p in _CONFIG_SEARCH:
             if os.path.isfile(p):
                 config_path = p
                 break
