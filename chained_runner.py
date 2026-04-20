@@ -128,6 +128,18 @@ def require_file(path: Path) -> None:
         raise FileNotFoundError(f"required file not found: {path}")
 
 
+def copy_if_missing(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or not src.is_file():
+        return
+    shutil.copy2(src, dst)
+
+
+def ensure_default_config(config_dir: Path) -> None:
+    copy_if_missing(Path("/opt/system_analyse/config.example.json"), config_dir / "config.json")
+    copy_if_missing(Path("/root/.pi/agent/models.json"), config_dir / "models.json")
+
+
 def write_empty_outputs(output_dir: Path, input_dir: Path) -> list[str]:
     modules_dir = output_dir / "modules"
     modules_dir.mkdir(parents=True, exist_ok=True)
@@ -177,6 +189,7 @@ def run_real() -> None:
     output_dir = RUN_ROOT / STAGE / "output"
     config_dir = RUN_ROOT / "config" / STAGE
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_default_config(config_dir)
     require_file(config_dir / "config.json")
     require_file(config_dir / "models.json")
     setup_data_links(input_dir, config_dir, output_dir)

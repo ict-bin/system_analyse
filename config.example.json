@@ -5,10 +5,10 @@
     "pi_max_retries": -1,
     "pi_retry_delay": 10,
     "stages": {
-        "classify":    {"min_rounds": 2, "max_rounds": -1, "pass_mode": "all"},
-        "refine":      {"min_rounds": 2, "max_rounds": -1, "pass_mode": "all"},
-        "analyse":     {"min_rounds": 2, "max_rounds": -1, "pass_mode": "all"},
-        "final_check": {"min_rounds": 2, "max_rounds": -1, "pass_mode": "all"}
+        "classify":    {"min_rounds": 2, "max_rounds": 2, "pass_mode": "all"},
+        "refine":      {"min_rounds": 2, "max_rounds": 2, "pass_mode": "all"},
+        "analyse":     {"min_rounds": 2, "max_rounds": 2, "pass_mode": "all"},
+        "final_check": {"min_rounds": 2, "max_rounds": 2, "pass_mode": "all"}
     },
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
