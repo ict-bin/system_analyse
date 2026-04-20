@@ -577,7 +577,7 @@ class Orchestrator:
                         prompt="\n".join(prompt_parts),
                         system_prompt=w_sys_prompt,
                         session_file=analyse_session,
-                        **w_base,
+                        **{**w_base, "cwd": str(mod_dir) if mod_dir.exists() else str(workspace)},
                     )
                     tokens += ar.token_usage
                     self._emit("stage_result", task_id, stage=3, module=mod_name)
@@ -737,7 +737,7 @@ class Orchestrator:
                                 prompt="\n".join(prompt_parts),
                                 system_prompt=w_sys_analyse,
                                 session_file=analyse_session,
-                                **w_base,
+                                **{**w_base, "cwd": str(mod_dir) if mod_dir.exists() else str(workspace)},
                             )
                             tokens += ar.token_usage
 
@@ -900,6 +900,7 @@ class Orchestrator:
 
             feedback = ""
             passed_count = 0
+            modules_root = _get_modules_root(str(workspace))
 
             for attempt in range(self._max_iter(s_cfg)):
                 self._emit("stage", task_id, stage="4b", attempt=attempt + 1)
@@ -913,7 +914,7 @@ class Orchestrator:
                     prompt="\n".join(prompt_parts),
                     system_prompt=report_sys_prompt,
                     session_file=report_session,
-                    **w_base,
+                    **{**w_base, "cwd": str(modules_root) if modules_root.exists() else str(workspace)},
                 )
                 tokens += ar.token_usage
 
