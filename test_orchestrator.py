@@ -536,9 +536,9 @@ def test_parse_edge_cases():
     r = _parse_eval_md("## 评分: 0\n...\n## 评分: 100\n## 通过: 是")
     assert r["score"] == 100 and r["pass"] == True, f"取最后评分: {r}"
 
-    # RESULT: PASS
+    # RESULT: PASS 但无评分 → Judge 格式不合规，应判 fail
     r = _parse_eval_md("RESULT: PASS")
-    assert r["pass"] == True, f"RESULT PASS: {r}"
+    assert r["pass"] == False and r["score"] == 0, f"无评分的 RESULT:PASS 应 fail: {r}"
 
     print("  ✅ 边界情况全部通过")
 
