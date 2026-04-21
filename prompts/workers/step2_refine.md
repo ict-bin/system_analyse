@@ -69,20 +69,42 @@ AFTER=$(cat modules/${MOD}_*/files.list | sort -u | wc -l)
 echo "拆分后: $AFTER 个文件"
 [ "$BEFORE" -eq "$AFTER" ] && echo "✅ 完整" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
 
-# 不删除原模块目录——保留以供 Judge 校验和重试参考
-# 清空原 files.list（避免 Stage 3 重复处理）
-> modules/$MOD/files.list
+# 删除原模块目录（快照已保存在 .s2_snapshots/ 中，不受影响）
+rm -rf modules/$MOD
 ```
 
-> ⚠️ 第二轮重试时（上轮拆分后原 files.list 已清空）：
-> 快照在 `.s2_snapshots/<模块名>.snapshot`，从中读取原始文件列表重新分配。
+> ⚠️ **第二轮重试时**（原模块目录已被上轮删除）：
+> 从 `.s2_snapshots/<模块名>.snapshot` 重建，并先清理上轮生成的子模块：
 
 ```bash
-# 第二轮起：从快照重建（如原 files.list 已为空）
-if [ ! -s modules/$MOD/files.list ]; then
-    cp .s2_snapshots/$MOD.snapshot /tmp/rebuild_$MOD.txt
-    # 重新按关键词分配到子模块...
+#!/bin/bash
+set -e
+MOD="<当前模块名>"
+
+# 清理上轮失败的子模块
+rm -rf modules/${MOD}_*
+
+# 从快照恢复文件列表
+BEFORE=$(wc -l < .s2_snapshots/$MOD.snapshot)
+echo "从快照重建: $BEFORE 个文件"
+
+# 重新按功能拆分（参考上轮 Judge 意见改进）
+mkdir -p modules/${MOD}_<功能1> modules/${MOD}_<功能2>
+grep -iE '<关键词1>' .s2_snapshots/$MOD.snapshot > modules/${MOD}_<功能1>/files.list || true
+# ... 其余分组 ...
+
+# 兜底未匹配
+cat modules/${MOD}_*/files.list | sort > /tmp/moved.txt
+sort .s2_snapshots/$MOD.snapshot > /tmp/orig.txt
+comm -23 /tmp/orig.txt /tmp/moved.txt > /tmp/remaining.txt
+if [ -s /tmp/remaining.txt ]; then
+    mkdir -p modules/${MOD}_core
+    cat /tmp/remaining.txt > modules/${MOD}_core/files.list
 fi
+
+for f in modules/${MOD}_*/files.list; do sort -u "$f" -o "$f"; done
+AFTER=$(cat modules/${MOD}_*/files.list | sort -u | wc -l)
+[ "$BEFORE" -eq "$AFTER" ] && echo "✅ $AFTER 个文件" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
 ```
 
 ## 4. 不需要拆分时
