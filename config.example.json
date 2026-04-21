@@ -1,23 +1,24 @@
 {
     "analyse_targets": ["binary"],
-    "binary_arch": ["arm", "aarch64"],
-    "parallel_modules": 2,
+    "binary_arch": ["all"],
+    "parallel_modules": 1,
+    "parallel_sub_workers": 1,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
     "pi_max_retries": -1,
     "pi_retry_delay": 10,
     "stages": {
-        "classify":    {"min_rounds": 2, "max_rounds": 2, "pass_mode": "all"},
-        "refine":      {"min_rounds": 2, "max_rounds": 2, "pass_mode": "all"},
-        "analyse":     {"min_rounds": 2, "max_rounds": 2, "pass_mode": "all"},
-        "final_check": {"min_rounds": 2, "max_rounds": 2, "pass_mode": "all"}
+        "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "analyse":     {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "final_check": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"}
     },
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
         "system_prompt_dir": "/opt/system_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            { "model": "gaiasec/auto" }
+            {"model": "vllm/zai-org/GLM-5"}
         ]
     },
     "judges": {
@@ -25,8 +26,7 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            { "model": "gaiasec/auto" },
-            { "model": "gaiasec/auto" }
+            {"model": "vllm/zai-org/GLM-5"}
         ]
     },
     "output_dir": "/data/output",

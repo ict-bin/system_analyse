@@ -1,142 +1,187 @@
 # system_analyse 使用手册
 
-这份文档只讲独立运行 `system_analyse`。如果你要跑整个 `softhack` 流水线，请看根目录 [CHAINED_PIPELINE.md](../CHAINED_PIPELINE.md)。
+## 1. 目录结构
 
-## 1. 准备目录
-
-```text
+```
 ~/my-analysis/
-├── target/
-│   └── ...                  # 固件解包目录或恢复后的源码目录
+├── target/          # 固件解包目录（只读挂载到 /data/target）
 ├── config/
-│   ├── config.json
-│   └── models.json
-└── output/
+│   ├── config.json  # 分析配置
+│   └── models.json  # 模型 provider 配置
+└── output/          # 分析结果输出
 ```
 
-挂载约定：
-
-- `target` -> `/data/target`
-- `config` -> `/data/config`
-- `output` -> `/data/output`
-
-## 2. 准备配置
-
-`config/config.json` 示例：
+## 2. 最小配置
 
 ```json
 {
-  "analyse_targets": ["all"],
-  "agent_max_retries": 100,
-  "agent_retry_delay": 30,
-  "pi_max_retries": -1,
-  "pi_retry_delay": 10,
-  "stages": {
-    "classify": { "min_rounds": 2, "max_rounds": -1, "pass_mode": "all" },
-    "refine": { "min_rounds": 2, "max_rounds": -1, "pass_mode": "all" },
-    "analyse": { "min_rounds": 2, "max_rounds": -1, "pass_mode": "all" },
-    "final_check": { "min_rounds": 2, "max_rounds": -1, "pass_mode": "all" }
-  },
-  "workers": {
-    "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
-    "system_prompt_dir": "/opt/system_analyse/prompts/workers",
-    "default_thinking_level": "off",
-    "agents": [{ "model": "gaiasec/auto" }]
-  },
-  "judges": {
-    "default_tools": ["read", "bash", "grep", "find"],
-    "system_prompt_dir": "/opt/system_analyse/prompts/judges",
-    "default_thinking_level": "off",
-    "agents": [{ "model": "gaiasec/auto" }, { "model": "gaiasec/auto" }]
-  },
-  "output_dir": "/data/output",
-  "archive_dir": "/data/output",
-  "result_dir": "/data/output"
+    "analyse_targets": ["all"],
+    "parallel_modules": 1,
+    "parallel_sub_workers": 1,
+    "agent_max_retries": 100,
+    "agent_retry_delay": 30,
+    "pi_max_retries": -1,
+    "pi_retry_delay": 10,
+    "stages": {
+        "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "analyse":     {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "final_check": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"}
+    },
+    "workers": {
+        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
+        "system_prompt_dir": "/opt/system_analyse/prompts/workers",
+        "agents": [{"model": "vllm/your-model"}]
+    },
+    "judges": {
+        "default_tools": ["read", "bash", "grep", "find"],
+        "system_prompt_dir": "/opt/system_analyse/prompts/judges",
+        "agents": [{"model": "vllm/your-model"}]
+    },
+    "output_dir": "/data/output",
+    "archive_dir": "/data/output",
+    "result_dir": "/data/output"
 }
 ```
 
-`config/models.json` 需要提供当前环境可用的模型 provider 配置。
+完整配置示例见 [config.example.json](config.example.json)。
 
-## 3. 运行 CLI
+## 3. 文件过滤配置
+
+### 按类型过滤 `analyse_targets`
+
+```json
+"analyse_targets": ["all"]                    // 不过滤（默认）
+"analyse_targets": ["binary"]                 // 只分析 ELF 二进制
+"analyse_targets": ["binary", "script"]       // 二进制 + 脚本
+"analyse_targets": ["config", "network_model"] // 配置 + 网络模型
+```
+
+支持的类型：`binary` `script` `config` `firmware` `crypto` `database` `web` `network_model` `document` `archive` `all`
+
+### 按架构过滤 `binary_arch`（仅 binary 类型）
+
+```json
+"analyse_targets": ["binary"],
+"binary_arch": ["all"]              // 不过滤（默认）
+"binary_arch": ["arm", "aarch64"]  // 只分析 ARM 32/64 位
+"binary_arch": ["x86_64"]          // 只分析 x86_64
+```
+
+支持：`arm` `aarch64` `x86` `x86_64` `mips` `mips64` `ppc` `ppc64` `riscv` `s390` `all`
+
+> **注意**：通过读取 ELF header（e_machine 字段）判断架构，不依赖 `file` 命令。
+
+## 4. 并行配置
+
+### `parallel_modules` — 模块间并行
+
+```json
+"parallel_modules": 1   // 串行（默认）
+"parallel_modules": 2   // 同时处理 2 个模块
+"parallel_modules": 4   // 同时处理 4 个模块
+```
+
+Stage 2/3 的模块处理完全独立，可安全并行。拆分出的子模块自动入队，不遗漏。
+
+### `parallel_sub_workers` — 模块内批次并行
+
+```json
+"parallel_sub_workers": 1   // 串行（默认）
+"parallel_sub_workers": 2   // 每模块内 2 个批次并行
+```
+
+文件数 > 20 的模块启用主/子 Worker 模式。子 Worker 并行读取文件，Master Worker 接收汇总后的文件清单表做决策。
+
+### 推荐配置
+
+```json
+// 单 GPU，均衡
+"parallel_modules": 2,
+"parallel_sub_workers": 2   // 最多 4 个并发 LLM 调用
+
+// 单 GPU，保守
+"parallel_modules": 2,
+"parallel_sub_workers": 1   // 最多 2 个并发 LLM 调用
+
+// 多 GPU 或高吞吐推理服务
+"parallel_modules": 4,
+"parallel_sub_workers": 2   // 最多 8 个并发 LLM 调用
+```
+
+## 5. 阶段配置
+
+### `min_rounds` 语义
+
+总运行轮次 ≥ min_rounds 且最后一轮通过即止：
+
+```
+min_rounds=1: 第1轮通过 → 结束（推荐用于生产）
+min_rounds=2: 第1轮失败+第2轮通过 → 结束（已满足2轮）
+              第1轮通过+第2轮通过 → 结束（2轮均通过）
+              第1轮通过 → 强制反思 → 第2轮通过 → 结束
+```
+
+> 设置 `min_rounds=2` 主要用于**测试反思逻辑**是否正确，生产环境建议 `min_rounds=1`。
+
+### `pass_mode`
+
+- `"all"` — 所有 Judge 都通过才算通过（默认，严格）
+- `"majority"` — 超半数 Judge 通过即可（宽松，适合多 Judge 场景）
+
+## 6. 运行方式
+
+### CLI
 
 ```bash
-docker run --rm --network host \
-  -v ~/my-analysis/target:/data/target:ro \
-  -v ~/my-analysis/config:/data/config:ro \
-  -v ~/my-analysis/output:/data/output \
-  -e GAIASEC_API_KEY=xxx \
+docker run -d --name system_analyse --network host \
+  -v /path/to/target:/data/target:ro \
+  -v /path/to/config:/data/config:ro \
+  -v /path/to/output:/data/output \
+  -e GLM_API_KEY=your_key \
   system_analyse \
-  python3 cli.py "对解包后的所有文件进行威胁分析与模块分析" \
-  --config /data/config/config.json
+  python3 cli.py "对解包后的固件进行系统模块分类和安全威胁分析"
+
+# 查看进度
+docker logs -f system_analyse
 ```
 
-如果你已经把 `config.json` 放在默认搜索路径，也可以省略 `--config`。
-
-## 4. 运行 REST API
+### REST API
 
 ```bash
-docker run -d --name system-analyse \
-  -p 3000:3000 \
-  -v ~/my-analysis/target:/data/target:ro \
-  -v ~/my-analysis/config:/data/config:ro \
-  -v ~/my-analysis/output:/data/output \
-  -e GAIASEC_API_KEY=xxx \
+docker run -d --name system_analyse -p 3000:3000 \
+  -v /path/to/target:/data/target:ro \
+  -v /path/to/config:/data/config:ro \
+  -v /path/to/output:/data/output \
+  -e GLM_API_KEY=your_key \
   system_analyse
-```
 
-提交任务：
-
-```bash
+# 提交任务
 curl -X POST http://localhost:3000/analyse \
   -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "对解包后的所有文件进行威胁分析与模块分析",
-    "cwd": "/data/target"
-  }'
+  -d '{"prompt": "对解包后的固件进行系统模块分类和安全威胁分析"}'
 ```
 
-查看任务：
+## 7. 输出说明
 
-```bash
-curl http://localhost:3000/task/<task_id>
-curl -N http://localhost:3000/task/<task_id>/stream
 ```
-
-## 5. 输出说明
-
-```text
 output/
-├── flag
-├── final_report.md
+├── flag                    # "1"=成功，"0"=失败
+├── final_report.md         # 总安全报告（含失败时的错误信息）
+├── modules.list            # 按风险等级排序的模块名，每行一个
+│                           # 严重→高→中→低→信息→未知
 ├── modules/
 │   └── <module>/
-│       ├── files.list
-│       └── module_report.md
-└── archive.zip
+│       ├── files.list      # 相对路径（不含 /data/target/），每行一个
+│       └── module_report.md # STRIDE 分析，含 RISK_LEVEL/RISK_SCORE
+└── archive.zip             # 所有中间产物（session、judge评审、workspace）
 ```
 
-判断结果时优先看：
+## 8. 验证测试
 
-- `flag`
-- `final_report.md`
-- `modules/<module>/module_report.md`
+调度逻辑可在无 GPU/API 的环境下运行 dry-run 测试：
 
-## 6. 常见问题
-
-### 没有生成模块
-
-先检查：
-
-- 输入目录是否真的包含可分析文件
-- prompt 是否指向了整个目录而不是单个函数
-- 模型配置和 API key 是否可用
-
-### 结果目录里只有兜底报告
-
-说明主流程没有形成稳定模块输出。常见原因是：
-
-- 输入树质量太差
-- 模型返回异常
-- Judge 长期未通过
-
-这时先看 `archive.zip` 中的过程日志。
+```bash
+python3 test_orchestrator.py
+# 结果: 11 通过, 0 失败
+```
