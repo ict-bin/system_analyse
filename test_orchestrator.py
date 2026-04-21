@@ -853,6 +853,102 @@ def test_2x2_parallel():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ─── 测试 12: stage_models 阶段模型覆盖 ────────────────────────────────────
+
+def test_stage_models():
+    """验证 stage_models 覆盖模型：子Worker用小模型，分析用大模型"""
+    print("=== Test: stage_models 阶段模型覆盖 ===")
+    from app.models import RoleConfig, AgentInstanceConfig
+    tmp_dir = tempfile.mkdtemp(prefix="orch_test_")
+
+    try:
+        setup_workspace(tmp_dir)
+        cfg = make_config(tmp_dir, min_rounds=1)
+
+        # 配置阶段模型：子Worker用 small-model，分析用 large-model
+        cfg.workers = RoleConfig(
+            default_tools=["read", "bash"],
+            system_prompt_dir=cfg.workers.system_prompt_dir,
+            agents=[AgentInstanceConfig(model="default-model")],
+            stage_models={
+                "sub_read": "small-fast-model",
+                "analyse":  "large-accurate-model",
+                "classify": "medium-model",
+            }
+        )
+        cfg.judges = RoleConfig(
+            default_tools=["read", "bash"],
+            system_prompt_dir=cfg.judges.system_prompt_dir,
+            agents=[AgentInstanceConfig(model="judge-default")],
+            stage_models={
+                "analyse": "large-judge-model",
+            }
+        )
+
+        # 验证 model_for 逗级回退
+        assert cfg.workers.model_for("sub_read") == "small-fast-model"
+        assert cfg.workers.model_for("analyse") == "large-accurate-model"
+        assert cfg.workers.model_for("classify") == "medium-model"
+        assert cfg.workers.model_for("refine") == "default-model"  # 回退到 agents[0]
+        assert cfg.workers.model_for("explore") == "default-model"
+        assert cfg.judges.model_for("analyse") == "large-judge-model"
+        assert cfg.judges.model_for("refine") == "judge-default"   # 回退
+
+        tracker = CallTracker()
+
+        def create_modules(cwd):
+            ws = Path(cwd)
+            # 大模块（>20文件，会启用子Worker）
+            d = ws / "mod_a"
+            d.mkdir(exist_ok=True)
+            files = "\n".join(f"file{i}.so" for i in range(25))
+            (d / "files.list").write_text(files + "\n", encoding="utf-8")
+
+        effects = {0: lambda cwd: None, 1: create_modules}
+        orig_mock = create_mock_agent(tracker, effects)
+        used_models: list[str] = []
+
+        async def tracking_mock(**kwargs):
+            used_models.append(kwargs.get("model", "?"))
+            r = await orig_mock(**kwargs)
+            cwd = kwargs.get("cwd", "")
+            prompt = kwargs.get("prompt", "")
+            if "分析模块" in prompt and "评审" not in prompt:
+                (Path(cwd) / "mod_a" / "module_report.md").write_text(
+                    "<!-- RISK_LEVEL: 高 -->\n# R\n", encoding="utf-8")
+            if "总报告" in prompt or "final_report" in prompt.lower():
+                (Path(cwd) / "final_report.md").write_text("# F", encoding="utf-8")
+            return r
+
+        with patch("app.orchestrator.run_agent", tracking_mock), \
+             patch("app.orchestrator.os.path.isfile", return_value=False):
+            orch = Orchestrator(cfg, on_event=tracker.on_event)
+            result = asyncio.run(orch.execute("test-012"))
+
+        assert result.status.value == "passed", f"应成功: {result.error}"
+
+        # 验证模型使用情况
+        assert "small-fast-model" in used_models, \
+            f"子Worker 应使用 small-fast-model: {set(used_models)}"
+        assert "large-accurate-model" in used_models, \
+            f"analyse Worker 应使用 large-accurate-model: {set(used_models)}"
+        assert "large-judge-model" in used_models, \
+            f"analyse Judge 应使用 large-judge-model: {set(used_models)}"
+        assert "medium-model" in used_models, \
+            f"classify Worker 应使用 medium-model: {set(used_models)}"
+        # 未配置 stage_models 的阶段回退到默认
+        assert "default-model" in used_models, \
+            f"refine/explore 应回退到 default-model: {set(used_models)}"
+
+        model_summary = {}
+        for m in used_models:
+            model_summary[m] = model_summary.get(m, 0) + 1
+        print(f"  ✅ stage_models 正确 (models used: {model_summary})")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ─── 运行全部测试 ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -873,6 +969,7 @@ if __name__ == "__main__":
         test_parallel_modules,
         test_sub_worker_summary,
         test_2x2_parallel,
+        test_stage_models,
     ]
 
     passed = 0

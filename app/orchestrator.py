@@ -267,7 +267,6 @@ class Orchestrator:
         j_count = len(j_cfgs)
 
         w_base = {
-            "model": w_cfg.model,
             "tools": w_cfg.tools or cfg.workers.default_tools,
             "cwd": str(workspace),
             "thinking_level": w_cfg.thinking_level or cfg.workers.default_thinking_level,
@@ -277,6 +276,14 @@ class Orchestrator:
             "pi_max_retries": cfg.pi_max_retries,
             "pi_retry_delay": cfg.pi_retry_delay,
         }
+
+        # 阶段模型获取助手（未配置 stage_models 时回退到 agents[0])
+        def _wm(stage: str) -> str:
+            return cfg.workers.model_for(stage)
+
+        def _jm(stage: str, j_item: "AgentInstanceConfig") -> str:
+            sm = cfg.judges.model_for(stage)
+            return sm if sm else j_item.model
 
         j_base_kw = {
             "thinking_level": cfg.judges.default_thinking_level or "off",
@@ -335,6 +342,7 @@ class Orchestrator:
                 explore_session = str(sess_dir / "explore.jsonl")
                 ar = await _run_agent_checked(
                     prompt=cfg.task,
+                    model=_wm("explore"),
                     system_prompt=explore_prompt,
                     session_file=explore_session,
                     **w_base,
@@ -377,6 +385,7 @@ class Orchestrator:
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
                 ar = await _run_agent_checked(
+                    model=_wm("classify"),
                     prompt="\n".join(prompt_parts),
                     system_prompt=w_sys_prompt,
                     session_file=classify_session,
@@ -394,7 +403,7 @@ class Orchestrator:
                 for j_idx, j_cfg_item in enumerate(j_cfgs):
                     ar = await _run_agent_checked(
                         prompt="请运行检查脚本验证分类完整性。",
-                        model=j_cfg_item.model,
+                        model=_jm("classify", j_cfg_item),
                         system_prompt=j_sys_prompt,
                         tools=cfg.judges.default_tools,
                         cwd=str(workspace),
@@ -465,7 +474,8 @@ class Orchestrator:
                 if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
                     file_summary = await self._collect_file_summaries(
                         task_id, mod_name, mod_dir, w_base, tokens,
-                        sub_prompt, parallel=cfg.parallel_sub_workers)
+                        sub_prompt, parallel=cfg.parallel_sub_workers,
+                        sub_model=cfg.workers.model_for("sub_read"))
 
                 for attempt in range(self._max_iter(s_cfg)):
                     self._emit("stage", task_id, stage=2,
@@ -479,6 +489,7 @@ class Orchestrator:
                         prompt_parts.append(chr(10)*2 + feedback)
                     ar = await _run_agent_checked(
                         prompt=chr(10).join(prompt_parts),
+                        model=_wm("refine"),
                         system_prompt=w_sys_prompt,
                         session_file=refine_session,
                         **w_base,
@@ -500,7 +511,7 @@ class Orchestrator:
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
                         ar = await _run_agent_checked(
                             prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
-                            model=j_cfg_item.model,
+                            model=_jm("refine", j_cfg_item),
                             system_prompt=j_sys_prompt,
                             tools=cfg.judges.default_tools,
                             cwd=str(workspace),
@@ -610,7 +621,8 @@ class Orchestrator:
                     if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
                         file_summary = await self._collect_file_summaries(
                             task_id, mod_name, mod_dir, w_base, tokens,
-                            sub_prompt, parallel=cfg.parallel_sub_workers)
+                            sub_prompt, parallel=cfg.parallel_sub_workers,
+                            sub_model=cfg.workers.model_for("sub_read"))
 
                     for attempt in range(self._max_iter(s_cfg)):
                         self._emit("stage", task_id, stage=3,
@@ -623,6 +635,7 @@ class Orchestrator:
                             prompt_parts.append(chr(10)*2 + feedback)
                         ar = await _run_agent_checked(
                             prompt=chr(10).join(prompt_parts),
+                            model=_wm("analyse"),
                             system_prompt=w_sys_prompt,
                             session_file=analyse_session,
                             **w_base,
@@ -634,7 +647,7 @@ class Orchestrator:
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
                             ar = await _run_agent_checked(
                                 prompt=f"评审模块 `{mod_name}` 的分析报告。",
-                                model=j_cfg_item.model,
+                                model=_jm("analyse", j_cfg_item),
                                 system_prompt=j_sys_prompt,
                                 tools=cfg.judges.default_tools,
                                 cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
@@ -728,6 +741,7 @@ class Orchestrator:
                                    module=mod_name, attempt=attempt + 1)
 
                         ar = await _run_agent_checked(
+                            model=_wm("refine"),
                             prompt=f"重新检查模块 `{mod_name}` 并细分。\n\n{feedback}",
                             system_prompt=w_sys_refine,
                             session_file=refine_session,
@@ -740,7 +754,7 @@ class Orchestrator:
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
                             ar = await _run_agent_checked(
                                 prompt=f"评审模块 `{mod_name}` 的重新细分。",
-                                model=j_cfg_item.model,
+                                model=_jm("refine", j_cfg_item),
                                 system_prompt=j_sys_refine,
                                 tools=cfg.judges.default_tools,
                                 cwd=eval_cwd,
@@ -790,6 +804,7 @@ class Orchestrator:
                             if feedback:
                                 prompt_parts.append(f"\n\n{feedback}")
                             ar = await _run_agent_checked(
+                                model=_wm("analyse"),
                                 prompt="\n".join(prompt_parts),
                                 system_prompt=w_sys_analyse,
                                 session_file=analyse_session,
@@ -801,7 +816,7 @@ class Orchestrator:
                             for j_idx, j_cfg_item in enumerate(j_cfgs):
                                 ar = await _run_agent_checked(
                                     prompt=f"评审模块 `{mod_name}` 的分析报告。",
-                                    model=j_cfg_item.model,
+                                    model=_jm("analyse", j_cfg_item),
                                     system_prompt=j_sys_analyse,
                                     tools=cfg.judges.default_tools,
                                     cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
@@ -844,7 +859,7 @@ class Orchestrator:
             for j_idx, j_cfg_item in enumerate(j_cfgs):
                 ar = await _run_agent_checked(
                     prompt="运行 check_outputs.sh 检查所有模块是否都有 module_report.md。",
-                    model=j_cfg_item.model,
+                    model=_jm("completeness", j_cfg_item),
                     system_prompt=j_completeness_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
@@ -893,6 +908,7 @@ class Orchestrator:
                     # Stage 2 补做
                     refine_session = str(sess_dir / f"refine-s4-{mod_name}.jsonl")
                     ar = await _run_agent_checked(
+                        model=_wm("refine"),
                         prompt=f"检查模块 `{mod_name}` 是否需要细分。",
                         system_prompt=w_sys_refine,
                         session_file=refine_session,
@@ -908,6 +924,7 @@ class Orchestrator:
                         if feedback:
                             prompt_parts.append(f"\n\n{feedback}")
                         ar = await _run_agent_checked(
+                            model=_wm("analyse"),
                             prompt="\n".join(prompt_parts),
                             system_prompt=w_sys_analyse,
                             session_file=analyse_session,
@@ -919,7 +936,7 @@ class Orchestrator:
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
                             ar = await _run_agent_checked(
                                 prompt=f"评审模块 `{mod_name}` 的分析报告。",
-                                model=j_cfg_item.model,
+                                model=_jm("analyse", j_cfg_item),
                                 system_prompt=j_sys_analyse,
                                 tools=cfg.judges.default_tools,
                                 cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
@@ -963,6 +980,7 @@ class Orchestrator:
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
                 ar = await _run_agent_checked(
+                    model=_wm("report"),
                     prompt="\n".join(prompt_parts),
                     system_prompt=report_sys_prompt,
                     session_file=report_session,
@@ -979,7 +997,7 @@ class Orchestrator:
                 for j_idx, j_cfg_item in enumerate(j_cfgs):
                     ar = await _run_agent_checked(
                         prompt="评审 final_report.md 的质量和完整性。",
-                        model=j_cfg_item.model,
+                        model=_jm("report", j_cfg_item),
                         system_prompt=j_report_prompt,
                         tools=cfg.judges.default_tools,
                         cwd=str(workspace),
@@ -1214,6 +1232,7 @@ class Orchestrator:
         w_base: dict, tokens: "TokenUsage",
         sub_prompt_template: str,
         parallel: int = 1,
+        sub_model: str = "",
     ) -> str:
         """并行子 Worker 逐批读取文件，返回合并后的文件摘要文本。
 
@@ -1243,7 +1262,7 @@ class Orchestrator:
                           f"{chr(10)}{chr(10)}{file_list_text}")
                 ar = await _run_agent_checked(
                     prompt=prompt,
-                    model=w_base["model"],
+                    model=sub_model or w_base.get("model", ""),
                     tools=w_base["tools"],
                     system_prompt=sub_prompt_template,
                     cwd=w_base["cwd"],

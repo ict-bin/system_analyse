@@ -19,7 +19,11 @@
         "default_thinking_level": "off",
         "agents": [
             {"model": "vllm/zai-org/GLM-5"}
-        ]
+        ],
+        "stage_models": {
+            "sub_read": "vllm/zai-org/GLM-5",
+            "analyse":  "vllm/zai-org/GLM-5"
+        }
     },
     "judges": {
         "default_tools": ["read", "bash", "grep", "find"],
@@ -27,7 +31,10 @@
         "default_thinking_level": "off",
         "agents": [
             {"model": "vllm/zai-org/GLM-5"}
-        ]
+        ],
+        "stage_models": {
+            "analyse": "vllm/zai-org/GLM-5"
+        }
     },
     "output_dir": "/data/output",
     "archive_dir": "/data/output",

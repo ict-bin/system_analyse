@@ -14,6 +14,14 @@ from pydantic import BaseModel, Field
 
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
 
+# Worker/Judge 可配置的阶段名（用于 stage_models 键）
+# Workers: explore / classify / refine / sub_read / analyse / report
+# Judges:  classify / refine / analyse / completeness / report
+
+WORKER_STAGES = ["explore", "classify", "refine", "sub_read", "analyse", "report"]
+JUDGE_STAGES  = ["classify", "refine", "analyse", "completeness", "report"]
+
+
 class AgentInstanceConfig(BaseModel):
     model: str = Field(..., description="该实例使用的 LLM 模型")
     tools: Optional[list[str]] = Field(default=None)
@@ -27,6 +35,20 @@ class RoleConfig(BaseModel):
     system_prompt_dir: str = Field(default="./prompts/workers")
     default_thinking_level: str = Field(default="off")
     agents: list[AgentInstanceConfig] = Field(default_factory=list)
+    stage_models: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "各阶段模型覆盖，优先级高于 agents[0]。"
+            "Workers: explore/classify/refine/sub_read/analyse/report。"
+            "Judges: classify/refine/analyse/completeness/report"
+        )
+    )
+
+    def model_for(self, stage: str) -> str:
+        """获取指定阶段的模型名。未配置时回退到 agents[0].model。"""
+        if stage in self.stage_models:
+            return self.stage_models[stage]
+        return self.agents[0].model if self.agents else self.default_model
 
 
 # ─── 服务配置 ─────────────────────────────────────────────────────────────────
