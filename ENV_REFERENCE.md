@@ -13,7 +13,7 @@
 | 变量 | 说明 | 示例 |
 |------|------|------|
 | `GLM_API_KEY` | GLM/vLLM 服务 API 密钥 | `1234` |
-| `GAIASEC_API_KEY` | GaiaSec 平台 API 密钥 | `sk-xxx` |
+| `MINIMAX_API_KEY` | MiniMax vLLM 服务 API 密钥 | `12345` |
 | `OPENAI_API_KEY` | OpenAI API 密钥 | `sk-xxx` |
 
 > 环境变量名由 `models.json` 中的 `"apiKey"` 字段指定（存的是变量名，不是密钥本身）。
@@ -24,12 +24,17 @@
 
 ### `config/models.json` — 模型 Provider 配置
 
-**本地 vLLM（GLM-5）：**
+**命名规则**：`provider名` + `/` + `model id` = 实际发给 API 的模型名。
+
+把 provider 命名为模型名的第一段，`provider/id` 拼起来正好就是原始模型名，
+在 config.json 中引用时无需额外前缀。
+
+**双模型示例（GLM-5 大模型 + MiniMax-M2.5 快模型）：**
 
 ```json
 {
     "providers": {
-        "glm": {
+        "zai-org": {
             "baseUrl": "http://your-vllm-host:8000/v1",
             "api": "openai-completions",
             "apiKey": "GLM_API_KEY",
@@ -39,11 +44,30 @@
             },
             "models": [
                 {
-                    "id": "vllm/zai-org/GLM-5",
+                    "id": "GLM-5",
                     "name": "GLM-5",
                     "reasoning": false,
                     "input": ["text"],
                     "contextWindow": 128000,
+                    "maxTokens": 8192
+                }
+            ]
+        },
+        "MiniMax": {
+            "baseUrl": "http://your-vllm-host:8003/v1",
+            "api": "openai-completions",
+            "apiKey": "MINIMAX_API_KEY",
+            "compat": {
+                "supportsDeveloperRole": false,
+                "supportsReasoningEffort": false
+            },
+            "models": [
+                {
+                    "id": "MiniMax-M2.5",
+                    "name": "MiniMax-M2.5",
+                    "reasoning": false,
+                    "input": ["text"],
+                    "contextWindow": 163804,
                     "maxTokens": 8192
                 }
             ]
@@ -52,21 +76,39 @@
 }
 ```
 
-**关键字段说明：**
+引用方式：
+- `zai-org/GLM-5` → provider=`zai-org`, id=`GLM-5` → API 收到 `zai-org/GLM-5` ✅
+- `MiniMax/MiniMax-M2.5` → provider=`MiniMax`, id=`MiniMax-M2.5` → API 收到 `MiniMax/MiniMax-M2.5` ✅
+
+**其他关键字段**：
 - `"apiKey": "GLM_API_KEY"` — 这里写**环境变量名**，不是密钥本身
-- `"id"` — 在 `config.json` 的 `agents[].model` 中引用此 ID
 - `"contextWindow"` — 根据实际模型调整，影响子 Worker 每批文件数
 
 ### `config/config.json` — 分析配置
 
-完整字段说明见 [USAGE.md](USAGE.md)，关键新增字段：
+完整字段说明见 [USAGE.md](USAGE.md)，关键字段：
 
 ```json
 {
-    "analyse_targets": ["binary"],      // 文件类型过滤
-    "binary_arch": ["arm", "aarch64"], // ELF 架构过滤（仅 binary 类型）
-    "parallel_modules": 2,              // 模块间并行度
-    "parallel_sub_workers": 2           // 模块内子Worker并行度
+    "analyse_targets": ["binary"],
+    "binary_arch": ["arm", "aarch64"],
+    "parallel_modules": 2,
+    "parallel_sub_workers": 2,
+    "workers": {
+        "agents": [{"model": "zai-org/GLM-5"}],
+        "stage_models": {
+            "explore":  "MiniMax/MiniMax-M2.5",
+            "sub_read": "MiniMax/MiniMax-M2.5"
+        }
+    },
+    "judges": {
+        "agents": [{"model": "zai-org/GLM-5"}],
+        "stage_models": {
+            "classify":     "MiniMax/MiniMax-M2.5",
+            "refine":       "MiniMax/MiniMax-M2.5",
+            "completeness": "MiniMax/MiniMax-M2.5"
+        }
+    }
 }
 ```
 
@@ -74,7 +116,7 @@
 
 ## 典型部署示例
 
-### 分析 ARM 二进制（2×2 并行）
+### 双模型：快/慢分工（推荐）
 
 ```bash
 docker run -d --name system_analyse --network host \
@@ -82,29 +124,17 @@ docker run -d --name system_analyse --network host \
   -v ~/config:/data/config:ro \
   -v ~/output:/data/output \
   -e GLM_API_KEY=1234 \
+  -e MINIMAX_API_KEY=12345 \
   system_analyse \
   python3 cli.py "对解包后的固件进行系统模块分类和安全威胁分析"
 ```
 
-`~/config/config.json`:
-```json
-{
-    "analyse_targets": ["binary"],
-    "binary_arch": ["arm", "aarch64"],
-    "parallel_modules": 2,
-    "parallel_sub_workers": 2,
-    ...
-}
-```
-
-### 分析全部文件（串行，保守）
+### 单模型（全用 GLM-5）
 
 ```json
 {
-    "analyse_targets": ["all"],
-    "parallel_modules": 1,
-    "parallel_sub_workers": 1,
-    ...
+    "workers": {"agents": [{"model": "zai-org/GLM-5"}]},
+    "judges":  {"agents": [{"model": "zai-org/GLM-5"}]}
 }
 ```
 
@@ -114,8 +144,7 @@ docker run -d --name system_analyse --network host \
 {
     "stages": {
         "classify":    {"min_rounds": 2, "max_rounds": -1, "pass_mode": "all"},
-        "refine":      {"min_rounds": 2, "max_rounds": -1, "pass_mode": "all"},
-        ...
+        "refine":      {"min_rounds": 2, "max_rounds": -1, "pass_mode": "all"}
     }
 }
 ```
