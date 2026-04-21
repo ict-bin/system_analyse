@@ -114,7 +114,9 @@ def main():
 
     # 关键词正则（词边界匹配，防止子串误匹配）
     # 使用 \b 词边界，但部分关键词如 "bgp" 在 libbgp.so 里也要能匹配
-    pattern_str = r'\b(' + '|'.join(re.escape(k) for k in sorted(KEYWORDS, key=len, reverse=True)) + r')\b'
+    # 不用 \b（对 _ 分隔的命名无效），改用字母边界
+    # 允许: libbras_dhcp.so 里的 dhcp, DHCP_SERVER 里的 DHCP, libbgp.so 里的 bgp
+    pattern_str = r'(?<![a-zA-Z])(' + '|'.join(re.escape(k) for k in sorted(KEYWORDS, key=len, reverse=True)) + r')(?![a-zA-Z])'
     KW_PATTERN = re.compile(pattern_str, re.IGNORECASE)
 
     # 构建文件列表

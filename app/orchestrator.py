@@ -627,6 +627,98 @@ class Orchestrator:
                 raise s2_errors[0]
 
             # ═══════════════════════════════════════════════════
+            # Stage 2 后：全局完整性检查 + 遗漏文件补分类（W+J）
+            # ═══════════════════════════════════════════════════
+            filtered_txt = workspace / "filtered_files.txt"
+            if filtered_txt.exists():
+                all_target = set(
+                    l.strip() for l in filtered_txt.read_text("utf-8").splitlines() if l.strip()
+                )
+                mods_root = _get_modules_root(str(workspace))
+                all_classified = set()
+                for flist in mods_root.glob("*/files.list"):
+                    if flist.name == "files.list.snapshot":
+                        continue
+                    for l in flist.read_text("utf-8").splitlines():
+                        l = l.strip()
+                        if l:
+                            all_classified.add(l)
+                missing_files = sorted(all_target - all_classified)
+
+                if missing_files:
+                    self._emit("log", task_id, level="warn",
+                               msg=f"Stage2 全局检查: {len(missing_files)} 个文件未归类，启动补分类")
+
+                    # 构建现有模块摘要
+                    mod_summary_lines = ["## 已有模块（名称 | 示例文件）"]
+                    for flist in sorted(mods_root.glob("*/files.list")):
+                        mod_name_s2 = flist.parent.name
+                        sample = next(
+                            (l.strip() for l in flist.read_text("utf-8").splitlines() if l.strip()),
+                            "(空)"
+                        )
+                        mod_summary_lines.append(f"- {mod_name_s2} | {Path(sample).name}")
+                    mod_summary = "
+".join(mod_summary_lines)
+
+                    reclass_prompt_tmpl = self._load_prompt(w_prompt_dir, "step2_reclassify")
+                    reclass_prompt = (
+                        f"## 待归类文件（{len(missing_files)} 个）
+
+"
+                        + "
+".join(missing_files)
+                        + f"
+
+{mod_summary}"
+                    )
+
+                    s2rc_cfg = cfg.stages.refine
+                    for rc_attempt in range(min(3, self._max_iter(s2rc_cfg))):
+                        rc_ar = await _run_agent_checked(
+                            prompt=reclass_prompt,
+                            model=self._wm("classify"),
+                            tools=w_base["tools"],
+                            system_prompt=reclass_prompt_tmpl,
+                            cwd=str(workspace),
+                            thinking_level=w_base.get("thinking_level", "off"),
+                            session_file=None,
+                            cancel_event=w_base.get("cancel_event"),
+                            max_retries=w_base.get("max_retries", 3),
+                            retry_delay=w_base.get("retry_delay", 10),
+                            pi_max_retries=w_base.get("pi_max_retries", -1),
+                            pi_retry_delay=w_base.get("pi_retry_delay", 10),
+                        )
+                        tokens += rc_ar.token_usage
+
+                        # 重新统计
+                        all_classified2 = set()
+                        for flist in mods_root.glob("*/files.list"):
+                            for l in flist.read_text("utf-8").splitlines():
+                                l = l.strip()
+                                if l:
+                                    all_classified2.add(l)
+                        still_missing = sorted(all_target - all_classified2)
+                        self._emit("log", task_id, level="info",
+                                   msg=f"补分类第{rc_attempt+1}轮: 剩余 {len(still_missing)} 个未归类")
+                        if not still_missing:
+                            break
+                        missing_files = still_missing
+                        reclass_prompt = (
+                            f"## 仍未归类文件（{len(missing_files)} 个）
+
+"
+                            + "
+".join(missing_files)
+                            + f"
+
+{mod_summary}"
+                        )
+                else:
+                    self._emit("log", task_id, level="info",
+                               msg=f"Stage2 全局检查: 全部 {len(all_target)} 个文件已归类 ✅")
+
+            # ═══════════════════════════════════════════════════
             # Stage 3: 子文件夹分析（parallel_modules 并行）
             # ═══════════════════════════════════════════════════
             s_cfg = cfg.stages.analyse
