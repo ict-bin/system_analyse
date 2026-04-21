@@ -151,6 +151,7 @@ class ServiceConfig(BaseModel):
         description="binary 类型的架构过滤，只在 analyse_targets 含 binary 时生效: all/x86/x86_64/arm/aarch64/mips/mips64/ppc/ppc64/riscv/s390"
     )
     parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1（串行）")
+    parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1（串行）")
     agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
@@ -182,6 +183,7 @@ class TaskConfig(BaseModel):
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
     binary_arch: list[str] = Field(default=["all"], description="binary 架构过滤")
     parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1（串行）")
+    parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1（串行）")
     stages: StagesConfig = Field(default_factory=StagesConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)

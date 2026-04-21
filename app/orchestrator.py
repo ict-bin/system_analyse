@@ -458,12 +458,23 @@ class Orchestrator:
                 refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                 feedback = ""
 
+                # 超过阈値时，先用子 Worker 收集文件摘要
+                sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
+                fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
+                file_summary = ""
+                if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
+                    file_summary = await self._collect_file_summaries(
+                        task_id, mod_name, mod_dir, w_base, tokens,
+                        sub_prompt, parallel=cfg.parallel_sub_workers)
+
                 for attempt in range(self._max_iter(s_cfg)):
                     self._emit("stage", task_id, stage=2,
                                module=mod_name, attempt=attempt + 1)
 
                     mods_before = set(_discover_modules(str(workspace)))
                     prompt_parts = [f"检查模块 `{mod_name}` 是否需要细分。"]
+                    if file_summary:
+                        prompt_parts.append(chr(10)*2 + "## 文件摘要（子 Worker 已分析）" + chr(10)*2 + file_summary)
                     if feedback:
                         prompt_parts.append(chr(10)*2 + feedback)
                     ar = await _run_agent_checked(
@@ -587,11 +598,27 @@ class Orchestrator:
                     analyse_session = str(sess_dir / f"analyse-{mod_name}.jsonl")
                     feedback = ""
 
+                    # 超过阈値时，先用子 Worker 收集文件摘要
+                    sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
+                    fc = 0
+                    try:
+                        flist = mod_dir / "files.list"
+                        fc = sum(1 for l in flist.read_text("utf-8").splitlines() if l.strip())
+                    except OSError:
+                        pass
+                    file_summary = ""
+                    if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
+                        file_summary = await self._collect_file_summaries(
+                            task_id, mod_name, mod_dir, w_base, tokens,
+                            sub_prompt, parallel=cfg.parallel_sub_workers)
+
                     for attempt in range(self._max_iter(s_cfg)):
                         self._emit("stage", task_id, stage=3,
                                    module=mod_name, attempt=attempt + 1)
 
                         prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
+                        if file_summary:
+                            prompt_parts.append(chr(10)*2 + "## 文件摘要（子 Worker 已分析）" + chr(10)*2 + file_summary)
                         if feedback:
                             prompt_parts.append(chr(10)*2 + feedback)
                         ar = await _run_agent_checked(
@@ -1186,60 +1213,60 @@ class Orchestrator:
         self, task_id: str, mod_name: str, mod_dir: Path,
         w_base: dict, tokens: "TokenUsage",
         sub_prompt_template: str,
+        parallel: int = 1,
     ) -> str:
-        """串行启动子 Worker 逐批读取文件，返回合并后的文件摘要文本。
+        """并行子 Worker 逐批读取文件，返回合并后的文件摘要文本。
 
-        每个 batch 完成后立即可用，节省算力（不并行占用多个 GPU slot）。
+        parallel=1 串行（默认），parallel>1 并行处理多个 batch。
         """
         flist_path = mod_dir / "files.list"
         files = [l.strip() for l in flist_path.read_text("utf-8").splitlines() if l.strip()]
 
-        # 分 batch
         batches: list[list[str]] = []
         for i in range(0, len(files), self.SUB_BATCH_SIZE):
             batches.append(files[i:i + self.SUB_BATCH_SIZE])
 
         self._emit("stage", task_id, stage="2-sub",
-                    module=mod_name, batches=len(batches), files=len(files))
+                   module=mod_name, batches=len(batches), files=len(files),
+                   parallel=parallel)
 
-        # 串行执行：逐 batch 调用子 Worker
-        summaries = []
-        for idx, batch in enumerate(batches):
-            file_list_text = chr(10).join(batch)
-            prompt = (f"请逐个读取以下 {len(batch)} 个文件并输出摘要："
-                      f"{chr(10)}{chr(10)}{file_list_text}")
+        semaphore = asyncio.Semaphore(max(1, parallel))
+        results: list[str | None] = [None] * len(batches)
 
-            self._emit("stage", task_id, stage="2-sub",
-                        module=mod_name, batch=idx + 1, total=len(batches))
+        async def _run_batch(idx: int, batch: list[str]) -> None:
+            nonlocal tokens
+            async with semaphore:
+                self._emit("stage", task_id, stage="2-sub",
+                           module=mod_name, batch=idx + 1, total=len(batches))
+                file_list_text = chr(10).join(batch)
+                prompt = (f"请逐个读取以下 {len(batch)} 个文件并输出摘要："
+                          f"{chr(10)}{chr(10)}{file_list_text}")
+                ar = await _run_agent_checked(
+                    prompt=prompt,
+                    model=w_base["model"],
+                    tools=w_base["tools"],
+                    system_prompt=sub_prompt_template,
+                    cwd=w_base["cwd"],
+                    thinking_level=w_base.get("thinking_level", "off"),
+                    session_file=None,
+                    cancel_event=w_base.get("cancel_event"),
+                    max_retries=w_base.get("max_retries", 3),
+                    retry_delay=w_base.get("retry_delay", 10),
+                    pi_max_retries=w_base.get("pi_max_retries", -1),
+                    pi_retry_delay=w_base.get("pi_retry_delay", 10),
+                )
+                tokens += ar.token_usage
+                if ar.output:
+                    results[idx] = f"# Batch {idx+1} ({len(batch)} files){chr(10)}{ar.output}"
+                else:
+                    fallback = chr(10).join(f"{f} | unknown | (读取失败)" for f in batch)
+                    results[idx] = f"# Batch {idx+1} (fallback){chr(10)}{fallback}"
 
-            ar = await _run_agent_checked(
-                prompt=prompt,
-                model=w_base["model"],
-                tools=w_base["tools"],
-                system_prompt=sub_prompt_template,
-                cwd=w_base["cwd"],
-                thinking_level=w_base.get("thinking_level", "off"),
-                session_file=None,
-                cancel_event=w_base.get("cancel_event"),
-                max_retries=w_base.get("max_retries", 3),
-                retry_delay=w_base.get("retry_delay", 10),
-                pi_max_retries=w_base.get("pi_max_retries", -1),
-                pi_retry_delay=w_base.get("pi_retry_delay", 10),
-            )
-            tokens += ar.token_usage
+        await asyncio.gather(*[_run_batch(i, b) for i, b in enumerate(batches)])
 
-            if ar.output:
-                summaries.append(
-                    f"# Batch {idx+1} ({len(batch)} files){chr(10)}{ar.output}")
-            else:
-                fallback = chr(10).join(
-                    f"{f} | unknown | (读取失败)" for f in batch)
-                summaries.append(
-                    f"# Batch {idx+1} (fallback){chr(10)}{fallback}")
-
-        merged = (chr(10) * 2).join(summaries)
+        merged = (chr(10) * 2).join(r for r in results if r)
         self._emit("stage_result", task_id, stage="2-sub",
-                    module=mod_name, summary_lines=merged.count(chr(10)))
+                   module=mod_name, summary_lines=merged.count(chr(10)))
         return merged
 
     def _load_prompt(self, prompt_dir: str, name: str) -> str:
