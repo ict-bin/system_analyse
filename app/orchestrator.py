@@ -323,7 +323,6 @@ class Orchestrator:
             reflect_prompt = self._load_prompt(w_prompt_dir, "reflect_classify")
 
             feedback = ""
-            passed_count = 0  # 连续通过计数（用于 min_rounds）
 
             # ── Step A: Worker 探索目录生成关键词列表 ──
             explore_prompt = self._load_prompt(w_prompt_dir, "step1_explore")
@@ -414,18 +413,17 @@ class Orchestrator:
                 voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                 if voted_pass:
-                    passed_count += 1
-                    if passed_count >= s_cfg.min_rounds:
-                        break  # 达到最少轮数 → 真正完成
+                    if attempt + 1 >= s_cfg.min_rounds:
+                        break
                     else:
-                        # 还没达到 min_rounds → 强制反思
                         self._emit("reflect", task_id, stage=1,
-                                   round=passed_count, min_rounds=s_cfg.min_rounds)
-                        feedback = f"# 自查要求（第 {passed_count} 次通过，需至少 {s_cfg.min_rounds} 次）\n\n{reflect_prompt}"
-                        _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
-                        feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
-                else:
-                    passed_count = 0  # 重置连续通过
+                            round=attempt+1, min_rounds=s_cfg.min_rounds)
+                        feedback = ("# 自查要求（第 " + str(attempt+1) +
+                            " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
+                            chr(10)*2 + reflect_prompt)
+                        _jfb = chr(10).join(
+                            f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                        feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
                     fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
                                         for i, r in enumerate(judge_results) if not r["pass"])
                     feedback = f"# 评审意见（未通过）\n\n{fail_fb}\n\n请根据评审意见修正。"
@@ -459,7 +457,6 @@ class Orchestrator:
 
                 refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                 feedback = ""
-                passed_count = 0
 
                 for attempt in range(self._max_iter(s_cfg)):
                     self._emit("stage", task_id, stage=2,
@@ -517,9 +514,7 @@ class Orchestrator:
                     voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                     if voted_pass:
-                        passed_count += 1
-                        if passed_count >= s_cfg.min_rounds:
-                            # 完成：如果模块被拆分，将本次新增的模块加入队列
+                        if attempt + 1 >= s_cfg.min_rounds:
                             if was_split and new_ones:
                                 for nm in new_ones:
                                     if nm not in refined_modules and nm not in modules_to_refine:
@@ -528,12 +523,13 @@ class Orchestrator:
                             break
                         else:
                             self._emit("reflect", task_id, stage=2,
-                                       module=mod_name, round=passed_count)
-                            feedback = f"# 自查要求（第 {passed_count} 次通过，需至少 {s_cfg.min_rounds} 次）\n\n{reflect_prompt}"
-                            _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
-                            feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
-                    else:
-                        passed_count = 0
+                                module=mod_name, round=attempt+1)
+                            feedback = ("# 自查要求（第 " + str(attempt+1) +
+                                " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
+                                chr(10)*2 + reflect_prompt)
+                            _jfb = chr(10).join(
+                                f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                            feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
                         fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
                                             for i, r in enumerate(judge_results) if not r["pass"])
                         # 区分文件丢失和拆分不合理，给出明确指导
@@ -563,7 +559,6 @@ class Orchestrator:
                 mod_dir = _get_modules_root(str(workspace)) / mod_name
                 analyse_session = str(sess_dir / f"analyse-{mod_name}.jsonl")
                 feedback = ""
-                passed_count = 0
 
                 for attempt in range(self._max_iter(s_cfg)):
                     self._emit("stage", task_id, stage=3,
@@ -577,7 +572,7 @@ class Orchestrator:
                         prompt="\n".join(prompt_parts),
                         system_prompt=w_sys_prompt,
                         session_file=analyse_session,
-                        **{**w_base, "cwd": str(mod_dir) if mod_dir.exists() else str(workspace)},
+                        **w_base,
                     )
                     tokens += ar.token_usage
                     self._emit("stage_result", task_id, stage=3, module=mod_name)
@@ -626,17 +621,17 @@ class Orchestrator:
                     voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                     if voted_pass:
-                        passed_count += 1
-                        if passed_count >= s_cfg.min_rounds:
+                        if attempt + 1 >= s_cfg.min_rounds:
                             break
                         else:
                             self._emit("reflect", task_id, stage=3,
-                                       module=mod_name, round=passed_count)
-                            feedback = f"# 自查要求（第 {passed_count} 次通过，需至少 {s_cfg.min_rounds} 次）\n\n{reflect_prompt}"
-                            _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
-                            feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
-                    else:
-                        passed_count = 0
+                                module=mod_name, round=attempt+1)
+                            feedback = ("# 自查要求（第 " + str(attempt+1) +
+                                " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
+                                chr(10)*2 + reflect_prompt)
+                            _jfb = chr(10).join(
+                                f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                            feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
                         fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
                                             for i, r in enumerate(judge_results) if not r["pass"])
                         feedback = f"# 评审意见（未通过）\n\n{fail_fb}\n\n请根据意见修正分析。"
@@ -662,7 +657,6 @@ class Orchestrator:
 
                     refine_session = str(sess_dir / f"refine-redo-{mod_name}.jsonl")
                     feedback = f"# 重分类要求\n\nStage 3 分析发现该模块分类不合理，需要重新细分。"
-                    passed_count = 0
 
                     for attempt in range(self._max_iter(s_cfg_redo)):
                         self._emit("stage", task_id, stage="2-redo",
@@ -697,14 +691,12 @@ class Orchestrator:
                         voted_pass = _check_voting(
                             judge_results, s_cfg_redo.pass_mode, j_count)
                         if voted_pass:
-                            passed_count += 1
-                            if passed_count >= s_cfg_redo.min_rounds:
+                            if attempt + 1 >= s_cfg_redo.min_rounds:
                                 break
-                            feedback = f"# 自查要求\n\n{reflect_refine}"
-                            _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
-                            feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
-                        else:
-                            passed_count = 0
+                            feedback = "# 自查要求" + chr(10)*2 + reflect_refine
+                            _jfb = chr(10).join(
+                                f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                            feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
                             fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
                                                 for i, r in enumerate(judge_results) if not r["pass"])
                             feedback = f"# 评审意见\n\n{fail_fb}"
@@ -726,7 +718,6 @@ class Orchestrator:
                         mod_dir = _get_modules_root(str(workspace)) / mod_name
                         analyse_session = str(sess_dir / f"analyse-redo-{mod_name}.jsonl")
                         feedback = ""
-                        passed_count = 0
                         for attempt in range(self._max_iter(s_cfg_a)):
                             self._emit("stage", task_id, stage="3-redo",
                                        module=mod_name, attempt=attempt + 1)
@@ -737,7 +728,7 @@ class Orchestrator:
                                 prompt="\n".join(prompt_parts),
                                 system_prompt=w_sys_analyse,
                                 session_file=analyse_session,
-                                **{**w_base, "cwd": str(mod_dir) if mod_dir.exists() else str(workspace)},
+                                **w_base,
                             )
                             tokens += ar.token_usage
 
@@ -761,14 +752,12 @@ class Orchestrator:
                             voted_pass = _check_voting(
                                 judge_results, s_cfg_a.pass_mode, j_count)
                             if voted_pass:
-                                passed_count += 1
-                                if passed_count >= s_cfg_a.min_rounds:
+                                if attempt + 1 >= s_cfg_a.min_rounds:
                                     break
-                                feedback = f"# 自查要求\n\n{reflect_analyse}"
-                                _jfb = "\n".join(f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
-                                feedback += f"\n\n## Judge 上轮意见\n\n{_jfb}"
-                            else:
-                                passed_count = 0
+                                feedback = "# 自查要求" + chr(10)*2 + reflect_analyse
+                                _jfb = chr(10).join(
+                                    f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                                feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
                                 fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
                                                     for i, r in enumerate(judge_results) if not r["pass"])
                                 feedback = f"# 评审意见\n\n{fail_fb}"
@@ -899,8 +888,6 @@ class Orchestrator:
             report_session = str(sess_dir / "final_report.jsonl")
 
             feedback = ""
-            passed_count = 0
-            modules_root = _get_modules_root(str(workspace))
 
             for attempt in range(self._max_iter(s_cfg)):
                 self._emit("stage", task_id, stage="4b", attempt=attempt + 1)
@@ -914,7 +901,7 @@ class Orchestrator:
                     prompt="\n".join(prompt_parts),
                     system_prompt=report_sys_prompt,
                     session_file=report_session,
-                    **{**w_base, "cwd": str(modules_root) if modules_root.exists() else str(workspace)},
+                    **w_base,
                 )
                 tokens += ar.token_usage
 
@@ -949,16 +936,14 @@ class Orchestrator:
                 voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
 
                 if voted_pass:
-                    passed_count += 1
-                    if passed_count >= s_cfg.min_rounds:
+                    if attempt + 1 >= s_cfg.min_rounds:
                         break
                     else:
                         self._emit("reflect", task_id, stage="4b",
-                                   round=passed_count, min_rounds=s_cfg.min_rounds)
-                        feedback = (f"# 自查要求（第 {passed_count} 次通过，"
-                                    f"需至少 {s_cfg.min_rounds} 次）\n\n{reflect_report}")
-                else:
-                    passed_count = 0
+                            round=attempt+1, min_rounds=s_cfg.min_rounds)
+                        feedback = ("# 自查要求（第 " + str(attempt+1) +
+                            " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
+                            chr(10)*2 + reflect_report)
                     fail_fb = "\n".join(
                         f"judge-{i}: {r['feedback'][:500]}"
                         for i, r in enumerate(judge_results) if not r["pass"])
