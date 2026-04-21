@@ -1387,7 +1387,8 @@ class Orchestrator:
                     if line and '|' in line:
                         all_lines.append(line)
 
-        header = f"文件清单（共 {len(all_lines)} 个文件）"
+        header = (f"文件清单（共 {len(all_lines)} 个文件）\n"
+                  f"格式: 路径 | 类型 | 功能摘要 | 核心技术标识 | 建议子模块")
         merged = header + chr(10) + chr(10).join(all_lines)
         self._emit("stage_result", task_id, stage="2-sub",
                    module=mod_name, file_count=len(all_lines))
