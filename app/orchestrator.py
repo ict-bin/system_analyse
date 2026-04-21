@@ -339,6 +339,7 @@ class Orchestrator:
             prescan_summary = ""
             if explore_prompt:
                 self._emit("stage", task_id, stage="explore")
+                self._emit("model", task_id, stage="explore", model=_wm("explore"))
                 explore_session = str(sess_dir / "explore.jsonl")
                 ar = await _run_agent_checked(
                     prompt=cfg.task,
@@ -371,6 +372,8 @@ class Orchestrator:
 
             for attempt in range(self._max_iter(s_cfg)):
                 self._emit("stage", task_id, stage=1, attempt=attempt + 1)
+                self._emit("model", task_id, stage="classify",
+                           worker=_wm("classify"), judge=_jm("classify", j_cfgs[0]) if j_cfgs else "?")
 
                 # Worker 工作
                 prompt_parts = [cfg.task]

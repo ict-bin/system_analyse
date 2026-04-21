@@ -176,6 +176,14 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         _flush_pending()
         print(f"\n  ❌ {d.get('error', '')[:200]}", file=sys.stderr)
 
+    elif t == "model":
+        stage = d.get('stage', '')
+        parts = [f"stage={stage}"]
+        if 'worker' in d: parts.append(f"worker={d['worker'].split('/')[-1]}")
+        if 'model' in d: parts.append(f"model={d['model'].split('/')[-1]}")
+        if 'judge' in d: parts.append(f"judge={d['judge'].split('/')[-1]}")
+        print(f"    🤖 {' | '.join(parts)}")
+
     elif t == "error":
         _flush_pending()
         print(f"\n  ❌ {d.get('error', '')[:200]}", file=sys.stderr)
