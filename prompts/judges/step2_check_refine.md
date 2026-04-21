@@ -13,16 +13,18 @@
 
 # 步骤
 
-## 1. 运行本地完整性校验（必做）
+## 1. 运行拆分完整性校验（必做）
+
+先确认当前模块名，然后运行：
 
 ```bash
-bash /opt/system_analyse/scripts/check_module.sh /data/target modules/<当前模块>
+bash /opt/system_analyse/scripts/check_module.sh /data/target modules <当前模块名>
 ```
 
-⚠️ **使用 check_module.sh 而非 check_classification.sh**：并行场景下其他模块尚未完成，全局计数不可靠。本地检查只验证当前模块的 files.list 中路径是否真实存在。
+**原理**：Worker 拆分前已备份 `files.list.snapshot`，脚本对比快照与拆分后所有子模块文件之和，确保零丢失。
 
 - `Missing files: 0` → 继续评审
-- `Missing files: N > 0` → **直接 0 分，不通过**
+- `Missing files: N > 0` → **直接 0 分，不通过**，列出丢失文件
 
 ## 2. 评审模块合理性
 

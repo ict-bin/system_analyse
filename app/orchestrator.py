@@ -499,6 +499,12 @@ class Orchestrator:
                 refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                 feedback = ""
 
+                # ── 拆分前保存快照，供 Judge 做完整性对比 ──
+                snapshot_path = mod_dir / "files.list.snapshot"
+                if not snapshot_path.exists():  # 只在第一次保存，重试时不覆盖
+                    import shutil as _sh2
+                    _sh2.copy2(str(mod_dir / "files.list"), str(snapshot_path))
+
                 # 超过阈値时，先用子 Worker 收集文件摘要
                 sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
                 file_summary = ""
