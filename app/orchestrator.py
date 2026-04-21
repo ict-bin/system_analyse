@@ -1257,16 +1257,28 @@ class Orchestrator:
                 )
                 tokens += ar.token_usage
                 if ar.output:
-                    results[idx] = f"# Batch {idx+1} ({len(batch)} files){chr(10)}{ar.output}"
+                    # 去掉子 Worker 的 <result> 标签，只保留文件清单行
+                    raw = ar.output
+                    raw = re.sub(r'<result>.*?</result>', '', raw, flags=re.DOTALL).strip()
+                    results[idx] = raw
                 else:
-                    fallback = chr(10).join(f"{f} | unknown | (读取失败)" for f in batch)
-                    results[idx] = f"# Batch {idx+1} (fallback){chr(10)}{fallback}"
+                    results[idx] = chr(10).join(f"{f} | unknown | (读取失败)" for f in batch)
 
         await asyncio.gather(*[_run_batch(i, b) for i, b in enumerate(batches)])
 
-        merged = (chr(10) * 2).join(r for r in results if r)
+        # 将各 batch 结果合并成一张完整文件清单表（去掉 batch 分隔标题）
+        all_lines = []
+        for r in results:
+            if r:
+                for line in r.splitlines():
+                    line = line.strip()
+                    if line and '|' in line:  # 只保留有效数据行
+                        all_lines.append(line)
+
+        header = f"文件清单（共 {len(all_lines)} 个文件）"
+        merged = header + chr(10) + chr(10).join(all_lines)
         self._emit("stage_result", task_id, stage="2-sub",
-                   module=mod_name, summary_lines=merged.count(chr(10)))
+                   module=mod_name, file_count=len(all_lines))
         return merged
 
     def _load_prompt(self, prompt_dir: str, name: str) -> str:
