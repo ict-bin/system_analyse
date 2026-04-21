@@ -32,38 +32,41 @@ fi
 
 # ── 读取关键词 ──
 KEYWORDS=$(tr '\n' '|' < "$KEYWORDS_FILE" | sed 's/|$//')
-KW_COUNT=$(wc -l < "$KEYWORDS_FILE")
-echo "关键词: $KW_COUNT 个"
+echo "关键词: $(wc -l < "$KEYWORDS_FILE") 个"
 
-# ── 构建文件列表 ──
-if [ "$USE_FILTERED" = "1" ]; then
-    INPUT="$FILTERED"
-else
-    INPUT="/tmp/prescan_input_$$.txt"
-    find "$TARGET_DIR" -type f | sed "s|^${TARGET_DIR}/||" > "$INPUT"
-fi
-
-# ── 扫描函数：文件名 + ELF前64KB符号（快速）──
-# 对 ELF 二进制：只读前 65536 字节，捕获段头+符号表
-# 对文本文件：直接读前30行
+# ── 扫描函数（按文件类型区分策略）──
 scan_file() {
     local relpath="$1"
     local fullpath="$TARGET_DIR/$relpath"
-    local name kw
+    local name ext kw
+
+    [ -f "$fullpath" ] || { echo "unknown|$relpath"; return; }
 
     name=$(basename "$relpath" | tr '[:upper:]' '[:lower:]')
+    ext="${name##*.}"
 
-    # 第1步：文件名匹配（最快）
+    # 第1步：文件名匹配（最快，所有类型都先试）
     kw=$(echo "$name" | grep -oiE "$KEYWORDS" | head -1 | tr '[:upper:]' '[:lower:]')
     if [ -n "$kw" ]; then
         echo "$kw|$relpath"
         return
     fi
 
-    # 第2步：读文件内容（只读前64KB，ELF符号表在头部）
-    kw=$(dd if="$fullpath" bs=65536 count=1 2>/dev/null \
-         | strings -n 5 2>/dev/null \
-         | grep -oiE "$KEYWORDS" | head -1 | tr '[:upper:]' '[:lower:]')
+    # 第2步：按文件类型选择内容读取策略
+    # 判断是否为二进制（ELF magic: 前4字节 = \x7fELF）
+    magic=$(dd if="$fullpath" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [ "$magic" = "7f454c46" ]; then
+        # ELF 二进制：只读前 128KB（符号表在 ELF 动态段，通常在头部）
+        kw=$(dd if="$fullpath" bs=131072 count=1 2>/dev/null \
+             | strings -n 5 2>/dev/null \
+             | grep -m1 -oiE "$KEYWORDS" \
+             | tr '[:upper:]' '[:lower:]')
+    else
+        # 文本文件（脚本/配置/XML等）：grep -m1 遇到第一个匹配立即停止
+        kw=$(grep -m1 -oiE "$KEYWORDS" "$fullpath" 2>/dev/null \
+             | head -1 | tr '[:upper:]' '[:lower:]')
+    fi
+
     if [ -n "$kw" ]; then
         echo "$kw|$relpath"
     else
@@ -73,26 +76,30 @@ scan_file() {
 export -f scan_file
 export KEYWORDS TARGET_DIR
 
-echo "  扫描中（xargs -P8 并行，每文件只读前64KB）..."
+# ── 构建输入文件列表 ──
+if [ "$USE_FILTERED" = "1" ]; then
+    INPUT="$FILTERED"
+else
+    INPUT="/tmp/prescan_input_$$.txt"
+    find "$TARGET_DIR" -type f | sed "s|^${TARGET_DIR}/||" > "$INPUT"
+fi
 
-# xargs -P8 并行扫描，每文件独立输出 "keyword|relpath"
-# 结果统一收集到临时文件
+echo "  扫描中（xargs -P8 并行）..."
 TMP_RESULT="/tmp/prescan_result_$$.txt"
 < "$INPUT" xargs -P8 -I{} bash -c 'scan_file "$@"' _ {} > "$TMP_RESULT" 2>/dev/null
 
 # ── 分发到各关键词 list ──
 while IFS='|' read -r kw relpath; do
     [ -z "$relpath" ] && continue
-    echo "$relpath" >> "$WORKSPACE/prescan/$kw.list"
+    echo "$relpath" >> "$WORKSPACE/prescan/${kw}.list"
 done < "$TMP_RESULT"
 rm -f "$TMP_RESULT"
+[ "$USE_FILTERED" != "1" ] && rm -f "$INPUT"
 
 # 去重
 for f in "$WORKSPACE"/prescan/*.list; do
     [ -f "$f" ] && sort -u "$f" -o "$f"
 done
-
-[ "$USE_FILTERED" != "1" ] && rm -f "$INPUT"
 
 # ── 生成摘要 ──
 {
@@ -105,8 +112,8 @@ done
     for listfile in "$WORKSPACE"/prescan/*.list; do
         [ -f "$listfile" ] || continue
         kw=$(basename "$listfile" .list)
-        count=$(wc -l < "$listfile")
-        [ "$count" -gt 0 ] && echo "$kw | $count"
+        cnt=$(wc -l < "$listfile")
+        [ "$cnt" -gt 0 ] && echo "$kw | $cnt"
     done | sort -t'|' -k2 -rn
     echo ""
     UNKNOWN=0
