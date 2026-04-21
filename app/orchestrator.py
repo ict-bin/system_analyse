@@ -499,8 +499,10 @@ class Orchestrator:
                 refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                 feedback = ""
 
-                # ── 拆分前保存快照，供 Judge 做完整性对比 ──
-                snapshot_path = mod_dir / "files.list.snapshot"
+                # ── 拆分前保存快照到 workspace/.s2_snapshots/（不随模块目录删除）──
+                snapshots_dir = workspace / ".s2_snapshots"
+                snapshots_dir.mkdir(exist_ok=True)
+                snapshot_path = snapshots_dir / f"{mod_name}.snapshot"
                 if not snapshot_path.exists():  # 只在第一次保存，重试时不覆盖
                     import shutil as _sh2
                     _sh2.copy2(str(mod_dir / "files.list"), str(snapshot_path))

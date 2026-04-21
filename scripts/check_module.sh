@@ -2,9 +2,10 @@
 # check_module.sh — Stage 2 拆分完整性校验
 # 用法: bash check_module.sh <target_dir> <modules_root> <mod_name>
 #
+# 快照保存在 <modules_root>/../.s2_snapshots/<mod_name>.snapshot
 # 两种情况：
-# A) 有 snapshot（已拆分）：对比快照 vs 所有 <mod_name>_* 子模块
-# B) 无 snapshot（未拆分）：直接验证 <mod_name>/files.list 文件存在性
+# A) 有快照（已尝试拆分）：对比快照 vs 所有 <mod_name>_* 子模块（原模块本身若存在也计入）
+# B) 无快照（未拆分）：直接验证 <mod_name>/files.list 文件存在性
 
 TARGET_DIR="${1:-/data/target}"
 MODULES_ROOT="${2:-modules}"
@@ -15,14 +16,15 @@ if [ -z "$MOD_NAME" ]; then
     exit 1
 fi
 
-SNAPSHOT="$MODULES_ROOT/$MOD_NAME/files.list.snapshot"
+# 快照在 workspace/.s2_snapshots/
+WORKSPACE=$(dirname "$MODULES_ROOT")
+SNAPSHOT="$WORKSPACE/.s2_snapshots/$MOD_NAME.snapshot"
 
 # ── 情况 B：无快照，原模块未拆分 ──
 if [ ! -f "$SNAPSHOT" ]; then
     flist="$MODULES_ROOT/$MOD_NAME/files.list"
     if [ ! -f "$flist" ]; then
-        # 原模块目录不存在（可能被其他并行Worker误操作）
-        echo "❌ $MOD_NAME: modules/$MOD_NAME/files.list 不存在"
+        echo "❌ $MOD_NAME: 无快照且无 files.list（模块可能已被错误删除）"
         echo "Missing files: -1"
         exit 1
     fi
@@ -44,13 +46,12 @@ fi
 sort -u "$SNAPSHOT" > /tmp/cm_snap_$$.txt
 SNAP_COUNT=$(wc -l < /tmp/cm_snap_$$.txt)
 
-# 收集所有子模块（<mod_name>_* 开头）的文件
+# 收集所有子模块（原模块本身 + <mod_name>_* 前缀子模块）
 > /tmp/cm_curr_$$.txt
 FOUND_MODS=()
 
-# 原模块目录本身（未完全拆分时可能还存在）
+# 原模块目录（拆分后可能删除，也可能保留空壳）
 if [ -f "$MODULES_ROOT/$MOD_NAME/files.list" ]; then
-    # 排除 snapshot 自身不算文件
     grep -v "^$" "$MODULES_ROOT/$MOD_NAME/files.list" >> /tmp/cm_curr_$$.txt 2>/dev/null || true
     FOUND_MODS+=("$MOD_NAME")
 fi
@@ -65,21 +66,19 @@ done
 sort -u /tmp/cm_curr_$$.txt > /tmp/cm_curr_sorted_$$.txt
 CURR_COUNT=$(wc -l < /tmp/cm_curr_sorted_$$.txt)
 
-# 计算丢失的文件
 MISSING_LIST=$(comm -23 /tmp/cm_snap_$$.txt /tmp/cm_curr_sorted_$$.txt)
-MISSING=$(echo "$MISSING_LIST" | grep -c '[^[:space:]]' || true)
+MISSING=$(printf '%s' "$MISSING_LIST" | grep -c '[^[:space:]]' || true)
 
 echo "快照文件数: $SNAP_COUNT"
-echo "拆分后子模块: ${FOUND_MODS[*]}"
+echo "子模块: ${FOUND_MODS[*]}"
 echo "拆分后总文件数: $CURR_COUNT"
 echo "Missing files: $MISSING"
 
 if [ "$MISSING" -gt 0 ]; then
-    echo "❌ 拆分后丢失文件:"
+    echo "❌ 丢失文件:"
     echo "$MISSING_LIST" | head -20
 fi
 
 rm -f /tmp/cm_snap_$$.txt /tmp/cm_curr_$$.txt /tmp/cm_curr_sorted_$$.txt
-
-[ "$MISSING" -eq 0 ] && echo "✅ 拆分完整性通过" || echo "❌ 失败"
+[ "$MISSING" -eq 0 ] && echo "✅ 通过" || echo "❌ 失败"
 exit $MISSING

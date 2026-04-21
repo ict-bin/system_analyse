@@ -69,8 +69,20 @@ AFTER=$(cat modules/${MOD}_*/files.list | sort -u | wc -l)
 echo "拆分后: $AFTER 个文件"
 [ "$BEFORE" -eq "$AFTER" ] && echo "✅ 完整" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
 
-# 删除原模块目录
-rm -rf modules/$MOD
+# 不删除原模块目录——保留以供 Judge 校验和重试参考
+# 清空原 files.list（避免 Stage 3 重复处理）
+> modules/$MOD/files.list
+```
+
+> ⚠️ 第二轮重试时（上轮拆分后原 files.list 已清空）：
+> 快照在 `.s2_snapshots/<模块名>.snapshot`，从中读取原始文件列表重新分配。
+
+```bash
+# 第二轮起：从快照重建（如原 files.list 已为空）
+if [ ! -s modules/$MOD/files.list ]; then
+    cp .s2_snapshots/$MOD.snapshot /tmp/rebuild_$MOD.txt
+    # 重新按关键词分配到子模块...
+fi
 ```
 
 ## 4. 不需要拆分时
