@@ -434,30 +434,27 @@ class Orchestrator:
                 raise StageError(f"Stage 1 分类检查未通过，已达最大轮数 {s_cfg.max_rounds}")
 
             # ═══════════════════════════════════════════════════
-            # Stage 2: 子文件夹细分
+            # Stage 2: 子文件夹细分（parallel_modules 并行）
             # ═══════════════════════════════════════════════════
             s_cfg = cfg.stages.refine
             w_sys_prompt = self._load_prompt(w_prompt_dir, "step2_refine")
             j_sys_prompt = self._load_prompt(cfg.judges.system_prompt_dir, "step2_check_refine")
             reflect_prompt = self._load_prompt(w_prompt_dir, "reflect_refine")
 
-            modules_to_refine = list(_discover_modules(str(workspace)))
+            parallel_s2 = max(1, cfg.parallel_modules)
+            s2_queue: asyncio.Queue[str] = asyncio.Queue()
             refined_modules: set[str] = set()
+            in_progress_s2: set[str] = set()
+            s2_errors: list[BaseException] = []
 
-            while modules_to_refine:
-                mod_name = modules_to_refine.pop(0)
-                if mod_name in refined_modules:
-                    continue
+            for _m in _discover_modules(str(workspace)):
+                await s2_queue.put(_m)
+
+            async def _refine_one(mod_name: str) -> None:
+                nonlocal tokens
                 mod_dir = _get_modules_root(str(workspace)) / mod_name
                 if not (mod_dir / "files.list").exists():
-                    continue
-
-                # 计算文件数（供主从模式判断用）
-                try:
-                    _fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
-                except OSError:
-                    _fc = 0
-
+                    return
                 refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                 feedback = ""
 
@@ -465,50 +462,45 @@ class Orchestrator:
                     self._emit("stage", task_id, stage=2,
                                module=mod_name, attempt=attempt + 1)
 
-                    # 记录 Worker 执行前的模块快照
                     mods_before = set(_discover_modules(str(workspace)))
-
-                    # Worker 细分
                     prompt_parts = [f"检查模块 `{mod_name}` 是否需要细分。"]
                     if feedback:
-                        prompt_parts.append(f"\n\n{feedback}")
+                        prompt_parts.append(chr(10)*2 + feedback)
                     ar = await _run_agent_checked(
-                        prompt="\n".join(prompt_parts),
+                        prompt=chr(10).join(prompt_parts),
                         system_prompt=w_sys_prompt,
                         session_file=refine_session,
                         **w_base,
                     )
                     tokens += ar.token_usage
 
-                    # 用快照差集计算本次 Worker 真正新增的模块
                     mods_after = set(_discover_modules(str(workspace)))
-                    new_ones = sorted(mods_after - mods_before)
-                    was_split = mod_name not in mods_after and bool(new_ones)
-
+                    # 只计入当前模块产生的新子模块（排除已在 refined/in_progress 中的）
+                    new_ones = sorted(
+                        (mods_after - mods_before) - refined_modules - in_progress_s2
+                    )
+                    was_split = mod_name not in mods_after and bool(
+                        mods_after - mods_before - refined_modules - in_progress_s2
+                    )
                     self._emit("stage_result", task_id, stage=2,
                                module=mod_name, split=was_split, new_modules=new_ones)
 
-                    # Judge 评审（cwd=workspace，check_classification.sh 需全局 */files.list）
                     judge_results = []
-                    eval_cwd = str(workspace)
-
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
                         ar = await _run_agent_checked(
                             prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
                             model=j_cfg_item.model,
                             system_prompt=j_sys_prompt,
                             tools=cfg.judges.default_tools,
-                            cwd=eval_cwd,
+                            cwd=str(workspace),
                             **j_base_kw,
                         )
                         tokens += ar.token_usage
                         parsed = _parse_eval_md(ar.output)
                         judge_results.append(parsed)
-
                         self._emit("judge_eval", task_id, stage=2,
                                    judge_id=f"judge-{j_idx}", module=mod_name,
                                    passed=parsed["pass"], score=parsed["score"])
-
                         self._archive(out_dir,
                             f"s2-{mod_name}-a{attempt+1}-j{j_idx}.md",
                             f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
@@ -518,37 +510,64 @@ class Orchestrator:
 
                     if voted_pass:
                         if attempt + 1 >= s_cfg.min_rounds:
+                            # 完成：将拆分出的新模块加入队列
                             if was_split and new_ones:
                                 for nm in new_ones:
-                                    if nm not in refined_modules and nm not in modules_to_refine:
-                                        modules_to_refine.append(nm)
+                                    if nm not in refined_modules and nm not in in_progress_s2:
+                                        in_progress_s2.add(nm)
+                                        await s2_queue.put(nm)
                             refined_modules.add(mod_name)
-                            break
+                            return  # 正常完成
                         else:
+                            # 还未到 min_rounds 轮 → 强制反思
                             self._emit("reflect", task_id, stage=2,
-                                module=mod_name, round=attempt+1)
-                            feedback = ("# 自查要求（第 " + str(attempt+1) +
+                                       module=mod_name, round=attempt+1)
+                            feedback = (
+                                "# 自查要求（第 " + str(attempt+1) +
                                 " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
                                 chr(10)*2 + reflect_prompt)
                             _jfb = chr(10).join(
-                                f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
+                                f"judge-{i}: {r['feedback'][:500]}"
+                                for i, r in enumerate(judge_results))
                             feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
-                        fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
-                                            for i, r in enumerate(judge_results) if not r["pass"])
-                        # 区分文件丢失和拆分不合理，给出明确指导
+                    else:
+                        fail_fb = chr(10).join(
+                            f"judge-{i}: {r['feedback'][:500]}"
+                            for i, r in enumerate(judge_results) if not r["pass"])
                         if "missing" in fail_fb.lower() or "丢失" in fail_fb or "遗漏" in fail_fb:
                             guidance = (
-                                "\n\n⚠️ **文件丢失！** 请修复文件覆盖问题，不要改变拆分策略。"
-                                "\n运行 check_classification.sh 查看遗漏文件，将它们归入合适的模块。")
+                                chr(10)*2 + "⚠️ **文件丢失！** 请修复文件覆盖问题，不要改变拆分策略。" +
+                                chr(10) + "运行 check_classification.sh 查看遗漏文件，将它们归入合适的模块。")
                         else:
-                            guidance = "\n\n请根据评审意见调整拆分策略。"
-                        feedback = f"# 评审意见（未通过）\n\n{fail_fb}{guidance}"
-                else:
-                    raise StageError(
-                        f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
+                            guidance = chr(10)*2 + "请根据评审意见调整拆分策略。"
+                        feedback = "# 评审意见（未通过）" + chr(10)*2 + fail_fb + guidance
+
+                # for 循环耗尽（未 return）→ 超出最大轮数
+                raise StageError(
+                    f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
+
+            async def _s2_worker() -> None:
+                while True:
+                    mod_name = await s2_queue.get()
+                    try:
+                        if mod_name not in refined_modules:
+                            await _refine_one(mod_name)
+                    except (StageError, PiFatalError) as e:
+                        s2_errors.append(e)
+                    finally:
+                        s2_queue.task_done()
+
+            _s2_workers = [asyncio.create_task(_s2_worker())
+                           for _ in range(parallel_s2)]
+            await s2_queue.join()
+            for _w in _s2_workers:
+                _w.cancel()
+            await asyncio.gather(*_s2_workers, return_exceptions=True)
+            if s2_errors:
+                raise s2_errors[0]
 
             # ═══════════════════════════════════════════════════
-            # Stage 3: 子文件夹分析
+            # Stage 3: 子文件夹分析（parallel_modules 并行）
             # ═══════════════════════════════════════════════════
             s_cfg = cfg.stages.analyse
             w_sys_prompt = self._load_prompt(w_prompt_dir, "step3_analyse")
@@ -557,91 +576,107 @@ class Orchestrator:
 
             final_modules = _discover_modules(str(workspace))
             modules_needing_reclassify: list[str] = []
+            s3_errors: list[BaseException] = []
 
-            for mod_name in final_modules:
-                mod_dir = _get_modules_root(str(workspace)) / mod_name
-                analyse_session = str(sess_dir / f"analyse-{mod_name}.jsonl")
-                feedback = ""
+            s3_sem = asyncio.Semaphore(max(1, cfg.parallel_modules))
 
-                for attempt in range(self._max_iter(s_cfg)):
-                    self._emit("stage", task_id, stage=3,
-                               module=mod_name, attempt=attempt + 1)
+            async def _analyse_one(mod_name: str) -> None:
+                nonlocal tokens
+                async with s3_sem:
+                    mod_dir = _get_modules_root(str(workspace)) / mod_name
+                    analyse_session = str(sess_dir / f"analyse-{mod_name}.jsonl")
+                    feedback = ""
 
-                    # Worker 分析
-                    prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
-                    if feedback:
-                        prompt_parts.append(f"\n\n{feedback}")
-                    ar = await _run_agent_checked(
-                        prompt="\n".join(prompt_parts),
-                        system_prompt=w_sys_prompt,
-                        session_file=analyse_session,
-                        **w_base,
-                    )
-                    tokens += ar.token_usage
-                    self._emit("stage_result", task_id, stage=3, module=mod_name)
+                    for attempt in range(self._max_iter(s_cfg)):
+                        self._emit("stage", task_id, stage=3,
+                                   module=mod_name, attempt=attempt + 1)
 
-                    # Judge 评审
-                    judge_results = []
-
-                    for j_idx, j_cfg_item in enumerate(j_cfgs):
+                        prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
+                        if feedback:
+                            prompt_parts.append(chr(10)*2 + feedback)
                         ar = await _run_agent_checked(
-                            prompt=f"评审模块 `{mod_name}` 的分析报告。",
-                            model=j_cfg_item.model,
-                            system_prompt=j_sys_prompt,
-                            tools=cfg.judges.default_tools,
-                            cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
-                            **j_base_kw,
+                            prompt=chr(10).join(prompt_parts),
+                            system_prompt=w_sys_prompt,
+                            session_file=analyse_session,
+                            **w_base,
                         )
                         tokens += ar.token_usage
-                        parsed = _parse_eval_md(ar.output)
-                        judge_results.append(parsed)
+                        self._emit("stage_result", task_id, stage=3, module=mod_name)
 
-                        self._emit("judge_eval", task_id, stage=3,
-                                   judge_id=f"judge-{j_idx}", module=mod_name,
-                                   passed=parsed["pass"], score=parsed["score"])
+                        judge_results = []
+                        for j_idx, j_cfg_item in enumerate(j_cfgs):
+                            ar = await _run_agent_checked(
+                                prompt=f"评审模块 `{mod_name}` 的分析报告。",
+                                model=j_cfg_item.model,
+                                system_prompt=j_sys_prompt,
+                                tools=cfg.judges.default_tools,
+                                cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                                **j_base_kw,
+                            )
+                            tokens += ar.token_usage
+                            parsed = _parse_eval_md(ar.output)
+                            judge_results.append(parsed)
+                            self._emit("judge_eval", task_id, stage=3,
+                                       judge_id=f"judge-{j_idx}", module=mod_name,
+                                       passed=parsed["pass"], score=parsed["score"])
+                            self._archive(out_dir,
+                                f"s3-{mod_name}-a{attempt+1}-j{j_idx}.md",
+                                f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
+                                f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
-                        self._archive(out_dir,
-                            f"s3-{mod_name}-a{attempt+1}-j{j_idx}.md",
-                            f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
-                            f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
+                        # 重分类检测
+                        has_reclassify = any("[需要重新分类]" in r.get("feedback", "")
+                                            for r in judge_results)
+                        if has_reclassify:
+                            reclass_votes = sum(1 for r in judge_results
+                                               if "[需要重新分类]" in r.get("feedback", ""))
+                            if _check_voting(
+                                [{"pass": True}] * reclass_votes +
+                                [{"pass": False}] * (j_count - reclass_votes),
+                                s_cfg.pass_mode, j_count,
+                            ):
+                                self._emit("reclassify", task_id, module=mod_name)
+                                modules_needing_reclassify.append(mod_name)
+                                return  # 跳出，后面统一重分类
 
-                    # 故障注入（必须在 reclassify 检测前）
-
-                    # 分类问题 → 投票确认是否真需要重分类
-                    has_reclassify = any("[需要重新分类]" in r.get("feedback", "")
-                                        for r in judge_results)
-                    if has_reclassify:
-                        reclass_votes = sum(1 for r in judge_results
-                                           if "[需要重新分类]" in r.get("feedback", ""))
-                        if _check_voting(
-                            [{"pass": True}] * reclass_votes + [{"pass": False}] * (j_count - reclass_votes),
-                            s_cfg.pass_mode, j_count
-                        ):
-                            self._emit("reclassify", task_id, module=mod_name)
-                            modules_needing_reclassify.append(mod_name)
-                            break  # 跳出 attempt 循环，后面统一处理
-
-                    voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
-
-                    if voted_pass:
-                        if attempt + 1 >= s_cfg.min_rounds:
-                            break
+                        voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
+                        if voted_pass:
+                            if attempt + 1 >= s_cfg.min_rounds:
+                                return  # 正常完成
+                            else:
+                                self._emit("reflect", task_id, stage=3,
+                                           module=mod_name, round=attempt+1)
+                                feedback = (
+                                    "# 自查要求（第 " + str(attempt+1) +
+                                    " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
+                                    chr(10)*2 + reflect_prompt)
+                                _jfb = chr(10).join(
+                                    f"judge-{i}: {r['feedback'][:500]}"
+                                    for i, r in enumerate(judge_results))
+                                feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
                         else:
-                            self._emit("reflect", task_id, stage=3,
-                                module=mod_name, round=attempt+1)
-                            feedback = ("# 自查要求（第 " + str(attempt+1) +
-                                " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
-                                chr(10)*2 + reflect_prompt)
-                            _jfb = chr(10).join(
-                                f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
-                            feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
-                        fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
-                                            for i, r in enumerate(judge_results) if not r["pass"])
-                        feedback = f"# 评审意见（未通过）\n\n{fail_fb}\n\n请根据意见修正分析。"
-                else:
+                            fail_fb = chr(10).join(
+                                f"judge-{i}: {r['feedback'][:500]}"
+                                for i, r in enumerate(judge_results) if not r["pass"])
+                            feedback = "# 评审意见（未通过）" + chr(10)*2 + fail_fb + chr(10)*2 + "请根据意见修正分析。"
+
+                    # for 循环耗尽 → 超出最大轮数
                     if mod_name not in modules_needing_reclassify:
                         raise StageError(
                             f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")
+
+            _s3_results = await asyncio.gather(
+                *[_analyse_one(m) for m in final_modules],
+                return_exceptions=True,
+            )
+            for _r in _s3_results:
+                if isinstance(_r, PiFatalError):
+                    raise _r
+            for _r in _s3_results:
+                if isinstance(_r, StageError):
+                    raise _r
+                if isinstance(_r, Exception) and not isinstance(_r, asyncio.CancelledError):
+                    raise _r
 
             # ── Stage 3 后处理：需要重分类的模块回 Stage 2 ──
             if modules_needing_reclassify:

@@ -180,6 +180,7 @@ class TaskConfig(BaseModel):
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
     binary_arch: list[str] = Field(default=["all"], description="binary 架构过滤")
+    parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1（串行）")
     stages: StagesConfig = Field(default_factory=StagesConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)

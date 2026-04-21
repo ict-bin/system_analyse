@@ -422,7 +422,7 @@ def test_max_rounds_exceeded():
 # ─── 测试 4: Stage 2 拆分 + 新模块入队 ───────────────────────────────────────
 
 def test_stage2_split():
-    print("=== Test: Stage 2 模块拆分 ===")
+    print("=== Test: Stage 2 模块拆分 + 并行队列 ===")
     tmp_dir = tempfile.mkdtemp(prefix="orch_test_")
 
     try:
@@ -616,6 +616,78 @@ def test_stage2_redo_cwd():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ─── 测试 9: parallel_modules=2 并行处理不互相干扰 ────────────────────
+
+def test_parallel_modules():
+    print("=== Test: parallel_modules=2 并行处理 ===")
+    tmp_dir = tempfile.mkdtemp(prefix="orch_test_")
+
+    try:
+        setup_workspace(tmp_dir)
+        cfg = make_config(tmp_dir, min_rounds=1)
+        cfg.parallel_modules = 2  # 开启并行
+        tracker = CallTracker()
+
+        def create_two_modules(cwd):
+            ws = Path(cwd)
+            for mod, files in [("mod_a", "file1.so\n"), ("mod_b", "file2.ko\n")]:
+                d = ws / mod
+                d.mkdir(exist_ok=True)
+                (d / "files.list").write_text(files, encoding="utf-8")
+
+        def create_reports(cwd):
+            ws = Path(cwd)
+            for mod in ["mod_a", "mod_b"]:
+                d = ws / mod
+                if d.exists():
+                    (d / "module_report.md").write_text(
+                        f"<!-- RISK_LEVEL: 中 -->\n# {mod}\n", encoding="utf-8")
+
+        effects = {0: lambda cwd: None, 1: create_two_modules}
+
+        # 两个模块并行进行 Stage 2、3，各模块各 1 次 Worker + 1 次 Judge
+        tracker.agent_responses = [
+            "<result>探索完成</result>",                    # 0: explore
+            "<result>分类</result>",                            # 1: classify Worker
+            "## 评分: 100\n## 通过: 是",                        # 2: classify Judge
+            # Stage 2: 两模块并行，顺序不确定，用默认 pass
+        ]
+
+        orig_mock = create_mock_agent(tracker, effects)
+        async def mock_with_all(**kwargs):
+            r = await orig_mock(**kwargs)
+            cwd = kwargs.get("cwd", "")
+            prompt = kwargs.get("prompt", "")
+            if "分析模块" in prompt:
+                create_reports(cwd)
+            if "总报告" in prompt or "final_report" in prompt.lower():
+                (Path(cwd) / "final_report.md").write_text("# Final", encoding="utf-8")
+            return r
+
+        with patch("app.orchestrator.run_agent", mock_with_all), \
+             patch("app.orchestrator.os.path.isfile", return_value=False):
+            orch = Orchestrator(cfg, on_event=tracker.on_event)
+            result = asyncio.run(orch.execute("test-009"))
+
+        assert result.status.value == "passed", f"应成功: {result.error}"
+
+        # 验证两个模块都被处理了
+        s2_modules = [e.get("module") for e in tracker.events
+                     if e["type"] == "stage" and e.get("stage") == 2]
+        assert "mod_a" in s2_modules, f"mod_a 应被处理: {s2_modules}"
+        assert "mod_b" in s2_modules, f"mod_b 应被处理: {s2_modules}"
+
+        s3_modules = [e.get("module") for e in tracker.events
+                     if e["type"] == "stage" and e.get("stage") == 3]
+        assert "mod_a" in s3_modules, f"mod_a 应分析: {s3_modules}"
+        assert "mod_b" in s3_modules, f"mod_b 应分析: {s3_modules}"
+
+        print(f"  ✅ 并行处理通过 (s2_modules={s2_modules}, s3_modules={s3_modules})")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ─── 运行全部测试 ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -633,6 +705,7 @@ if __name__ == "__main__":
         test_max_rounds_exceeded,
         test_stage2_split,
         test_stage2_redo_cwd,
+        test_parallel_modules,
     ]
 
     passed = 0
