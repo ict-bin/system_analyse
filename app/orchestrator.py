@@ -499,7 +499,8 @@ class Orchestrator:
                     file_summary = await self._collect_file_summaries(
                         task_id, mod_name, mod_dir, w_base, tokens,
                         sub_prompt, parallel=cfg.parallel_sub_workers,
-                        sub_model=cfg.workers.model_for("sub_read"))
+                        sub_model=cfg.workers.model_for("sub_read"),
+                        target_dir=cfg.target_dir)
 
                 for attempt in range(self._max_iter(s_cfg)):
                     self._emit("stage", task_id, stage=2,
@@ -646,7 +647,8 @@ class Orchestrator:
                         file_summary = await self._collect_file_summaries(
                             task_id, mod_name, mod_dir, w_base, tokens,
                             sub_prompt, parallel=cfg.parallel_sub_workers,
-                            sub_model=cfg.workers.model_for("sub_read"))
+                            sub_model=cfg.workers.model_for("sub_read"),
+                            target_dir=cfg.target_dir)
 
                     for attempt in range(self._max_iter(s_cfg)):
                         self._emit("stage", task_id, stage=3,
@@ -1251,16 +1253,65 @@ class Orchestrator:
     SUB_BATCH_SIZE = 20       # 每个子 Worker 处理的文件数
     SUB_WORKER_THRESHOLD = 20 # 文件数超过此值启用主从模式
 
+    # ── 预读单个文件（同步，在线程池中执行）────────────────────────────────
+    @staticmethod
+    def _pre_read_file(fullpath: str) -> tuple[str, list[str]]:
+        """返回 (file_type, top_strings)。ELF只读前128KB，文本读全文（限4MB）。"""
+        ELF_MAGIC = b"\x7fELF"
+        MIN_STR = 5
+        MAX_ELF = 131072
+        MAX_TEXT = 4 * 1024 * 1024
+
+        def _strings(data: bytes) -> list[str]:
+            out, cur = [], []
+            for b in data:
+                c = chr(b)
+                if c.isprintable() and c not in ('\n', '\r'):
+                    cur.append(c)
+                else:
+                    if len(cur) >= MIN_STR:
+                        out.append(''.join(cur))
+                    cur = []
+            if len(cur) >= MIN_STR:
+                out.append(''.join(cur))
+            return out
+
+        try:
+            with open(fullpath, 'rb') as f:
+                magic = f.read(4)
+                if magic == ELF_MAGIC:
+                    f.seek(0)
+                    data = f.read(MAX_ELF)
+                    strs = _strings(data)
+                    # 过滤纯路径/版本号噪声，保留有意义的符号
+                    filtered = [s for s in strs
+                                if len(s) >= 5
+                                and not s.startswith('/')
+                                and not s.startswith('.')
+                                and ' ' not in s[:3]]  # 排除编译器路径等
+                    return ('ELF', filtered[:60])
+                else:
+                    f.seek(0)
+                    raw = f.read(MAX_TEXT)
+                    try:
+                        text = raw.decode('utf-8', errors='ignore')
+                    except Exception:
+                        return ('binary', [])
+                    lines = [l.strip() for l in text.splitlines() if l.strip()][:80]
+                    return ('text', lines)
+        except (OSError, IOError):
+            return ('unknown', [])
+
     async def _collect_file_summaries(
         self, task_id: str, mod_name: str, mod_dir: Path,
         w_base: dict, tokens: "TokenUsage",
         sub_prompt_template: str,
         parallel: int = 1,
         sub_model: str = "",
+        target_dir: str = "/data/target",
     ) -> str:
-        """并行子 Worker 逐批读取文件，返回合并后的文件摘要文本。
-
-        parallel=1 串行（默认），parallel>1 并行处理多个 batch。
+        """Python预读文件内容注入prompt，子Worker只做分析不调工具。
+        parallel 控制并发批次数。
         """
         flist_path = mod_dir / "files.list"
         files = [l.strip() for l in flist_path.read_text("utf-8").splitlines() if l.strip()]
@@ -1281,13 +1332,33 @@ class Orchestrator:
             async with semaphore:
                 self._emit("stage", task_id, stage="2-sub",
                            module=mod_name, batch=idx + 1, total=len(batches))
-                file_list_text = chr(10).join(batch)
-                prompt = (f"请逐个读取以下 {len(batch)} 个文件并输出摘要："
-                          f"{chr(10)}{chr(10)}{file_list_text}")
+
+                # ── Python 预读每个文件内容 ──────────────────────────────
+                loop = asyncio.get_event_loop()
+                pre_reads: list[tuple[str, list[str]]] = []
+                for relpath in batch:
+                    fullpath = os.path.join(target_dir, relpath)
+                    ftype, lines = await loop.run_in_executor(
+                        None, self._pre_read_file, fullpath)
+                    pre_reads.append((ftype, lines))
+
+                # ── 构建带内容的 prompt（子Worker无需tool调用）──────────
+                parts = [f"以下是 {len(batch)} 个文件的内容摘要，直接分析，无需再读文件：\n"]
+                for relpath, (ftype, lines) in zip(batch, pre_reads):
+                    fname = os.path.basename(relpath)
+                    parts.append(f"\n=== {fname} ({ftype}) ===")
+                    parts.append(f"路径: {relpath}")
+                    if lines:
+                        content_preview = '\n'.join(lines[:40])
+                        parts.append(f"内容:\n{content_preview}")
+                    else:
+                        parts.append("内容: (空文件或无法读取)")
+                prompt = '\n'.join(parts)
+
                 ar = await _run_agent_checked(
                     prompt=prompt,
                     model=sub_model or w_base.get("model", ""),
-                    tools=w_base["tools"],
+                    tools=[],   # 内容已预读，无需工具
                     system_prompt=sub_prompt_template,
                     cwd=w_base["cwd"],
                     thinking_level=w_base.get("thinking_level", "off"),
@@ -1300,22 +1371,20 @@ class Orchestrator:
                 )
                 tokens += ar.token_usage
                 if ar.output:
-                    # 去掉子 Worker 的 <result> 标签，只保留文件清单行
-                    raw = ar.output
-                    raw = re.sub(r'<result>.*?</result>', '', raw, flags=re.DOTALL).strip()
+                    raw = re.sub(r'<result>.*?</result>', '', ar.output, flags=re.DOTALL).strip()
                     results[idx] = raw
                 else:
-                    results[idx] = chr(10).join(f"{f} | unknown | (读取失败)" for f in batch)
+                    results[idx] = chr(10).join(
+                        f"{f} | unknown | (分析失败) | -" for f in batch)
 
         await asyncio.gather(*[_run_batch(i, b) for i, b in enumerate(batches)])
 
-        # 将各 batch 结果合并成一张完整文件清单表（去掉 batch 分隔标题）
         all_lines = []
         for r in results:
             if r:
                 for line in r.splitlines():
                     line = line.strip()
-                    if line and '|' in line:  # 只保留有效数据行
+                    if line and '|' in line:
                         all_lines.append(line)
 
         header = f"文件清单（共 {len(all_lines)} 个文件）"
