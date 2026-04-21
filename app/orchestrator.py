@@ -352,12 +352,16 @@ class Orchestrator:
 
                 # Step B: 用 Worker 生成的 keywords.txt 跑预扫描脚本
                 keywords_file = workspace / "keywords.txt"
-                prescan_script = "/opt/system_analyse/scripts/prescan_files.sh"
+                prescan_script = "/opt/system_analyse/scripts/prescan_files.py"
+                if not os.path.isfile(prescan_script):
+                    prescan_script = "/opt/system_analyse/scripts/prescan_files.sh"
                 if keywords_file.exists() and os.path.isfile(prescan_script):
                     self._emit("stage", task_id, stage="prescan")
                     try:
+                        cmd = (["python3", prescan_script] if prescan_script.endswith(".py")
+                               else ["bash", prescan_script])
                         proc = await asyncio.create_subprocess_exec(
-                            "bash", prescan_script, cfg.target_dir, str(workspace),
+                            *cmd, cfg.target_dir, str(workspace),
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                         )
