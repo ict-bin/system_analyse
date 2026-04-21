@@ -47,6 +47,20 @@ class StagesConfig(BaseModel):
 
 # ─── 分析目标文件类型 ───────────────────────────────────────────────────
 
+# 支持的 ELF 架构及对应的 file 命令关键词
+BINARY_ARCH = {
+    "x86":     ["Intel 80386", "i386", "i486", "i586", "i686"],
+    "x86_64":  ["x86-64", "AMD x86-64"],
+    "arm":     ["ARM,", "EABI", "ARM EABI", "ARM, EABI"],
+    "aarch64": ["ARM aarch64", "AArch64", "aarch64"],
+    "mips":    ["MIPS"],
+    "mips64":  ["MIPS64", "MIPS 64"],
+    "ppc":     ["PowerPC", "Power PC"],
+    "ppc64":   ["64-bit PowerPC", "PowerPC64"],
+    "riscv":   ["RISC-V"],
+    "s390":    ["IBM S/390", "S390"],
+}
+
 # 支持的分析类型（可组合）
 ANALYSE_TYPES = {
     "binary": {
@@ -132,6 +146,10 @@ class ServiceConfig(BaseModel):
         default=["all"],
         description="分析目标文件类型，可组合: binary/script/config/firmware/crypto/database/web/network_model/document/archive/all"
     )
+    binary_arch: list[str] = Field(
+        default=["all"],
+        description="binary 类型的架构过滤，只在 analyse_targets 含 binary 时生效: all/x86/x86_64/arm/aarch64/mips/mips64/ppc/ppc64/riscv/s390"
+    )
     agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
@@ -161,6 +179,7 @@ class TaskConfig(BaseModel):
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
+    binary_arch: list[str] = Field(default=["all"], description="binary 架构过滤")
     stages: StagesConfig = Field(default_factory=StagesConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)

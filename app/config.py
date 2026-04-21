@@ -38,6 +38,7 @@ def build_task_config(svc: ServiceConfig, prompt: str) -> TaskConfig:
         pi_max_retries=svc.pi_max_retries,
         pi_retry_delay=svc.pi_retry_delay,
         analyse_targets=svc.analyse_targets,
+        binary_arch=svc.binary_arch,
         stages=svc.stages.model_copy(deep=True),
         workers=svc.workers.model_copy(deep=True),
         judges=svc.judges.model_copy(deep=True),

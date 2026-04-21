@@ -297,10 +297,13 @@ class Orchestrator:
             filter_script = "/opt/system_analyse/scripts/filter_files.sh"
             if os.path.isfile(filter_script):
                 types_str = " ".join(cfg.analyse_targets)
-                self._emit("stage", task_id, stage="filter", types=types_str)
+                arch_str = " ".join(cfg.binary_arch)
+                self._emit("stage", task_id, stage="filter", types=types_str, arch=arch_str)
                 proc = await asyncio.create_subprocess_exec(
                     "bash", filter_script, cfg.target_dir,
-                    str(workspace / "filtered_files.txt"), *cfg.analyse_targets,
+                    str(workspace / "filtered_files.txt"),
+                    "--arch", arch_str,
+                    *cfg.analyse_targets,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )

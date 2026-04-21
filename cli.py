@@ -78,8 +78,10 @@ def _flush_pending():
         print(f"    📂 {count} 个模块: {preview}")
     elif stage == "filter":
         types = d.get('types', [])
+        arch = d.get('arch', 'all')
         fc = d.get('file_count', 0)
-        print(f"    📁 {fc} 个文件 (types: {', '.join(types)})")
+        arch_str = f" arch={arch}" if arch and arch != 'all' else ''
+        print(f"    📁 {fc} 个文件 (types: {', '.join(types) if isinstance(types,list) else types}{arch_str})")
     elif stage == 2 or stage == "2-redo" or stage == "2-redo-s4":
         mod = d.get('module', '')
         if d.get('skipped'):

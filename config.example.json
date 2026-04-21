@@ -1,5 +1,6 @@
 {
     "analyse_targets": ["all"],
+    "binary_arch": ["all"],
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
     "pi_max_retries": -1,
