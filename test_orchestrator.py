@@ -688,6 +688,171 @@ def test_parallel_modules():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ─── 测试 10: 子 Worker 摘要接入 Stage 2/3 ─────────────────────────────────
+
+def test_sub_worker_summary():
+    """Stage 2/3 中大模块先调子 Worker 收集摘要，小模块直接跳过子 Worker。"""
+    print("=== Test: 子 Worker 摘要接入 ===")
+    tmp_dir = tempfile.mkdtemp(prefix="orch_test_")
+
+    try:
+        setup_workspace(tmp_dir)
+        cfg = make_config(tmp_dir, min_rounds=1)
+        cfg.parallel_modules = 1
+        cfg.parallel_sub_workers = 1
+        tracker = CallTracker()
+
+        def create_modules(cwd):
+            ws = Path(cwd)
+            # big_mod: 25 个文件，超过 SUB_WORKER_THRESHOLD(20) → 应调子 Worker
+            d = ws / "big_mod"
+            d.mkdir(exist_ok=True)
+            files = "\n".join(f"file{i}.so" for i in range(25))
+            (d / "files.list").write_text(files + "\n", encoding="utf-8")
+            # small_mod: 5 个文件，不到阈値 → 不应调子 Worker
+            d2 = ws / "small_mod"
+            d2.mkdir(exist_ok=True)
+            (d2 / "files.list").write_text("a.so\nb.ko\nc.so\n", encoding="utf-8")
+
+        effects = {0: lambda cwd: None, 1: create_modules}
+
+        tracker.agent_responses = [
+            "<result>探索完成</result>",                 # 0: explore
+            "<result>分类</result>",                         # 1: classify Worker
+            "## 评分: 100\n## 通过: 是",                   # 2: classify Judge
+            # big_mod Stage 2:
+            "<result>子Worker摘要batch1</result>",         # 3: sub-worker batch1 (file 0-19)
+            "<result>子Worker摘要batch2</result>",         # 4: sub-worker batch2 (file 20-24)
+            "<result>无需细分</result>",                   # 5: refine big_mod Master
+            "## 评分: 90\n## 通过: 是",                    # 6: refine big_mod Judge
+            # small_mod Stage 2 (无子Worker):
+            "<result>无需细分</result>",                   # 7: refine small_mod Master (no sub)
+            "## 评分: 90\n## 通过: 是",                    # 8: refine small_mod Judge
+            # Stage 3 big_mod:
+            "<result>子Worker摘要batch1</result>",         # 9: sub-worker batch1
+            "<result>子Worker摘要batch2</result>",         # 10: sub-worker batch2
+            "<result>分析完成</result>",                   # 11: analyse big_mod Master
+            "## 评分: 85\n## 通过: 是",                    # 12: analyse big_mod Judge
+            # Stage 3 small_mod (无子Worker):
+            "<result>分析完成</result>",                   # 13: analyse small_mod Master
+            "## 评分: 85\n## 通过: 是",                    # 14: analyse small_mod Judge
+        ]
+
+        orig_mock = create_mock_agent(tracker, effects)
+        async def mock_with_reports(**kwargs):
+            r = await orig_mock(**kwargs)
+            cwd = kwargs.get("cwd", "")
+            prompt = kwargs.get("prompt", "")
+            if "分析模块" in prompt and "评审" not in prompt:
+                ws = Path(cwd)
+                for mod in ["big_mod", "small_mod"]:
+                    d = ws / mod
+                    if d.exists() and not (d / "module_report.md").exists():
+                        (d / "module_report.md").write_text(
+                            "<!-- RISK_LEVEL: 中 -->\n# Report\n", encoding="utf-8")
+            if "总报告" in prompt or "final_report" in prompt.lower():
+                (Path(cwd) / "final_report.md").write_text("# Final", encoding="utf-8")
+            return r
+
+        with patch("app.orchestrator.run_agent", mock_with_reports), \
+             patch("app.orchestrator.os.path.isfile", return_value=False):
+            orch = Orchestrator(cfg, on_event=tracker.on_event)
+            result = asyncio.run(orch.execute("test-010"))
+
+        assert result.status.value == "passed", f"应成功: {result.error}"
+
+        # 验证子 Worker 被调用了（big_mod S2: 2 batches + S3: 2 batches = 4 次）
+        sub_calls = [c for c in tracker.calls
+                     if "请逐个读取" in c.get("prompt", "")]
+        assert len(sub_calls) == 4, f"big_mod 应有 4 次子Worker调用: {len(sub_calls)}"
+
+        # 验证 big_mod 的 Master prompt 包含子Worker 摘要
+        master_calls = [c for c in tracker.calls
+                        if "文件摘要（子 Worker 已分析）" in c.get("prompt", "")]
+        assert len(master_calls) >= 2, f"big_mod S2+S3 Master 应收到摘要: {len(master_calls)}"
+
+        # 验证 small_mod 的 Master prompt 不包含子Worker 摘要
+        small_calls = [c for c in tracker.calls
+                       if "检查模块 `small_mod`" in c.get("prompt", "")
+                       or "分析模块 `small_mod`" in c.get("prompt", "")]
+        for c in small_calls:
+            assert "子 Worker已分析" not in c.get("prompt", ""), \
+                "small_mod 不应有子Worker摘要"
+
+        print(f"  ✅ 子 Worker 接入正确 (sub_calls={len(sub_calls)}, master_with_summary={len(master_calls)})")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ─── 测试 11: 2x2 并行模式 (parallel_modules=2, parallel_sub_workers=2) ────────────
+
+def test_2x2_parallel():
+    """parallel_modules=2 + parallel_sub_workers=2：验证两个维度并行不冲突。"""
+    print("=== Test: 2×2 并行模式 ===")
+    tmp_dir = tempfile.mkdtemp(prefix="orch_test_")
+
+    try:
+        setup_workspace(tmp_dir)
+        cfg = make_config(tmp_dir, min_rounds=1)
+        cfg.parallel_modules = 2
+        cfg.parallel_sub_workers = 2
+        tracker = CallTracker()
+
+        def create_modules(cwd):
+            ws = Path(cwd)
+            for mod in ["mod_x", "mod_y"]:
+                d = ws / mod
+                d.mkdir(exist_ok=True)
+                # 每个模块 25 个文件，会展开子 Worker
+                files = "\n".join(f"file{i}.so" for i in range(25))
+                (d / "files.list").write_text(files + "\n", encoding="utf-8")
+
+        effects = {0: lambda cwd: None, 1: create_modules}
+
+        orig_mock = create_mock_agent(tracker, effects)
+        async def mock_with_reports(**kwargs):
+            r = await orig_mock(**kwargs)
+            cwd = kwargs.get("cwd", "")
+            prompt = kwargs.get("prompt", "")
+            if "分析模块" in prompt and "评审" not in prompt:
+                ws = Path(cwd)
+                for mod in ["mod_x", "mod_y"]:
+                    d = ws / mod
+                    if d.exists() and not (d / "module_report.md").exists():
+                        (d / "module_report.md").write_text(
+                            "<!-- RISK_LEVEL: 低 -->\n# Report\n", encoding="utf-8")
+            if "总报告" in prompt or "final_report" in prompt.lower():
+                (Path(cwd) / "final_report.md").write_text("# Final", encoding="utf-8")
+            return r
+
+        with patch("app.orchestrator.run_agent", mock_with_reports), \
+             patch("app.orchestrator.os.path.isfile", return_value=False):
+            orch = Orchestrator(cfg, on_event=tracker.on_event)
+            result = asyncio.run(orch.execute("test-011"))
+
+        assert result.status.value == "passed", f"应成功: {result.error}"
+
+        # 两个模块都进入了 Stage 2/3
+        s2 = [e.get("module") for e in tracker.events
+              if e["type"] == "stage" and e.get("stage") == 2]
+        s3 = [e.get("module") for e in tracker.events
+              if e["type"] == "stage" and e.get("stage") == 3]
+        assert "mod_x" in s2 and "mod_y" in s2, f"Stage 2 未覆盖所有模块: {s2}"
+        assert "mod_x" in s3 and "mod_y" in s3, f"Stage 3 未覆盖所有模块: {s3}"
+
+        # 每个模块 25 文件→ 2 batches，子Worker并行度=2，S2+S3共 4*2=8 次子Worker调用
+        sub_stages = [e for e in tracker.events
+                      if e["type"] == "stage" and e.get("stage") == "2-sub"]
+        sub_batch_count = sum(1 for e in sub_stages if "batch" in e)
+        assert sub_batch_count >= 4, f"至少 4 次子Worker batch: {sub_batch_count}"
+
+        print(f"  ✅ 2×2 并行正确 (s2={s2}, sub_batches={sub_batch_count})")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ─── 运行全部测试 ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -706,6 +871,8 @@ if __name__ == "__main__":
         test_stage2_split,
         test_stage2_redo_cwd,
         test_parallel_modules,
+        test_sub_worker_summary,
+        test_2x2_parallel,
     ]
 
     passed = 0
