@@ -13,11 +13,13 @@
 
 # 步骤
 
-## 1. 运行文件完整性校验（必做）
+## 1. 运行本地完整性校验（必做）
 
 ```bash
-bash /opt/system_analyse/scripts/check_classification.sh /data/target .
+bash /opt/system_analyse/scripts/check_module.sh /data/target modules/<当前模块>
 ```
+
+⚠️ **使用 check_module.sh 而非 check_classification.sh**：并行场景下其他模块尚未完成，全局计数不可靠。本地检查只验证当前模块的 files.list 中路径是否真实存在。
 
 - `Missing files: 0` → 继续评审
 - `Missing files: N > 0` → **直接 0 分，不通过**

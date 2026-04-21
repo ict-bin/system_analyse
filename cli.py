@@ -126,28 +126,25 @@ def render_event(event: SwarmEvent, quiet: bool = False):
             print(f"{'━' * 60}")
 
         # 模块切换时打印开始提示
-        if mod and (mod != _st.current_module or att == 1):
-            if mod != _st.current_module:
-                _flush_pending()
-                _st.current_module = mod
-                _st.module_start = time.time()
-                if stage != "2-sub":
-                    print(f"  ▸ {mod}", end="", flush=True)
+        if mod and mod != _st.current_module:
+            _flush_pending()
+            _st.current_module = mod
+            _st.module_start = time.time()
+            if stage != "2-sub":
+                print(f"  ▸ {mod}", flush=True)
 
-        # 子 Worker batch 进度（覆盖当前行）
+        # 子 Worker batch 进度（每批独立行，并行不互相覆盖）
         if stage == "2-sub":
             batch = d.get('batch', 0)
             total = d.get('total', 0)
             if batch and total:
-                sys.stdout.write(f"\r    📖 [{mod}] 读取 {batch}/{total}")
-                sys.stdout.flush()
+                print(f"    📖 [{mod}] 读取 {batch}/{total}", flush=True)
 
     elif t == "stage_result":
-        # 缓存，等 judge_eval 出来后一起输出
         _st.pending_result = d
-        # 子 Worker 摘要完成：换行（覆盖了之前的 \r 行）
         if d.get('stage') == "2-sub":
-            print()  # 换行
+            fc = d.get('file_count', 0)
+            print(f"      📖 [{mod if mod else d.get('module','')}] 摘要完成 ({fc} 个文件)")
             _flush_pending()
 
     elif t == "judge_eval":
@@ -158,12 +155,13 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         att_val = d.get('attempt', _st.module_start)  # fallback
         dur = _st.module_elapsed()
 
+        mod_label = d.get('module', _st.current_module or '')
+        prefix = f"  ▸ {mod_label}" if mod_label else "  "
         if passed:
-            print(f"  ✅ {judge}={score}  {dur}")
+            print(f"{prefix}  ✅ {judge}={score}  {dur}")
         else:
-            # 失败：不换行重打模块名，紧凑显示
             att = d.get('attempt', 0)
-            print(f"  · {judge}={score} retry")
+            print(f"{prefix}  · {judge}={score} retry[{att}]")
 
     elif t == "reflect":
         print(f"    🔄 反思")

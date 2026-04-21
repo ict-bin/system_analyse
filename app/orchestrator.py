@@ -488,12 +488,19 @@ class Orchestrator:
                 mod_dir = _get_modules_root(str(workspace)) / mod_name
                 if not (mod_dir / "files.list").exists():
                     return
+                fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
+                # 空模块：Stage 1 创建但过滤后无文件（如 chassis 只有 lua 脚本）
+                if fc == 0:
+                    self._emit("log", task_id, level="warn",
+                               msg=f"[跳过] {mod_name} 过滤后 0 个文件，自动移除空模块")
+                    import shutil as _sh
+                    _sh.rmtree(str(mod_dir), ignore_errors=True)
+                    return
                 refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                 feedback = ""
 
                 # 超过阈値时，先用子 Worker 收集文件摘要
                 sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
-                fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
                 file_summary = ""
                 if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
                     file_summary = await self._collect_file_summaries(
