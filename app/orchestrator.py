@@ -377,7 +377,24 @@ class Orchestrator:
 
                 # Worker 工作
                 prompt_parts = [cfg.task]
-                # 第一轮附带预扫描摘要（如果有）
+                # 第一轮：告知 Worker 过滤后的文件列表（如果有过滤）
+                filtered_path = workspace / "filtered_files.txt"
+                if attempt == 0 and filtered_path.exists():
+                    fc = sum(1 for l in filtered_path.read_text("utf-8").splitlines() if l.strip())
+                    prompt_parts.append(
+                        chr(10)*2 +
+                        f"❗ 当前配置已开启文件类型过滤，" +
+                        f"工作目录下的 `filtered_files.txt` 包含将要分析的 {fc} 个文件（相对路径）。" +
+                        chr(10)*2 +
+                        "你必须且只能对这 {fc} 个文件进行分类，" +
+                        "不要撫烧其他文件。" +
+                        chr(10)*2 +
+                        "分类时用 `cat filtered_files.txt` 作为输入源，" +
+                        "而不是 `find /data/target -type f`。" +
+                        chr(10)*2 +
+                        "每个模块的 files.list 必须写就是 filtered_files.txt 里的相对路径。"
+                    )
+                # 附带预扫描摘要（如果有）
                 if attempt == 0 and prescan_summary:
                     prompt_parts.append(
                         f"\n\n# 预扫描摘要（已自动生成，请基于此分类）\n\n"

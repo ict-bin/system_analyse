@@ -2,7 +2,7 @@
 
 # 任务
 
-对 `/data/target` 下所有文件按功能归类到模块。
+对目标文件集合按功能归类到模块。
 
 ⚠️ **目标是全覆盖、零遗漏。不要求精确，后续阶段会精细化。**
 
@@ -13,14 +13,31 @@
 3. **每个文件只归入一个模块**，用 `files.list` 记录
 4. **按功能命名模块**，不要按文件名前缀/编号命名
 
+# ⚠️ 待分类文件来源
+
+**优先使用 `filtered_files.txt`**（如果存在），这是经过类型/架构过滤后的文件列表（相对路径）：
+
+```bash
+# 检查是否有过滤文件
+if [ -f filtered_files.txt ]; then
+    echo "使用过滤文件，共 $(wc -l < filtered_files.txt) 个文件"
+    SOURCE="filtered_files.txt"
+else
+    echo "无过滤文件，扫描全量"
+    find /data/target -type f | sed 's|^/data/target/||' > /tmp/all_files.txt
+    SOURCE="/tmp/all_files.txt"
+fi
+head -10 $SOURCE    # 查看样本
+```
+
+**只对 `$SOURCE` 里的文件分类，不要扫描超出范围的文件。**
+
 # ⚠️ files.list 路径格式
 
 **必须使用相对路径**（相对于 `/data/target`），不含前缀。
 
-✅ 正确：`scripts/bgp_init.sh`、`lib/libcrypto.so`
-❌ 错误：`/data/target/scripts/bgp_init.sh`
-
-生成方法：`find /data/target -type f | sed 's|^/data/target/||'`
+✅ 正确：`squashfs_extracted/aarch64/lib/libbgp.so`
+❌ 错误：`/data/target/squashfs_extracted/aarch64/lib/libbgp.so`
 
 # 分类策略（按优先级）
 
@@ -41,48 +58,63 @@ done
 # 可以合并相近的关键词（如 dhcp+dhcpv6 → dhcp）
 ```
 
-## 策略 1：目录结构清晰时
+## 策略 1：路径/文件名有语义时
 
-如果 `/data/target` 下有子目录且目录名有语义（如 `bgp/`、`configs/`），直接按子目录映射为模块。
-
-## 策略 2：扁平目录或文件名无语义时
-
-必须扫描文件内容关键词来分类：
+按路径中的关键词（协议名、功能名）直接分类：
 
 ```bash
 #!/bin/bash
-cd <工作目录>
-KEYWORDS="bgp ospf dhcp ipsec snmp ntp ssh evpn mpls vxlan lacp bfd acl ztp upgrade patch kernel driver"
+SOURCE="filtered_files.txt"
+[ ! -f "$SOURCE" ] && find /data/target -type f | sed 's|^/data/target/||' > /tmp/s.txt && SOURCE=/tmp/s.txt
 
-while IFS= read -r f; do
-    rel=$(echo "$f" | sed 's|^/data/target/||')
-    kw=$(head -50 "$f" 2>/dev/null | grep -oiE "$(echo $KEYWORDS | tr ' ' '|')" | head -1 | tr '[:upper:]' '[:lower:]')
-    [ -z "$kw" ] && kw=$(strings "$f" 2>/dev/null | head -100 | grep -oiE "$(echo $KEYWORDS | tr ' ' '|')" | head -1 | tr '[:upper:]' '[:lower:]')
+while IFS= read -r rel; do
+    kw=$(echo "$rel" | grep -oiE "bgp|ospf|dhcp|ipsec|ssh|mpls|vxlan|evpn|isis|ldp|bfd|lacp|multicast|qos|acl|nat|snmp|ntp|ipsec|ssl|cert" | head -1 | tr '[:upper:]' '[:lower:]')
     [ -z "$kw" ] && kw="unknown"
     mkdir -p "$kw"
     echo "$rel" >> "$kw/files.list"
-done < <(find /data/target -type f)
+done < "$SOURCE"
 ```
 
-## 策略 3：混合策略
+## 策略 2：文件名无语义时（按内容关键词）
 
-先按目录分，再对大目录内的文件按内容关键词细分。
+```bash
+#!/bin/bash
+SOURCE="filtered_files.txt"
+[ ! -f "$SOURCE" ] && find /data/target -type f | sed 's|^/data/target/||' > /tmp/s.txt && SOURCE=/tmp/s.txt
+
+while IFS= read -r rel; do
+    f="/data/target/$rel"
+    kw=$(strings "$f" 2>/dev/null | head -100 | grep -oiE "bgp|ospf|dhcp|ipsec|ssh|mpls|kernel|driver" | head -1 | tr '[:upper:]' '[:lower:]')
+    [ -z "$kw" ] && kw="unknown"
+    mkdir -p "$kw"
+    echo "$rel" >> "$kw/files.list"
+done < "$SOURCE"
+```
 
 # 校验
 
 ```bash
-cat */files.list 2>/dev/null | sort -u > /tmp/classified.txt
-find /data/target -type f | sed 's|^/data/target/||' | sort > /tmp/all.txt
-comm -23 /tmp/all.txt /tmp/classified.txt > /tmp/remaining.txt
-echo "遗漏文件: $(wc -l < /tmp/remaining.txt)"
+SOURCE="filtered_files.txt"
+[ ! -f "$SOURCE" ] && find /data/target -type f | sed 's|^/data/target/||' | sort > /tmp/s.txt && SOURCE=/tmp/s.txt
+
+TOTAL=$(wc -l < "$SOURCE")
+CLASSIFIED=$(cat */files.list 2>/dev/null | sort -u | wc -l)
+echo "总文件: $TOTAL  已分类: $CLASSIFIED"
+
+# 找遗漏
+cat */files.list 2>/dev/null | sort -u > /tmp/c.txt
+sort "$SOURCE" > /tmp/a.txt
+comm -23 /tmp/a.txt /tmp/c.txt > /tmp/missing.txt
+echo "遗漏: $(wc -l < /tmp/missing.txt)"
+head -10 /tmp/missing.txt
 ```
 
-如有遗漏，补充处理直到覆盖率 100%。
+如有遗漏，写补充脚本处理，直到 100% 覆盖。
 
 # 模块命名
 
 小写英文 + 下划线，**按实际功能命名**：
-- ✅ `bgp`, `ospf`, `dhcp`, `ipsec`, `system_upgrade`, `kernel_modules`
+- ✅ `bgp`, `ospf`, `dhcp`, `ipsec`, `kernel_modules`, `shared_libraries`
 - ❌ `entry_02_scripts`（包编号不是功能）
 - ❌ `network`（太笼统）
 
