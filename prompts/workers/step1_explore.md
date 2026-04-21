@@ -35,11 +35,18 @@ done
 
 ## 3. 根据观察，生成关键词列表
 
-将关键词写入 `keywords.txt`，每行一个关键词（小写）。关键词应该是：
-- 协议名（bgp, ospf, dhcp, ipsec, ...）
-- 服务名（ssh, snmp, ntp, http, ...）
-- 功能模块名（kernel, driver, firmware, upgrade, ...）
-- 本软件包特有的关键词（根据你观察到的特征）
+将关键词写入 `keywords.txt`，每行一个关键词（小写）。关键词必须是**功能性关键词**：
+- ✅ 协议名（bgp, ospf, dhcp, ipsec, ssl, snmp, radius, ...）
+- ✅ 服务/功能名（firewall, routing, qos, acl, nat, vpn, auth, ...）
+- ✅ 系统子系统名（driver, scheduler, watchdog, ...）
+
+❌ **不要包含以下无意义词**：
+- 架构名：aarch64, x86_64, arm, mips
+- 打包格式：squashfs, lzma, rpm, tar
+- 品牌/产品名：huawei, cisco, ne8000, vrp
+- 配置格式名：yang, yin, netconf（除非是功能模块的核心词）
+- 语言名：python, lua, perl
+- 通用路径词：module, modules, lib, usr, opt, kernel（太泛）
 
 ```bash
 cat > keywords.txt << 'EOF'

@@ -97,13 +97,20 @@ def main():
         print(f"ERROR: {keywords_file} 不存在，跳过预扫描")
         sys.exit(1)
 
-    # 读取关键词，过滤掉长度<4的（避免 rr/sr 误匹配）
+    # 读取关键词，过滤掉长度<4的短词和非功能性词
+    BLACKLIST = {
+        'aarch64', 'x86_64', 'x86', 'arm', 'mips', 'ppc',  # 架构名
+        'squashfs', 'lzma', 'bzip', 'gzip', 'xz', 'rpm', 'rpmdb', 'tar',  # 打包格式
+        'huawei', 'cisco', 'juniper', 'nokia',  # 品牌名
+        'python', 'lua', 'perl', 'ruby',  # 脚本语言
+        'module', 'modules', 'kernel', 'firmware', 'upgrade',  # 过于通用
+        'yang', 'yin', 'conf', 'json', 'yaml', 'proto',  # 配置格式
+    }
     raw_kws = [l.strip().lower() for l in keywords_file.read_text().splitlines() if l.strip()]
-    KEYWORDS = [k for k in raw_kws if len(k) >= 4]
+    KEYWORDS = [k for k in raw_kws if len(k) >= 4 and k not in BLACKLIST]
     skipped = len(raw_kws) - len(KEYWORDS)
     if skipped:
-        print(f"  跳过 {skipped} 个过短关键词（<4字符）: "
-              f"{[k for k in raw_kws if len(k) < 4]}")
+        print(f"  跳过 {skipped} 个无效关键词（过短或非功能性）")
 
     # 关键词正则（词边界匹配，防止子串误匹配）
     # 使用 \b 词边界，但部分关键词如 "bgp" 在 libbgp.so 里也要能匹配
