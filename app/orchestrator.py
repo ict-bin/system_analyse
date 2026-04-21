@@ -658,8 +658,7 @@ class Orchestrator:
                             "(空)"
                         )
                         mod_summary_lines.append(f"- {mod_name_s2} | {Path(sample).name}")
-                    mod_summary = "
-".join(mod_summary_lines)
+                    mod_summary = chr(10).join(mod_summary_lines)
 
                     reclass_prompt_tmpl = self._load_prompt(w_prompt_dir, "step2_reclassify")
                     reclass_prompt = (
