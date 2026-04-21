@@ -661,15 +661,11 @@ class Orchestrator:
                     mod_summary = chr(10).join(mod_summary_lines)
 
                     reclass_prompt_tmpl = self._load_prompt(w_prompt_dir, "step2_reclassify")
+                    _nl = chr(10)
                     reclass_prompt = (
-                        f"## 待归类文件（{len(missing_files)} 个）
-
-"
-                        + "
-".join(missing_files)
-                        + f"
-
-{mod_summary}"
+                        f"## 待归类文件（{len(missing_files)} 个）{_nl}{_nl}"
+                        + _nl.join(missing_files)
+                        + f"{_nl}{_nl}{mod_summary}"
                     )
 
                     s2rc_cfg = cfg.stages.refine
@@ -704,14 +700,9 @@ class Orchestrator:
                             break
                         missing_files = still_missing
                         reclass_prompt = (
-                            f"## 仍未归类文件（{len(missing_files)} 个）
-
-"
-                            + "
-".join(missing_files)
-                            + f"
-
-{mod_summary}"
+                            f"## 仍未归类文件（{len(missing_files)} 个）{_nl}{_nl}"
+                            + _nl.join(missing_files)
+                            + f"{_nl}{_nl}{mod_summary}"
                         )
                 else:
                     self._emit("log", task_id, level="info",
