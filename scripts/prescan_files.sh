@@ -56,15 +56,20 @@ scan_file() {
     # 判断是否为二进制（ELF magic: 前4字节 = \x7fELF）
     magic=$(dd if="$fullpath" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
     if [ "$magic" = "7f454c46" ]; then
-        # ELF 二进制：只读前 128KB（符号表在 ELF 动态段，通常在头部）
+        # ELF 二进制：只读前 128KB（动态符号表通常在头部）
+        # 统计各关键词出现次数，取最高频的
         kw=$(dd if="$fullpath" bs=131072 count=1 2>/dev/null \
              | strings -n 5 2>/dev/null \
-             | grep -m1 -oiE "$KEYWORDS" \
-             | tr '[:upper:]' '[:lower:]')
+             | grep -oiE "$KEYWORDS" \
+             | tr '[:upper:]' '[:lower:]' \
+             | sort | uniq -c | sort -rn \
+             | awk 'NR==1{print $2}')
     else
-        # 文本文件（脚本/配置/XML等）：grep -m1 遇到第一个匹配立即停止
-        kw=$(grep -m1 -oiE "$KEYWORDS" "$fullpath" 2>/dev/null \
-             | head -1 | tr '[:upper:]' '[:lower:]')
+        # 文本文件（脚本/配置/XML等）：读完整文件，取出现最多的关键词
+        kw=$(grep -oiE "$KEYWORDS" "$fullpath" 2>/dev/null \
+             | tr '[:upper:]' '[:lower:]' \
+             | sort | uniq -c | sort -rn \
+             | awk 'NR==1{print $2}')
     fi
 
     if [ -n "$kw" ]; then
