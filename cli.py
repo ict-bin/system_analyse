@@ -94,8 +94,8 @@ def _flush_pending():
                 names += f" (+{len(new)-5})"
             print(f"      ↳ 拆分 → {names}")
     elif stage == "2-sub":
-        lines = d.get('summary_lines', 0)
-        print(f"      📖 摘要完成 ({lines} 行)")
+        lines = d.get('file_count', 0)
+        print(f"      📖 摘要完成 ({lines} 个文件)")
 
 
 # ─── 渲染 ────────────────────────────────────────────────────────────────────
