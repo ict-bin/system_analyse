@@ -310,259 +310,136 @@ class Orchestrator:
             _skip_s12 = (cfg.start_stage >= 3 and bool(cfg.resume_workspace))
 
             # ═══════════════════════════════════════════════════
-            # Stage 0: 文件类型过滤
-            # ═══════════════════════════════════════════════════
-            filter_script = "/opt/system_analyse/scripts/filter_files.sh"
-            if os.path.isfile(filter_script):
-                types_str = " ".join(cfg.analyse_targets)
-                arch_str = " ".join(cfg.binary_arch)
-                self._emit("stage", task_id, stage="filter", types=types_str, arch=arch_str)
-                proc = await asyncio.create_subprocess_exec(
-                    "bash", filter_script, cfg.target_dir,
-                    str(workspace / "filtered_files.txt"),
-                    "--arch", arch_str,
-                    *cfg.analyse_targets,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
-                filter_count = 0
-                filtered_path = workspace / "filtered_files.txt"
-                if filtered_path.exists():
-                    filter_count = sum(
-                        1 for l in filtered_path.read_text("utf-8").splitlines() if l.strip())
-                self._emit("stage_result", task_id, stage="filter",
-                           types=cfg.analyse_targets, file_count=filter_count)
-
-            # ═══════════════════════════════════════════════════
-            # Stage 1: 全局分类 + 完整性检查
-            # ═══════════════════════════════════════════════════
-            s_cfg = cfg.stages.classify
-            classify_session = str(sess_dir / "classify.jsonl")
-            w_sys_prompt = self._load_prompt(w_prompt_dir, "step1_classify")
-            j_sys_prompt = self._load_prompt(cfg.judges.system_prompt_dir, "step1_check_classify")
-            reflect_prompt = self._load_prompt(w_prompt_dir, "reflect_classify")
-
-            feedback = ""
-
-            # ── Step A: Worker 探索目录生成关键词列表 ──
-            explore_prompt = self._load_prompt(w_prompt_dir, "step1_explore")
-            prescan_summary = ""
-            if explore_prompt:
-                self._emit("stage", task_id, stage="explore")
-                self._emit("model", task_id, stage="explore", model=_wm("explore"))
-                explore_session = str(sess_dir / "explore.jsonl")
-                ar = await _run_agent_checked(
-                    prompt=cfg.task,
-                    model=_wm("explore"),
-                    system_prompt=explore_prompt,
-                    session_file=explore_session,
-                    **w_base,
-                )
-                tokens += ar.token_usage
-
-                # Step B: 用 Worker 生成的 keywords.txt 跑预扫描脚本
-                keywords_file = workspace / "keywords.txt"
-                prescan_script = "/opt/system_analyse/scripts/prescan_files.py"
-                if not os.path.isfile(prescan_script):
-                    prescan_script = "/opt/system_analyse/scripts/prescan_files.sh"
-                if keywords_file.exists() and os.path.isfile(prescan_script):
-                    self._emit("stage", task_id, stage="prescan")
-                    try:
-                        cmd = (["python3", prescan_script] if prescan_script.endswith(".py")
-                               else ["bash", prescan_script])
-                        proc = await asyncio.create_subprocess_exec(
-                            *cmd, cfg.target_dir, str(workspace),
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        stdout, stderr = await proc.communicate()
-                        summary_file = workspace / "keyword_summary.txt"
-                        if summary_file.exists():
-                            prescan_summary = summary_file.read_text("utf-8")
-                            self._emit("stage_result", task_id, stage="prescan",
-                                       summary_lines=prescan_summary.count(chr(10)))
-                    except Exception as e:
-                        self._emit("error", task_id, error=f"预扫描失败: {e}")
-
-            for attempt in range(self._max_iter(s_cfg)):
-                self._emit("stage", task_id, stage=1, attempt=attempt + 1)
-                self._emit("model", task_id, stage="classify",
-                           worker=_wm("classify"), judge=_jm("classify", j_cfgs[0]) if j_cfgs else "?")
-
-                # Worker 工作
-                prompt_parts = [cfg.task]
-                # 第一轮：告知 Worker 过滤后的文件列表（如果有过滤）
-                filtered_path = workspace / "filtered_files.txt"
-                if attempt == 0 and filtered_path.exists():
-                    fc = sum(1 for l in filtered_path.read_text("utf-8").splitlines() if l.strip())
-                    prompt_parts.append(
-                        chr(10)*2 +
-                        f"❗ 当前配置已开启文件类型过滤，" +
-                        f"工作目录下的 `filtered_files.txt` 包含将要分析的 {fc} 个文件（相对路径）。" +
-                        chr(10)*2 +
-                        "你必须且只能对这 {fc} 个文件进行分类，" +
-                        "不要撫烧其他文件。" +
-                        chr(10)*2 +
-                        "分类时用 `cat filtered_files.txt` 作为输入源，" +
-                        "而不是 `find /data/target -type f`。" +
-                        chr(10)*2 +
-                        "每个模块的 files.list 必须写就是 filtered_files.txt 里的相对路径。"
+            if not _skip_s12:
+                # Stage 0: 文件类型过滤
+                # ═══════════════════════════════════════════════════
+                filter_script = "/opt/system_analyse/scripts/filter_files.sh"
+                if os.path.isfile(filter_script):
+                    types_str = " ".join(cfg.analyse_targets)
+                    arch_str = " ".join(cfg.binary_arch)
+                    self._emit("stage", task_id, stage="filter", types=types_str, arch=arch_str)
+                    proc = await asyncio.create_subprocess_exec(
+                        "bash", filter_script, cfg.target_dir,
+                        str(workspace / "filtered_files.txt"),
+                        "--arch", arch_str,
+                        *cfg.analyse_targets,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
                     )
-                # 附带预扫描摘要（如果有）
-                if attempt == 0 and prescan_summary:
-                    prompt_parts.append(
-                        f"\n\n# 预扫描摘要（已自动生成，请基于此分类）\n\n"
-                        f"{prescan_summary}\n\n"
-                        f"预扫描已将文件按关键词分组到 `prescan/` 目录下，"
-                        f"每个 `prescan/<keyword>.list` 包含对应文件列表。\n"
-                        f"你可以直接用脚本将 prescan/*.list 移入模块目录。")
-                if feedback:
-                    prompt_parts.append(f"\n\n{feedback}")
-                ar = await _run_agent_checked(
-                    model=_wm("classify"),
-                    prompt="\n".join(prompt_parts),
-                    system_prompt=w_sys_prompt,
-                    session_file=classify_session,
-                    **w_base,
-                )
-                tokens += ar.token_usage
-                result.final_output = _extract_result(ar.output)
+                    stdout, _ = await proc.communicate()
+                    filter_count = 0
+                    filtered_path = workspace / "filtered_files.txt"
+                    if filtered_path.exists():
+                        filter_count = sum(
+                            1 for l in filtered_path.read_text("utf-8").splitlines() if l.strip())
+                    self._emit("stage_result", task_id, stage="filter",
+                               types=cfg.analyse_targets, file_count=filter_count)
 
-                modules = _discover_modules(str(workspace))
-                self._emit("stage_result", task_id, stage=1,
-                           modules=modules, module_count=len(modules))
+                # ═══════════════════════════════════════════════════
+                # Stage 1: 全局分类 + 完整性检查
+                # ═══════════════════════════════════════════════════
+                s_cfg = cfg.stages.classify
+                classify_session = str(sess_dir / "classify.jsonl")
+                w_sys_prompt = self._load_prompt(w_prompt_dir, "step1_classify")
+                j_sys_prompt = self._load_prompt(cfg.judges.system_prompt_dir, "step1_check_classify")
+                reflect_prompt = self._load_prompt(w_prompt_dir, "reflect_classify")
 
-                # Judge 检查
-                judge_results = []
-                for j_idx, j_cfg_item in enumerate(j_cfgs):
-                    ar = await _run_agent_checked(
-                        prompt="请运行检查脚本验证分类完整性。",
-                        model=_jm("classify", j_cfg_item),
-                        system_prompt=j_sys_prompt,
-                        tools=cfg.judges.default_tools,
-                        cwd=str(workspace),
-                        **j_base_kw,
-                    )
-                    tokens += ar.token_usage
-                    parsed = _parse_eval_md(ar.output)
-                    judge_results.append(parsed)
-
-                    self._emit("judge_eval", task_id, stage=1,
-                               judge_id=f"judge-{j_idx}",
-                               passed=parsed["pass"], score=parsed["score"])
-
-                    self._archive(out_dir,
-                        f"s1-a{attempt+1}-j{j_idx}.md",
-                        f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
-                        f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
-
-                voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
-
-                if voted_pass:
-                    if attempt + 1 >= s_cfg.min_rounds:
-                        break
-                    else:
-                        self._emit("reflect", task_id, stage=1,
-                            round=attempt+1, min_rounds=s_cfg.min_rounds)
-                        feedback = ("# 自查要求（第 " + str(attempt+1) +
-                            " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
-                            chr(10)*2 + reflect_prompt)
-                        _jfb = chr(10).join(
-                            f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
-                        feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
-                    fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
-                                        for i, r in enumerate(judge_results) if not r["pass"])
-                    feedback = f"# 评审意见（未通过）\n\n{fail_fb}\n\n请根据评审意见修正。"
-            else:
-                raise StageError(f"Stage 1 分类检查未通过，已达最大轮数 {s_cfg.max_rounds}")
-
-            # ═══════════════════════════════════════════════════
-            # Stage 2: 子文件夹细分（parallel_modules 并行）
-            # ═══════════════════════════════════════════════════
-            s_cfg = cfg.stages.refine
-            w_sys_prompt = self._load_prompt(w_prompt_dir, "step2_refine")
-            j_sys_prompt = self._load_prompt(cfg.judges.system_prompt_dir, "step2_check_refine")
-            reflect_prompt = self._load_prompt(w_prompt_dir, "reflect_refine")
-
-            parallel_s2 = max(1, cfg.parallel_modules)
-            s2_queue: asyncio.Queue[str] = asyncio.Queue()
-            refined_modules: set[str] = set()
-            in_progress_s2: set[str] = set()
-            s2_errors: list[BaseException] = []
-
-            for _m in _discover_modules(str(workspace)):
-                await s2_queue.put(_m)
-
-            async def _refine_one(mod_name: str) -> None:
-                nonlocal tokens
-                mod_dir = _get_modules_root(str(workspace)) / mod_name
-                if not (mod_dir / "files.list").exists():
-                    return
-                fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
-                # 空模块：Stage 1 创建但过滤后无文件（如 chassis 只有 lua 脚本）
-                if fc == 0:
-                    self._emit("log", task_id, level="warn",
-                               msg=f"[跳过] {mod_name} 过滤后 0 个文件，自动移除空模块")
-                    import shutil as _sh
-                    _sh.rmtree(str(mod_dir), ignore_errors=True)
-                    return
-                refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
                 feedback = ""
 
-                # ── 拆分前保存快照到 workspace/.s2_snapshots/（不随模块目录删除）──
-                snapshots_dir = workspace / ".s2_snapshots"
-                snapshots_dir.mkdir(exist_ok=True)
-                snapshot_path = snapshots_dir / f"{mod_name}.snapshot"
-                if not snapshot_path.exists():  # 只在第一次保存，重试时不覆盖
-                    import shutil as _sh2
-                    _sh2.copy2(str(mod_dir / "files.list"), str(snapshot_path))
-
-                # 超过阈値时，先用子 Worker 收集文件摘要
-                sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
-                file_summary = ""
-                if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
-                    file_summary = await self._collect_file_summaries(
-                        task_id, mod_name, mod_dir, w_base, tokens,
-                        sub_prompt, parallel=cfg.parallel_sub_workers,
-                        sub_model=cfg.workers.model_for("sub_read"),
-                        target_dir=cfg.target_dir)
-
-                for attempt in range(self._max_iter(s_cfg)):
-                    self._emit("stage", task_id, stage=2,
-                               module=mod_name, attempt=attempt + 1)
-
-                    mods_before = set(_discover_modules(str(workspace)))
-                    prompt_parts = [f"检查模块 `{mod_name}` 是否需要细分。"]
-                    if file_summary:
-                        prompt_parts.append(chr(10)*2 + "## 文件摘要（子 Worker 已分析）" + chr(10)*2 + file_summary)
-                    if feedback:
-                        prompt_parts.append(chr(10)*2 + feedback)
+                # ── Step A: Worker 探索目录生成关键词列表 ──
+                explore_prompt = self._load_prompt(w_prompt_dir, "step1_explore")
+                prescan_summary = ""
+                if explore_prompt:
+                    self._emit("stage", task_id, stage="explore")
+                    self._emit("model", task_id, stage="explore", model=_wm("explore"))
+                    explore_session = str(sess_dir / "explore.jsonl")
                     ar = await _run_agent_checked(
-                        prompt=chr(10).join(prompt_parts),
-                        model=_wm("refine"),
-                        system_prompt=w_sys_prompt,
-                        session_file=refine_session,
+                        prompt=cfg.task,
+                        model=_wm("explore"),
+                        system_prompt=explore_prompt,
+                        session_file=explore_session,
                         **w_base,
                     )
                     tokens += ar.token_usage
 
-                    mods_after = set(_discover_modules(str(workspace)))
-                    # 只计入当前模块产生的新子模块（排除已在 refined/in_progress 中的）
-                    new_ones = sorted(
-                        (mods_after - mods_before) - refined_modules - in_progress_s2
-                    )
-                    was_split = mod_name not in mods_after and bool(
-                        mods_after - mods_before - refined_modules - in_progress_s2
-                    )
-                    self._emit("stage_result", task_id, stage=2,
-                               module=mod_name, split=was_split, new_modules=new_ones)
+                    # Step B: 用 Worker 生成的 keywords.txt 跑预扫描脚本
+                    keywords_file = workspace / "keywords.txt"
+                    prescan_script = "/opt/system_analyse/scripts/prescan_files.py"
+                    if not os.path.isfile(prescan_script):
+                        prescan_script = "/opt/system_analyse/scripts/prescan_files.sh"
+                    if keywords_file.exists() and os.path.isfile(prescan_script):
+                        self._emit("stage", task_id, stage="prescan")
+                        try:
+                            cmd = (["python3", prescan_script] if prescan_script.endswith(".py")
+                                   else ["bash", prescan_script])
+                            proc = await asyncio.create_subprocess_exec(
+                                *cmd, cfg.target_dir, str(workspace),
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            stdout, stderr = await proc.communicate()
+                            summary_file = workspace / "keyword_summary.txt"
+                            if summary_file.exists():
+                                prescan_summary = summary_file.read_text("utf-8")
+                                self._emit("stage_result", task_id, stage="prescan",
+                                           summary_lines=prescan_summary.count(chr(10)))
+                        except Exception as e:
+                            self._emit("error", task_id, error=f"预扫描失败: {e}")
 
+                for attempt in range(self._max_iter(s_cfg)):
+                    self._emit("stage", task_id, stage=1, attempt=attempt + 1)
+                    self._emit("model", task_id, stage="classify",
+                               worker=_wm("classify"), judge=_jm("classify", j_cfgs[0]) if j_cfgs else "?")
+
+                    # Worker 工作
+                    prompt_parts = [cfg.task]
+                    # 第一轮：告知 Worker 过滤后的文件列表（如果有过滤）
+                    filtered_path = workspace / "filtered_files.txt"
+                    if attempt == 0 and filtered_path.exists():
+                        fc = sum(1 for l in filtered_path.read_text("utf-8").splitlines() if l.strip())
+                        prompt_parts.append(
+                            chr(10)*2 +
+                            f"❗ 当前配置已开启文件类型过滤，" +
+                            f"工作目录下的 `filtered_files.txt` 包含将要分析的 {fc} 个文件（相对路径）。" +
+                            chr(10)*2 +
+                            "你必须且只能对这 {fc} 个文件进行分类，" +
+                            "不要撫烧其他文件。" +
+                            chr(10)*2 +
+                            "分类时用 `cat filtered_files.txt` 作为输入源，" +
+                            "而不是 `find /data/target -type f`。" +
+                            chr(10)*2 +
+                            "每个模块的 files.list 必须写就是 filtered_files.txt 里的相对路径。"
+                        )
+                    # 附带预扫描摘要（如果有）
+                    if attempt == 0 and prescan_summary:
+                        prompt_parts.append(
+                            f"\n\n# 预扫描摘要（已自动生成，请基于此分类）\n\n"
+                            f"{prescan_summary}\n\n"
+                            f"预扫描已将文件按关键词分组到 `prescan/` 目录下，"
+                            f"每个 `prescan/<keyword>.list` 包含对应文件列表。\n"
+                            f"你可以直接用脚本将 prescan/*.list 移入模块目录。")
+                    if feedback:
+                        prompt_parts.append(f"\n\n{feedback}")
+                    ar = await _run_agent_checked(
+                        model=_wm("classify"),
+                        prompt="\n".join(prompt_parts),
+                        system_prompt=w_sys_prompt,
+                        session_file=classify_session,
+                        **w_base,
+                    )
+                    tokens += ar.token_usage
+                    result.final_output = _extract_result(ar.output)
+
+                    modules = _discover_modules(str(workspace))
+                    self._emit("stage_result", task_id, stage=1,
+                               modules=modules, module_count=len(modules))
+
+                    # Judge 检查
                     judge_results = []
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
                         ar = await _run_agent_checked(
-                            prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
-                            model=_jm("refine", j_cfg_item),
+                            prompt="请运行检查脚本验证分类完整性。",
+                            model=_jm("classify", j_cfg_item),
                             system_prompt=j_sys_prompt,
                             tools=cfg.judges.default_tools,
                             cwd=str(workspace),
@@ -571,11 +448,13 @@ class Orchestrator:
                         tokens += ar.token_usage
                         parsed = _parse_eval_md(ar.output)
                         judge_results.append(parsed)
-                        self._emit("judge_eval", task_id, stage=2,
-                                   judge_id=f"judge-{j_idx}", module=mod_name,
+
+                        self._emit("judge_eval", task_id, stage=1,
+                                   judge_id=f"judge-{j_idx}",
                                    passed=parsed["pass"], score=parsed["score"])
+
                         self._archive(out_dir,
-                            f"s2-{mod_name}-a{attempt+1}-j{j_idx}.md",
+                            f"s1-a{attempt+1}-j{j_idx}.md",
                             f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                             f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
 
@@ -583,145 +462,268 @@ class Orchestrator:
 
                     if voted_pass:
                         if attempt + 1 >= s_cfg.min_rounds:
-                            # 完成：将拆分出的新模块加入队列
-                            if was_split and new_ones:
-                                for nm in new_ones:
-                                    if nm not in refined_modules and nm not in in_progress_s2:
-                                        in_progress_s2.add(nm)
-                                        await s2_queue.put(nm)
-                            refined_modules.add(mod_name)
-                            return  # 正常完成
+                            break
                         else:
-                            # 还未到 min_rounds 轮 → 强制反思
-                            self._emit("reflect", task_id, stage=2,
-                                       module=mod_name, round=attempt+1)
-                            feedback = (
-                                "# 自查要求（第 " + str(attempt+1) +
+                            self._emit("reflect", task_id, stage=1,
+                                round=attempt+1, min_rounds=s_cfg.min_rounds)
+                            feedback = ("# 自查要求（第 " + str(attempt+1) +
                                 " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
                                 chr(10)*2 + reflect_prompt)
                             _jfb = chr(10).join(
-                                f"judge-{i}: {r['feedback'][:500]}"
-                                for i, r in enumerate(judge_results))
+                                f"judge-{i}: {r['feedback'][:500]}" for i, r in enumerate(judge_results))
                             feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
-                    else:
-                        fail_fb = chr(10).join(
-                            f"judge-{i}: {r['feedback'][:500]}"
-                            for i, r in enumerate(judge_results) if not r["pass"])
-                        if "missing" in fail_fb.lower() or "丢失" in fail_fb or "遗漏" in fail_fb:
-                            guidance = (
-                                chr(10)*2 + "⚠️ **文件丢失！** 请修复文件覆盖问题，不要改变拆分策略。" +
-                                chr(10) + "运行 check_classification.sh 查看遗漏文件，将它们归入合适的模块。")
+                        fail_fb = "\n".join(f"judge-{i}: {r['feedback'][:500]}"
+                                            for i, r in enumerate(judge_results) if not r["pass"])
+                        feedback = f"# 评审意见（未通过）\n\n{fail_fb}\n\n请根据评审意见修正。"
+                else:
+                    raise StageError(f"Stage 1 分类检查未通过，已达最大轮数 {s_cfg.max_rounds}")
+
+                # ═══════════════════════════════════════════════════
+                # Stage 2: 子文件夹细分（parallel_modules 并行）
+                # ═══════════════════════════════════════════════════
+                s_cfg = cfg.stages.refine
+                w_sys_prompt = self._load_prompt(w_prompt_dir, "step2_refine")
+                j_sys_prompt = self._load_prompt(cfg.judges.system_prompt_dir, "step2_check_refine")
+                reflect_prompt = self._load_prompt(w_prompt_dir, "reflect_refine")
+
+                parallel_s2 = max(1, cfg.parallel_modules)
+                s2_queue: asyncio.Queue[str] = asyncio.Queue()
+                refined_modules: set[str] = set()
+                in_progress_s2: set[str] = set()
+                s2_errors: list[BaseException] = []
+
+                for _m in _discover_modules(str(workspace)):
+                    await s2_queue.put(_m)
+
+                async def _refine_one(mod_name: str) -> None:
+                    nonlocal tokens
+                    mod_dir = _get_modules_root(str(workspace)) / mod_name
+                    if not (mod_dir / "files.list").exists():
+                        return
+                    fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
+                    # 空模块：Stage 1 创建但过滤后无文件（如 chassis 只有 lua 脚本）
+                    if fc == 0:
+                        self._emit("log", task_id, level="warn",
+                                   msg=f"[跳过] {mod_name} 过滤后 0 个文件，自动移除空模块")
+                        import shutil as _sh
+                        _sh.rmtree(str(mod_dir), ignore_errors=True)
+                        return
+                    refine_session = str(sess_dir / f"refine-{mod_name}.jsonl")
+                    feedback = ""
+
+                    # ── 拆分前保存快照到 workspace/.s2_snapshots/（不随模块目录删除）──
+                    snapshots_dir = workspace / ".s2_snapshots"
+                    snapshots_dir.mkdir(exist_ok=True)
+                    snapshot_path = snapshots_dir / f"{mod_name}.snapshot"
+                    if not snapshot_path.exists():  # 只在第一次保存，重试时不覆盖
+                        import shutil as _sh2
+                        _sh2.copy2(str(mod_dir / "files.list"), str(snapshot_path))
+
+                    # 超过阈値时，先用子 Worker 收集文件摘要
+                    sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
+                    file_summary = ""
+                    if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
+                        file_summary = await self._collect_file_summaries(
+                            task_id, mod_name, mod_dir, w_base, tokens,
+                            sub_prompt, parallel=cfg.parallel_sub_workers,
+                            sub_model=cfg.workers.model_for("sub_read"),
+                            target_dir=cfg.target_dir)
+
+                    for attempt in range(self._max_iter(s_cfg)):
+                        self._emit("stage", task_id, stage=2,
+                                   module=mod_name, attempt=attempt + 1)
+
+                        mods_before = set(_discover_modules(str(workspace)))
+                        prompt_parts = [f"检查模块 `{mod_name}` 是否需要细分。"]
+                        if file_summary:
+                            prompt_parts.append(chr(10)*2 + "## 文件摘要（子 Worker 已分析）" + chr(10)*2 + file_summary)
+                        if feedback:
+                            prompt_parts.append(chr(10)*2 + feedback)
+                        ar = await _run_agent_checked(
+                            prompt=chr(10).join(prompt_parts),
+                            model=_wm("refine"),
+                            system_prompt=w_sys_prompt,
+                            session_file=refine_session,
+                            **w_base,
+                        )
+                        tokens += ar.token_usage
+
+                        mods_after = set(_discover_modules(str(workspace)))
+                        # 只计入当前模块产生的新子模块（排除已在 refined/in_progress 中的）
+                        new_ones = sorted(
+                            (mods_after - mods_before) - refined_modules - in_progress_s2
+                        )
+                        was_split = mod_name not in mods_after and bool(
+                            mods_after - mods_before - refined_modules - in_progress_s2
+                        )
+                        self._emit("stage_result", task_id, stage=2,
+                                   module=mod_name, split=was_split, new_modules=new_ones)
+
+                        judge_results = []
+                        for j_idx, j_cfg_item in enumerate(j_cfgs):
+                            ar = await _run_agent_checked(
+                                prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
+                                model=_jm("refine", j_cfg_item),
+                                system_prompt=j_sys_prompt,
+                                tools=cfg.judges.default_tools,
+                                cwd=str(workspace),
+                                **j_base_kw,
+                            )
+                            tokens += ar.token_usage
+                            parsed = _parse_eval_md(ar.output)
+                            judge_results.append(parsed)
+                            self._emit("judge_eval", task_id, stage=2,
+                                       judge_id=f"judge-{j_idx}", module=mod_name,
+                                       passed=parsed["pass"], score=parsed["score"])
+                            self._archive(out_dir,
+                                f"s2-{mod_name}-a{attempt+1}-j{j_idx}.md",
+                                f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
+                                f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
+
+                        voted_pass = _check_voting(judge_results, s_cfg.pass_mode, j_count)
+
+                        if voted_pass:
+                            if attempt + 1 >= s_cfg.min_rounds:
+                                # 完成：将拆分出的新模块加入队列
+                                if was_split and new_ones:
+                                    for nm in new_ones:
+                                        if nm not in refined_modules and nm not in in_progress_s2:
+                                            in_progress_s2.add(nm)
+                                            await s2_queue.put(nm)
+                                refined_modules.add(mod_name)
+                                return  # 正常完成
+                            else:
+                                # 还未到 min_rounds 轮 → 强制反思
+                                self._emit("reflect", task_id, stage=2,
+                                           module=mod_name, round=attempt+1)
+                                feedback = (
+                                    "# 自查要求（第 " + str(attempt+1) +
+                                    " 轮，需至少 " + str(s_cfg.min_rounds) + " 轮）" +
+                                    chr(10)*2 + reflect_prompt)
+                                _jfb = chr(10).join(
+                                    f"judge-{i}: {r['feedback'][:500]}"
+                                    for i, r in enumerate(judge_results))
+                                feedback += chr(10)*2 + "## Judge 上轮意见" + chr(10)*2 + _jfb
                         else:
-                            guidance = chr(10)*2 + "请根据评审意见调整拆分策略。"
-                        feedback = "# 评审意见（未通过）" + chr(10)*2 + fail_fb + guidance
+                            fail_fb = chr(10).join(
+                                f"judge-{i}: {r['feedback'][:500]}"
+                                for i, r in enumerate(judge_results) if not r["pass"])
+                            if "missing" in fail_fb.lower() or "丢失" in fail_fb or "遗漏" in fail_fb:
+                                guidance = (
+                                    chr(10)*2 + "⚠️ **文件丢失！** 请修复文件覆盖问题，不要改变拆分策略。" +
+                                    chr(10) + "运行 check_classification.sh 查看遗漏文件，将它们归入合适的模块。")
+                            else:
+                                guidance = chr(10)*2 + "请根据评审意见调整拆分策略。"
+                            feedback = "# 评审意见（未通过）" + chr(10)*2 + fail_fb + guidance
 
-                # for 循环耗尽（未 return）→ 超出最大轮数
-                raise StageError(
-                    f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
+                    # for 循环耗尽（未 return）→ 超出最大轮数
+                    raise StageError(
+                        f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
 
-            async def _s2_worker() -> None:
-                while True:
-                    mod_name = await s2_queue.get()
-                    try:
-                        if mod_name not in refined_modules:
-                            await _refine_one(mod_name)
-                    except (StageError, PiFatalError) as e:
-                        s2_errors.append(e)
-                    finally:
-                        s2_queue.task_done()
+                async def _s2_worker() -> None:
+                    while True:
+                        mod_name = await s2_queue.get()
+                        try:
+                            if mod_name not in refined_modules:
+                                await _refine_one(mod_name)
+                        except (StageError, PiFatalError) as e:
+                            s2_errors.append(e)
+                        finally:
+                            s2_queue.task_done()
 
-            _s2_workers = [asyncio.create_task(_s2_worker())
-                           for _ in range(parallel_s2)]
-            await s2_queue.join()
-            for _w in _s2_workers:
-                _w.cancel()
-            await asyncio.gather(*_s2_workers, return_exceptions=True)
-            if s2_errors:
-                raise s2_errors[0]
+                _s2_workers = [asyncio.create_task(_s2_worker())
+                               for _ in range(parallel_s2)]
+                await s2_queue.join()
+                for _w in _s2_workers:
+                    _w.cancel()
+                await asyncio.gather(*_s2_workers, return_exceptions=True)
+                if s2_errors:
+                    raise s2_errors[0]
 
-            # ═══════════════════════════════════════════════════
-            # Stage 2 后：全局完整性检查 + 遗漏文件补分类（W+J）
-            # ═══════════════════════════════════════════════════
-            filtered_txt = workspace / "filtered_files.txt"
-            if filtered_txt.exists():
-                all_target = set(
-                    l.strip() for l in filtered_txt.read_text("utf-8").splitlines() if l.strip()
-                )
-                mods_root = _get_modules_root(str(workspace))
-                all_classified = set()
-                for flist in mods_root.glob("*/files.list"):
-                    if flist.name == "files.list.snapshot":
-                        continue
-                    for l in flist.read_text("utf-8").splitlines():
-                        l = l.strip()
-                        if l:
-                            all_classified.add(l)
-                missing_files = sorted(all_target - all_classified)
-
-                if missing_files:
-                    self._emit("log", task_id, level="warn",
-                               msg=f"Stage2 全局检查: {len(missing_files)} 个文件未归类，启动补分类")
-
-                    # 构建现有模块摘要
-                    mod_summary_lines = ["## 已有模块（名称 | 示例文件）"]
-                    for flist in sorted(mods_root.glob("*/files.list")):
-                        mod_name_s2 = flist.parent.name
-                        sample = next(
-                            (l.strip() for l in flist.read_text("utf-8").splitlines() if l.strip()),
-                            "(空)"
-                        )
-                        mod_summary_lines.append(f"- {mod_name_s2} | {Path(sample).name}")
-                    mod_summary = chr(10).join(mod_summary_lines)
-
-                    reclass_prompt_tmpl = self._load_prompt(w_prompt_dir, "step2_reclassify")
-                    _nl = chr(10)
-                    reclass_prompt = (
-                        f"## 待归类文件（{len(missing_files)} 个）{_nl}{_nl}"
-                        + _nl.join(missing_files)
-                        + f"{_nl}{_nl}{mod_summary}"
+                # ═══════════════════════════════════════════════════
+                # Stage 2 后：全局完整性检查 + 遗漏文件补分类（W+J）
+                # ═══════════════════════════════════════════════════
+                filtered_txt = workspace / "filtered_files.txt"
+                if filtered_txt.exists():
+                    all_target = set(
+                        l.strip() for l in filtered_txt.read_text("utf-8").splitlines() if l.strip()
                     )
+                    mods_root = _get_modules_root(str(workspace))
+                    all_classified = set()
+                    for flist in mods_root.glob("*/files.list"):
+                        if flist.name == "files.list.snapshot":
+                            continue
+                        for l in flist.read_text("utf-8").splitlines():
+                            l = l.strip()
+                            if l:
+                                all_classified.add(l)
+                    missing_files = sorted(all_target - all_classified)
 
-                    s2rc_cfg = cfg.stages.refine
-                    for rc_attempt in range(min(3, self._max_iter(s2rc_cfg))):
-                        rc_ar = await _run_agent_checked(
-                            prompt=reclass_prompt,
-                            model=self._wm("classify"),
-                            tools=w_base["tools"],
-                            system_prompt=reclass_prompt_tmpl,
-                            cwd=str(workspace),
-                            thinking_level=w_base.get("thinking_level", "off"),
-                            session_file=None,
-                            cancel_event=w_base.get("cancel_event"),
-                            max_retries=w_base.get("max_retries", 3),
-                            retry_delay=w_base.get("retry_delay", 10),
-                            pi_max_retries=w_base.get("pi_max_retries", -1),
-                            pi_retry_delay=w_base.get("pi_retry_delay", 10),
-                        )
-                        tokens += rc_ar.token_usage
+                    if missing_files:
+                        self._emit("log", task_id, level="warn",
+                                   msg=f"Stage2 全局检查: {len(missing_files)} 个文件未归类，启动补分类")
 
-                        # 重新统计
-                        all_classified2 = set()
-                        for flist in mods_root.glob("*/files.list"):
-                            for l in flist.read_text("utf-8").splitlines():
-                                l = l.strip()
-                                if l:
-                                    all_classified2.add(l)
-                        still_missing = sorted(all_target - all_classified2)
-                        self._emit("log", task_id, level="info",
-                                   msg=f"补分类第{rc_attempt+1}轮: 剩余 {len(still_missing)} 个未归类")
-                        if not still_missing:
-                            break
-                        missing_files = still_missing
+                        # 构建现有模块摘要
+                        mod_summary_lines = ["## 已有模块（名称 | 示例文件）"]
+                        for flist in sorted(mods_root.glob("*/files.list")):
+                            mod_name_s2 = flist.parent.name
+                            sample = next(
+                                (l.strip() for l in flist.read_text("utf-8").splitlines() if l.strip()),
+                                "(空)"
+                            )
+                            mod_summary_lines.append(f"- {mod_name_s2} | {Path(sample).name}")
+                        mod_summary = chr(10).join(mod_summary_lines)
+
+                        reclass_prompt_tmpl = self._load_prompt(w_prompt_dir, "step2_reclassify")
+                        _nl = chr(10)
                         reclass_prompt = (
-                            f"## 仍未归类文件（{len(missing_files)} 个）{_nl}{_nl}"
+                            f"## 待归类文件（{len(missing_files)} 个）{_nl}{_nl}"
                             + _nl.join(missing_files)
                             + f"{_nl}{_nl}{mod_summary}"
                         )
-                else:
-                    self._emit("log", task_id, level="info",
-                               msg=f"Stage2 全局检查: 全部 {len(all_target)} 个文件已归类 ✅")
 
-            # ═══════════════════════════════════════════════════
+                        s2rc_cfg = cfg.stages.refine
+                        for rc_attempt in range(min(3, self._max_iter(s2rc_cfg))):
+                            rc_ar = await _run_agent_checked(
+                                prompt=reclass_prompt,
+                                model=self._wm("classify"),
+                                tools=w_base["tools"],
+                                system_prompt=reclass_prompt_tmpl,
+                                cwd=str(workspace),
+                                thinking_level=w_base.get("thinking_level", "off"),
+                                session_file=None,
+                                cancel_event=w_base.get("cancel_event"),
+                                max_retries=w_base.get("max_retries", 3),
+                                retry_delay=w_base.get("retry_delay", 10),
+                                pi_max_retries=w_base.get("pi_max_retries", -1),
+                                pi_retry_delay=w_base.get("pi_retry_delay", 10),
+                            )
+                            tokens += rc_ar.token_usage
+
+                            # 重新统计
+                            all_classified2 = set()
+                            for flist in mods_root.glob("*/files.list"):
+                                for l in flist.read_text("utf-8").splitlines():
+                                    l = l.strip()
+                                    if l:
+                                        all_classified2.add(l)
+                            still_missing = sorted(all_target - all_classified2)
+                            self._emit("log", task_id, level="info",
+                                       msg=f"补分类第{rc_attempt+1}轮: 剩余 {len(still_missing)} 个未归类")
+                            if not still_missing:
+                                break
+                            missing_files = still_missing
+                            reclass_prompt = (
+                                f"## 仍未归类文件（{len(missing_files)} 个）{_nl}{_nl}"
+                                + _nl.join(missing_files)
+                                + f"{_nl}{_nl}{mod_summary}"
+                            )
+                    else:
+                        self._emit("log", task_id, level="info",
+                                   msg=f"Stage2 全局检查: 全部 {len(all_target)} 个文件已归类 ✅")
+
+                # ═══════════════════════════════════════════════════
+
             # ── resume 时从已有 workspace 加载模块列表 ──
             if _skip_s12:
                 _mods_root = _get_modules_root(str(workspace))
