@@ -754,21 +754,19 @@ class Orchestrator:
                     analyse_session = str(sess_dir / f"analyse-{mod_name}.jsonl")
                     feedback = ""
 
-                    # 超过阈値时，先用子 Worker 收集文件摘要
-                    sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
-                    fc = 0
-                    try:
-                        flist = mod_dir / "files.list"
-                        fc = sum(1 for l in flist.read_text("utf-8").splitlines() if l.strip())
-                    except OSError:
-                        pass
-                    file_summary = ""
-                    if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
-                        file_summary = await self._collect_file_summaries(
-                            task_id, mod_name, mod_dir, w_base, tokens,
-                            sub_prompt, parallel=cfg.parallel_sub_workers,
-                            sub_model=cfg.workers.model_for("sub_read"),
-                            target_dir=cfg.target_dir)
+                    # 预读所有文件（Python侧，无需 LLM tool call）
+                    loop = asyncio.get_event_loop()
+                    pre_read_content = await loop.run_in_executor(
+                        None, self._pre_read_module, cfg.target_dir, mod_dir
+                    )
+                    # 将模板占位符替换
+                    w_sys = w_sys_prompt.replace(
+                        "{{PRE_READ_CONTENT}}", pre_read_content
+                    ).replace(
+                        "{{MODULE_NAME}}", mod_name
+                    )
+                    # Worker 不需要读文件，只需要 write 写报告
+                    w_tools_s3 = ["write"]
 
                     for attempt in range(self._max_iter(s_cfg)):
                         self._emit("stage", task_id, stage=3,
@@ -776,22 +774,20 @@ class Orchestrator:
 
                         _nl = chr(10)
                         prompt_parts = [
-                            f"分析模块 `{mod_name}` 的所有文件。",
-                            f"",
-                            f"⚠️ 路径说明（cwd=workspace根目录）：",
-                            f"- 文件列表：`modules/{mod_name}/files.list`",
-                            f"- 报告输出：`modules/{mod_name}/module_report.md`（必须写入此路径）",
+                            f"现在将模块 `{mod_name}` 的分析报告写入 `modules/{mod_name}/module_report.md`。",
+                            f"文件内容已在 system prompt 中提供，直接写报告即可。",
                         ]
-                        if file_summary:
-                            prompt_parts.append(_nl*2 + "## 文件摘要（子 Worker 已分析）" + _nl*2 + file_summary)
                         if feedback:
                             prompt_parts.append(_nl*2 + feedback)
                         ar = await _run_agent_checked(
                             prompt=_nl.join(prompt_parts),
                             model=_wm("analyse"),
-                            system_prompt=w_sys_prompt,
+                            system_prompt=w_sys,
+                            tools=w_tools_s3,
                             session_file=analyse_session,
-                            **w_base,
+                            cwd=str(workspace),
+                            max_retries=w_base.get("max_retries", 1),
+                            retry_delay=w_base.get("retry_delay", 0),
                         )
                         tokens += ar.token_usage
                         self._emit("stage_result", task_id, stage=3, module=mod_name)
@@ -961,19 +957,34 @@ class Orchestrator:
                     for mod_name in redo_analyse:
                         mod_dir = _get_modules_root(str(workspace)) / mod_name
                         analyse_session = str(sess_dir / f"analyse-redo-{mod_name}.jsonl")
+                        # 预读文件内容
+                        pre_content = await asyncio.get_event_loop().run_in_executor(
+                            None, self._pre_read_module, cfg.target_dir, mod_dir
+                        )
+                        w_sys_redo = w_sys_analyse.replace(
+                            "{{PRE_READ_CONTENT}}", pre_content
+                        ).replace(
+                            "{{MODULE_NAME}}", mod_name
+                        )
                         feedback = ""
                         for attempt in range(self._max_iter(s_cfg_a)):
                             self._emit("stage", task_id, stage="3-redo",
                                        module=mod_name, attempt=attempt + 1)
-                            prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
+                            prompt_parts = [
+                                f"将模块 `{mod_name}` 的分析报告写入 `modules/{mod_name}/module_report.md`。",
+                                f"文件内容已在 system prompt 中提供。",
+                            ]
                             if feedback:
                                 prompt_parts.append(f"\n\n{feedback}")
                             ar = await _run_agent_checked(
                                 model=_wm("analyse"),
                                 prompt="\n".join(prompt_parts),
-                                system_prompt=w_sys_analyse,
+                                system_prompt=w_sys_redo,
+                                tools=["write"],
                                 session_file=analyse_session,
-                                **w_base,
+                                cwd=str(workspace),
+                                max_retries=w_base.get("max_retries", 1),
+                                retry_delay=w_base.get("retry_delay", 0),
                             )
                             tokens += ar.token_usage
 
@@ -1081,19 +1092,33 @@ class Orchestrator:
                     )
                     tokens += ar.token_usage
 
-                    # Stage 3 补做
+                    # Stage 3 补做（预读内容）
                     analyse_session = str(sess_dir / f"analyse-s4-{mod_name}.jsonl")
+                    pre_content_s4 = await asyncio.get_event_loop().run_in_executor(
+                        None, self._pre_read_module, cfg.target_dir, mod_dir
+                    )
+                    w_sys_s4 = w_sys_analyse.replace(
+                        "{{PRE_READ_CONTENT}}", pre_content_s4
+                    ).replace(
+                        "{{MODULE_NAME}}", mod_name
+                    )
                     feedback = ""
                     for attempt in range(self._max_iter(s_cfg_a)):
-                        prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
+                        prompt_parts = [
+                            f"将模块 `{mod_name}` 的分析报告写入 `modules/{mod_name}/module_report.md`。",
+                            f"文件内容已在 system prompt 中提供。",
+                        ]
                         if feedback:
                             prompt_parts.append(f"\n\n{feedback}")
                         ar = await _run_agent_checked(
                             model=_wm("analyse"),
                             prompt="\n".join(prompt_parts),
-                            system_prompt=w_sys_analyse,
+                            system_prompt=w_sys_s4,
+                            tools=["write"],
                             session_file=analyse_session,
-                            **w_base,
+                            cwd=str(workspace),
+                            max_retries=w_base.get("max_retries", 1),
+                            retry_delay=w_base.get("retry_delay", 0),
                         )
                         tokens += ar.token_usage
 
@@ -1428,7 +1453,7 @@ class Orchestrator:
                                 and not s.startswith('/')
                                 and not s.startswith('.')
                                 and ' ' not in s[:3]]  # 排除编译器路径等
-                    return ('ELF', filtered[:60])
+                    return ('ELF', filtered[:200])  # 200条 strings 够分析用
                 else:
                     f.seek(0)
                     raw = f.read(MAX_TEXT)
@@ -1436,10 +1461,63 @@ class Orchestrator:
                         text = raw.decode('utf-8', errors='ignore')
                     except Exception:
                         return ('binary', [])
-                    lines = [l.strip() for l in text.splitlines() if l.strip()][:80]
+                    lines = [l.strip() for l in text.splitlines() if l.strip()][:120]
                     return ('text', lines)
         except (OSError, IOError):
             return ('unknown', [])
+
+    @staticmethod
+    def _pre_read_module(target_dir: str, mod_dir: "Path") -> str:
+        """预读模块所有文件，返回注入 prompt 的文本块。
+
+        这样 Stage 3 Worker 收到 prompt 时就有全部内容，
+        无需再调用 bash/read tool，可以设置 tools=[\"write\"]。
+        """
+        import concurrent.futures
+        _cls = Orchestrator
+        try:
+            flist = (mod_dir / "files.list").read_text("utf-8").strip().splitlines()
+        except OSError:
+            return "(files.list 不可读)"
+
+        files = [l.strip() for l in flist if l.strip()]
+        if not files:
+            return "(模块文件列表为空)"
+
+        parts = []
+        # 并行预读（线程池），最多16个文件
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                (relpath, pool.submit(
+                    _cls._pre_read_file,
+                    str((Path(target_dir) / relpath))
+                ))
+                for relpath in files[:16]  # 防止超上下文
+            ]
+            for relpath, fut in futures:
+                try:
+                    ftype, lines = fut.result(timeout=15)
+                except Exception:
+                    ftype, lines = 'unknown', []
+
+                parts.append(f"### {relpath}")
+                if ftype == 'ELF':
+                    parts.append(f"类型: ELF 二进制 (AArch64)")
+                    parts.append(f"strings 输出 ({len(lines)} 条):")
+                    parts.append("```")
+                    parts.extend(lines)
+                    parts.append("```")
+                elif ftype == 'text':
+                    parts.append(f"类型: 文本文件 ({len(lines)} 行)")
+                    parts.append("```")
+                    parts.extend(lines)
+                    parts.append("```")
+                else:
+                    parts.append(f"类型: {ftype} (无法解析内容)")
+
+        if len(files) > 16:
+            parts.append(f"\n*(仅展示前16个文件，共{len(files)}个)*")
+        return chr(10).join(parts)
 
     async def _collect_file_summaries(
         self, task_id: str, mod_name: str, mod_dir: Path,
