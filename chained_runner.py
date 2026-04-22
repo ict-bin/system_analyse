@@ -21,6 +21,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def log(message: str) -> None:
+    print(f"[{now_iso()}] [{STAGE}] {message}", flush=True)
+
+
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -61,6 +65,28 @@ def create_request_for_next(payload: dict) -> None:
     save_json(RUN_ROOT / NEXT_STAGE / "request.json", payload)
 
 
+def stage_already_completed(mode: str) -> bool:
+    status = load_json(RUN_ROOT / STAGE / "status.json").get("status")
+    summary = load_json(RUN_ROOT / STAGE / "output" / "summary.json")
+    return status == "passed" and summary.get("mode") == mode
+
+
+def resume_from_history(mode: str) -> None:
+    summary = load_json(RUN_ROOT / STAGE / "output" / "summary.json")
+    if mode == "smoke":
+        final_output = summary.get("final_output")
+        if final_output:
+            create_request_for_next({"from_stage": STAGE, "input_file": final_output, "mode": "smoke"})
+    else:
+        create_request_for_next({
+            "from_stage": STAGE,
+            "modules": summary.get("modules", []),
+            "mode": "real",
+        })
+    update_status("passed", "already completed historically; skipped rerun")
+    update_pipeline(NEXT_STAGE, "running", "current stage already completed historically", mode=mode)
+
+
 def has_any_file(root: Path) -> bool:
     return root.is_dir() and any(p.is_file() for p in root.rglob("*"))
 
@@ -98,6 +124,7 @@ def sync_tree(src: Path, dst: Path, *, exclude_run: bool = False) -> None:
 def prepare_input() -> Path:
     input_dir = RUN_ROOT / STAGE / "input"
     src_root = downstream_source_root()
+    log(f"preparing input: src={src_root} dst={input_dir}")
     sync_tree(src_root, input_dir, exclude_run=(src_root == APP_ROOT))
     return input_dir
 
@@ -185,6 +212,7 @@ def run_smoke() -> None:
 
 
 def run_real() -> None:
+    log("real mode start")
     input_dir = prepare_input()
     output_dir = RUN_ROOT / STAGE / "output"
     config_dir = RUN_ROOT / "config" / STAGE
@@ -192,22 +220,30 @@ def run_real() -> None:
     ensure_default_config(config_dir)
     require_file(config_dir / "config.json")
     require_file(config_dir / "models.json")
+    log(f"config ready: config={config_dir / 'config.json'} models={config_dir / 'models.json'}")
     setup_data_links(input_dir, config_dir, output_dir)
+    log(f"data links ready: target=/data/target config=/data/config output=/data/output")
 
     try:
-        subprocess.run([
+        cmd = [
             "python3", "cli.py",
             "对 /app 目标根目录进行系统模块分类与威胁分析",
             "--config", "/data/config/config.json",
-            "--quiet",
-        ], check=True)
-    except subprocess.CalledProcessError:
-        pass
+        ]
+        if os.environ.get("GAIASEC_CLI_QUIET", "").lower() in {"1", "true", "yes"}:
+            cmd.append("--quiet")
+        log(f"launching cli: {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+        log("cli finished successfully")
+    except subprocess.CalledProcessError as exc:
+        log(f"cli exited non-zero: returncode={exc.returncode}; continue to inspect outputs")
 
     modules_dir = output_dir / "modules"
     modules = sorted(p.name for p in modules_dir.iterdir() if p.is_dir()) if modules_dir.is_dir() else []
     if not modules:
+        log("no modules produced; writing fallback empty outputs")
         modules = write_empty_outputs(output_dir, input_dir)
+    log(f"real mode complete: module_count={len(modules)} final_report={output_dir / 'final_report.md'}")
     save_json(output_dir / "summary.json", {
         "stage": STAGE,
         "mode": "real",
@@ -223,8 +259,13 @@ def run_real() -> None:
 
 
 def main() -> int:
-    require_previous_passed()
     mode = os.environ.get("CHAINED_MODE") or load_json(RUN_ROOT / STAGE / "request.json").get("mode") or "real"
+    if stage_already_completed(mode):
+        log(f"stage already completed historically; skipping rerun for mode={mode}")
+        resume_from_history(mode)
+        return 0
+    require_previous_passed()
+    log(f"stage start: mode={mode} app_root={APP_ROOT}")
     update_pipeline(STAGE, "running", mode=mode)
     update_status("running")
     try:
@@ -233,11 +274,13 @@ def main() -> int:
         else:
             run_real()
     except Exception as exc:
+        log(f"stage failed: {exc}")
         update_status("failed", str(exc))
         update_pipeline(STAGE, "failed", str(exc), mode=mode)
         raise
     update_status("passed")
     update_pipeline(NEXT_STAGE, "running", mode=mode)
+    log(f"stage passed; next_stage={NEXT_STAGE}")
     return 0
 
 

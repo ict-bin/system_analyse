@@ -13,9 +13,12 @@ from app.orchestrator import Orchestrator
 # ─── Stage 名映射 ────────────────────────────────────────────────────────────
 
 _STAGE_NAMES = {
-    1: "分类", "1": "分类",
-    2: "细分", "2": "细分",
-    3: "分析", "3": "分析",
+    1: "分类",
+    "1": "分类",
+    2: "细分",
+    "2": "细分",
+    3: "分析",
+    "3": "分析",
     "explore": "探索目录",
     "prescan": "预扫描",
     "filter": "文件过滤",
@@ -28,26 +31,30 @@ _STAGE_NAMES = {
     "3-redo-s4": "补做分析",
 }
 
+
 def _sname(stage) -> str:
     return _STAGE_NAMES.get(stage, str(stage))
+
 
 def _fmt_dur(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
     elif seconds < 3600:
-        return f"{seconds/60:.0f}m{seconds%60:.0f}s"
+        return f"{seconds / 60:.0f}m{seconds % 60:.0f}s"
     else:
-        return f"{seconds/3600:.0f}h{(seconds%3600)/60:.0f}m"
+        return f"{seconds / 3600:.0f}h{(seconds % 3600) / 60:.0f}m"
 
 
 # ─── 状态跟踪 ────────────────────────────────────────────────────────────────
+
 
 class CLIState:
     def __init__(self):
         self.current_stage = None
         self.current_module = None
-        self.module_start = 0.0         # 当前模块开始时间
+        self.module_start = 0.0  # 当前模块开始时间
         self.task_start = 0.0
+        self.current_attempt = None
         # 缓存 stage_result，等 judge 结果出来后一起输出
         self.pending_result: dict | None = None
 
@@ -59,6 +66,7 @@ class CLIState:
             return _fmt_dur(time.time() - self.module_start)
         return ""
 
+
 _st = CLIState()
 
 
@@ -68,37 +76,57 @@ def _flush_pending():
         return
     d = _st.pending_result
     _st.pending_result = None
-    stage = d.get('stage')
+    stage = d.get("stage")
     if stage == 1:
-        modules = d.get('modules', [])
-        count = d.get('module_count', len(modules))
-        preview = ', '.join(modules[:6])
+        modules = d.get("modules", [])
+        count = d.get("module_count", len(modules))
+        preview = ", ".join(modules[:6])
         if count > 6:
             preview += f" (+{count - 6})"
         print(f"    📂 {count} 个模块: {preview}")
     elif stage == "filter":
-        types = d.get('types', [])
-        arch = d.get('arch', 'all')
-        fc = d.get('file_count', 0)
-        arch_str = f" arch={arch}" if arch and arch != 'all' else ''
-        print(f"    📁 {fc} 个文件 (types: {', '.join(types) if isinstance(types,list) else types}{arch_str})")
+        types = d.get("types", [])
+        arch = d.get("arch", "all")
+        fc = d.get("file_count", 0)
+        arch_str = f" arch={arch}" if arch and arch != "all" else ""
+        print(
+            f"    📁 {fc} 个文件 (types: {', '.join(types) if isinstance(types, list) else types}{arch_str})"
+        )
     elif stage == 2 or stage == "2-redo" or stage == "2-redo-s4":
-        mod = d.get('module', '')
-        if d.get('skipped'):
-            fc = d.get('file_count', 0)
+        mod = d.get("module", "")
+        if d.get("skipped"):
+            fc = d.get("file_count", 0)
             print(f"  ▸ {mod} ({fc} files, 跳过)")
-        elif d.get('split'):
-            new = d.get('new_modules', [])
-            names = ', '.join(new[:5])
+        elif d.get("split"):
+            new = d.get("new_modules", [])
+            names = ", ".join(new[:5])
             if len(new) > 5:
-                names += f" (+{len(new)-5})"
+                names += f" (+{len(new) - 5})"
             print(f"      ↳ 拆分 → {names}")
+        else:
+            print(f"      ↳ 保持模块不变")
     elif stage == "2-sub":
-        lines = d.get('file_count', 0)
-        print(f"      📖 摘要完成 ({lines} 个文件)")
+        lines = d.get("summary_lines", 0)
+        print(f"      📖 摘要完成 ({lines} 行)")
+    elif stage == 3 or stage == "3-redo" or stage == "3-redo-s4":
+        mod = d.get("module", "")
+        has_report = d.get("has_report")
+        if has_report is None:
+            print(f"      📝 {mod} 分析已产出")
+        else:
+            status = (
+                "已生成 module_report.md" if has_report else "未见 module_report.md"
+            )
+            print(f"      📝 {mod} {status}")
+    elif stage == "4b":
+        status = (
+            "已生成 final_report.md" if d.get("has_report") else "未见 final_report.md"
+        )
+        print(f"    📄 {status}")
 
 
 # ─── 渲染 ────────────────────────────────────────────────────────────────────
+
 
 def render_event(event: SwarmEvent, quiet: bool = False):
     if quiet:
@@ -113,9 +141,9 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         print(f"{'─' * 60}")
 
     elif t == "stage":
-        stage = d.get('stage')
-        mod = d.get('module', '')
-        att = d.get('attempt', 1)
+        stage = d.get("stage")
+        mod = d.get("module", "")
+        att = d.get("attempt", 1)
 
         # Stage 切换时打标题
         if stage != _st.current_stage and stage != "2-sub":
@@ -126,41 +154,49 @@ def render_event(event: SwarmEvent, quiet: bool = False):
             print(f"{'━' * 60}")
 
         # 模块切换时打印开始提示
-        if mod and mod != _st.current_module:
-            _flush_pending()
-            _st.current_module = mod
-            _st.module_start = time.time()
-            if stage != "2-sub":
-                print(f"  ▸ {mod}", flush=True)
+        if mod and (mod != _st.current_module or att == 1):
+            if mod != _st.current_module:
+                _flush_pending()
+                _st.current_module = mod
+                _st.module_start = time.time()
+                if stage != "2-sub":
+                    print(f"  ▸ {mod}", end="", flush=True)
+        if stage != "2-sub" and att != _st.current_attempt:
+            _st.current_attempt = att
+            if mod:
+                print(f" (attempt {att})", flush=True)
+            else:
+                print(f"  · attempt {att}")
 
         # 子 Worker batch 进度（每批独立行，并行不互相覆盖）
         if stage == "2-sub":
-            batch = d.get('batch', 0)
-            total = d.get('total', 0)
+            batch = d.get("batch", 0)
+            total = d.get("total", 0)
             if batch and total:
                 print(f"    📖 [{mod}] 读取 {batch}/{total}", flush=True)
 
     elif t == "stage_result":
         _st.pending_result = d
-        if d.get('stage') == "2-sub":
-            fc = d.get('file_count', 0)
-            print(f"      📖 [{mod if mod else d.get('module','')}] 摘要完成 ({fc} 个文件)")
+        if d.get("stage") == "2-sub":
+            fc = d.get("file_count", 0)
+            print(
+                f"      📖 [{mod if mod else d.get('module', '')}] 摘要完成 ({fc} 个文件)"
+            )
             _flush_pending()
 
     elif t == "judge_eval":
         _flush_pending()
         passed = d.get("passed")
-        score = d.get('score', 0)
-        judge = d.get('judge_id', 'judge-0')
-        att_val = d.get('attempt', _st.module_start)  # fallback
+        score = d.get("score", 0)
+        judge = d.get("judge_id", "judge-0")
         dur = _st.module_elapsed()
 
-        mod_label = d.get('module', _st.current_module or '')
+        mod_label = d.get("module", _st.current_module or "")
         prefix = f"  ▸ {mod_label}" if mod_label else "  "
         if passed:
             print(f"{prefix}  ✅ {judge}={score}  {dur}")
         else:
-            att = d.get('attempt', 0)
+            att = d.get("attempt", 0)
             print(f"{prefix}  · {judge}={score} retry[{att}]")
 
     elif t == "reflect":
@@ -175,11 +211,14 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         print(f"\n  ❌ {d.get('error', '')[:200]}", file=sys.stderr)
 
     elif t == "model":
-        stage = d.get('stage', '')
+        stage = d.get("stage", "")
         parts = [f"stage={stage}"]
-        if 'worker' in d: parts.append(f"worker={d['worker'].split('/')[-1]}")
-        if 'model' in d: parts.append(f"model={d['model'].split('/')[-1]}")
-        if 'judge' in d: parts.append(f"judge={d['judge'].split('/')[-1]}")
+        if "worker" in d:
+            parts.append(f"worker={d['worker'].split('/')[-1]}")
+        if "model" in d:
+            parts.append(f"model={d['model'].split('/')[-1]}")
+        if "judge" in d:
+            parts.append(f"judge={d['judge'].split('/')[-1]}")
         print(f"    🤖 {' | '.join(parts)}")
 
     elif t == "error":
@@ -188,15 +227,18 @@ def render_event(event: SwarmEvent, quiet: bool = False):
 
     elif t == "task_end":
         _flush_pending()
-        status = d.get('status', '').upper()
+        status = d.get("status", "").upper()
         icon = "✅" if status == "PASSED" else "❌"
         print(f"\n{'═' * 60}")
         print(f"  {icon} {status}    [{_st.elapsed()}]")
         print(f"{'═' * 60}")
         if d.get("report"):
             print(f"  📄 {d.get('report')}")
-        if d.get("modules"):
-            print(f"  📂 {d.get('modules')}")
+        modules = d.get("modules")
+        if modules:
+            print(f"  📂 {modules}")
+        elif d.get("module_count") is not None:
+            print(f"  📂 module_count={d.get('module_count')}")
         if d.get("archive"):
             print(f"  📦 {d.get('archive')}")
 
@@ -215,7 +257,7 @@ _CONFIG_SEARCH = [
 
 async def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("用法: python3 cli.py \"对解包后的所有文件进行威胁分析与模块分析\"")
+        print('用法: python3 cli.py "对解包后的所有文件进行威胁分析与模块分析"')
         sys.exit(0)
 
     quiet = "--quiet" in sys.argv
