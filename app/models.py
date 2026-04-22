@@ -187,6 +187,8 @@ class ServiceConfig(BaseModel):
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
+    start_stage: int = Field(default=1, description="从指定阶段开始（1=全流程，3=跳过S1/S2直接S3）")
+    resume_workspace: str = Field(default="", description="已有的 workspace 路径，start_stage>1 时使用")
 
 
 # ─── 运行时任务 ───────────────────────────────────────────────────────────────
