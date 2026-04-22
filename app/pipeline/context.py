@@ -81,4 +81,4 @@ class PipelineContext:
     def emit_event(self, event_type: str, **data):
         """便捷 emit，自动带 task_id"""
         from ..models import SwarmEvent
-        self.emit(SwarmEvent(type=event_type, data={"task_id": self.task_id, **data}))
+        self.emit(SwarmEvent(type=event_type, task_id=self.task_id, data=data))

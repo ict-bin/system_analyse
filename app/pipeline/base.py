@@ -31,7 +31,7 @@ class Pipeline:
     def __init__(self, stages: list[BaseStage]):
         self._stages = sorted(stages, key=lambda s: s.stage_num)
 
-    async def run(self, ctx: PipelineContext, start_stage: int = 1) -> PipelineContext:
+    async def run(self, ctx: PipelineContext, start_stage: int = 0) -> PipelineContext:
         for stage in self._stages:
             if stage.stage_num < start_stage:
                 ctx.emit_event(
