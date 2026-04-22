@@ -212,6 +212,10 @@ class TaskConfig(BaseModel):
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
+    # 恢复运行：跳过前 N-1 阶段，直接从第 start_stage 阶段开始
+    # start_stage=3 时必须同时指定 resume_workspace 指向已有 workspace 路径
+    start_stage: int = Field(default=1, description="从指定阶段开始（1=全流程，3=跳过S1/S2直接S3）")
+    resume_workspace: str = Field(default="", description="已有的 workspace 路径，start_stage>1 时使用")
 
     @property
     def worker_count(self) -> int:

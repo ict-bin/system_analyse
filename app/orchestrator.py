@@ -242,12 +242,20 @@ class Orchestrator:
         start = time.time()
         self._cancel_event = asyncio.Event()
 
-        out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        sess_dir = out_dir / "sessions"
-        sess_dir.mkdir(exist_ok=True)
-        workspace = out_dir / "workspace"
-        workspace.mkdir(exist_ok=True)
+        # ── resume_workspace: 直接使用已有 workspace（跳过 Stage 1/2）──
+        if cfg.resume_workspace and cfg.start_stage > 1:
+            workspace = Path(os.path.abspath(cfg.resume_workspace))
+            out_dir = workspace.parent
+            task_id = out_dir.name  # 继承原 task_id
+            sess_dir = out_dir / "sessions"
+            sess_dir.mkdir(exist_ok=True)
+        else:
+            out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            sess_dir = out_dir / "sessions"
+            sess_dir.mkdir(exist_ok=True)
+            workspace = out_dir / "workspace"
+            workspace.mkdir(exist_ok=True)
 
         result = TaskResult(task_id=task_id, status=TaskStatus.RUNNING,
                             task=cfg.task, config_snapshot=cfg.model_dump())
@@ -298,6 +306,9 @@ class Orchestrator:
         tokens = TokenUsage()
 
         try:
+            # ── resume: start_stage>=3 时跳过 Stage 0-2 ──────────
+            _skip_s12 = (cfg.start_stage >= 3 and bool(cfg.resume_workspace))
+
             # ═══════════════════════════════════════════════════
             # Stage 0: 文件类型过滤
             # ═══════════════════════════════════════════════════
@@ -711,6 +722,16 @@ class Orchestrator:
                                msg=f"Stage2 全局检查: 全部 {len(all_target)} 个文件已归类 ✅")
 
             # ═══════════════════════════════════════════════════
+            # ── resume 时从已有 workspace 加载模块列表 ──
+            if _skip_s12:
+                _mods_root = _get_modules_root(str(workspace))
+                final_modules = [
+                    d.name for d in _mods_root.iterdir()
+                    if d.is_dir() and (d / "files.list").exists()
+                ]
+                self._emit("log", task_id, level="info",
+                           msg=f"resume: 从 workspace 加载 {len(final_modules)} 个模块，跳过 Stage 0-2")
+
             # Stage 3: 子文件夹分析（parallel_modules 并行）
             # ═══════════════════════════════════════════════════
             s_cfg = cfg.stages.analyse

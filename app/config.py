@@ -47,6 +47,8 @@ def build_task_config(svc: ServiceConfig, prompt: str) -> TaskConfig:
         output_dir=svc.output_dir,
         archive_dir=svc.archive_dir,
         result_dir=svc.result_dir,
+        start_stage=svc.start_stage,
+        resume_workspace=svc.resume_workspace,
     )
 
     _backfill_role(cfg.workers)
