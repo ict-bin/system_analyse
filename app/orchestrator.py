@@ -751,13 +751,20 @@ class Orchestrator:
                         self._emit("stage", task_id, stage=3,
                                    module=mod_name, attempt=attempt + 1)
 
-                        prompt_parts = [f"分析模块 `{mod_name}` 的所有文件。"]
+                        _nl = chr(10)
+                        prompt_parts = [
+                            f"分析模块 `{mod_name}` 的所有文件。",
+                            f"",
+                            f"⚠️ 路径说明（cwd=workspace根目录）：",
+                            f"- 文件列表：`modules/{mod_name}/files.list`",
+                            f"- 报告输出：`modules/{mod_name}/module_report.md`（必须写入此路径）",
+                        ]
                         if file_summary:
-                            prompt_parts.append(chr(10)*2 + "## 文件摘要（子 Worker 已分析）" + chr(10)*2 + file_summary)
+                            prompt_parts.append(_nl*2 + "## 文件摘要（子 Worker 已分析）" + _nl*2 + file_summary)
                         if feedback:
-                            prompt_parts.append(chr(10)*2 + feedback)
+                            prompt_parts.append(_nl*2 + feedback)
                         ar = await _run_agent_checked(
-                            prompt=chr(10).join(prompt_parts),
+                            prompt=_nl.join(prompt_parts),
                             model=_wm("analyse"),
                             system_prompt=w_sys_prompt,
                             session_file=analyse_session,

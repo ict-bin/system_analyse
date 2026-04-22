@@ -6,10 +6,9 @@
 
 # 步骤
 
-1. 使用 `read` 读取 `files.list` 获取文件列表（每行是相对路径）
-2. 逐个使用 `read` 读取文件（在路径前加 `/data/target/` 前缀）
-   例如 files.list 中的 `lib/libcrypto.so` → 读取 `/data/target/lib/libcrypto.so`
-3. 将分析结果写入 `module_report.md`
+1. 读取 `modules/<模块名>/files.list` 获取文件列表（每行是相对路径）
+2. 逐个分析文件内容（二进制文件用 `bash -c "strings -n 6 /data/target/<路径> | head -50"` 提取符号）
+3. **必须**将分析结果写入 `modules/<模块名>/module_report.md`（完整路径，相对于 workspace 根目录）
 
 # module_report.md 必须包含
 
