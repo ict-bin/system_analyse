@@ -804,6 +804,64 @@ def test_orchestrator_stop():
 
 # ─── Runner ──────────────────────────────────────────────────────────────────
 
+
+# ─── 13. Stage 3-redo 模块筛选逻辑 ────────────────────────────────────────────
+
+def test_redo_analyse_only_new_and_nonempty():
+    """Stage 3-redo 只处理新子模块 + 非空的原始重分类模块，排除空壳。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        mods = Path(tmp)
+        # 创建模拟目录结构
+        for m, c in [
+            ("bgp",  "bgp.so"),
+            ("ospf", "ospf.so"),
+            ("auth_ssh",     "libssh.so"),
+            ("auth_hardware","libhw.so"),
+        ]:
+            (mods/m).mkdir(); (mods/m/"files.list").write_text(c + chr(10))
+        # auth 为空壳（拆分后文件已移走）
+        (mods/"auth").mkdir(); (mods/"auth"/"files.list").write_text("")
+
+        final_modules = {"auth", "bgp", "ospf"}
+        modules_needing_reclassify = {"auth"}
+        new_mods_set = {"bgp","ospf","auth","auth_ssh","auth_hardware"}
+
+        # 复现修复后的筛选逻辑
+        redo = []
+        for m in new_mods_set:
+            if m not in final_modules:
+                redo.append(m)
+            elif m in modules_needing_reclassify:
+                flist = mods/m/"files.list"
+                if flist.exists() and flist.stat().st_size > 0:
+                    redo.append(m)
+        redo = sorted(redo)
+        assert redo == ["auth_hardware", "auth_ssh"], f"空壳应被排除: {redo}"
+    print("  ✅ redo_analyse 排除空壳原始模块，只含新子模块")
+
+
+def test_redo_analyse_nonempty_original_included():
+    """原始模块未被拆分（files.list非空）时，应进入 redo_analyse。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        mods = Path(tmp)
+        for m, c in [("bgp","bgp.so"),("ospf","ospf.so"),("auth","libauth.so")]:
+            (mods/m).mkdir(); (mods/m/"files.list").write_text(c + chr(10))
+        # auth 没有子模块（Stage 2-redo 决定不拆）
+        final_modules = {"auth","bgp","ospf"}
+        modules_needing_reclassify = {"auth"}
+        new_mods_set = {"bgp","ospf","auth"}
+
+        redo = []
+        for m in new_mods_set:
+            if m not in final_modules:
+                redo.append(m)
+            elif m in modules_needing_reclassify:
+                flist = mods/m/"files.list"
+                if flist.exists() and flist.stat().st_size > 0:
+                    redo.append(m)
+        assert sorted(redo) == ["auth"], f"非空原始模块应进入redo: {redo}"
+    print("  ✅ redo_analyse 非空原始模块（未拆分）正确包含")
+
 TESTS = [
     # helpers
     test_parse_eval_md_standard,
@@ -849,6 +907,9 @@ TESTS = [
     # orchestrator 薄层
     test_orchestrator_delegates_to_legacy,
     test_orchestrator_stop,
+    # Stage 3-redo 筛选
+    test_redo_analyse_only_new_and_nonempty,
+    test_redo_analyse_nonempty_original_included,
 ]
 
 

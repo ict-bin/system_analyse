@@ -936,9 +936,21 @@ class Orchestrator:
                         raise StageError(
                             f"Stage 2-redo 模块 {mod_name} 重分类未通过")
 
-                # 重分类后的模块也需要 Stage 3 分析
+                # Stage 3-redo: 只处理两类模块：
+                #   1. 重分类产生的新子模块（在 new_mods 但不在 final_modules）
+                #   2. 原始需重分类模块中 files.list 非空的（避免空壳）
                 new_mods = _discover_modules(str(workspace))
-                redo_analyse = [m for m in new_mods if m not in final_modules or m in modules_needing_reclassify]
+                mods_root = _get_modules_root(str(workspace))
+                redo_analyse = []
+                for _m in new_mods:
+                    if _m not in final_modules:
+                        # 新产生的子模块
+                        redo_analyse.append(_m)
+                    elif _m in modules_needing_reclassify:
+                        # 原始模块：files.list 非空才重分析（排除空壳）
+                        _flist = mods_root / _m / "files.list"
+                        if _flist.exists() and _flist.stat().st_size > 0:
+                            redo_analyse.append(_m)
                 if redo_analyse:
                     self._emit("stage", task_id, stage="3-redo", modules=redo_analyse)
                     s_cfg_a = cfg.stages.analyse
