@@ -759,14 +759,19 @@ class Orchestrator:
                     pre_read_content = await loop.run_in_executor(
                         None, self._pre_read_module, cfg.target_dir, mod_dir
                     )
+                    # 解析前缀标记：是否含非-ELF 文本文件
+                    has_text = pre_read_content.startswith('__HAS_TEXT__' + chr(10))
+                    if has_text:
+                        pre_read_content = pre_read_content[len('__HAS_TEXT__' + chr(10)):]
                     # 将模板占位符替换
                     w_sys = w_sys_prompt.replace(
                         "{{PRE_READ_CONTENT}}", pre_read_content
                     ).replace(
                         "{{MODULE_NAME}}", mod_name
                     )
-                    # Worker 不需要读文件，只需要 write 写报告
-                    w_tools_s3 = ["write"]
+                    # 纯 ELF 模块: 只需写报告
+                    # 含文本文件: 需要 read 工具读取其他内容
+                    w_tools_s3 = ["read", "write"] if has_text else ["write"]
 
                     for attempt in range(self._max_iter(s_cfg)):
                         self._emit("stage", task_id, stage=3,
@@ -961,6 +966,10 @@ class Orchestrator:
                         pre_content = await asyncio.get_event_loop().run_in_executor(
                             None, self._pre_read_module, cfg.target_dir, mod_dir
                         )
+                        # 解析前缀标记
+                        _has_text_redo = pre_content.startswith('__HAS_TEXT__' + chr(10))
+                        if _has_text_redo:
+                            pre_content = pre_content[len('__HAS_TEXT__' + chr(10)):]
                         w_sys_redo = w_sys_analyse.replace(
                             "{{PRE_READ_CONTENT}}", pre_content
                         ).replace(
@@ -980,7 +989,7 @@ class Orchestrator:
                                 model=_wm("analyse"),
                                 prompt="\n".join(prompt_parts),
                                 system_prompt=w_sys_redo,
-                                tools=["write"],
+                                tools=["read", "write"] if _has_text_redo else ["write"],
                                 session_file=analyse_session,
                                 cwd=str(workspace),
                                 max_retries=w_base.get("max_retries", 1),
@@ -1524,14 +1533,22 @@ class Orchestrator:
             else:
                 try:
                     with open(fp, encoding='utf-8', errors='replace') as f:
-                        lines = f.read().splitlines()[:120]
-                    return relpath, 'text', {"lines": lines}
+                        content_full = f.read()
+                    return relpath, 'text', {"content": content_full}
                 except Exception:
                     return relpath, 'binary', {}
 
         # 并行读取全部文件（无数量上限）
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             futs = [(rp, pool.submit(_read_one, rp)) for rp in files]
+
+        # 非-ELF 文本内容共享总字符上限，防止大模块 OOM
+        # ELF 符号表已在 _read_one_elf 内截断，不占此预算
+        TEXT_TOTAL_CHAR_LIMIT = 150_000   # ~150KB 总上限
+        TEXT_FILE_CHAR_LIMIT  = 8_000     # 单文件最多展示 8KB
+        text_chars_used = 0
+        has_text_files = False
+        truncated_files: list[str] = []
 
         parts = []
         for rp, fut in futs:
@@ -1558,14 +1575,43 @@ class Orchestrator:
                     parts.append(f"strings头部 ({len(sh)}行):")
                     parts.append("```"); parts.extend(sh); parts.append("```")
             elif ftype == 'text':
-                lines = data.get('lines', [])
-                parts.append(f"类型: 文本文件 ({len(lines)}行):")
-                parts.append("```"); parts.extend(lines); parts.append("```")
+                has_text_files = True
+                full = data.get('content', '')
+                if text_chars_used >= TEXT_TOTAL_CHAR_LIMIT:
+                    # 总预算耗尽：只列路径，提示可用 read 工具
+                    truncated_files.append(rp)
+                    parts.append(chr(10).join([
+                        "类型: 文本文件",
+                        "〔内容已略去（总预算已满），可用 read 工具获取完整内容〕",
+                    ]))
+                else:
+                    remaining = TEXT_TOTAL_CHAR_LIMIT - text_chars_used
+                    take = min(len(full), TEXT_FILE_CHAR_LIMIT, remaining)
+                    snippet = full[:take]
+                    total_lines = full.count(chr(10)) + 1
+                    shown_lines = snippet.count(chr(10)) + 1
+                    text_chars_used += take
+                    is_cut = take < len(full)
+                    cut_note = (f"  (前{shown_lines}行/{total_lines}行，已截断"
+                                f"，余下内容可用 read 工具获取)") if is_cut else f"  ({total_lines}行)"
+                    parts.append(f"类型: 文本文件{cut_note}:")
+                    parts.append("```"); parts.extend(snippet.splitlines()); parts.append("```")
             elif ftype == 'missing':
                 parts.append("(文件不存在 target_dir)")
             else:
                 parts.append(f"类型: {ftype}")
-        return chr(10).join(parts)
+
+        if truncated_files:
+            parts.append("")
+            parts.append(f"⚠️ 以下 {len(truncated_files)} 个文件因总内容超限未展示，"
+                         f"可用 read 工具直接读取：")
+            for tf in truncated_files:
+                parts.append(f"  - /data/target/{tf}")
+
+        result_str = chr(10).join(parts)
+        # 前缀标记是否含非-ELF 文件，供调用方决定 worker tools
+        prefix = '__HAS_TEXT__' + chr(10) if has_text_files else ''
+        return prefix + result_str
 
     async def _collect_file_summaries(
         self, task_id: str, mod_name: str, mod_dir: Path,
