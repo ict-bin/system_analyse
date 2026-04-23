@@ -47,6 +47,21 @@ echo "Modules:$MODULES"
 echo "Missing files: $MISSING_COUNT"
 echo "Duplicate files: $DUP_COUNT"
 
+# 诊断：missing 过多时检查目录结构，给 Worker 明确反馈
+if [ "$MISSING_COUNT" -gt 100 ]; then
+    echo ""
+    echo "=== DIAGNOSIS: 目录结构异常 ==="
+    if [ -d "$WORKSPACE_DIR/modules" ] && [ "$(ls -A "$WORKSPACE_DIR/modules" 2>/dev/null)" ]; then
+        echo "modules/ 已存在且非空"
+    else
+        echo "⚠ 错误原因: modules/ 目录不存在或为空！"
+        echo "  Worker 可能将模块写到了错误位置，当前 workspace 根目录内容:"
+        ls "$WORKSPACE_DIR/" | grep -vE '^filtered_files|^keywords|^\.'
+        echo "  必须修正: 将所有模块目录移入 modules/ 下"
+        echo "  正确结构: modules/<模块名>/files.list"
+    fi
+fi
+
 if [ "$MISSING_COUNT" -gt 0 ]; then
     echo ""
     echo "=== MISSING FILES ==="
