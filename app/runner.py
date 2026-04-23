@@ -203,6 +203,8 @@ _RETRYABLE_API_PATTERNS = [
     "network_error",        # gptplus5 并发超限
     "finish_reason",        # provider finish_reason: network_error
     "too many requests",    # 429 另一种表达
+    "ENOBUFS",              # pipe buffer 满（大响应导致）
+    "EPIPE",                # 管道断裂
 ]
 
 # 速率限制模式：这些关键词匹配时延长待机时间
@@ -526,6 +528,20 @@ async def _run_with_api_retry(
                     buffer.decode("utf-8", errors="replace"), result, on_stream
                 )
 
+            # agent_ended 后必须继续 drain stdout 直到 EOF，
+            # 否则 pi 继续写导致 pipe buffer 满 → ENOBUFS
+            if agent_ended:
+                try:
+                    async def _drain_stdout():
+                        assert proc.stdout is not None
+                        while True:
+                            chunk = await proc.stdout.read(65536)
+                            if not chunk:
+                                break
+                    await asyncio.wait_for(_drain_stdout(), timeout=10.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
             # 关闭 stdin → pi 检测 EOF 后退出
             try:
                 proc.stdin.close()
@@ -631,6 +647,19 @@ async def _run_with_api_retry(
 
         # ── 成功或不可重试的未知错误 ──
         if result.exit_code != 0 and result.error:
+            err_lower = (result.error or "").lower()
+            # ENOBUFS/EPIPE 是可重试的管道错误，不属于“不可重试”
+            if any(p in err_lower for p in ("enobufs", "epipe", "broken pipe")):
+                api_attempt += 1
+                can_retry = (max_retries == -1) or (api_attempt <= max_retries)
+                if can_retry:
+                    delay = _backoff(retry_delay, api_attempt)
+                    _log_warn(
+                        f"管道错误 [{api_attempt}/{_fmt_max(max_retries)}], {delay:.0f}s 后重试: "
+                        f"{(result.error or '')[:200]}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
             _log_warn(
                 f"pi 退出码 {result.exit_code} (有输出，不重试): {result.error[:200]}"
             )
