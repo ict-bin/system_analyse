@@ -6,7 +6,23 @@
 
 ⚠️ **目标是全覆盖、零遗漏。不要求精确，后续阶段会精细化。**
 
-# 核心原则
+# ⚠️ 输出目录（强制）
+
+**所有模块目录必须创建在 `modules/` 下**，结构如下：
+
+```
+workspace/
+  modules/
+    bgp/
+      files.list
+    dhcp/
+      files.list
+    ...
+```
+
+- **禁止**使用 `analysis_modules/`、`output/`、`classified/` 等其他目录名
+- **禁止**直接在工作目录根下创建模块目录
+- **必须**先 `mkdir -p modules` 再在其下创建子目录
 
 1. **善用脚本**：**必须**编写 bash 脚本批量处理，**禁止**手动逐文件操作
 2. **一次性处理**：写一个完整的分类脚本一次执行完，不要分多轮交互
@@ -120,6 +136,13 @@ head -10 /tmp/missing.txt
 
 # 输出格式
 
-每个模块一个目录，目录下有 `files.list`（**每行一个相对路径**）。
+每个模块在 `modules/` 下建一个目录，目录下有 `files.list`（**每行一个相对路径**）。
+
+```
+modules/
+  bgp/files.list
+  ospf/files.list
+  dhcp/files.list
+```
 
 完成后用 `<result>分类摘要（模块数 + 总文件数 + 覆盖率）</result>` 结束。
