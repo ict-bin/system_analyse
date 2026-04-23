@@ -13,9 +13,11 @@ Stage 2 做两件事：
 # ⚠️ 铁律
 
 1. **文件零丢失**：拆分前后该模块下的文件总数必须完全一致
-2. **子模块命名按实际功能/技术栈命名**（如 `mbedtls_crypto`、`openthread_core`、`nordic_radio`），**不要**以父模块名为前缀
-   - ✅ 正确：`mbedtls_docs`、`openthread_mac`、`nxp_platform`
-   - ❌ 错误：`crypto_certs_docs`、`kernel_modules_nxp_timers`（父模块名做前缀）
+2. **子模块命名规则**：
+   - **父模块名有语义**（如 `openthread`、`mbedtls`、`nrf5_sdk`）→ 可用 `<父名>_<功能>` 作前缀（如 `openthread_core`、`mbedtls_ssl`）
+   - **父模块名无语义**（`unknown`、`misc`、`other`、`shared_libraries` 等占位符）→ **必须**直接用功能名，禁止以无语义词做前缀
+     - ✅ `thread_core`、`mac_layer`、`coap_client`
+     - ❌ `unknown_core`、`misc_crypto`（无语义前缀）
    - 若子模块名与已有模块重名，才加最短必要前缀区分
 3. **所有文件操作必须用 bash 脚本**
 4. 拆分完成后**必须删除原模块目录**（文件已分散到子模块）
