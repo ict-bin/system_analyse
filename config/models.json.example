@@ -1,22 +1,46 @@
 {
     "providers": {
-        "gaiasec": {
-            "baseUrl": "http://gaiasec.ai.icsl.huawei.com/v1/",
+        "icsl_vllm_1": {
+            "baseUrl": "http://your-vllm-host:8000/v1/",
             "api": "openai-completions",
-            "apiKey": "GAIASEC_TOKEN",
-            "compat": {
-                "supportsDeveloperRole": false,
-                "supportsReasoningEffort": false
-            },
+            "apiKey": "1234",
             "models": [
                 {
-                    "id": "auto",
-                    "name": "auto",
-                    "reasoning": false,
-                    "input": ["text"],
-                    "contextWindow": 128000,
-                    "maxTokens": 8192,
-                    "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+                    "id": "zai-org/GLM-5",
+                    "reasoning": true
+                }
+            ]
+        },
+        "icsl_vllm_2": {
+            "baseUrl": "http://your-vllm-host:8003/v1/",
+            "api": "openai-completions",
+            "apiKey": "12345",
+            "models": [
+                {
+                    "id": "MiniMax/MiniMax-M2.5",
+                    "reasoning": true
+                }
+            ]
+        },
+        "gptplus_glm": {
+            "baseUrl": "https://your-api-proxy.com/v1",
+            "api": "openai-completions",
+            "apiKey": "GPTPLUS_API_KEY",
+            "models": [
+                {
+                    "id": "glm-5.1",
+                    "reasoning": true
+                }
+            ]
+        },
+        "gptplus_minimax": {
+            "baseUrl": "https://your-api-proxy.com/v1",
+            "api": "openai-completions",
+            "apiKey": "GPTPLUS_API_KEY",
+            "models": [
+                {
+                    "id": "MiniMax-M2.7",
+                    "reasoning": true
                 }
             ]
         }
