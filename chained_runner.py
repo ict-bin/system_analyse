@@ -230,6 +230,7 @@ def run_real() -> None:
     setup_data_links(input_dir, config_dir, output_dir)
     log(f"data links ready: target=/data/target config=/data/config output=/data/output")
 
+    cli_log_path = output_dir / "cli.log"
     try:
         cmd = [
             "python3", "cli.py",
@@ -239,10 +240,31 @@ def run_real() -> None:
         if os.environ.get("GAIASEC_CLI_QUIET", "").lower() in {"1", "true", "yes"}:
             cmd.append("--quiet")
         log(f"launching cli: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
-        log("cli finished successfully")
-    except subprocess.CalledProcessError as exc:
-        log(f"cli exited non-zero: returncode={exc.returncode}; continue to inspect outputs")
+        log(f"cli output → {cli_log_path}")
+        with open(cli_log_path, "w", encoding="utf-8", errors="replace") as cli_log:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,   # 合并 stderr→stdout
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            cli_log.write(result.stdout or "")
+            # 同时把 cli 输出转发到容器日志（截断避免刷屏）
+            for line in (result.stdout or "").splitlines()[-200:]:
+                logger.info("[cli] %s", line.rstrip())
+        if result.returncode != 0:
+            log(f"cli exited non-zero: returncode={result.returncode}; "  # noqa: G004
+                f"tail saved to {cli_log_path}")
+            # 把末尾 30 行摘要打到结构化日志，方便排查
+            tail = (result.stdout or "").strip().splitlines()[-30:]
+            logger.error("[cli-tail] %s", chr(10).join(tail))
+        else:
+            log("cli finished successfully")
+    except Exception as exc:
+        log(f"cli launch failed: {exc}")
+        logger.exception("cli subprocess exception")
 
     modules_dir = output_dir / "modules"
     modules = sorted(p.name for p in modules_dir.iterdir() if p.is_dir()) if modules_dir.is_dir() else []
