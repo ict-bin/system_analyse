@@ -1585,14 +1585,11 @@ class Orchestrator:
         for i in range(0, len(files), self.SUB_BATCH_SIZE):
             batches.append(files[i:i + self.SUB_BATCH_SIZE])
 
-        # 大模块自动扩大并发：批次多时不应受 parallel_sub_workers 限制
-        # 上限取 min(批次数, parallel*4, 16) 避免 API 过载
-        effective_parallel = min(len(batches), parallel * 4, 16)
         self._emit("stage", task_id, stage="2-sub",
                    module=mod_name, batches=len(batches), files=len(files),
-                   parallel=effective_parallel)
+                   parallel=parallel)
 
-        semaphore = asyncio.Semaphore(max(1, effective_parallel))
+        semaphore = asyncio.Semaphore(max(1, parallel))
         results: list[str | None] = [None] * len(batches)
 
         async def _run_batch(idx: int, batch: list[str]) -> None:
