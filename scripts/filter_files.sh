@@ -34,6 +34,7 @@ else
             firmware)     EXT_PATTERNS="$EXT_PATTERNS .bin .img .dtb .dts .rom .fw .fpga .hex .srec .ubifs .squashfs" ;;
             crypto)       EXT_PATTERNS="$EXT_PATTERNS .pem .crt .cer .key .csr .p12 .pfx .sig .cms .crl" ;;
             database)     EXT_PATTERNS="$EXT_PATTERNS .db .sqlite .sqlite3 .sql .mdb .ldb" ;;
+            source)       EXT_PATTERNS="$EXT_PATTERNS .c .h .cpp .cc .cxx .c++ .hpp .hh .hxx .inc .inl .ipp .S .s .asm" ;;
             web)          EXT_PATTERNS="$EXT_PATTERNS .html .htm .css .js .jsx .ts .php .jsp .vue .svg" ;;
             network_model) EXT_PATTERNS="$EXT_PATTERNS .yang .mib .asn .asn1 .proto .protobuf .xsd .wsdl .ncf" ;;
             document)     EXT_PATTERNS="$EXT_PATTERNS .md .txt .rst .log .csv .pdf" ;;

@@ -124,6 +124,13 @@ ANALYSE_TYPES = {
                        ".php", ".jsp", ".vue", ".svg"],
         "magic": ["HTML"],
     },
+    "source": {
+        "desc": "C/C++ 源代码、汇编",
+        "extensions": [".c", ".h", ".cpp", ".cc", ".cxx", ".c++",
+                       ".hpp", ".hh", ".hxx", ".inc", ".inl", ".ipp",
+                       ".S", ".s", ".asm"],
+        "magic": [],
+    },
     "network_model": {
         "desc": "网络模型/协议定义",
         "extensions": [".yang", ".mib", ".asn", ".asn1", ".proto", ".protobuf",
@@ -166,7 +173,7 @@ def get_analyse_filter(types: list[str]) -> dict:
 class ServiceConfig(BaseModel):
     analyse_targets: list[str] = Field(
         default=["all"],
-        description="分析目标文件类型，可组合: binary/script/config/firmware/crypto/database/web/network_model/document/archive/all"
+        description="分析目标文件类型，可组合: binary/script/source/config/firmware/crypto/database/web/network_model/document/archive/all"
     )
     binary_arch: list[str] = Field(
         default=["all"],
