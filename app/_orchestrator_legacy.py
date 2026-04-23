@@ -1467,11 +1467,40 @@ class Orchestrator:
             return ('unknown', [])
 
     @staticmethod
-    def _pre_read_module(target_dir: str, mod_dir: "Path") -> str:
-        """预读模块所有文件，返回注入 prompt 的文本块。
+    def _read_one_elf(fullpath: str) -> dict:
+        """ELF 三层提取：nm 导出/导入符号 + readelf 依赖库 + strings 头部。"""
+        import subprocess as sp, re as _re
+        res = {"exports": [], "imports": [], "needed": [], "strings_head": []}
+        try:
+            r = sp.run(["nm", "-D", fullpath], capture_output=True, text=True, timeout=15)
+            for line in r.stdout.splitlines():
+                p = line.split()
+                if len(p) >= 3:
+                    st, sn = p[-2], p[-1]
+                    if st in ('T', 't'): res["exports"].append(sn)
+                    elif st == 'U':      res["imports"].append(sn)
+                elif len(p) == 2 and p[0] == 'U':
+                    res["imports"].append(p[1])
+            res["exports"] = res["exports"][:300]
+            res["imports"] = res["imports"][:150]
+            r = sp.run(["readelf", "-d", fullpath], capture_output=True, text=True, timeout=15)
+            for line in r.stdout.splitlines():
+                if "NEEDED" in line:
+                    m = _re.search(r'\[([^\]]+)\]', line)
+                    if m: res["needed"].append(m.group(1))
+            r = sp.run(["strings", "-n", "6", fullpath], capture_output=True, text=True, timeout=15)
+            res["strings_head"] = r.stdout.splitlines()[:50]
+        except Exception:
+            pass
+        return res
 
-        这样 Stage 3 Worker 收到 prompt 时就有全部内容，
-        无需再调用 bash/read tool，可以设置 tools=[\"write\"]。
+    @staticmethod
+    def _pre_read_module(target_dir: str, mod_dir: "Path") -> str:
+        """预读模块所有文件，注入结构化内容到 prompt。
+
+        ELF: nm 导出符号(攻击面) + 导入符号(危险函数) + readelf 依赖库 + strings头部。
+        实测: 29文件模块约 25K tokens，GLM-5 上限 202K，安全，无需文件数上限。
+        Worker 可以设置 tools=["write"]，无需再用 nm/readelf/strings。
         """
         import concurrent.futures
         _cls = Orchestrator
@@ -1479,44 +1508,63 @@ class Orchestrator:
             flist = (mod_dir / "files.list").read_text("utf-8").strip().splitlines()
         except OSError:
             return "(files.list 不可读)"
-
         files = [l.strip() for l in flist if l.strip()]
         if not files:
             return "(模块文件列表为空)"
 
-        parts = []
-        # 并行预读（线程池），最多16个文件
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [
-                (relpath, pool.submit(
-                    _cls._pre_read_file,
-                    str((Path(target_dir) / relpath))
-                ))
-                for relpath in files[:16]  # 防止超上下文
-            ]
-            for relpath, fut in futures:
+        def _read_one(relpath: str):
+            fp = str(Path(target_dir) / relpath)
+            try:
+                with open(fp, 'rb') as f:
+                    magic = f.read(4)
+            except OSError:
+                return relpath, 'missing', {}
+            if magic == b'ELF':
+                return relpath, 'ELF', _cls._read_one_elf(fp)
+            else:
                 try:
-                    ftype, lines = fut.result(timeout=15)
+                    with open(fp, encoding='utf-8', errors='replace') as f:
+                        lines = f.read().splitlines()[:120]
+                    return relpath, 'text', {"lines": lines}
                 except Exception:
-                    ftype, lines = 'unknown', []
+                    return relpath, 'binary', {}
 
-                parts.append(f"### {relpath}")
-                if ftype == 'ELF':
-                    parts.append(f"类型: ELF 二进制 (AArch64)")
-                    parts.append(f"strings 输出 ({len(lines)} 条):")
-                    parts.append("```")
-                    parts.extend(lines)
-                    parts.append("```")
-                elif ftype == 'text':
-                    parts.append(f"类型: 文本文件 ({len(lines)} 行)")
-                    parts.append("```")
-                    parts.extend(lines)
-                    parts.append("```")
-                else:
-                    parts.append(f"类型: {ftype} (无法解析内容)")
+        # 并行读取全部文件（无数量上限）
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            futs = [(rp, pool.submit(_read_one, rp)) for rp in files]
 
-        if len(files) > 16:
-            parts.append(f"\n*(仅展示前16个文件，共{len(files)}个)*")
+        parts = []
+        for rp, fut in futs:
+            try:
+                _, ftype, data = fut.result(timeout=20)
+            except Exception:
+                ftype, data = 'unknown', {}
+            parts.append(f"### {rp}")
+            if ftype == 'ELF':
+                exports = data.get('exports', [])
+                imports = data.get('imports', [])
+                needed  = data.get('needed', [])
+                sh      = data.get('strings_head', [])
+                parts.append("类型: ELF 共享库 (AArch64)")
+                if needed:
+                    parts.append(f"依赖库: {', '.join(needed)}")
+                if exports:
+                    parts.append(f"导出函数 ({len(exports)}个, 对外攻击面):")
+                    parts.append("```"); parts.extend(exports); parts.append("```")
+                if imports:
+                    parts.append(f"外部调用 ({len(imports)}个, 含潜在危险函数):")
+                    parts.append("```"); parts.extend(imports); parts.append("```")
+                if sh:
+                    parts.append(f"strings头部 ({len(sh)}行):")
+                    parts.append("```"); parts.extend(sh); parts.append("```")
+            elif ftype == 'text':
+                lines = data.get('lines', [])
+                parts.append(f"类型: 文本文件 ({len(lines)}行):")
+                parts.append("```"); parts.extend(lines); parts.append("```")
+            elif ftype == 'missing':
+                parts.append("(文件不存在 target_dir)")
+            else:
+                parts.append(f"类型: {ftype}")
         return chr(10).join(parts)
 
     async def _collect_file_summaries(
