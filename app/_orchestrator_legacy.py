@@ -686,7 +686,7 @@ class Orchestrator:
                         for rc_attempt in range(min(3, self._max_iter(s2rc_cfg))):
                             rc_ar = await _run_agent_checked(
                                 prompt=reclass_prompt,
-                                model=self._wm("classify"),
+                                model=_wm("classify"),
                                 tools=w_base["tools"],
                                 system_prompt=reclass_prompt_tmpl,
                                 cwd=str(workspace),
