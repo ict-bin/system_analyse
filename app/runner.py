@@ -21,12 +21,11 @@ import json
 import logging
 import os
 import shutil
-import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from .logging_utils import log_event
 from .models import TokenUsage
 
 logger = logging.getLogger("sa.runner")
@@ -35,6 +34,7 @@ _MAX_BACKOFF = 300  # 退避上限 5 分钟
 
 
 # ─── 结果类 ───────────────────────────────────────────────────────────────────
+
 
 class AgentResult:
     """单个 Agent 执行的结果。"""
@@ -50,37 +50,36 @@ class AgentResult:
 
 # ─── 内部异常 ─────────────────────────────────────────────────────────────────
 
+
 class _PiProcessError(Exception):
     """pi 进程级错误（非 API 错误），由内层向外层传递。"""
+
     pass
 
 
 class PiFatalError(Exception):
     """pi 致命错误（不可重试），调用者应终止流水线。"""
+
     pass
 
 
 # ─── 日志工具 ─────────────────────────────────────────────────────────────────
 
+
 def _log_error(msg: str) -> None:
-    logger.error(msg)
-    ts = time.strftime("%H:%M:%S")
-    print(f"\n  ❗ [{ts}] {msg}", file=sys.stderr, flush=True)
+    log_event(logger, logging.ERROR, msg, event="runner_error")
 
 
 def _log_warn(msg: str) -> None:
-    logger.warning(msg)
-    ts = time.strftime("%H:%M:%S")
-    print(f"  ⚠️  [{ts}] {msg}", file=sys.stderr, flush=True)
+    log_event(logger, logging.WARNING, msg, event="runner_warning")
 
 
 def _log_info(msg: str) -> None:
-    logger.info(msg)
-    ts = time.strftime("%H:%M:%S")
-    print(f"  ℹ️  [{ts}] {msg}", file=sys.stderr, flush=True)
+    log_event(logger, logging.INFO, msg, event="runner_info")
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
+
 
 def _backoff(base_delay: float, attempt: int) -> float:
     """指数退避，带上限。attempt 从 1 开始。"""
@@ -91,7 +90,9 @@ def _fmt_max(n: int) -> str:
     return "∞" if n < 0 else str(n)
 
 
-def _should_retry(failures: int, max_retries: int, cancel: asyncio.Event | None) -> bool:
+def _should_retry(
+    failures: int, max_retries: int, cancel: asyncio.Event | None
+) -> bool:
     if cancel and cancel.is_set():
         return False
     if max_retries < 0:
@@ -118,12 +119,16 @@ def _find_pi_command() -> list[str]:
     if npx:
         return [npx, "pi"]
     raise FileNotFoundError(
-        "找不到 'pi'。请安装: npm install -g @mariozechner/pi-coding-agent")
+        "找不到 'pi'。请安装: npm install -g @mariozechner/pi-coding-agent"
+    )
 
 
 def _build_args(
-    pi_cmd: list[str], model: str, tools: list[str],
-    thinking_level: str, session_file: str | None,
+    pi_cmd: list[str],
+    model: str,
+    tools: list[str],
+    thinking_level: str,
+    session_file: str | None,
 ) -> list[str]:
     """构造 pi RPC 模式启动参数（不含 system_prompt 和 prompt）。
 
@@ -144,6 +149,20 @@ def _build_args(
     return args
 
 
+def _write_temp_markdown(
+    tmp_dir: str | None,
+    prefix: str,
+    filename: str,
+    content: str,
+) -> tuple[str, str]:
+    """将 prompt 写入临时 markdown 文件，返回 (tmp_dir, file_path)。"""
+    if tmp_dir is None:
+        tmp_dir = tempfile.mkdtemp(prefix=prefix)
+    file_path = os.path.join(tmp_dir, filename)
+    Path(file_path).write_text(content, encoding="utf-8")
+    return tmp_dir, file_path
+
+
 # ─── 错误分类 ─────────────────────────────────────────────────────────────────
 
 # 致命错误：配置/环境问题，重试无意义
@@ -160,23 +179,54 @@ _FATAL_PATTERNS = [
 
 # API 可重试错误
 _RETRYABLE_API_PATTERNS = [
-    "connection", "timeout", "timed out", "ECONNREFUSED", "ECONNRESET",
-    "ETIMEDOUT", "ENOTFOUND", "socket hang up", "fetch failed",
-    "rate limit", "429", "503", "502", "500",
-    "overloaded", "capacity", "temporarily unavailable",
-    "server error", "internal error", "bad gateway",
-    "service unavailable", "request failed",
+    "connection",
+    "timeout",
+    "timed out",
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "ENOTFOUND",
+    "socket hang up",
+    "fetch failed",
+    "rate limit",
+    "429",
+    "503",
+    "502",
+    "500",
+    "overloaded",
+    "capacity",
+    "temporarily unavailable",
+    "server error",
+    "internal error",
+    "bad gateway",
+    "service unavailable",
+    "request failed",
 ]
 
 # pi 进程崩溃关键词
 _PI_CRASH_PATTERNS = [
-    "cannot find module", "module not found",
-    "syntaxerror", "referenceerror", "typeerror",
-    "segmentation fault", "segfault", "killed", "signal",
-    "enoent", "eacces", "eperm",
-    "heap out of memory", "allocation failed", "oom", "out of memory",
-    "spawn", "execvp", "core dump", "bus error",
-    "permission denied", "no such file",
+    "cannot find module",
+    "module not found",
+    "syntaxerror",
+    "referenceerror",
+    "typeerror",
+    "segmentation fault",
+    "segfault",
+    "killed",
+    "signal",
+    "enoent",
+    "eacces",
+    "eperm",
+    "heap out of memory",
+    "allocation failed",
+    "oom",
+    "out of memory",
+    "spawn",
+    "execvp",
+    "core dump",
+    "bus error",
+    "permission denied",
+    "no such file",
 ]
 
 
@@ -218,6 +268,7 @@ def _is_pi_crash(result: AgentResult) -> bool:
 # 公开接口
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 async def run_agent(
     prompt: str,
     *,
@@ -229,10 +280,10 @@ async def run_agent(
     session_file: str | None = None,
     on_stream: Callable[[str], None] | None = None,
     cancel_event: asyncio.Event | None = None,
-    max_retries: int = 3,               # API 错误最大重试（-1=无限）
-    retry_delay: float = 10.0,          # API 重试首次等待
-    pi_max_retries: int = -1,           # pi 进程最大重试（-1=无限）
-    pi_retry_delay: float = 10.0,       # pi 进程重试首次等待
+    max_retries: int = 3,  # API 错误最大重试（-1=无限）
+    retry_delay: float = 10.0,  # API 重试首次等待
+    pi_max_retries: int = -1,  # pi 进程最大重试（-1=无限）
+    pi_retry_delay: float = 10.0,  # pi 进程重试首次等待
 ) -> AgentResult:
     """
     运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
@@ -253,27 +304,37 @@ async def run_agent(
 
     args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
 
-    # System Prompt → 临时文件
+    # System/User Prompt → 临时文件，避免超长 argv 导致 Argument list too long
     tmp_dir: str | None = None
-    tmp_file: str | None = None
+    sys_tmp_file: str | None = None
+    prompt_tmp_file: str | None = None
     if system_prompt.strip():
-        tmp_dir = tempfile.mkdtemp(prefix="sa-")
-        tmp_file = os.path.join(tmp_dir, "system.md")
-        Path(tmp_file).write_text(system_prompt, encoding="utf-8")
-        args.extend(["--append-system-prompt", tmp_file])
+        tmp_dir, sys_tmp_file = _write_temp_markdown(
+            tmp_dir, "sa-", "system.md", system_prompt
+        )
+        args.extend(["--append-system-prompt", sys_tmp_file])
 
     try:
         return await _run_with_pi_retry(
-            args=args, cwd=os.path.abspath(cwd),
+            args=args,
+            cwd=os.path.abspath(cwd),
             prompt=prompt,
-            cancel_event=cancel_event, on_stream=on_stream,
-            max_retries=max_retries, retry_delay=retry_delay,
-            pi_max_retries=pi_max_retries, pi_retry_delay=pi_retry_delay,
+            cancel_event=cancel_event,
+            on_stream=on_stream,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            pi_max_retries=pi_max_retries,
+            pi_retry_delay=pi_retry_delay,
         )
     finally:
-        if tmp_file and os.path.exists(tmp_file):
+        if sys_tmp_file and os.path.exists(sys_tmp_file):
             try:
-                os.unlink(tmp_file)
+                os.unlink(sys_tmp_file)
+            except OSError:
+                pass
+        if prompt_tmp_file and os.path.exists(prompt_tmp_file):
+            try:
+                os.unlink(prompt_tmp_file)
             except OSError:
                 pass
         if tmp_dir and os.path.exists(tmp_dir):
@@ -285,13 +346,18 @@ async def run_agent(
 
 # ─── 外层：pi 进程级重试 ─────────────────────────────────────────────────────
 
+
 async def _run_with_pi_retry(
-    *, args: list[str], cwd: str,
+    *,
+    args: list[str],
+    cwd: str,
     prompt: str,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
-    max_retries: int, retry_delay: float,
-    pi_max_retries: int, pi_retry_delay: float,
+    max_retries: int,
+    retry_delay: float,
+    pi_max_retries: int,
+    pi_retry_delay: float,
 ) -> AgentResult:
     """外层循环：处理 pi 进程拉起失败、崩溃、致命错误。"""
     # cwd 不存在是致命错误（目录被删除等），不进入重试
@@ -313,10 +379,13 @@ async def _run_with_pi_retry(
 
         try:
             result = await _run_with_api_retry(
-                args=args, cwd=cwd,
+                args=args,
+                cwd=cwd,
                 prompt=prompt,
-                cancel_event=cancel_event, on_stream=on_stream,
-                max_retries=max_retries, retry_delay=retry_delay,
+                cancel_event=cancel_event,
+                on_stream=on_stream,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
             )
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
@@ -329,12 +398,12 @@ async def _run_with_pi_retry(
             if _is_pi_crash(result):
                 raise _PiProcessError(
                     f"exit_code={result.exit_code}: "
-                    f"{result.error or '(no error message)'}")
+                    f"{result.error or '(no error message)'}"
+                )
 
             return result
 
-        except (OSError, FileNotFoundError, PermissionError,
-                _PiProcessError) as exc:
+        except (OSError, FileNotFoundError, PermissionError, _PiProcessError) as exc:
             pi_attempt += 1
             label = f"{pi_attempt}/{_fmt_max(pi_max_retries)}"
 
@@ -359,11 +428,13 @@ async def _run_with_pi_retry(
                 delay = _backoff(pi_retry_delay, pi_attempt)
                 _log_warn(
                     f"pi 进程失败 [{label}], {delay:.0f}s 后重试: {exc}\n"
-                    f"    命令: {_cmd_preview(args)}")
+                    f"    命令: {_cmd_preview(args)}"
+                )
                 if on_stream:
                     on_stream(
                         f"\n❌ pi 进程失败 (exit={getattr(exc, 'exit_code', '?')})，"
-                        f"{delay:.0f}s 后重试 ({label})...\n")
+                        f"{delay:.0f}s 后重试 ({label})...\n"
+                    )
                 await asyncio.sleep(delay)
                 continue
             else:
@@ -376,12 +447,16 @@ async def _run_with_pi_retry(
 
 # ─── 内层：API 级重试 ────────────────────────────────────────────────────────
 
+
 async def _run_with_api_retry(
-    *, args: list[str], cwd: str,
+    *,
+    args: list[str],
+    cwd: str,
     prompt: str,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
-    max_retries: int, retry_delay: float,
+    max_retries: int,
+    retry_delay: float,
 ) -> AgentResult:
     """内层循环：启动 pi 子进程，处理 API 级错误重试。"""
     api_attempt = 0
@@ -391,20 +466,23 @@ async def _run_with_api_retry(
 
         # ── 拉起子进程（OSError 由外层 catch）──
         proc = await asyncio.create_subprocess_exec(
-            *args, cwd=cwd,
+            *args,
+            cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,   # RPC: 通过 stdin 发送 prompt
+            stdin=asyncio.subprocess.PIPE,  # RPC: 通过 stdin 发送 prompt
         )
 
         cancel_task = None
         if cancel_event:
+
             async def _cancel_monitor():
                 await cancel_event.wait()
                 try:
                     proc.terminate()
                 except ProcessLookupError:
                     pass
+
             cancel_task = asyncio.create_task(_cancel_monitor())
 
         # ── RPC: 发送 prompt，读取事件直到 agent_end ──
@@ -430,16 +508,17 @@ async def _run_with_api_retry(
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
                     ended = _process_line(
-                        line.decode("utf-8", errors="replace"),
-                        result, on_stream)
+                        line.decode("utf-8", errors="replace"), result, on_stream
+                    )
                     if ended:
                         agent_ended = True
                         break
                 if agent_ended:
                     break
             if buffer.strip():
-                _process_line(buffer.decode("utf-8", errors="replace"),
-                              result, on_stream)
+                _process_line(
+                    buffer.decode("utf-8", errors="replace"), result, on_stream
+                )
 
             # 关闭 stdin → pi 检测 EOF 后退出
             try:
@@ -449,8 +528,7 @@ async def _run_with_api_retry(
 
             assert proc.stderr is not None
             try:
-                stderr_data = await asyncio.wait_for(
-                    proc.stderr.read(), timeout=10.0)
+                stderr_data = await asyncio.wait_for(proc.stderr.read(), timeout=10.0)
                 stderr_text = stderr_data.decode("utf-8", errors="replace").strip()
                 if stderr_text and not result.error:
                     result.error = stderr_text
@@ -491,8 +569,11 @@ async def _run_with_api_retry(
         # ── 提取输出 ──
         for msg in reversed(result.messages):
             if msg.get("role") == "assistant":
-                texts = [c["text"] for c in (msg.get("content") or [])
-                         if c.get("type") == "text"]
+                texts = [
+                    c["text"]
+                    for c in (msg.get("content") or [])
+                    if c.get("type") == "text"
+                ]
                 result.output = "\n".join(texts)
                 break
 
@@ -502,8 +583,9 @@ async def _run_with_api_retry(
         # ── pi 崩溃 → 不在内层重试，交给外层 ──
         if _is_pi_crash(result):
             if result.error:
-                _log_warn(f"pi 进程崩溃 (exit={result.exit_code}): "
-                          f"{result.error[:300]}")
+                _log_warn(
+                    f"pi 进程崩溃 (exit={result.exit_code}): {result.error[:300]}"
+                )
             return result
 
         # ── 致命错误 → 不重试，直接返回让外层处理 ──
@@ -517,30 +599,38 @@ async def _run_with_api_retry(
             if can_retry:
                 delay = _backoff(retry_delay, api_attempt)
                 label = f"{api_attempt}/{_fmt_max(max_retries)}"
-                _log_warn(f"API 错误 [{label}], {delay:.0f}s 后重试: "
-                          f"{(result.error or '')[:200]}")
+                _log_warn(
+                    f"API 错误 [{label}], {delay:.0f}s 后重试: "
+                    f"{(result.error or '')[:200]}"
+                )
                 if on_stream:
                     on_stream(f"\n⚠️ API 错误，{delay:.0f}s 后重试 ({label})...\n")
                 await asyncio.sleep(delay)
                 continue
             else:
-                _log_error(f"API 重试耗尽 [{api_attempt}/{max_retries}]: "
-                           f"{(result.error or '')[:200]}")
-                result.error = (result.error or "") + \
-                    f" [API 重试耗尽: {api_attempt} 次失败]"
+                _log_error(
+                    f"API 重试耗尽 [{api_attempt}/{max_retries}]: "
+                    f"{(result.error or '')[:200]}"
+                )
+                result.error = (
+                    result.error or ""
+                ) + f" [API 重试耗尽: {api_attempt} 次失败]"
                 return result
 
         # ── 成功或不可重试的未知错误 ──
         if result.exit_code != 0 and result.error:
-            _log_warn(f"pi 退出码 {result.exit_code} (有输出，不重试): "
-                      f"{result.error[:200]}")
+            _log_warn(
+                f"pi 退出码 {result.exit_code} (有输出，不重试): {result.error[:200]}"
+            )
         return result
 
 
 # ─── JSON Lines 解析 ──────────────────────────────────────────────────────────
 
+
 def _process_line(
-    line: str, result: AgentResult,
+    line: str,
+    result: AgentResult,
     on_stream: Callable[[str], None] | None,
 ) -> bool:
     """解析一行 JSONL。返回 True 表示收到 agent_end（调用方应停止读取）。"""
@@ -555,9 +645,15 @@ def _process_line(
     etype = event.get("type")
 
     # RPC mode: 过滤命令响应和与 agent 无关的事件
-    if etype in ("response", "session", "queue_update",
-                 "compaction_start", "compaction_end",
-                 "auto_retry_start", "auto_retry_end"):
+    if etype in (
+        "response",
+        "session",
+        "queue_update",
+        "compaction_start",
+        "compaction_end",
+        "auto_retry_start",
+        "auto_retry_end",
+    ):
         return False
 
     # agent_end 信号本轮完成
@@ -594,8 +690,10 @@ def _process_line(
 
 # ─── 并行执行 ────────────────────────────────────────────────────────────────
 
+
 async def run_agents_parallel(
-    tasks: list[dict], concurrency: int = 4,
+    tasks: list[dict],
+    concurrency: int = 4,
 ) -> list[AgentResult]:
     semaphore = asyncio.Semaphore(concurrency)
     results: list[AgentResult | None] = [None] * len(tasks)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -10,19 +11,24 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.logging_utils import configure_container_logging, log_event
+
 APP_ROOT = Path(os.environ.get("APP_ROOT", "/app")).resolve()
 RUN_ROOT = APP_ROOT / ".run"
 STAGE = "01-system"
 PREV_STAGE = "00-unpack"
 NEXT_STAGE = "02-re"
 
+configure_container_logging("01-system_analyse")
+logger = logging.getLogger("sa.chained")
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def log(message: str) -> None:
-    print(f"[{now_iso()}] [{STAGE}] {message}", flush=True)
+def log(message: str, **fields: object) -> None:
+    log_event(logger, logging.INFO, message, stage=STAGE, event="stage_log", **fields)
 
 
 def load_json(path: Path) -> dict:

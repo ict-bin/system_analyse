@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -24,10 +25,13 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from .config import build_task_config, load_service_config
+from .logging_utils import configure_container_logging, log_event
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
 
 load_dotenv()
+configure_container_logging("01-system_analyse")
+logger = logging.getLogger("sa.server")
 
 # 使用统一的路径配置（优先读取环境变量）
 from .config import CONFIG_DIR, TARGET_DIR
@@ -112,11 +116,28 @@ async def submit_analyse(body: AnalyseRequest):
     entry = TaskEntry(orch, task_id, body.prompt)
     entry.callback_url = body.callback_url or None
     _tasks[task_id] = entry
+    log_event(
+        logger,
+        logging.INFO,
+        "analysis task accepted",
+        event="task_submitted",
+        task_id=task_id,
+        cwd=cwd,
+        callback_url=entry.callback_url or "",
+    )
 
     async def _run():
         try:
             entry.result = await orch.execute(task_id)
         except Exception as e:
+            log_event(
+                logger,
+                logging.ERROR,
+                "analysis task failed",
+                event="task_failed",
+                task_id=task_id,
+                error=str(e),
+            )
             entry.result = TaskResult(
                 task_id=task_id, status=TaskStatus.ERROR,
                 task=body.prompt, error=str(e))
@@ -131,6 +152,15 @@ async def submit_analyse(body: AnalyseRequest):
                 except asyncio.QueueFull:
                     pass
             entry.done.set()
+            if entry.result:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "analysis task finished",
+                    event="task_finished",
+                    task_id=task_id,
+                    status=entry.result.status.value,
+                )
             if entry.callback_url and entry.result:
                 await _notify(entry)
             await asyncio.sleep(CLEANUP_DELAY)
@@ -159,7 +189,14 @@ async def _notify(entry: TaskEntry):
                 "cost": entry.result.total_tokens.cost,
             })
     except Exception:
-        pass
+        log_event(
+            logger,
+            logging.WARNING,
+            "callback notification failed",
+            event="callback_failed",
+            task_id=entry.task_id,
+            callback_url=entry.callback_url or "",
+        )
 
 
 @app.get("/task/{task_id}")

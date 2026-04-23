@@ -12,7 +12,10 @@ import sys
 import uvicorn
 from dotenv import load_dotenv
 
+from app.logging_utils import configure_container_logging, log_event
+
 load_dotenv()
+logger = configure_container_logging("01-system_analyse")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3000"))
@@ -21,19 +24,19 @@ if __name__ == "__main__":
         if idx + 1 < len(sys.argv):
             port = int(sys.argv[idx + 1])
 
-    print(f"""
-╔═══════════════════════════════════════════════════════╗
-║            system_analyse API Server                 ║
-╠═══════════════════════════════════════════════════════╣
-║  URL:    http://localhost:{port:<38}║
-║  POST /analyse  — 提交分析任务                         ║
-║  GET  /task/{{id}}/stream  — SSE 实时事件流            ║
-╚═══════════════════════════════════════════════════════╝
-""")
+    log_event(
+        logger,
+        20,
+        "starting system analyse api server",
+        event="service_start",
+        port=port,
+        host="0.0.0.0",
+    )
 
     uvicorn.run(
         "app.server:app",
         host="0.0.0.0",
         port=port,
         reload=os.environ.get("DEV", "") == "1",
+        log_config=None,
     )
