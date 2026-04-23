@@ -125,8 +125,12 @@ def _build_args(
     pi_cmd: list[str], model: str, tools: list[str],
     thinking_level: str, session_file: str | None,
 ) -> list[str]:
-    """构造 pi 命令行参数（不含 system prompt 和 prompt）。"""
-    args = [*pi_cmd, "--mode", "json", "-p"]
+    """构造 pi RPC 模式启动参数（不含 system_prompt 和 prompt）。
+
+    使用 --mode rpc：pi 保持运行，prompt 通过 stdin JSONL 发送，
+    彻底绕过 Linux ARG_MAX 限制，支持任意大小的 prompt/system_prompt。
+    """
+    args = [*pi_cmd, "--mode", "rpc"]
     if session_file:
         args.extend(["--session", session_file])
     else:
@@ -258,11 +262,10 @@ async def run_agent(
         Path(tmp_file).write_text(system_prompt, encoding="utf-8")
         args.extend(["--append-system-prompt", tmp_file])
 
-    args.append(prompt)
-
     try:
         return await _run_with_pi_retry(
             args=args, cwd=os.path.abspath(cwd),
+            prompt=prompt,
             cancel_event=cancel_event, on_stream=on_stream,
             max_retries=max_retries, retry_delay=retry_delay,
             pi_max_retries=pi_max_retries, pi_retry_delay=pi_retry_delay,
@@ -284,6 +287,7 @@ async def run_agent(
 
 async def _run_with_pi_retry(
     *, args: list[str], cwd: str,
+    prompt: str,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
@@ -310,6 +314,7 @@ async def _run_with_pi_retry(
         try:
             result = await _run_with_api_retry(
                 args=args, cwd=cwd,
+                prompt=prompt,
                 cancel_event=cancel_event, on_stream=on_stream,
                 max_retries=max_retries, retry_delay=retry_delay,
             )
@@ -373,6 +378,7 @@ async def _run_with_pi_retry(
 
 async def _run_with_api_retry(
     *, args: list[str], cwd: str,
+    prompt: str,
     cancel_event: asyncio.Event | None,
     on_stream: Callable[[str], None] | None,
     max_retries: int, retry_delay: float,
@@ -388,7 +394,7 @@ async def _run_with_api_retry(
             *args, cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,   # RPC: 通过 stdin 发送 prompt
         )
 
         cancel_task = None
@@ -401,9 +407,20 @@ async def _run_with_api_retry(
                     pass
             cancel_task = asyncio.create_task(_cancel_monitor())
 
-        # ── 读取 JSON Lines 输出（try/except 保护）──
+        # ── RPC: 发送 prompt，读取事件直到 agent_end ──
+        agent_ended = False
         try:
+            assert proc.stdin is not None
             assert proc.stdout is not None
+
+            # 发送初始 prompt（无 ARG_MAX 限制）
+            prompt_cmd = json.dumps(
+                {"type": "prompt", "message": prompt},
+                ensure_ascii=False,
+            ) + chr(10)
+            proc.stdin.write(prompt_cmd.encode("utf-8"))
+            await proc.stdin.drain()
+
             buffer = b""
             while True:
                 chunk = await proc.stdout.read(4096)
@@ -412,20 +429,42 @@ async def _run_with_api_retry(
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
-                    _process_line(line.decode("utf-8", errors="replace"),
-                                  result, on_stream)
+                    ended = _process_line(
+                        line.decode("utf-8", errors="replace"),
+                        result, on_stream)
+                    if ended:
+                        agent_ended = True
+                        break
+                if agent_ended:
+                    break
             if buffer.strip():
                 _process_line(buffer.decode("utf-8", errors="replace"),
                               result, on_stream)
 
-            assert proc.stderr is not None
-            stderr_data = await proc.stderr.read()
-            stderr_text = stderr_data.decode("utf-8", errors="replace").strip()
-            if stderr_text and not result.error:
-                result.error = stderr_text
+            # 关闭 stdin → pi 检测 EOF 后退出
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
 
-            await proc.wait()
-            result.exit_code = proc.returncode or 0
+            assert proc.stderr is not None
+            try:
+                stderr_data = await asyncio.wait_for(
+                    proc.stderr.read(), timeout=10.0)
+                stderr_text = stderr_data.decode("utf-8", errors="replace").strip()
+                if stderr_text and not result.error:
+                    result.error = stderr_text
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=15.0)
+                result.exit_code = proc.returncode or 0
+            except asyncio.TimeoutError:
+                _log_warn("pi 进程未在 15s 内退出，强制终止")
+                proc.kill()
+                await proc.wait()
+                result.exit_code = -1
 
         except Exception as e:
             # 管道断裂、进程被杀等
@@ -503,16 +542,28 @@ async def _run_with_api_retry(
 def _process_line(
     line: str, result: AgentResult,
     on_stream: Callable[[str], None] | None,
-) -> None:
+) -> bool:
+    """解析一行 JSONL。返回 True 表示收到 agent_end（调用方应停止读取）。"""
     line = line.strip()
     if not line:
-        return
+        return False
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
-        return
+        return False
 
     etype = event.get("type")
+
+    # RPC mode: 过滤命令响应和与 agent 无关的事件
+    if etype in ("response", "session", "queue_update",
+                 "compaction_start", "compaction_end",
+                 "auto_retry_start", "auto_retry_end"):
+        return False
+
+    # agent_end 信号本轮完成
+    if etype == "agent_end":
+        # agent_end 含全量 messages，可备用但不重复处理
+        return True
 
     if etype == "message_update":
         ae = event.get("assistantMessageEvent", {})
@@ -537,6 +588,8 @@ def _process_line(
 
             if msg.get("stopReason") == "error":
                 result.error = msg.get("errorMessage", "Unknown error")
+
+    return False
 
 
 # ─── 并行执行 ────────────────────────────────────────────────────────────────
