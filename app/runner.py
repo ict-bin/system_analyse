@@ -25,7 +25,6 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
-from .logging_utils import log_event
 from .models import TokenUsage
 
 logger = logging.getLogger("sa.runner")
@@ -67,15 +66,15 @@ class PiFatalError(Exception):
 
 
 def _log_error(msg: str) -> None:
-    log_event(logger, logging.ERROR, msg, event="runner_error")
+    logger.error(msg)
 
 
 def _log_warn(msg: str) -> None:
-    log_event(logger, logging.WARNING, msg, event="runner_warning")
+    logger.warning(msg)
 
 
 def _log_info(msg: str) -> None:
-    log_event(logger, logging.INFO, msg, event="runner_info")
+    logger.info(msg)
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -201,7 +200,14 @@ _RETRYABLE_API_PATTERNS = [
     "bad gateway",
     "service unavailable",
     "request failed",
+    "network_error",        # gptplus5 并发超限
+    "finish_reason",        # provider finish_reason: network_error
+    "too many requests",    # 429 另一种表达
 ]
+
+# 速率限制模式：这些关键词匹配时延长待机时间
+_RATE_LIMIT_PATTERNS = ["rate limit", "429", "too many requests", "network_error", "finish_reason"]
+_RATE_LIMIT_EXTRA_DELAY = 60   # 限流时额外等彥60s
 
 # pi 进程崩溃关键词
 _PI_CRASH_PATTERNS = [
@@ -598,13 +604,19 @@ async def _run_with_api_retry(
             can_retry = (max_retries == -1) or (api_attempt <= max_retries)
             if can_retry:
                 delay = _backoff(retry_delay, api_attempt)
+                # 限流错误额外等待，避免连续冲击并发限制
+                err_lower = (result.error or "").lower()
+                is_rate_limit = any(p in err_lower for p in _RATE_LIMIT_PATTERNS)
+                if is_rate_limit:
+                    delay = max(delay, _RATE_LIMIT_EXTRA_DELAY)
                 label = f"{api_attempt}/{_fmt_max(max_retries)}"
+                kind = "限流" if is_rate_limit else "API"
                 _log_warn(
-                    f"API 错误 [{label}], {delay:.0f}s 后重试: "
+                    f"{kind}错误 [{label}], {delay:.0f}s 后重试: "
                     f"{(result.error or '')[:200]}"
                 )
                 if on_stream:
-                    on_stream(f"\n⚠️ API 错误，{delay:.0f}s 后重试 ({label})...\n")
+                    on_stream(f"\n⚠️ {kind}错误，{delay:.0f}s 后重试 ({label})...\n")
                 await asyncio.sleep(delay)
                 continue
             else:
