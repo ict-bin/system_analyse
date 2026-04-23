@@ -3,7 +3,7 @@
 # 职责范围
 
 Stage 2 做两件事：
-1. **拆分**：将功能混杂的模块按功能拆分成子模块（命名以 `<当前模块名>_` 为前缀）
+1. **拆分**：将功能混杂的模块按功能拆分成子模块
 2. **迁移错分文件**：将明显不属于本模块的文件移到已有的正确模块
 
 ⚠️ 迁移时必须用 **flock 防并发冲突**，确保文件不丢失
@@ -13,7 +13,10 @@ Stage 2 做两件事：
 # ⚠️ 铁律
 
 1. **文件零丢失**：拆分前后该模块下的文件总数必须完全一致
-2. **子模块命名必须以 `<当前模块名>_` 开头**（如 `bras_dhcp`、`bras_auth`）
+2. **子模块命名按实际功能/技术栈命名**（如 `mbedtls_crypto`、`openthread_core`、`nordic_radio`），**不要**以父模块名为前缀
+   - ✅ 正确：`mbedtls_docs`、`openthread_mac`、`nxp_platform`
+   - ❌ 错误：`crypto_certs_docs`、`kernel_modules_nxp_timers`（父模块名做前缀）
+   - 若子模块名与已有模块重名，才加最短必要前缀区分
 3. **所有文件操作必须用 bash 脚本**
 4. 拆分完成后**必须删除原模块目录**（文件已分散到子模块）
 
@@ -69,33 +72,33 @@ echo "已迁移 $(basename $FILE) → $DST_MOD"
 ```bash
 #!/bin/bash
 set -e
-MOD="<当前模块名>"  # 如 bras
+MOD="<当前模块名>"  # 如 crypto_certs
 BEFORE=$(wc -l < modules/$MOD/files.list)
 echo "拆分前: $BEFORE 个文件"
 
-# 按功能分组（子模块名必须以 ${MOD}_ 开头）
-mkdir -p modules/${MOD}_dhcp modules/${MOD}_auth modules/${MOD}_tunnel
+# 按实际功能/技术栈命名（不加父模块前缀）
+# 例：crypto_certs 模块含 mbedtls 库，应拆分为：
+mkdir -p modules/mbedtls_crypto modules/mbedtls_ssl modules/mbedtls_docs
 
 # 按关键词分类到子模块
-grep -iE 'dhcp' modules/$MOD/files.list > modules/${MOD}_dhcp/files.list || true
-grep -iE 'radius|diameter|eap|auth' modules/$MOD/files.list > modules/${MOD}_auth/files.list || true
-grep -iE 'l2tp|lac|lns|tunnel' modules/$MOD/files.list > modules/${MOD}_tunnel/files.list || true
+grep -iE 'aes|sha|rsa|ecp|bignum|cipher|hash' modules/$MOD/files.list > modules/mbedtls_crypto/files.list || true
+grep -iE 'ssl|tls|x509|pkcs' modules/$MOD/files.list > modules/mbedtls_ssl/files.list || true
+grep -iE 'README|doc|CHANGE|LICENSE|AUTHORS' modules/$MOD/files.list > modules/mbedtls_docs/files.list || true
 
-# 未匹配的归入 _core（兜底，保证无遗漏）
-cat modules/${MOD}_*/files.list | sort > /tmp/moved.txt
+# 未匹配的归入功能最接近的子模块（兜底，保证无遗漏）
+cat modules/mbedtls_*/files.list 2>/dev/null | sort > /tmp/moved.txt
 sort modules/$MOD/files.list > /tmp/orig.txt
-comm -23 /tmp/orig.txt /tmp/moved.txt > modules/${MOD}_core/files.list || true
-mkdir -p modules/${MOD}_core
+comm -23 /tmp/orig.txt /tmp/moved.txt >> modules/mbedtls_crypto/files.list || true
 
 # 去重
-for f in modules/${MOD}_*/files.list; do sort -u "$f" -o "$f"; done
+for f in modules/mbedtls_*/files.list; do sort -u "$f" -o "$f"; done
 
 # 校验：拆分后总数 == 拆分前
-AFTER=$(cat modules/${MOD}_*/files.list | sort -u | wc -l)
+AFTER=$(cat modules/mbedtls_*/files.list | sort -u | wc -l)
 echo "拆分后: $AFTER 个文件"
 [ "$BEFORE" -eq "$AFTER" ] && echo "✅ 完整" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
 
-# 删除原模块目录（快照已保存在 .s2_snapshots/ 中，不受影响）
+# 删除原模块目录（快照已保存在 .s2_snapshots/ 中）
 rm -rf modules/$MOD
 ```
 
@@ -107,16 +110,16 @@ rm -rf modules/$MOD
 set -e
 MOD="<当前模块名>"
 
-# 清理上轮失败的子模块
-rm -rf modules/${MOD}_*
+# 清理上轮失败的子模块（按实际命名，非父模块前缀）
+rm -rf modules/mbedtls_* modules/openthread_*  # 根据实际情况调整
 
 # 从快照恢复文件列表
 BEFORE=$(wc -l < .s2_snapshots/$MOD.snapshot)
 echo "从快照重建: $BEFORE 个文件"
 
 # 重新按功能拆分（参考上轮 Judge 意见改进）
-mkdir -p modules/${MOD}_<功能1> modules/${MOD}_<功能2>
-grep -iE '<关键词1>' .s2_snapshots/$MOD.snapshot > modules/${MOD}_<功能1>/files.list || true
+mkdir -p modules/<功能1> modules/<功能2>
+grep -iE '<关键词1>' .s2_snapshots/$MOD.snapshot > modules/<功能1>/files.list || true
 # ... 其余分组 ...
 
 # 兜底未匹配
