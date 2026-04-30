@@ -3,12 +3,14 @@ FROM dfa-base:layer5
 ENV PYTHONUNBUFFERED=1
 
 # ═══ 项目代码 ═════════════════════════════════════════════════════════════════
-WORKDIR /opt/system_analyse
+WORKDIR /app
 COPY app/               ./app/
 COPY cli.py main.py     ./
 COPY prompts/           ./prompts/
 COPY scripts/           ./scripts/
 COPY config.example.json .env.example ./
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
 # 修复 Windows CRLF + 添加执行权限
 RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true
 

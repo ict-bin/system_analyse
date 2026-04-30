@@ -55,6 +55,7 @@ def configure_container_logging(service: str = "system_analyse") -> None:
     # 移除已有 handler 避免重复
     root.handlers.clear()
     root.addHandler(handler)
+    return root
 
 
 def log_event(

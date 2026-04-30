@@ -1,0 +1,219 @@
+"""Per-project analysis config service."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict
+
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.db.models import AppSaModelsConfig, AppSaProjectConfig
+
+logger = logging.getLogger("sa.config_service")
+
+# Fields in workers/judges that must NOT be stored in DB — always use fixed defaults
+_ROLE_READONLY_FIELDS = {"system_prompt_dir"}
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge *override* into *base*, returning a new dict.
+
+    Rules:
+    - Nested dicts are merged recursively.
+    - A ``None`` (or non-dict) value in *override* for a key whose base value is
+      a dict is **ignored** — the base dict is kept intact.  This prevents a
+      corrupted / partially-migrated stored config from wiping out default
+      nested structures (e.g. ``stages``, ``workers``, ``judges``).
+    - All other scalar / list values in *override* replace those in *base*.
+    """
+    result = dict(base)
+    for key, val in override.items():
+        base_val = result.get(key)
+        if isinstance(base_val, dict) and not isinstance(val, dict):
+            # Never overwrite a default dict with None / scalar / list
+            continue
+        if isinstance(base_val, dict) and isinstance(val, dict):
+            result[key] = _deep_merge(base_val, val)
+        else:
+            result[key] = val
+    return result
+
+_DEFAULT_CONFIG: Dict[str, Any] = {
+    "analyse_targets": ["binary", "source"],
+    "binary_arch": ["arm", "aarch64"],
+    "parallel_modules": 4,
+    "parallel_sub_workers": 4,
+    "agent_max_retries": 100,
+    "agent_retry_delay": 60,
+    "pi_max_retries": -1,
+    "pi_retry_delay": 5,
+    "stages": {
+        "classify":    {"min_rounds": 1, "max_rounds": 8,  "pass_mode": "all"},
+        "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "analyse":     {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "final_check": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+    },
+    "workers": {
+        "default_model": "",
+        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
+        "system_prompt_dir": "/app/prompts/workers",
+        "default_thinking_level": "off",
+        "agents": [
+            {"model": "gptplus_openai/gpt-5.4", "tools": None, "system_prompt": None, "thinking_level": None},
+        ],
+        "stage_models": {
+            "explore": "gptplus_minimax/MiniMax-M2.7",
+        },
+    },
+    "judges": {
+        "default_model": "",
+        "default_tools": ["read", "bash", "grep", "find"],
+        "system_prompt_dir": "/app/prompts/judges",
+        "default_thinking_level": "off",
+        "agents": [
+            {"model": "gptplus_openai/gpt-5.4", "tools": None, "system_prompt": None, "thinking_level": None},
+        ],
+        "stage_models": {},
+    },
+    "output_dir": "/data/output",
+    "archive_dir": "/data/output",
+    "result_dir": "/data/output",
+    "start_stage": 1,
+    "resume_workspace": "",
+}
+
+
+class ConfigService:
+    def get_config(self, db: Session, project_id: str) -> dict:
+        row = db.query(AppSaProjectConfig).filter_by(project_id=project_id).first()
+        if row and row.config_json:
+            data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
+        else:
+            data = dict(_DEFAULT_CONFIG)
+        data["project_id"] = project_id
+        data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
+        return data
+
+    def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
+        # Strip meta-fields from the stored blob
+        blob = {k: v for k, v in config_data.items() if k not in ("project_id", "updated_at")}
+        # Strip read-only role fields so they always fall back to defaults
+        for role_key in ("workers", "judges"):
+            if isinstance(blob.get(role_key), dict):
+                blob[role_key] = {k: v for k, v in blob[role_key].items() if k not in _ROLE_READONLY_FIELDS}
+        row = db.query(AppSaProjectConfig).filter_by(project_id=project_id).first()
+        if row:
+            row.config_json = blob
+        else:
+            row = AppSaProjectConfig(project_id=project_id, config_json=blob)
+            db.add(row)
+        db.commit()
+        db.refresh(row)
+        # Return fully-merged config (same shape as get_config)
+        result = _deep_merge(_DEFAULT_CONFIG, blob)
+        result["project_id"] = project_id
+        result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
+        return result
+
+
+_config_service: ConfigService | None = None
+
+
+def get_config_service() -> ConfigService:
+    global _config_service
+    if _config_service is None:
+        _config_service = ConfigService()
+    return _config_service
+
+
+_DEFAULT_MODELS_CONFIG: Dict[str, Any] = {
+    "providers": {
+        "icsl_vllm_1": {
+            "baseUrl": "http://172.31.29.10:8000/v1/",
+            "api": "openai-completions",
+            "apiKey": "1234",
+            "models": [
+                {"id": "zai-org/GLM-5", "reasoning": True},
+            ],
+        },
+        "icsl_vllm_2": {
+            "baseUrl": "http://172.31.29.10:8003/v1/",
+            "api": "openai-completions",
+            "apiKey": "12345",
+            "models": [
+                {"id": "MiniMax/MiniMax-M2.5", "reasoning": True},
+            ],
+        },
+        "gptplus_glm": {
+            "baseUrl": "https://az.gptplus5.com/v1",
+            "api": "openai-completions",
+            "apiKey": "sk-8zyyvaRQ6QlQzwONikzreTNlRqbLBokuUFH70Akk0AMTcF6y",
+            "models": [
+                {"id": "glm-5.1", "reasoning": True},
+            ],
+        },
+        "gptplus_minimax": {
+            "baseUrl": "https://az.gptplus5.com/v1",
+            "api": "openai-completions",
+            "apiKey": "sk-8zyyvaRQ6QlQzwONikzreTNlRqbLBokuUFH70Akk0AMTcF6y",
+            "models": [
+                {"id": "MiniMax-M2.7", "reasoning": True},
+            ],
+        },
+        "gptplus_openai": {
+            "baseUrl": "https://az.gptplus5.com/v1",
+            "api": "openai-completions",
+            "apiKey": "sk-8zyyvaRQ6QlQzwONikzreTNlRqbLBokuUFH70Akk0AMTcF6y",
+            "models": [
+                {"id": "gpt-5.4", "reasoning": False},
+            ],
+        },
+    }
+}
+
+
+class ModelConfigService:
+    """Global models.json configuration stored in the database."""
+
+    def get_models_config(self, db: Session) -> dict:
+        try:
+            row = db.query(AppSaModelsConfig).filter_by(config_key="global").first()
+        except SQLAlchemyError as exc:
+            logger.error("Failed to query models config: %s", exc)
+            return dict(_DEFAULT_MODELS_CONFIG)
+        if row and row.config_json:
+            data = dict(row.config_json)
+        else:
+            data = dict(_DEFAULT_MODELS_CONFIG)
+        data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
+        return data
+
+    def save_models_config(self, db: Session, config_data: dict) -> dict:
+        blob = {k: v for k, v in config_data.items() if k != "updated_at"}
+        try:
+            row = db.query(AppSaModelsConfig).filter_by(config_key="global").first()
+            if row:
+                row.config_json = blob
+            else:
+                row = AppSaModelsConfig(config_key="global", config_json=blob)
+                db.add(row)
+            db.commit()
+            db.refresh(row)
+        except SQLAlchemyError as exc:
+            logger.error("Failed to save models config: %s", exc)
+            db.rollback()
+            raise
+        result = dict(blob)
+        result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
+        return result
+
+
+_model_config_service: ModelConfigService | None = None
+
+
+def get_model_config_service() -> ModelConfigService:
+    global _model_config_service
+    if _model_config_service is None:
+        _model_config_service = ModelConfigService()
+    return _model_config_service

@@ -1,12 +1,23 @@
 """
 system_analyse — REST API 服务器
 
-  POST /analyse           提交分析（body: {"prompt": "对解包后的所有文件进行威胁分析与模块分析"}）
-  GET  /task/{id}         查询结果
-  GET  /task/{id}/stream  SSE 实时事件流
-  POST /task/{id}/abort   中止
-  GET  /tasks             列出任务
-  GET  /health            健康检查
+  Management layer (persistent, project-scoped):
+    POST /api/app/system-analyse/tasks          创建任务（input_path, prompt 自动生成）
+    GET  /api/app/system-analyse/tasks          任务列表（project_id 过滤）
+    GET  /api/app/system-analyse/tasks/{id}     任务详情
+    POST /api/app/system-analyse/tasks/{id}/cancel   取消任务
+    POST /api/app/system-analyse/tasks/{id}/restart  以当前配置重新运行任务
+    POST /api/app/system-analyse/generate-prompt    根据路径生成 prompt
+    CRUD /api/app/system-analyse/prompts/*      Prompt 模板
+    GET/PUT /api/app/system-analyse/config      项目配置
+    GET  /api/app/system-analyse/health         健康检查
+
+  Legacy engine routes (in-memory, backward compat):
+    POST /analyse           直接提交分析（CLI 兼容）
+    GET  /task/{id}         查询结果
+    GET  /task/{id}/stream  SSE 实时事件流
+    POST /task/{id}/stop    中止
+    GET  /tasks             列出内存任务
 """
 
 from __future__ import annotations
@@ -15,7 +26,7 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
+from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
@@ -24,7 +35,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from .config import build_task_config, load_service_config
+from .config import (
+    CONFIG_DIR, TARGET_DIR,
+    build_task_config, get_service_yaml, load_service_config,
+)
 from .logging_utils import configure_container_logging, log_event
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
@@ -33,12 +47,71 @@ load_dotenv()
 configure_container_logging("01-system_analyse")
 logger = logging.getLogger("sa.server")
 
-# 使用统一的路径配置（优先读取环境变量）
-from .config import CONFIG_DIR, TARGET_DIR
-
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", f"{CONFIG_DIR}/config.json")
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 
+
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    svc_yaml = get_service_yaml()
+    db_url = svc_yaml.database.url
+
+    try:
+        from .db import init_db
+        init_db(
+            db_url,
+            pool_size=svc_yaml.database.pool_size,
+            max_overflow=svc_yaml.database.max_overflow,
+        )
+        logger.info("DB initialized: %s:%s/%s", svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name)
+    except Exception as exc:
+        logger.warning("DB init failed (management APIs will be unavailable): %s", exc)
+
+    # --- Recover orphaned tasks from a previous pod instance ---
+    try:
+        from datetime import datetime, timezone
+        from .db import get_db
+        from .db.models import AppSaTask
+        _db = next(get_db())
+        orphaned = _db.query(AppSaTask).filter(
+            AppSaTask.status.in_(["running", "pending"]),
+            AppSaTask.is_deleted.is_(False),
+        ).all()
+        if orphaned:
+            for t in orphaned:
+                t.status = "error"
+                t.error = "服务重启，任务被中断"
+                t.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            _db.commit()
+            logger.warning("Recovered %d orphaned task(s) from previous pod instance", len(orphaned))
+    except Exception as exc:
+        logger.warning("Orphan task recovery failed: %s", exc)
+
+    try:
+        from .service.registry_service import get_registry_service
+        registry = get_registry_service()
+        await registry.register()
+        registry.start()
+    except Exception as exc:
+        logger.warning("Registry startup failed: %s", exc)
+
+    from .api import router as mgmt_router
+    app.include_router(mgmt_router)
+
+    yield
+
+    # --- shutdown ---
+    try:
+        from .service.registry_service import get_registry_service
+        get_registry_service().stop()
+    except Exception:
+        pass
+
+
+# ─── Application ──────────────────────────────────────────────────────────────
 
 class TaskEntry:
     def __init__(self, orch: Orchestrator, task_id: str, prompt: str):
@@ -54,10 +127,9 @@ class TaskEntry:
 
 _tasks: dict[str, TaskEntry] = {}
 
-app = FastAPI(title="system_analyse", version="1.0.0")
+app = FastAPI(title="system_analyse", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# 启动时加载一次服务配置
 _svc_config = None
 
 
@@ -73,7 +145,7 @@ def _get_svc_config():
     return _svc_config
 
 
-# ─── 请求体 ──────────────────────────────────────────────────────────────────
+# ─── Health ───────────────────────────────────────────────────────────────────
 
 class AnalyseRequest(BaseModel):
     prompt: str = Field(..., description="一句话任务描述，如：对解包后的所有文件进行威胁分析与模块分析")
@@ -81,9 +153,8 @@ class AnalyseRequest(BaseModel):
     callback_url: str = Field(default="", description="任务完成后 POST 通知的 URL")
 
 
-# ─── 路由 ─────────────────────────────────────────────────────────────────────
-
 @app.get("/health")
+@app.get("/api/app/system-analyse/health")
 async def health():
     return {
         "status": "ok",
@@ -94,7 +165,7 @@ async def health():
 
 @app.post("/analyse", status_code=202)
 async def submit_analyse(body: AnalyseRequest):
-    """提交分析任务。只需一句话 prompt。"""
+    """直接提交分析任务（CLI 兼容路由）。"""
     svc = _get_svc_config()
     cwd = body.cwd or TARGET_DIR
     cfg = build_task_config(svc, body.prompt, cwd=cwd)
@@ -116,28 +187,16 @@ async def submit_analyse(body: AnalyseRequest):
     entry = TaskEntry(orch, task_id, body.prompt)
     entry.callback_url = body.callback_url or None
     _tasks[task_id] = entry
-    log_event(
-        logger,
-        logging.INFO,
-        "analysis task accepted",
-        event="task_submitted",
-        task_id=task_id,
-        cwd=cwd,
-        callback_url=entry.callback_url or "",
-    )
+    log_event(logger, logging.INFO, "analysis task accepted",
+              event="task_submitted", task_id=task_id, cwd=cwd,
+              callback_url=entry.callback_url or "")
 
     async def _run():
         try:
             entry.result = await orch.execute(task_id)
         except Exception as e:
-            log_event(
-                logger,
-                logging.ERROR,
-                "analysis task failed",
-                event="task_failed",
-                task_id=task_id,
-                error=str(e),
-            )
+            log_event(logger, logging.ERROR, "analysis task failed",
+                      event="task_failed", task_id=task_id, error=str(e))
             entry.result = TaskResult(
                 task_id=task_id, status=TaskStatus.ERROR,
                 task=body.prompt, error=str(e))
@@ -153,14 +212,8 @@ async def submit_analyse(body: AnalyseRequest):
                     pass
             entry.done.set()
             if entry.result:
-                log_event(
-                    logger,
-                    logging.INFO,
-                    "analysis task finished",
-                    event="task_finished",
-                    task_id=task_id,
-                    status=entry.result.status.value,
-                )
+                log_event(logger, logging.INFO, "analysis task finished",
+                          event="task_finished", task_id=task_id, status=entry.result.status.value)
             if entry.callback_url and entry.result:
                 await _notify(entry)
             await asyncio.sleep(CLEANUP_DELAY)
@@ -189,14 +242,9 @@ async def _notify(entry: TaskEntry):
                 "cost": entry.result.total_tokens.cost,
             })
     except Exception:
-        log_event(
-            logger,
-            logging.WARNING,
-            "callback notification failed",
-            event="callback_failed",
-            task_id=entry.task_id,
-            callback_url=entry.callback_url or "",
-        )
+        log_event(logger, logging.WARNING, "callback notification failed",
+                  event="callback_failed", task_id=entry.task_id,
+                  callback_url=entry.callback_url or "")
 
 
 @app.get("/task/{task_id}")
@@ -239,19 +287,20 @@ async def stream_task(task_id: str):
     return EventSourceResponse(gen())
 
 
-@app.post("/task/{task_id}/abort")
-async def abort_task(task_id: str):
+@app.post("/task/{task_id}/stop")
+@app.post("/task/{task_id}/abort")  # alias kept for compatibility
+async def stop_task(task_id: str):
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404)
     if entry.result:
         return {"message": "Already completed", "status": entry.result.status.value}
-    entry.orch.abort()
-    return {"message": "Abort sent", "task_id": task_id}
+    entry.orch.stop()
+    return {"message": "Stop sent", "task_id": task_id}
 
 
 @app.get("/tasks")
-async def list_tasks():
+async def list_engine_tasks():
     return {"tasks": [
         {"task_id": tid, "prompt": e.prompt[:100],
          "status": e.result.status.value if e.result else "running"}
