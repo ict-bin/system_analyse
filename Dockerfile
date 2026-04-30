@@ -1,6 +1,21 @@
-FROM dfa-base:layer5
+FROM ubuntu:24.04
 
+ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+
+# ═══ 系统工具 ═════════════════════════════════════════════════════════════════
+RUN apt-get update && apt-get install -y \
+    curl wget gnupg ca-certificates git zip \
+    python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# ═══ Node.js 22 ═══════════════════════════════════════════════════════════════
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ═══ pi-coding-agent ══════════════════════════════════════════════════════════
+RUN npm install -g @mariozechner/pi-coding-agent
 
 # ═══ 项目代码 ═════════════════════════════════════════════════════════════════
 WORKDIR /app
