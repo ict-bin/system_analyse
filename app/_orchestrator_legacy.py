@@ -221,6 +221,25 @@ class Orchestrator:
             except Exception:
                 pass
 
+    def _make_stream_handler(self, task_id: str, stage: str):
+        """Returns an on_stream callback that batches LLM text and emits agent_stream events."""
+        buf: list[str] = []
+        buf_size = [0]
+
+        def handler(text: str) -> None:
+            buf.append(text)
+            buf_size[0] += len(text)
+            # Flush on newline or every 400 chars to provide live progress
+            if "\n" in text or buf_size[0] >= 400:
+                chunk = "".join(buf).strip()
+                buf.clear()
+                buf_size[0] = 0
+                if chunk:
+                    self._emit("agent_stream", task_id, stage=stage,
+                               text=chunk[:600])
+
+        return handler
+
     def abort(self):
         if self._cancel_event:
             self._cancel_event.set()
@@ -249,6 +268,8 @@ class Orchestrator:
             task_id = out_dir.name  # 继承原 task_id
             sess_dir = out_dir / "sessions"
             sess_dir.mkdir(exist_ok=True)
+            task_tmp = workspace / "tmp"
+            task_tmp.mkdir(exist_ok=True)
         else:
             out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -256,6 +277,15 @@ class Orchestrator:
             sess_dir.mkdir(exist_ok=True)
             workspace = out_dir / "workspace"
             workspace.mkdir(exist_ok=True)
+            # Per-task workspace isolation: private tmp dir + read-only target symlink
+            task_tmp = workspace / "tmp"
+            task_tmp.mkdir(exist_ok=True)
+            target_link = workspace / "target"
+            if not target_link.exists():
+                try:
+                    target_link.symlink_to(os.path.abspath(cfg.target_dir))
+                except OSError:
+                    pass
 
         result = TaskResult(task_id=task_id, status=TaskStatus.RUNNING,
                             task=cfg.task, config_snapshot=cfg.model_dump())
@@ -277,6 +307,7 @@ class Orchestrator:
         w_base = {
             "tools": w_cfg.tools or cfg.workers.default_tools,
             "cwd": str(workspace),
+            "env": {**os.environ, "TMPDIR": str(task_tmp), "HOME": str(workspace)},
             "thinking_level": w_cfg.thinking_level or cfg.workers.default_thinking_level,
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
@@ -313,7 +344,7 @@ class Orchestrator:
             if not _skip_s12:
                 # Stage 0: 文件类型过滤
                 # ═══════════════════════════════════════════════════
-                filter_script = "/opt/system_analyse/scripts/filter_files.sh"
+                filter_script = "/app/scripts/filter_files.sh"
                 if os.path.isfile(filter_script):
                     types_str = " ".join(cfg.analyse_targets)
                     arch_str = " ".join(cfg.binary_arch)
@@ -325,8 +356,15 @@ class Orchestrator:
                         *cfg.analyse_targets,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        env={**os.environ, "TMPDIR": str(task_tmp)},
                     )
-                    stdout, _ = await proc.communicate()
+                    stdout, stderr_bytes = await proc.communicate()
+                    # Emit script output for visibility
+                    _out = (stdout or b"").decode("utf-8", errors="replace").strip()
+                    _err = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
+                    _cli = (_out + ("\n" + _err if _err else "")).strip()
+                    if _cli:
+                        self._emit("cli_output", task_id, stage="filter", text=_cli[:3000])
                     filter_count = 0
                     filtered_path = workspace / "filtered_files.txt"
                     if filtered_path.exists():
@@ -358,15 +396,20 @@ class Orchestrator:
                         model=_wm("explore"),
                         system_prompt=explore_prompt,
                         session_file=explore_session,
+                        on_stream=self._make_stream_handler(task_id, "explore"),
                         **w_base,
                     )
                     tokens += ar.token_usage
+                    # Emit the final agent output snippet for debugging
+                    if ar.output:
+                        self._emit("agent_output", task_id, stage="explore",
+                                   output=ar.output[-1200:])
 
                     # Step B: 用 Worker 生成的 keywords.txt 跑预扫描脚本
                     keywords_file = workspace / "keywords.txt"
-                    prescan_script = "/opt/system_analyse/scripts/prescan_files.py"
+                    prescan_script = "/app/scripts/prescan_files.py"
                     if not os.path.isfile(prescan_script):
-                        prescan_script = "/opt/system_analyse/scripts/prescan_files.sh"
+                        prescan_script = "/app/scripts/prescan_files.sh"
                     if keywords_file.exists() and os.path.isfile(prescan_script):
                         self._emit("stage", task_id, stage="prescan")
                         try:
@@ -376,8 +419,15 @@ class Orchestrator:
                                 *cmd, cfg.target_dir, str(workspace),
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
+                                env={**os.environ, "TMPDIR": str(task_tmp)},
                             )
                             stdout, stderr = await proc.communicate()
+                            # Emit prescan CLI output
+                            _pout = (stdout or b"").decode("utf-8", errors="replace").strip()
+                            _perr = (stderr or b"").decode("utf-8", errors="replace").strip()
+                            _pcli = (_pout + ("\n" + _perr if _perr else "")).strip()
+                            if _pcli:
+                                self._emit("cli_output", task_id, stage="prescan", text=_pcli[:3000])
                             summary_file = workspace / "keyword_summary.txt"
                             if summary_file.exists():
                                 prescan_summary = summary_file.read_text("utf-8")
@@ -393,6 +443,15 @@ class Orchestrator:
 
                     # Worker 工作
                     prompt_parts = [cfg.task]
+                    # 始终注入工作目录和目标目录绝对路径，防止模型迷失
+                    prompt_parts.append(
+                        f"\n\n## 📂 关键路径（必须遵守）\n"
+                        f"- **工作目录**（创建模块结构的位置）: `{workspace}`\n"
+                        f"- **过滤文件列表**: `{workspace}/filtered_files.txt`\n"
+                        f"- **目标文件目录**（仅用于读取文件内容）: `{cfg.target_dir}`\n\n"
+                        f"⚠️ 所有 `modules/` 子目录必须创建在 `{workspace}/modules/` 下。\n"
+                        f"⚠️ 执行 bash 命令时，始终先 `cd {workspace}` 再创建目录，切勿在目标目录下创建文件。"
+                    )
                     # 第一轮：告知 Worker 过滤后的文件列表（如果有过滤）
                     filtered_path = workspace / "filtered_files.txt"
                     if attempt == 0 and filtered_path.exists():
@@ -400,15 +459,15 @@ class Orchestrator:
                         prompt_parts.append(
                             chr(10)*2 +
                             f"❗ 当前配置已开启文件类型过滤，" +
-                            f"工作目录下的 `filtered_files.txt` 包含将要分析的 {fc} 个文件（相对路径）。" +
+                            f"`{workspace}/filtered_files.txt` 包含将要分析的 {fc} 个文件（相对于目标目录的相对路径）。" +
                             chr(10)*2 +
-                            "你必须且只能对这 {fc} 个文件进行分类，" +
-                            "不要撫烧其他文件。" +
+                            f"你必须且只能对这 {fc} 个文件进行分类，" +
+                            "不要超出范围扫描其他文件。" +
                             chr(10)*2 +
-                            "分类时用 `cat filtered_files.txt` 作为输入源，" +
-                            "而不是 `find /data/target -type f`。" +
+                            f"分类时用 `cat {workspace}/filtered_files.txt` 作为输入源，" +
+                            f"而不是 `find {cfg.target_dir} -type f`。" +
                             chr(10)*2 +
-                            "每个模块的 files.list 必须写就是 filtered_files.txt 里的相对路径。"
+                            "每个模块的 files.list 写的是相对于目标目录的相对路径（与 filtered_files.txt 格式一致）。"
                         )
                     # 附带预扫描摘要（如果有）
                     if attempt == 0 and prescan_summary:

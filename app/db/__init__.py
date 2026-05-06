@@ -15,6 +15,23 @@ logger = logging.getLogger("sa.db")
 _engine = None
 _SessionLocal = None
 
+_MIGRATIONS = [
+    # Add stages_json column for real-time stage tracking (added 2026-05)
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN stages_json JSON NULL",
+]
+
+
+def _run_migrations(engine) -> None:
+    """Apply additive schema migrations; silently skips already-applied ones."""
+    with engine.connect() as conn:
+        for stmt in _MIGRATIONS:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+                logger.info("Migration applied: %s", stmt[:60])
+            except Exception:
+                conn.rollback()
+
 
 def init_db(db_url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
     """Initialize the database engine and create tables."""
@@ -28,6 +45,7 @@ def init_db(db_url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
     )
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
     Base.metadata.create_all(bind=_engine)
+    _run_migrations(_engine)
     logger.info("Database initialized")
 
 

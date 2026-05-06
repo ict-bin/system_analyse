@@ -1,4 +1,4 @@
-"""Task management service for secflow-app-system-analyse.
+﻿"""Task management service for secflow-app-system-analyse.
 
 Bridges the FastAPI management layer with the existing Orchestrator engine.
 Each task is persisted in MySQL and executed asynchronously.
@@ -9,16 +9,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time as _time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.config import build_task_config, get_service_yaml, load_service_config
+from app.config import build_task_config, load_service_config
 from app.db.models import AppSaTask
 from app.logging_utils import log_event
-from app.models import TaskStatus
+from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
 
 logger = logging.getLogger("sa.task_service")
@@ -37,7 +38,6 @@ def _load_svc_config():
 
 
 def generate_prompt_from_path(input_path: str) -> str:
-    """Generate a default Chinese analysis prompt from the input path."""
     path_lower = input_path.lower()
     if any(kw in path_lower for kw in ("firmware", "unpacked", "squashfs", "rootfs")):
         subject = "固件解包后的所有文件"
@@ -51,23 +51,37 @@ def generate_prompt_from_path(input_path: str) -> str:
         subject = "源代码文件"
     else:
         subject = "目标文件"
-
     return (
         f"对路径 `{input_path}` 下的{subject}进行系统性安全分析，"
         "重点关注：威胁识别、模块功能分类、安全漏洞、敏感信息暴露及风险等级评估。"
     )
 
 
+def _flush_stages(task_id: str, events: list[dict]) -> None:
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+        from app.db import get_db as _get_db
+        _gen = _get_db()
+        _db = next(_gen)
+        try:
+            _r = _db.query(AppSaTask).filter_by(task_id=task_id).first()
+            if _r:
+                _r.stages_json = {"events": [dict(e) for e in events]}
+                flag_modified(_r, "stages_json")
+                _db.commit()
+        finally:
+            try:
+                next(_gen)
+            except StopIteration:
+                pass
+    except Exception as _exc:
+        logger.warning("_flush_stages failed: %s", _exc, exc_info=True)
+
+
 class TaskService:
-    def list_tasks(
-        self,
-        db: Session,
-        *,
-        project_id: str,
-        page: int = 1,
-        per_page: int = 20,
-        status: Optional[str] = None,
-    ) -> dict:
+
+    def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
+                   per_page: int = 20, status: Optional[str] = None) -> dict:
         query = db.query(AppSaTask).filter(
             AppSaTask.project_id == project_id,
             AppSaTask.is_deleted.is_(False),
@@ -75,169 +89,118 @@ class TaskService:
         if status:
             query = query.filter(AppSaTask.status == status)
         total = query.count()
-        rows = (
-            query.order_by(AppSaTask.created_at.desc())
-            .offset((page - 1) * per_page)
-            .limit(per_page)
-            .all()
-        )
-        return {
-            "items": [self._row_to_dict(r) for r in rows],
-            "total": total,
-            "page": page,
-            "per_page": per_page,
-        }
+        rows = (query.order_by(AppSaTask.created_at.desc())
+                .offset((page - 1) * per_page).limit(per_page).all())
+        return {"items": [self._row_to_dict(r) for r in rows],
+                "total": total, "page": page, "per_page": per_page}
 
     def get_task(self, db: Session, task_id: str) -> dict:
-        row = self._get_or_404(db, task_id)
-        return self._row_to_dict(row)
+        return self._row_to_dict(self._get_or_404(db, task_id))
 
-    def create_task(
-        self,
-        db: Session,
-        *,
-        project_id: str,
-        task_name: str,
-        input_path: str,
-        output_path: Optional[str] = None,
-        task_description: Optional[str] = None,
-        prompt_template_id: Optional[str] = None,
-        prompt_content: str,
-        created_by: Optional[str] = None,
-    ) -> dict:
+    def create_task(self, db: Session, *, project_id: str, task_name: str,
+                    input_path: str, output_path: Optional[str] = None,
+                    task_description: Optional[str] = None,
+                    prompt_template_id: Optional[str] = None,
+                    prompt_content: str, created_by: Optional[str] = None,
+                    task_config_json: Optional[dict] = None) -> dict:
         task_id = f"sat_{uuid.uuid4().hex[:16]}"
         effective_output = output_path or os.environ.get("OUTPUT_DIR", "/data/output")
-
         row = AppSaTask(
-            task_id=task_id,
-            project_id=project_id,
-            task_name=task_name,
-            task_description=task_description,
-            input_path=input_path,
-            output_path=effective_output,
-            prompt_template_id=prompt_template_id,
-            prompt_content=prompt_content,
-            status="pending",
-            created_by=created_by,
+            task_id=task_id, project_id=project_id, task_name=task_name,
+            task_description=task_description, input_path=input_path,
+            output_path=effective_output, prompt_template_id=prompt_template_id,
+            prompt_content=prompt_content, status="pending", created_by=created_by,
+            task_config_json=task_config_json,
         )
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-
-        # Fire background execution
-        asyncio_task = asyncio.create_task(
-            self._execute_task(task_id),
-            name=f"sa_task_{task_id}",
-        )
+        db.add(row); db.commit(); db.refresh(row)
+        asyncio_task = asyncio.create_task(self._execute_task(task_id),
+                                            name=f"sa_task_{task_id}")
         _running_tasks[task_id] = asyncio_task
-
-        log_event(logger, logging.INFO, "task created", event="task_created", task_id=task_id, project_id=project_id)
+        log_event(logger, logging.INFO, "task created",
+                  event="task_created", task_id=task_id, project_id=project_id)
         return self._row_to_dict(row)
 
     def restart_task(self, db: Session, task_id: str) -> dict:
-        """Create and immediately start a new task cloned from an existing one.
-
-        The new task inherits all parameters (input_path, prompt_content, etc.)
-        but runs against the current service configuration.
-        Active tasks (pending / running) cannot be restarted; cancel them first.
-        """
         row = self._get_or_404(db, task_id)
         if row.status in ("pending", "running"):
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
-
         new_task_id = f"sat_{uuid.uuid4().hex[:16]}"
         effective_output = row.output_path or os.environ.get("OUTPUT_DIR", "/data/output")
-
         new_row = AppSaTask(
-            task_id=new_task_id,
-            project_id=row.project_id,
-            task_name=row.task_name,
-            task_description=row.task_description,
-            input_path=row.input_path,
-            output_path=effective_output,
-            prompt_template_id=row.prompt_template_id,
-            prompt_content=row.prompt_content,
-            status="pending",
-            created_by=row.created_by,
+            task_id=new_task_id, project_id=row.project_id, task_name=row.task_name,
+            task_description=row.task_description, input_path=row.input_path,
+            output_path=effective_output, prompt_template_id=row.prompt_template_id,
+            prompt_content=row.prompt_content, status="pending", created_by=row.created_by,
+            task_config_json=row.task_config_json,
         )
-        db.add(new_row)
-        db.commit()
-        db.refresh(new_row)
-
-        asyncio_task = asyncio.create_task(
-            self._execute_task(new_task_id),
-            name=f"sa_task_{new_task_id}",
-        )
+        db.add(new_row); db.commit(); db.refresh(new_row)
+        asyncio_task = asyncio.create_task(self._execute_task(new_task_id),
+                                            name=f"sa_task_{new_task_id}")
         _running_tasks[new_task_id] = asyncio_task
-
-        log_event(
-            logger, logging.INFO, "task restarted",
-            event="task_restarted",
-            task_id=new_task_id,
-            original_task_id=task_id,
-            project_id=row.project_id,
-        )
+        log_event(logger, logging.INFO, "task restarted", event="task_restarted",
+                  task_id=new_task_id, original_task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(new_row)
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         if row.status in ("passed", "failed", "error", "cancelled"):
             return self._row_to_dict(row)
-
-        # Cancel the asyncio task if still running
         at = _running_tasks.get(task_id)
         if at and not at.done():
             at.cancel()
-
         row.status = "cancelled"
         row.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        db.commit()
-        db.refresh(row)
+        db.commit(); db.refresh(row)
         return self._row_to_dict(row)
 
-    # ── private ──────────────────────────────────────────────────────────────
-
     async def _execute_task(self, task_id: str) -> None:
-        """Run the Orchestrator engine and persist results."""
         from app.db import get_db
-        # Get a fresh DB session for background task
         db_gen = get_db()
         db: Session = next(db_gen)
+        event_buffer: list[dict] = []
+
+        def on_event(event: SwarmEvent) -> None:
+            event_buffer.append({"ts": _time.time(), "type": event.type,
+                                  "data": dict(event.data)})
+            n = len(event_buffer)
+            if n == 1 or n % 3 == 0:
+                _flush_stages(task_id, event_buffer)
+
         try:
             row = db.query(AppSaTask).filter_by(task_id=task_id).first()
             if not row or row.status == "cancelled":
                 return
-
             row.status = "running"
             row.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
-
             svc = _load_svc_config()
+            # Apply per-task config overrides (analyse_targets, binary_arch, etc.)
+            tcfg = row.task_config_json or {}
+            if tcfg.get("analyse_targets"):
+                svc.analyse_targets = tcfg["analyse_targets"]
+            if tcfg.get("binary_arch"):
+                svc.binary_arch = tcfg["binary_arch"]
             cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
-
-            orch = Orchestrator(config=cfg)
+            orch = Orchestrator(config=cfg, on_event=on_event)
             result = await orch.execute(task_id)
-
-            # Re-fetch row in case it was cancelled externally
-            db.expire(row)
-            db.refresh(row)
+            _flush_stages(task_id, event_buffer)
+            db.expire(row); db.refresh(row)
             if row.status == "cancelled":
                 return
-
             row.status = result.status.value if result else "error"
             row.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            row.stages_json = {"events": event_buffer, "final": True}
             if result:
                 row.result_json = result.model_dump(mode="json")
                 if result.error:
                     row.error = result.error
             db.commit()
-
         except asyncio.CancelledError:
-            # Task was cancelled externally; status already set by cancel_task()
             pass
         except Exception as exc:
-            log_event(logger, logging.ERROR, "task execution failed", event="task_error", task_id=task_id, error=str(exc))
+            log_event(logger, logging.ERROR, "task execution failed",
+                      event="task_error", task_id=task_id, error=str(exc))
             try:
                 db.rollback()
                 r = db.query(AppSaTask).filter_by(task_id=task_id).first()
@@ -245,6 +208,7 @@ class TaskService:
                     r.status = "error"
                     r.error = str(exc)
                     r.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    r.stages_json = {"events": event_buffer, "final": True}
                     db.commit()
             except Exception:
                 pass
@@ -268,25 +232,19 @@ class TaskService:
     @staticmethod
     def _row_to_dict(row: AppSaTask) -> dict:
         def fmt(dt: datetime | None) -> str | None:
-            return dt.isoformat() if dt else None
-
+            return dt.isoformat() + "Z" if dt else None
         return {
-            "task_id": row.task_id,
-            "project_id": row.project_id,
-            "task_name": row.task_name,
-            "task_description": row.task_description,
-            "input_path": row.input_path,
-            "output_path": row.output_path,
+            "task_id": row.task_id, "project_id": row.project_id,
+            "task_name": row.task_name, "task_description": row.task_description,
+            "input_path": row.input_path, "output_path": row.output_path,
             "prompt_template_id": row.prompt_template_id,
-            "prompt_content": row.prompt_content,
-            "status": row.status,
-            "error": row.error,
-            "result_json": row.result_json,
+            "prompt_content": row.prompt_content, "status": row.status,
+            "error": row.error, "result_json": row.result_json,
+            "stages_json": row.stages_json,
+            "task_config_json": row.task_config_json,
             "created_by": row.created_by,
-            "created_at": fmt(row.created_at),
-            "updated_at": fmt(row.updated_at),
-            "started_at": fmt(row.started_at),
-            "finished_at": fmt(row.finished_at),
+            "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
+            "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
         }
 
 

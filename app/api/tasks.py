@@ -22,6 +22,8 @@ class TaskCreateRequest(BaseModel):
     task_description: Optional[str] = None
     prompt_template_id: Optional[str] = None
     prompt_content: Optional[str] = None  # If omitted, auto-generated from input_path
+    analyse_targets: Optional[list[str]] = None  # Override service-level analyse_targets
+    binary_arch: Optional[list[str]] = None      # Override service-level binary_arch
 
 
 class GeneratePromptRequest(BaseModel):
@@ -35,6 +37,13 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         prompt = generate_prompt_from_path(body.input_path)
 
     svc = get_task_service()
+    task_config: dict | None = None
+    if body.analyse_targets is not None or body.binary_arch is not None:
+        task_config = {}
+        if body.analyse_targets is not None:
+            task_config["analyse_targets"] = body.analyse_targets
+        if body.binary_arch is not None:
+            task_config["binary_arch"] = body.binary_arch
     return svc.create_task(
         db,
         project_id=body.project_id,
@@ -44,6 +53,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         task_description=body.task_description,
         prompt_template_id=body.prompt_template_id,
         prompt_content=prompt,
+        task_config_json=task_config,
     )
 
 
@@ -72,6 +82,24 @@ async def cancel_task(task_id: str, db: Session = Depends(get_db)):
 async def restart_task(task_id: str, db: Session = Depends(get_db)):
     """Clone an existing task and start it immediately with the current service config."""
     return get_task_service().restart_task(db, task_id)
+
+
+@router.get("/tasks/{task_id}/logs")
+async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
+    """Return stages_json for the task (stage events used as structured log stream)."""
+    from app.db.models import AppSaTask
+    row = db.query(AppSaTask).filter(
+        AppSaTask.task_id == task_id,
+        AppSaTask.is_deleted.is_(False),
+    ).first()
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    return {
+        "task_id": task_id,
+        "status": row.status,
+        "stages_json": row.stages_json or {"events": []},
+    }
 
 
 @router.post("/generate-prompt")

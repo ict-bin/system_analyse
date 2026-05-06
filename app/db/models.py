@@ -34,12 +34,15 @@ class AppSaTask(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     result_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    stages_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    task_config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 

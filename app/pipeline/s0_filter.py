@@ -29,7 +29,7 @@ class FilterStage(BaseStage):
         workspace = ctx.workspace
         task_id = ctx.task_id
 
-        filter_script = "/opt/system_analyse/scripts/filter_files.sh"
+        filter_script = "/app/scripts/filter_files.sh"
         if not os.path.isfile(filter_script):
             return
 
