@@ -80,8 +80,14 @@ async def cancel_task(task_id: str, db: Session = Depends(get_db)):
 
 @router.post("/tasks/{task_id}/restart", status_code=201)
 async def restart_task(task_id: str, db: Session = Depends(get_db)):
-    """Clone an existing task and start it immediately with the current service config."""
+    """Reset and restart an existing task in-place, reusing the same task ID."""
     return get_task_service().restart_task(db, task_id)
+
+
+@router.post("/tasks/{task_id}/resume", status_code=201)
+async def resume_task(task_id: str, db: Session = Depends(get_db)):
+    """Resume a task from Stage 3 (断点续跑), reusing the same task ID."""
+    return get_task_service().resume_task(db, task_id)
 
 
 @router.get("/tasks/{task_id}/logs")

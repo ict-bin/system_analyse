@@ -125,22 +125,53 @@ class TaskService:
         if row.status in ("pending", "running"):
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
-        new_task_id = f"sat_{uuid.uuid4().hex[:16]}"
-        effective_output = row.output_path or os.environ.get("OUTPUT_DIR", "/data/output")
-        new_row = AppSaTask(
-            task_id=new_task_id, project_id=row.project_id, task_name=row.task_name,
-            task_description=row.task_description, input_path=row.input_path,
-            output_path=effective_output, prompt_template_id=row.prompt_template_id,
-            prompt_content=row.prompt_content, status="pending", created_by=row.created_by,
-            task_config_json=row.task_config_json,
-        )
-        db.add(new_row); db.commit(); db.refresh(new_row)
-        asyncio_task = asyncio.create_task(self._execute_task(new_task_id),
-                                            name=f"sa_task_{new_task_id}")
-        _running_tasks[new_task_id] = asyncio_task
-        log_event(logger, logging.INFO, "task restarted", event="task_restarted",
-                  task_id=new_task_id, original_task_id=task_id, project_id=row.project_id)
-        return self._row_to_dict(new_row)
+        # Reset in-place — strip any resume overrides from previous resume_task call
+        from sqlalchemy.orm.attributes import flag_modified
+        clean_config = {k: v for k, v in (row.task_config_json or {}).items()
+                        if k not in ("start_stage", "resume_workspace")} or None
+        row.task_config_json = clean_config
+        row.status = "pending"
+        row.started_at = None
+        row.finished_at = None
+        row.stages_json = None
+        row.result_json = None
+        row.error = None
+        flag_modified(row, "task_config_json")
+        db.commit(); db.refresh(row)
+        asyncio_task = asyncio.create_task(self._execute_task(task_id),
+                                            name=f"sa_task_{task_id}")
+        _running_tasks[task_id] = asyncio_task
+        log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
+                  task_id=task_id, project_id=row.project_id)
+        return self._row_to_dict(row)
+
+    def resume_task(self, db: Session, task_id: str) -> dict:
+        """从断点续跑：保留同一任务ID，跳过 Stage 1/2 直接从 Stage 3 开始。"""
+        row = self._get_or_404(db, task_id)
+        if row.status in ("pending", "running"):
+            from fastapi import HTTPException
+            raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
+        from sqlalchemy.orm.attributes import flag_modified
+        svc = _load_svc_config()
+        resume_workspace = os.path.join(svc.output_dir, task_id, "workspace")
+        tcfg = dict(row.task_config_json or {})
+        tcfg["start_stage"] = 3
+        tcfg["resume_workspace"] = resume_workspace
+        row.task_config_json = tcfg
+        row.status = "pending"
+        row.started_at = None
+        row.finished_at = None
+        row.stages_json = None
+        row.result_json = None
+        row.error = None
+        flag_modified(row, "task_config_json")
+        db.commit(); db.refresh(row)
+        asyncio_task = asyncio.create_task(self._execute_task(task_id),
+                                            name=f"sa_task_{task_id}")
+        _running_tasks[task_id] = asyncio_task
+        log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
+                  task_id=task_id, project_id=row.project_id, resume_workspace=resume_workspace)
+        return self._row_to_dict(row)
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -181,6 +212,10 @@ class TaskService:
                 svc.analyse_targets = tcfg["analyse_targets"]
             if tcfg.get("binary_arch"):
                 svc.binary_arch = tcfg["binary_arch"]
+            if tcfg.get("start_stage"):
+                svc.start_stage = tcfg["start_stage"]
+            if tcfg.get("resume_workspace"):
+                svc.resume_workspace = tcfg["resume_workspace"]
             cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
             orch = Orchestrator(config=cfg, on_event=on_event)
             result = await orch.execute(task_id)
