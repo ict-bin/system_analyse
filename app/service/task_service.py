@@ -138,6 +138,15 @@ class TaskService:
         row.error = None
         flag_modified(row, "task_config_json")
         db.commit(); db.refresh(row)
+        # Clean up previous run directory so fresh execution starts from scratch
+        if row.output_path:
+            import shutil as _shutil
+            task_root = os.path.join(row.output_path, task_id)
+            if os.path.isdir(task_root):
+                try:
+                    _shutil.rmtree(task_root)
+                except Exception as _e:
+                    logger.warning("Failed to clean task dir %s: %s", task_root, _e)
         asyncio_task = asyncio.create_task(self._execute_task(task_id),
                                             name=f"sa_task_{task_id}")
         _running_tasks[task_id] = asyncio_task
@@ -153,7 +162,8 @@ class TaskService:
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
         from sqlalchemy.orm.attributes import flag_modified
         svc = _load_svc_config()
-        resume_workspace = os.path.join(svc.output_dir, task_id, "workspace")
+        effective_output = row.output_path or svc.output_dir
+        resume_workspace = os.path.join(effective_output, task_id, "run", "workspace")
         tcfg = dict(row.task_config_json or {})
         tcfg["start_stage"] = 3
         tcfg["resume_workspace"] = resume_workspace
@@ -216,6 +226,13 @@ class TaskService:
                 svc.start_stage = tcfg["start_stage"]
             if tcfg.get("resume_workspace"):
                 svc.resume_workspace = tcfg["resume_workspace"]
+            # Use row.output_path as the working root so the Orchestrator writes to
+            # the user-specified location ({output_path}/{task_id}/workspace/) rather
+            # than the global /data/output directory from config.json.
+            if row.output_path:
+                svc.output_dir = row.output_path
+                svc.archive_dir = row.output_path
+                svc.result_dir = row.output_path
             cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
             orch = Orchestrator(config=cfg, on_event=on_event)
             result = await orch.execute(task_id)

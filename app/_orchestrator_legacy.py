@@ -264,18 +264,25 @@ class Orchestrator:
         # ── resume_workspace: 直接使用已有 workspace（跳过 Stage 1/2）──
         if cfg.resume_workspace and cfg.start_stage > 1:
             workspace = Path(os.path.abspath(cfg.resume_workspace))
-            out_dir = workspace.parent
-            task_id = out_dir.name  # 继承原 task_id
-            sess_dir = out_dir / "sessions"
+            run_dir = workspace.parent          # workspace is inside run/
+            out_dir = run_dir.parent            # task root
+            task_id = out_dir.name              # 继承原 task_id
+            final_out_dir = out_dir / "output"
+            final_out_dir.mkdir(exist_ok=True)
+            sess_dir = run_dir / "sessions"
             sess_dir.mkdir(exist_ok=True)
             task_tmp = workspace / "tmp"
             task_tmp.mkdir(exist_ok=True)
         else:
             out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
             out_dir.mkdir(parents=True, exist_ok=True)
-            sess_dir = out_dir / "sessions"
+            run_dir = out_dir / "run"
+            run_dir.mkdir(exist_ok=True)
+            final_out_dir = out_dir / "output"
+            final_out_dir.mkdir(exist_ok=True)
+            sess_dir = run_dir / "sessions"
             sess_dir.mkdir(exist_ok=True)
-            workspace = out_dir / "workspace"
+            workspace = run_dir / "workspace"
             workspace.mkdir(exist_ok=True)
             # Per-task workspace isolation: private tmp dir + read-only target symlink
             task_tmp = workspace / "tmp"
@@ -291,8 +298,7 @@ class Orchestrator:
                             task=cfg.task, config_snapshot=cfg.model_dump())
 
         # flag 文件：立即写 0（失败），只有完全成功才改为 1
-        result_dir = Path(os.path.abspath(cfg.result_dir))
-        result_dir.mkdir(parents=True, exist_ok=True)
+        result_dir = final_out_dir  # {task_id}/output/
         flag_path = result_dir / "flag"
         flag_path.write_text("0", encoding="utf-8")
 
@@ -512,7 +518,7 @@ class Orchestrator:
                                    judge_id=f"judge-{j_idx}",
                                    passed=parsed["pass"], score=parsed["score"])
 
-                        self._archive(out_dir,
+                        self._archive(run_dir,
                             f"s1-a{attempt+1}-j{j_idx}.md",
                             f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                             f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
@@ -634,7 +640,7 @@ class Orchestrator:
                             self._emit("judge_eval", task_id, stage=2,
                                        judge_id=f"judge-{j_idx}", module=mod_name,
                                        passed=parsed["pass"], score=parsed["score"])
-                            self._archive(out_dir,
+                            self._archive(run_dir,
                                 f"s2-{mod_name}-a{attempt+1}-j{j_idx}.md",
                                 f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                                 f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
@@ -872,7 +878,7 @@ class Orchestrator:
                             self._emit("judge_eval", task_id, stage=3,
                                        judge_id=f"judge-{j_idx}", module=mod_name,
                                        passed=parsed["pass"], score=parsed["score"])
-                            self._archive(out_dir,
+                            self._archive(run_dir,
                                 f"s3-{mod_name}-a{attempt+1}-j{j_idx}.md",
                                 f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                                 f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
@@ -1117,7 +1123,7 @@ class Orchestrator:
                            judge_id=f"judge-{j_idx}",
                            passed=parsed["pass"], score=parsed["score"])
 
-                self._archive(out_dir,
+                self._archive(run_dir,
                     f"s4a-j{j_idx}.md",
                     f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                     f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
@@ -1269,7 +1275,7 @@ class Orchestrator:
                                judge_id=f"judge-{j_idx}",
                                passed=parsed["pass"], score=parsed["score"])
 
-                    self._archive(out_dir,
+                    self._archive(run_dir,
                         f"s4b-a{attempt+1}-j{j_idx}.md",
                         f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                         f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{ar.output[:3000]}")
@@ -1349,10 +1355,10 @@ class Orchestrator:
             self._strip_target_prefix(report_dst.parent, cfg.target_dir)
 
         # 6) archive.zip — 所有中间件 (judge评审、session、原始workspace)
-        (out_dir / "result.json").write_text(
+        (run_dir / "result.json").write_text(
             result.model_dump_json(indent=2), encoding="utf-8")
-        archive_path = str(result_dir / "archive")
-        shutil.make_archive(archive_path, "zip", str(out_dir.parent), out_dir.name)
+        archive_path = str(run_dir / "archive")
+        shutil.make_archive(archive_path, "zip", str(run_dir.parent), run_dir.name)
 
         # 写最终 flag: 成功=1, 失败/错误=0
         try:
@@ -1366,11 +1372,6 @@ class Orchestrator:
                     report=str(report_dst),
                     modules=str(modules_out),
                     archive=f"{archive_path}.zip")
-
-        try:
-            shutil.rmtree(str(out_dir))
-        except OSError:
-            pass
 
         return result
 
