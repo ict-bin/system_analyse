@@ -109,6 +109,12 @@ class AnalyseStage(BaseStage):
         sess_name = f"analyse{session_suffix}-{mod_name}.jsonl"
         analyse_session = str(ctx.sess_dir / sess_name)
 
+        # 如果 module_report.md 已存在（如 Pod 重启后续跑），直接跳过重新分析
+        if (mod_dir / "module_report.md").exists():
+            ctx.emit_event("log", level="info",
+                           msg=f"[跳过 S3] {mod_name} module_report.md 已存在，跳过本轮分析")
+            return
+
         # 预读所有文件（Python侧，无需 LLM tool call）
         loop = asyncio.get_event_loop()
         pre_read_content = await loop.run_in_executor(
@@ -117,6 +123,21 @@ class AnalyseStage(BaseStage):
         has_text = pre_read_content.startswith('__HAS_TEXT__\n')
         if has_text:
             pre_read_content = pre_read_content[len('__HAS_TEXT__\n'):]
+
+        # 如果 mod_dir 中存在 analysis.md / SPLITTING_EVAL.md 等阶段产出文件，
+        # 将其内容追加到 system prompt，并开启 read 工具让 worker 可继续查阅
+        for extra_md in ["analysis.md", "SPLITTING_EVAL.md"]:
+            extra_path = mod_dir / extra_md
+            if extra_path.exists():
+                try:
+                    extra_content = extra_path.read_text(encoding="utf-8", errors="ignore")
+                    if extra_content.strip():
+                        pre_read_content += (
+                            f"\n\n## 模块目录已有分析文件：{extra_md}\n\n{extra_content}"
+                        )
+                        has_text = True  # 开启 read 工具，以便 worker 进一步查阅
+                except OSError:
+                    pass
 
         w_sys = w_sys_prompt.replace("{{PRE_READ_CONTENT}}", pre_read_content) \
                             .replace("{{MODULE_NAME}}", mod_name)
