@@ -37,6 +37,21 @@ def _load_svc_config():
     raise RuntimeError(f"Service config not found: {SERVICE_CONFIG_PATH}")
 
 
+def _load_svc_config_from_db(db: "Session", project_id: str) -> "ServiceConfig":
+    """从数据库读取分析配置，构造 ServiceConfig；失败时回退到文件读取。"""
+    try:
+        from app.service.config_service import get_config_service
+        from app.models import ServiceConfig as _ServiceConfig
+        cfg_dict = get_config_service().get_config(db, project_id)
+        # Strip meta/readonly fields not part of ServiceConfig schema
+        for _k in ("updated_at", "project_id"):
+            cfg_dict.pop(_k, None)
+        return _ServiceConfig(**cfg_dict)
+    except Exception as _exc:
+        logger.warning("_load_svc_config_from_db failed (%s), falling back to file: %s", project_id, _exc)
+        return _load_svc_config()
+
+
 def generate_prompt_from_path(input_path: str) -> str:
     path_lower = input_path.lower()
     if any(kw in path_lower for kw in ("firmware", "unpacked", "squashfs", "rootfs")):
@@ -78,6 +93,24 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
         logger.warning("_flush_stages failed: %s", _exc, exc_info=True)
 
 
+def _write_models_json_from_db(db: Session) -> None:
+    """从数据库读取 models 配置并写入 pi 的配置目录，使 pi 能识别模型。"""
+    try:
+        from app.service.config_service import get_model_config_service
+        import json as _json
+        pi_dir = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
+        os.makedirs(pi_dir, exist_ok=True)
+        models_cfg = get_model_config_service().get_models_config(db)
+        # strip meta field before writing
+        blob = {k: v for k, v in models_cfg.items() if k != "updated_at"}
+        dest = os.path.join(pi_dir, "models.json")
+        with open(dest, "w", encoding="utf-8") as _f:
+            _json.dump(blob, _f, ensure_ascii=False, indent=2)
+        logger.info("models.json written from DB → %s", dest)
+    except Exception as _exc:
+        logger.warning("_write_models_json_from_db failed: %s", _exc, exc_info=True)
+
+
 class TaskService:
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
@@ -104,7 +137,8 @@ class TaskService:
                     prompt_content: str, created_by: Optional[str] = None,
                     task_config_json: Optional[dict] = None) -> dict:
         task_id = f"sat_{uuid.uuid4().hex[:16]}"
-        effective_output = output_path or os.environ.get("OUTPUT_DIR", "/data/output")
+        _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
+        effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-system-analyse"
         row = AppSaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
             task_description=task_description, input_path=input_path,
@@ -161,7 +195,7 @@ class TaskService:
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
         from sqlalchemy.orm.attributes import flag_modified
-        svc = _load_svc_config()
+        svc = _load_svc_config_from_db(db, row.project_id)
         effective_output = row.output_path or svc.output_dir
         resume_workspace = os.path.join(effective_output, task_id, "run", "workspace")
         tcfg = dict(row.task_config_json or {})
@@ -215,7 +249,8 @@ class TaskService:
             row.status = "running"
             row.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
-            svc = _load_svc_config()
+            _write_models_json_from_db(db)
+            svc = _load_svc_config_from_db(db, row.project_id)
             # Apply per-task config overrides (analyse_targets, binary_arch, etc.)
             tcfg = row.task_config_json or {}
             if tcfg.get("analyse_targets"):

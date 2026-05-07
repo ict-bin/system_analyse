@@ -4,12 +4,13 @@ pipeline/context.py — 流水线上下文（各阶段共享的状态容器）
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..models import TaskConfig, TokenUsage, SwarmEvent
+    from ..models import TaskConfig, TokenUsage, SwarmEvent, AgentInstanceConfig
 
 
 @dataclass
@@ -32,6 +33,16 @@ class PipelineContext:
 
     # ── 取消事件 ──────────────────────────────────────────────
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    # ── 输出目录（最终交付件） ────────────────────────────────
+    final_out_dir: Path = field(default_factory=lambda: Path("."))
+    """最终交付件目录（{task_id}/output/）"""
+
+    flag_path: Path = field(default_factory=lambda: Path("flag"))
+    """完成标志文件（0=运行中/失败，1=成功）"""
+
+    # ── Stage 0 → Stage 1 传递的预扫描摘要 ────────────────────
+    prescan_summary: str = ""
 
     # ══════════════════════════════════════════════════════════
     # Stage 0 输出
@@ -82,3 +93,58 @@ class PipelineContext:
         """便捷 emit，自动带 task_id"""
         from ..models import SwarmEvent
         self.emit(SwarmEvent(type=event_type, task_id=self.task_id, data=data))
+
+    # ── Worker / Judge 参数构建 ────────────────────────────────
+
+    @property
+    def task_tmp(self) -> Path:
+        """临时目录 workspace/tmp"""
+        return self.workspace / "tmp"
+
+    @property
+    def j_cfgs(self) -> "list[AgentInstanceConfig]":
+        return self.cfg.judges.agents
+
+    @property
+    def j_count(self) -> int:
+        return len(self.cfg.judges.agents)
+
+    def wm(self, stage: str) -> str:
+        """获取 Worker 在指定阶段使用的模型。"""
+        return self.cfg.workers.model_for(stage)
+
+    def jm(self, stage: str, j_item: "AgentInstanceConfig") -> str:
+        """获取 Judge 在指定阶段使用的模型。"""
+        sm = self.cfg.judges.model_for(stage)
+        return sm if sm else j_item.model
+
+    def make_w_base(self) -> dict:
+        """构建 Worker 的公共 kwargs（tools/cwd/env/thinking_level 等）。"""
+        from ..models import AgentInstanceConfig
+        w_cfg = (self.cfg.workers.agents[0] if self.cfg.workers.agents
+                 else AgentInstanceConfig(model=""))
+        return {
+            "tools": w_cfg.tools or self.cfg.workers.default_tools,
+            "cwd": str(self.workspace),
+            "env": {**os.environ,
+                    "TMPDIR": str(self.task_tmp),
+                    "HOME": str(self.workspace)},
+            "thinking_level": w_cfg.thinking_level or self.cfg.workers.default_thinking_level,
+            "cancel_event": self.cancel_event,
+            "max_retries": self.cfg.agent_max_retries,
+            "retry_delay": self.cfg.agent_retry_delay,
+            "pi_max_retries": self.cfg.pi_max_retries,
+            "pi_retry_delay": self.cfg.pi_retry_delay,
+        }
+
+    def make_j_base(self) -> dict:
+        """构建 Judge 的公共 kwargs（无 tools/cwd）。"""
+        return {
+            "thinking_level": self.cfg.judges.default_thinking_level or "off",
+            "cancel_event": self.cancel_event,
+            "max_retries": self.cfg.agent_max_retries,
+            "retry_delay": self.cfg.agent_retry_delay,
+            "pi_max_retries": self.cfg.pi_max_retries,
+            "pi_retry_delay": self.cfg.pi_retry_delay,
+            "session_file": None,
+        }

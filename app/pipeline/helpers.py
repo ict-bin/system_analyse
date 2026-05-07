@@ -4,12 +4,17 @@ pipeline/helpers.py — 各阶段共用的底层函数
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    from .context import PipelineContext
 
 # ── 公共：运行 pi agent（带重试） ─────────────────────────────────────────────
 from ..runner import run_agent, AgentResult  # noqa: E402
@@ -122,3 +127,407 @@ def load_prompt(prompt_dir: str, name: str) -> str:
         if p.exists():
             return p.read_text(encoding="utf-8").strip()
     return ""
+
+
+# ── 通用小工具 ─────────────────────────────────────────────────────────────────
+
+def max_iter(s_cfg) -> int:
+    """max_rounds=-1 时返回一个很大的数（≈无限）。"""
+    return s_cfg.max_rounds if s_cfg.max_rounds > 0 else 999_999
+
+
+def extract_result(output: str) -> str:
+    """从 <result>…</result> 提取结果，否则返回原始输出。"""
+    m = re.search(r"<result>(.*?)</result>", output, re.DOTALL)
+    return m.group(1).strip() if m else output
+
+
+def archive_file(output_dir: Path, name: str, content: str) -> None:
+    """将内容写入 output_dir/name（中间件存档）。"""
+    try:
+        (output_dir / name).write_text(content, encoding="utf-8")
+    except OSError:
+        pass
+
+
+# ─── ELF / 文件预读 ──────────────────────────────────────────────────────────
+
+SUB_BATCH_SIZE = 20        # 每个子 Worker 处理的文件数
+SUB_WORKER_THRESHOLD = 20  # 文件数超过此值启用主从模式
+
+
+def pre_read_file(fullpath: str) -> tuple[str, list[str]]:
+    """返回 (file_type, top_strings)。ELF 只读前 128KB，文本读全文（限 4MB）。"""
+    ELF_MAGIC = b"\x7fELF"
+    MIN_STR = 5
+    MAX_ELF = 131_072
+    MAX_TEXT = 4 * 1024 * 1024
+
+    def _strings(data: bytes) -> list[str]:
+        out, cur = [], []
+        for b in data:
+            c = chr(b)
+            if c.isprintable() and c not in ('\n', '\r'):
+                cur.append(c)
+            else:
+                if len(cur) >= MIN_STR:
+                    out.append(''.join(cur))
+                cur = []
+        if len(cur) >= MIN_STR:
+            out.append(''.join(cur))
+        return out
+
+    try:
+        with open(fullpath, 'rb') as f:
+            magic = f.read(4)
+            if magic == ELF_MAGIC:
+                f.seek(0)
+                data = f.read(MAX_ELF)
+                strs = _strings(data)
+                filtered = [s for s in strs
+                            if len(s) >= 5
+                            and not s.startswith('/')
+                            and not s.startswith('.')
+                            and ' ' not in s[:3]]
+                return ('ELF', filtered[:200])
+            else:
+                f.seek(0)
+                raw = f.read(MAX_TEXT)
+                try:
+                    text = raw.decode('utf-8', errors='ignore')
+                except Exception:
+                    return ('binary', [])
+                lines = [l.strip() for l in text.splitlines() if l.strip()][:120]
+                return ('text', lines)
+    except (OSError, IOError):
+        return ('unknown', [])
+
+
+def read_one_elf(fullpath: str) -> dict:
+    """ELF 三层提取：nm 导出/导入符号 + readelf 依赖库 + strings 头部。"""
+    res: dict = {"exports": [], "imports": [], "needed": [], "strings_head": []}
+    try:
+        r = subprocess.run(["nm", "-D", fullpath],
+                           capture_output=True, text=True, timeout=15)
+        for line in r.stdout.splitlines():
+            p = line.split()
+            if len(p) >= 3:
+                st, sn = p[-2], p[-1]
+                if st in ('T', 't'):
+                    res["exports"].append(sn)
+                elif st == 'U':
+                    res["imports"].append(sn)
+            elif len(p) == 2 and p[0] == 'U':
+                res["imports"].append(p[1])
+        res["exports"] = res["exports"][:300]
+        res["imports"] = res["imports"][:150]
+        r = subprocess.run(["readelf", "-d", fullpath],
+                           capture_output=True, text=True, timeout=15)
+        for line in r.stdout.splitlines():
+            if "NEEDED" in line:
+                m = re.search(r'\[([^\]]+)\]', line)
+                if m:
+                    res["needed"].append(m.group(1))
+        r = subprocess.run(["strings", "-n", "6", fullpath],
+                           capture_output=True, text=True, timeout=15)
+        res["strings_head"] = r.stdout.splitlines()[:50]
+    except Exception:
+        pass
+    return res
+
+
+def pre_read_module(target_dir: str, mod_dir: Path) -> str:
+    """预读模块所有文件，注入结构化内容到 system prompt。
+
+    ELF: nm 导出符号 + 导入符号 + readelf 依赖库 + strings 头部。
+    文本: 直接读取内容（限总计 150KB）。
+    返回带 '__HAS_TEXT__\\n' 前缀（如有非 ELF 文件），供调用方决定 tools。
+    """
+    try:
+        flist = (mod_dir / "files.list").read_text("utf-8").strip().splitlines()
+    except OSError:
+        return "(files.list 不可读)"
+    files = [l.strip() for l in flist if l.strip()]
+    if not files:
+        return "(模块文件列表为空)"
+
+    def _read_one(relpath: str):
+        fp = str(Path(target_dir) / relpath)
+        try:
+            with open(fp, 'rb') as f:
+                magic = f.read(4)
+        except OSError:
+            return relpath, 'missing', {}
+        if magic == b'\x7fELF':
+            return relpath, 'ELF', read_one_elf(fp)
+        else:
+            try:
+                with open(fp, encoding='utf-8', errors='replace') as f:
+                    content_full = f.read()
+                return relpath, 'text', {"content": content_full}
+            except Exception:
+                return relpath, 'binary', {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        futs = [(rp, pool.submit(_read_one, rp)) for rp in files]
+
+    TEXT_TOTAL_CHAR_LIMIT = 150_000
+    TEXT_FILE_CHAR_LIMIT = 8_000
+    text_chars_used = 0
+    has_text_files = False
+    truncated_files: list[str] = []
+
+    parts = []
+    for rp, fut in futs:
+        try:
+            _, ftype, data = fut.result(timeout=20)
+        except Exception:
+            ftype, data = 'unknown', {}
+        parts.append(f"### {rp}")
+        if ftype == 'ELF':
+            exports = data.get('exports', [])
+            imports = data.get('imports', [])
+            needed = data.get('needed', [])
+            sh = data.get('strings_head', [])
+            parts.append("类型: ELF 共享库 (AArch64)")
+            if needed:
+                parts.append(f"依赖库: {', '.join(needed)}")
+            if exports:
+                parts.append(f"导出函数 ({len(exports)}个, 对外攻击面):")
+                parts.append("```")
+                parts.extend(exports)
+                parts.append("```")
+            if imports:
+                parts.append(f"外部调用 ({len(imports)}个, 含潜在危险函数):")
+                parts.append("```")
+                parts.extend(imports)
+                parts.append("```")
+            if sh:
+                parts.append(f"strings头部 ({len(sh)}行):")
+                parts.append("```")
+                parts.extend(sh)
+                parts.append("```")
+        elif ftype == 'text':
+            has_text_files = True
+            full = data.get('content', '')
+            if text_chars_used >= TEXT_TOTAL_CHAR_LIMIT:
+                truncated_files.append(rp)
+                parts.append("类型: 文本文件")
+                parts.append("〔内容已略去（总预算已满），可用 read 工具获取完整内容〕")
+            else:
+                remaining = TEXT_TOTAL_CHAR_LIMIT - text_chars_used
+                take = min(len(full), TEXT_FILE_CHAR_LIMIT, remaining)
+                snippet = full[:take]
+                total_lines = full.count('\n') + 1
+                shown_lines = snippet.count('\n') + 1
+                text_chars_used += take
+                is_cut = take < len(full)
+                cut_note = (f"  (前{shown_lines}行/{total_lines}行，已截断"
+                            f"，余下内容可用 read 工具获取)") if is_cut else f"  ({total_lines}行)"
+                parts.append(f"类型: 文本文件{cut_note}:")
+                parts.append("```")
+                parts.extend(snippet.splitlines())
+                parts.append("```")
+        elif ftype == 'missing':
+            parts.append("(文件不存在 target_dir)")
+        else:
+            parts.append(f"类型: {ftype}")
+
+    if truncated_files:
+        parts.append("")
+        parts.append(f"⚠️ 以下 {len(truncated_files)} 个文件因总内容超限未展示，"
+                     f"可用 read 工具直接读取：")
+        for tf in truncated_files:
+            parts.append(f"  - /data/target/{tf}")
+
+    result_str = '\n'.join(parts)
+    prefix = '__HAS_TEXT__\n' if has_text_files else ''
+    return prefix + result_str
+
+
+async def collect_file_summaries(
+    ctx: "PipelineContext",
+    mod_name: str,
+    mod_dir: Path,
+    sub_prompt_template: str,
+    parallel: int = 1,
+    sub_model: str = "",
+    target_dir: str = "/data/target",
+) -> str:
+    """主从模式：子 Worker 并行分批读取文件，返回合并的文件摘要字符串。"""
+    w_base = ctx.make_w_base()
+    flist_path = mod_dir / "files.list"
+    files = [l.strip() for l in flist_path.read_text("utf-8").splitlines() if l.strip()]
+
+    batches: list[list[str]] = []
+    for i in range(0, len(files), SUB_BATCH_SIZE):
+        batches.append(files[i:i + SUB_BATCH_SIZE])
+
+    ctx.emit_event("stage", stage="2-sub",
+                   module=mod_name, batches=len(batches), files=len(files),
+                   parallel=parallel)
+
+    semaphore = asyncio.Semaphore(max(1, parallel))
+    results: list[str | None] = [None] * len(batches)
+    loop = asyncio.get_event_loop()
+
+    async def _run_batch(idx: int, batch: list[str]) -> None:
+        async with semaphore:
+            ctx.emit_event("stage", stage="2-sub",
+                           module=mod_name, batch=idx + 1, total=len(batches))
+
+            pre_reads: list[tuple[str, list[str]]] = []
+            for relpath in batch:
+                fullpath = os.path.join(target_dir, relpath)
+                ftype, lines = await loop.run_in_executor(None, pre_read_file, fullpath)
+                pre_reads.append((ftype, lines))
+
+            parts = [f"以下是 {len(batch)} 个文件的内容摘要，直接分析，无需再读文件：\n"]
+            for relpath, (ftype, lines) in zip(batch, pre_reads):
+                fname = os.path.basename(relpath)
+                parts.append(f"\n=== {fname} ({ftype}) ===")
+                parts.append(f"路径: {relpath}")
+                if lines:
+                    content_preview = '\n'.join(lines[:40])
+                    parts.append(f"内容:\n{content_preview}")
+                else:
+                    parts.append("内容: (空文件或无法读取)")
+            prompt = '\n'.join(parts)
+
+            ar = await run_agent_checked(
+                context=f"s2-sub-{mod_name}-batch{idx+1}",
+                prompt=prompt,
+                model=sub_model or w_base.get("model", ""),
+                tools=[],
+                system_prompt=sub_prompt_template,
+                cwd=w_base["cwd"],
+                thinking_level=w_base.get("thinking_level", "off"),
+                session_file=None,
+                cancel_event=w_base.get("cancel_event"),
+                max_retries=w_base.get("max_retries", 3),
+                retry_delay=w_base.get("retry_delay", 10),
+                pi_max_retries=w_base.get("pi_max_retries", -1),
+                pi_retry_delay=w_base.get("pi_retry_delay", 10),
+            )
+            ctx.tokens += ar.token_usage
+            if ar.output:
+                raw = re.sub(r'<result>.*?</result>', '', ar.output, flags=re.DOTALL).strip()
+                results[idx] = raw
+            else:
+                results[idx] = '\n'.join(
+                    f"{f} | unknown | (分析失败) | -" for f in batch)
+
+    await asyncio.gather(*[_run_batch(i, b) for i, b in enumerate(batches)])
+
+    all_lines = []
+    for r in results:
+        if r:
+            for line in r.splitlines():
+                line = line.strip()
+                if line and '|' in line:
+                    all_lines.append(line)
+
+    header = (f"文件清单（共 {len(all_lines)} 个文件）\n"
+              f"格式: 路径 | 类型 | 功能摘要 | 核心技术标识 | 建议子模块")
+    merged = header + '\n' + '\n'.join(all_lines)
+    ctx.emit_event("stage_result", stage="2-sub",
+                   module=mod_name, file_count=len(all_lines))
+    return merged
+
+
+# ─── 输出后处理工具 ──────────────────────────────────────────────────────────
+
+def write_failure_report(
+    report_path: Path,
+    task_id: str,
+    status_value: str,
+    error: str,
+    duration_ms: float,
+    modules: list[str],
+    modules_root: str,
+) -> None:
+    """任务失败/错误时生成 final_report.md，记录失败原因和已完成进度。"""
+    lines = [
+        "# 固件系统威胁分析总报告",
+        "",
+        f"> ⚠️ **任务状态：{status_value.upper()}**",
+        "",
+        "## 失败原因",
+        "",
+        "```",
+        f"{error or 'unknown error'}",
+        "```",
+        "",
+        f"- 任务ID: {task_id}",
+        f"- 耗时: {duration_ms / 1000:.1f}s",
+        "",
+        "## 已完成的模块",
+        "",
+    ]
+    if modules:
+        lines.append("| 模块 | 文件数 | 报告 |")
+        lines.append("|------|--------|------|")
+        for mod in modules:
+            mod_dir = Path(modules_root) / mod
+            flist = mod_dir / "files.list"
+            report = mod_dir / "module_report.md"
+            fc = 0
+            if flist.exists():
+                try:
+                    fc = sum(1 for l in flist.read_text("utf-8").splitlines() if l.strip())
+                except OSError:
+                    pass
+            has_report = "✅" if report.exists() and report.stat().st_size > 100 else "❌"
+            lines.append(f"| {mod} | {fc} | {has_report} |")
+        lines.append("")
+        lines.append(f"**已发现 {len(modules)} 个模块**")
+    else:
+        lines.append("*尚未完成模块分类*")
+    lines.append("")
+    try:
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def generate_modules_list(modules_dir: Path, output_path: Path) -> None:
+    """生成 modules.list：按风险等级排序，每行一个模块名。"""
+    RISK_ORDER = {"严重": 0, "高": 1, "中": 2, "低": 3, "信息": 4, "未知": 5}
+    entries: list[tuple[str, int, str]] = []
+
+    for mod_dir in sorted(modules_dir.iterdir()):
+        if not mod_dir.is_dir():
+            continue
+        mod_name = mod_dir.name
+        risk_level = "未知"
+        risk_score = 0
+        report = mod_dir / "module_report.md"
+        if report.exists():
+            text = report.read_text("utf-8", errors="replace")[:2000]
+            m = re.search(r'RISK_LEVEL:\s*(.+?)\s*-->', text)
+            if m:
+                risk_level = m.group(1).strip()
+            m = re.search(r'RISK_SCORE:\s*(\d+)', text)
+            if m:
+                risk_score = min(int(m.group(1)), 100)
+        entries.append((risk_level, risk_score, mod_name))
+
+    entries.sort(key=lambda e: (RISK_ORDER.get(e[0], 5), -e[1]))
+    output_path.write_text(
+        "\n".join(name for _, _, name in entries) + "\n", encoding="utf-8")
+
+
+def strip_target_prefix(output_dir: Path, target_dir: str) -> None:
+    """将输出文件中的容器绝对路径 /data/target/… 替换为相对路径。"""
+    prefix = target_dir.rstrip("/") + "/"
+    for p in output_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix not in (".list", ".md", ".txt", ".json"):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+            if prefix in text:
+                p.write_text(text.replace(prefix, ""), encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            pass

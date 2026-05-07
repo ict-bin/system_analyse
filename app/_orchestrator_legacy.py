@@ -376,6 +376,9 @@ class Orchestrator:
                     if filtered_path.exists():
                         filter_count = sum(
                             1 for l in filtered_path.read_text("utf-8").splitlines() if l.strip())
+                        # ── 备份过滤结果，防止后续 agent 步骤覆盖 ──
+                        (workspace / ".filtered_backup.txt").write_text(
+                            filtered_path.read_text("utf-8"), encoding="utf-8")
                     self._emit("stage_result", task_id, stage="filter",
                                types=cfg.analyse_targets, file_count=filter_count)
 
@@ -397,8 +400,31 @@ class Orchestrator:
                     self._emit("stage", task_id, stage="explore")
                     self._emit("model", task_id, stage="explore", model=_wm("explore"))
                     explore_session = str(sess_dir / "explore.jsonl")
+                    # ── 聚焦探索提示词：禁止安全分析，只生成分类关键词 ──
+                    # 直接传 cfg.task 会导致模型进行完整安全漏洞挖掘而非目录探索
+                    _filtered_for_explore = workspace / "filtered_files.txt"
+                    _explore_scope = ""
+                    if _filtered_for_explore.exists():
+                        _efc = sum(1 for l in _filtered_for_explore.read_text("utf-8").splitlines() if l.strip())
+                        _explore_scope = (
+                            f"\n\n⚠️ **文件范围（不得修改）**: `{workspace}/filtered_files.txt` "
+                            f"已含 {_efc} 个待分析文件。"
+                            f"请从该文件采样文件路径来了解目录结构，"
+                            f"**不要重新扫描目标目录，不要修改该文件**。"
+                        )
+                    else:
+                        _explore_scope = (
+                            f"\n\n目标目录：`{cfg.target_dir}`（通过工作目录下 `target/` 符号链接访问）"
+                        )
+                    _explore_user_prompt = (
+                        f"探索目标软件包目录结构，生成功能分类关键词并写入 keywords.txt。\n"
+                        f"工作目录: `{workspace}`\n"
+                        f"**⚠️ 任务：仅通过文件名/路径了解功能组成，输出分类关键词列表。**\n"
+                        f"**⚠️ 禁止做安全分析或漏洞挖掘。禁止读取文件内容（二进制或文本）。**"
+                        + _explore_scope
+                    )
                     ar = await _run_agent_checked(
-                        prompt=cfg.task,
+                        prompt=_explore_user_prompt,
                         model=_wm("explore"),
                         system_prompt=explore_prompt,
                         session_file=explore_session,
@@ -410,6 +436,11 @@ class Orchestrator:
                     if ar.output:
                         self._emit("agent_output", task_id, stage="explore",
                                    output=ar.output[-1200:])
+                    # ── 还原 filtered_files.txt（防止 explore agent 意外修改）──
+                    _filter_backup = workspace / ".filtered_backup.txt"
+                    if _filter_backup.exists():
+                        (workspace / "filtered_files.txt").write_text(
+                            _filter_backup.read_text("utf-8"), encoding="utf-8")
 
                     # Step B: 用 Worker 生成的 keywords.txt 跑预扫描脚本
                     keywords_file = workspace / "keywords.txt"

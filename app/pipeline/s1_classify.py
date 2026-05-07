@@ -52,7 +52,7 @@ class ClassifyStage(BaseStage):
                        judge=judge_model.split("/")[-1])
 
         # ── 构建 prescan 摘要注入 ──
-        prescan_summary = getattr(ctx, "_prescan_summary", "")
+        prescan_summary = ctx.prescan_summary
 
         # ── 基础 Worker 参数 ──
         w_tools = cfg.workers.default_tools
