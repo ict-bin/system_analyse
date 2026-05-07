@@ -100,11 +100,18 @@ class AppConfig:
 
 
 @dataclass
+class ConfigCenterConfig:
+    base_url: str = "http://secflow-platform-configcenter/api/configcenter"
+    timeout: int = 30
+
+
+@dataclass
 class ServiceYaml:
     database: DbConfig = field(default_factory=DbConfig)
     auth_service: AuthConfig = field(default_factory=AuthConfig)
     registry: RegistryConfig = field(default_factory=RegistryConfig)
     app: AppConfig = field(default_factory=AppConfig)
+    configcenter: ConfigCenterConfig = field(default_factory=ConfigCenterConfig)
 
 
 def _parse_menu(raw: Dict[str, Any]) -> MenuConfig:
@@ -181,7 +188,13 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> ServiceYaml:
         debug=bool(app_raw.get("debug", False)),
     )
 
-    return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg)
+    cc_raw = raw.get("configcenter_service", raw.get("configcenter", {}))
+    configcenter = ConfigCenterConfig(
+        base_url=cc_raw.get("base_url", "http://secflow-platform-configcenter/api/configcenter"),
+        timeout=int(cc_raw.get("timeout", 30)),
+    )
+
+    return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg, configcenter=configcenter)
 
 
 # Module-level singleton

@@ -18,6 +18,8 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+from .config import get_service_yaml
+from .service.llm_provider_sync import sync_providers_to_pi
 from .models import (
     TaskConfig, TaskResult, TaskStatus, TokenUsage, SwarmEvent,
 )
@@ -74,6 +76,20 @@ class Orchestrator:
         task_id = task_id or make_id()
         start = time.time()
         self._cancel_event = asyncio.Event()
+
+        # ── 同步配置中心的 LLM Provider → pi models.json ─────────────────────
+        try:
+            svc = get_service_yaml()
+            await sync_providers_to_pi(
+                base_url=svc.configcenter.base_url,
+                token=svc.auth_service.service_machine_token,
+                timeout=svc.configcenter.timeout,
+            )
+        except Exception as _sync_err:
+            import logging as _log
+            _log.getLogger("sa.orchestrator").warning(
+                "LLM Provider 同步失败，使用已有 models.json: %s", _sync_err
+            )
 
         # ── 目录初始化 ────────────────────────────────────────────────────────
         if cfg.resume_workspace and cfg.start_stage > 1:

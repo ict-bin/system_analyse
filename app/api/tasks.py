@@ -90,6 +90,16 @@ async def resume_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().resume_task(db, task_id)
 
 
+@router.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(
+    task_id: str,
+    delete_files: bool = True,
+    db: Session = Depends(get_db),
+):
+    """删除任务记录（软删除），并可选同步删除输出目录下的任务文件。"""
+    get_task_service().delete_task(db, task_id, delete_files=delete_files)
+
+
 @router.get("/tasks/{task_id}/logs")
 async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
     """Return stages_json for the task (stage events used as structured log stream)."""

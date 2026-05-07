@@ -203,9 +203,8 @@ class TaskService:
         tcfg["resume_workspace"] = resume_workspace
         row.task_config_json = tcfg
         row.status = "pending"
-        row.started_at = None
+        # 保留 started_at 和 stages_json，使续跑后仍能看到前序阶段的时间与事件
         row.finished_at = None
-        row.stages_json = None
         row.result_json = None
         row.error = None
         flag_modified(row, "task_config_json")
@@ -229,6 +228,27 @@ class TaskService:
         db.commit(); db.refresh(row)
         return self._row_to_dict(row)
 
+    def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
+        """软删除任务记录，并可选删除输出目录下的任务文件。运行中任务不允许删除。"""
+        import shutil as _shutil
+        from fastapi import HTTPException
+        row = self._get_or_404(db, task_id)
+        # 运行中的任务必须先取消，不允许直接删除
+        if row.status == "running":
+            raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+        # 删除输出文件
+        if delete_files and row.output_path:
+            task_dir = os.path.join(row.output_path, task_id)
+            if os.path.isdir(task_dir):
+                try:
+                    _shutil.rmtree(task_dir)
+                    logger.info("delete_task: removed task dir %s", task_dir)
+                except Exception as _e:
+                    logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
+        # 软删除
+        row.is_deleted = True
+        db.commit()
+
     async def _execute_task(self, task_id: str) -> None:
         from app.db import get_db
         db_gen = get_db()
@@ -247,7 +267,9 @@ class TaskService:
             if not row or row.status == "cancelled":
                 return
             row.status = "running"
-            row.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            # 续跑时保留原始 started_at，首次运行才设置
+            if row.started_at is None:
+                row.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
             db.commit()
             _write_models_json_from_db(db)
             svc = _load_svc_config_from_db(db, row.project_id)
@@ -277,7 +299,10 @@ class TaskService:
                 return
             row.status = result.status.value if result else "error"
             row.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            row.stages_json = {"events": event_buffer, "final": True}
+            # 合并历史事件（续跑场景保留前序阶段记录）
+            _prev = row.stages_json
+            _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
+            row.stages_json = {"events": _prev_events + event_buffer, "final": True}
             if result:
                 row.result_json = result.model_dump(mode="json")
                 if result.error:
@@ -295,7 +320,9 @@ class TaskService:
                     r.status = "error"
                     r.error = str(exc)
                     r.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                    r.stages_json = {"events": event_buffer, "final": True}
+                    _prev2 = r.stages_json
+                    _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
+                    r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
                     db.commit()
             except Exception:
                 pass
