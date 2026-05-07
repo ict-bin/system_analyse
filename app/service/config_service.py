@@ -79,7 +79,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "output_dir": "/data/output",
     "archive_dir": "/data/output",
     "result_dir": "/data/output",
-    "start_stage": 1,
+    "start_stage": 0,
     "resume_workspace": "",
 }
 
@@ -96,8 +96,11 @@ class ConfigService:
         return data
 
     def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
-        # Strip meta-fields from the stored blob
-        blob = {k: v for k, v in config_data.items() if k not in ("project_id", "updated_at")}
+        # Strip meta-fields and task-execution-only overrides from the stored blob
+        # start_stage / resume_workspace are ephemeral per-run values set by
+        # resume_task / restart_task; they must never be persisted in project config.
+        _STRIP = {"project_id", "updated_at", "start_stage", "resume_workspace"}
+        blob = {k: v for k, v in config_data.items() if k not in _STRIP}
         # Strip read-only role fields so they always fall back to defaults
         for role_key in ("workers", "judges"):
             if isinstance(blob.get(role_key), dict):

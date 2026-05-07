@@ -279,10 +279,11 @@ class TaskService:
                 svc.analyse_targets = tcfg["analyse_targets"]
             if tcfg.get("binary_arch"):
                 svc.binary_arch = tcfg["binary_arch"]
-            if tcfg.get("start_stage"):
-                svc.start_stage = tcfg["start_stage"]
-            if tcfg.get("resume_workspace"):
-                svc.resume_workspace = tcfg["resume_workspace"]
+            # start_stage / resume_workspace come ONLY from task_config_json
+            # (set by resume_task).  Never inherit from project config so that
+            # fresh runs and restarts always start from Stage 0.
+            svc.start_stage = tcfg["start_stage"] if tcfg.get("start_stage") else 0
+            svc.resume_workspace = tcfg.get("resume_workspace") or ""
             # Use row.output_path as the working root so the Orchestrator writes to
             # the user-specified location ({output_path}/{task_id}/workspace/) rather
             # than the global /data/output directory from config.json.
