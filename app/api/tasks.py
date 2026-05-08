@@ -37,6 +37,49 @@ class GeneratePromptRequest(BaseModel):
     input_path: str
 
 
+class TaskResultSummaryResponse(BaseModel):
+    module_count: int = 0
+    high_risk_module_count: int = 0
+    medium_risk_module_count: int = 0
+    low_risk_module_count: int = 0
+    total_file_count: int = 0
+    threat_count: int = 0
+
+
+class TaskResultModuleSectionResponse(BaseModel):
+    level: int
+    title: str
+    anchor: str
+
+
+class TaskResultModuleResponse(BaseModel):
+    module_name: str
+    rank: int
+    module_dir_path: Optional[str] = None
+    files_list_path: Optional[str] = None
+    module_report_path: Optional[str] = None
+    module_report_markdown: Optional[str] = None
+    files: list[str] = Field(default_factory=list)
+    file_count: int = 0
+    risk_level: Optional[str] = None
+    risk_score: Optional[int] = None
+    report_sections: list[TaskResultModuleSectionResponse] = Field(default_factory=list)
+    report_preview: Optional[str] = None
+
+
+class TaskResultResponse(BaseModel):
+    task_id: str
+    available: bool
+    status: str
+    output_root: Optional[str] = None
+    final_report_path: Optional[str] = None
+    modules_list_path: Optional[str] = None
+    final_report_markdown: Optional[str] = None
+    modules: list[TaskResultModuleResponse] = Field(default_factory=list)
+    summary: TaskResultSummaryResponse
+    warnings: list[str] = Field(default_factory=list)
+
+
 @router.post("/tasks", status_code=201)
 async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     prompt = body.prompt_content
@@ -85,6 +128,11 @@ async def list_tasks(
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task(db, task_id)
+
+
+@router.get("/tasks/{task_id}/result", response_model=TaskResultResponse)
+async def get_task_result(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_task_result(db, task_id)
 
 
 @router.post("/tasks/{task_id}/cancel")

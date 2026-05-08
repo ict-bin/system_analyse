@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time as _time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -28,6 +30,83 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
+
+_SUMMARY_PATTERNS = {
+    "module_count": re.compile(r"\|\s*分析模块数\s*\|\s*(\d+)\s*\|"),
+    "total_file_count": re.compile(r"\|\s*总文件数\s*\|\s*(\d+)\s*\|"),
+    "high_risk_module_count": re.compile(r"\|\s*高风险模块数\s*\|\s*(\d+)\s*\|"),
+    "medium_risk_module_count": re.compile(r"\|\s*中风险模块数\s*\|\s*(\d+)\s*\|"),
+    "low_risk_module_count": re.compile(r"\|\s*低风险模块数\s*\|\s*(\d+)\s*\|"),
+    "threat_count": re.compile(r"\|\s*威胁总数\s*\|\s*(\d+)\s*\|"),
+}
+
+_RISK_LEVEL_RE = re.compile(r"<!--\s*RISK_LEVEL:\s*([^\-][^>]*)-->")
+_RISK_SCORE_RE = re.compile(r"<!--\s*RISK_SCORE:\s*(\d+)\s*-->")
+_MARKDOWN_HEADING_RE = re.compile(r"^(#{1,2})\s+(.+)$", re.MULTILINE)
+
+
+def _read_text_if_exists(path: Path) -> tuple[str | None, str | None]:
+    if not path.exists() or not path.is_file():
+        return None, f"文件不存在: {path.name}"
+    try:
+        return path.read_text("utf-8"), None
+    except Exception as exc:
+        return None, f"文件读取失败: {path.name} ({exc})"
+
+
+def _parse_summary(final_report_markdown: str | None) -> dict:
+    summary = {
+        "module_count": 0,
+        "high_risk_module_count": 0,
+        "medium_risk_module_count": 0,
+        "low_risk_module_count": 0,
+        "total_file_count": 0,
+        "threat_count": 0,
+    }
+    if not final_report_markdown:
+        return summary
+    for key, pattern in _SUMMARY_PATTERNS.items():
+        match = pattern.search(final_report_markdown)
+        if match:
+            summary[key] = int(match.group(1))
+    return summary
+
+
+def _parse_report_sections(markdown: str | None) -> list[dict]:
+    if not markdown:
+        return []
+    sections: list[dict] = []
+    for idx, match in enumerate(_MARKDOWN_HEADING_RE.finditer(markdown)):
+        sections.append({
+            "level": len(match.group(1)),
+            "title": match.group(2).strip(),
+            "anchor": f"section-{idx + 1}",
+        })
+    return sections
+
+
+def _infer_risk_level(markdown: str | None) -> str | None:
+    if not markdown:
+        return None
+    level_match = _RISK_LEVEL_RE.search(markdown)
+    if level_match:
+        return level_match.group(1).strip()
+    if "🔴高" in markdown or "风险等级 | 🔴高" in markdown:
+        return "高"
+    if "🟡中" in markdown or "风险等级 | 🟡中" in markdown:
+        return "中"
+    if "🟢低" in markdown or "风险等级 | 🟢低" in markdown:
+        return "低"
+    return None
+
+
+def _infer_risk_score(markdown: str | None) -> int | None:
+    if not markdown:
+        return None
+    score_match = _RISK_SCORE_RE.search(markdown)
+    if score_match:
+        return int(score_match.group(1))
+    return None
 
 
 def _origin_payload(row: AppSaTask) -> dict:
@@ -152,6 +231,105 @@ class TaskService:
 
     def get_task(self, db: Session, task_id: str) -> dict:
         return self._row_to_dict(self._get_or_404(db, task_id))
+
+    def get_task_result(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        output_root = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
+        final_report_path = output_root / "final_report.md" if output_root else None
+        modules_list_path = output_root / "modules.list" if output_root else None
+        modules_root = output_root / "modules" if output_root else None
+        warnings: list[str] = []
+
+        final_report_markdown: str | None = None
+        if final_report_path:
+            final_report_markdown, err = _read_text_if_exists(final_report_path)
+            if err:
+                warnings.append(err)
+
+        modules_order: list[str] = []
+        if modules_list_path:
+            modules_list_markdown, err = _read_text_if_exists(modules_list_path)
+            if err:
+                warnings.append(err)
+            elif modules_list_markdown:
+                modules_order = [line.strip() for line in modules_list_markdown.splitlines() if line.strip()]
+
+        available = bool(final_report_markdown or (modules_root and modules_root.exists()))
+        if row.status not in ("passed", "failed", "error", "cancelled"):
+            available = False
+
+        modules: list[dict] = []
+        total_files_counted = 0
+        high_risk_modules_counted = 0
+        if modules_root and modules_root.exists():
+            discovered = {
+                path.name
+                for path in modules_root.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            }
+            ordered_names = modules_order + sorted(discovered - set(modules_order))
+            for rank, module_name in enumerate(ordered_names, start=1):
+                module_dir = modules_root / module_name
+                if not module_dir.exists() or not module_dir.is_dir():
+                    warnings.append(f"模块目录不存在: {module_name}")
+                    continue
+                files_list_path = module_dir / "files.list"
+                module_report_path = module_dir / "module_report.md"
+                if not module_report_path.exists():
+                    fallback_report_path = module_dir / "modules_report.md"
+                    if fallback_report_path.exists():
+                        module_report_path = fallback_report_path
+
+                files_list_content, files_err = _read_text_if_exists(files_list_path)
+                if files_err:
+                    warnings.append(f"{module_name}: {files_err}")
+                module_report_markdown, report_err = _read_text_if_exists(module_report_path)
+                if report_err:
+                    warnings.append(f"{module_name}: {report_err}")
+
+                files = [line.strip() for line in (files_list_content or "").splitlines() if line.strip()]
+                file_count = len(files)
+                total_files_counted += file_count
+                risk_level = _infer_risk_level(module_report_markdown)
+                risk_score = _infer_risk_score(module_report_markdown)
+                if risk_level == "高":
+                    high_risk_modules_counted += 1
+                report_lines = [line for line in (module_report_markdown or "").splitlines() if line.strip()]
+                modules.append({
+                    "module_name": module_name,
+                    "rank": rank,
+                    "module_dir_path": str(module_dir),
+                    "files_list_path": str(files_list_path),
+                    "module_report_path": str(module_report_path),
+                    "module_report_markdown": module_report_markdown,
+                    "files": files,
+                    "file_count": file_count,
+                    "risk_level": risk_level,
+                    "risk_score": risk_score,
+                    "report_sections": _parse_report_sections(module_report_markdown),
+                    "report_preview": "\n".join(report_lines[:12]) if report_lines else None,
+                })
+
+        summary = _parse_summary(final_report_markdown)
+        if summary["module_count"] == 0 and modules:
+            summary["module_count"] = len(modules)
+        if summary["high_risk_module_count"] == 0 and high_risk_modules_counted:
+            summary["high_risk_module_count"] = high_risk_modules_counted
+        if summary["total_file_count"] == 0 and total_files_counted:
+            summary["total_file_count"] = total_files_counted
+
+        return {
+            "task_id": row.task_id,
+            "available": available,
+            "status": row.status,
+            "output_root": str(output_root) if output_root else None,
+            "final_report_path": str(final_report_path) if final_report_path else None,
+            "modules_list_path": str(modules_list_path) if modules_list_path else None,
+            "final_report_markdown": final_report_markdown,
+            "modules": modules,
+            "summary": summary,
+            "warnings": warnings,
+        }
 
     def create_task(self, db: Session, *, project_id: str, task_name: str,
                     input_path: str, output_path: Optional[str] = None,
