@@ -125,6 +125,13 @@ def _task_sessions_root(row: AppSaTask) -> Path | None:
     return root / "run" / "sessions"
 
 
+def _task_run_root(row: AppSaTask) -> Path | None:
+    root = _task_root(row)
+    if not root:
+        return None
+    return root / "run"
+
+
 def _normalize_relative_session_path(path: str) -> str:
     parts = [part for part in str(path or "").replace("\\", "/").split("/") if part and part != "."]
     if not parts:
@@ -543,6 +550,64 @@ class TaskService:
             "events": events,
             "warnings": warnings,
             "line_count": line_count,
+        }
+
+    def get_task_evaluation(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        run_root = _task_run_root(row)
+        warnings: list[str] = []
+        if not run_root or not run_root.is_dir():
+            return {
+                "task_id": row.task_id,
+                "status": row.status,
+                "available": False,
+                "summary": None,
+                "rounds": [],
+                "warnings": warnings,
+            }
+
+        summary: dict | None = None
+        summary_path = run_root / "evaluation_summary.json"
+        if summary_path.exists():
+            try:
+                loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    summary = loaded
+                else:
+                    warnings.append("evaluation_summary.json 格式不是对象")
+            except Exception as exc:
+                warnings.append(f"evaluation_summary.json 读取失败: {exc}")
+
+        rounds: list[dict] = []
+        for round_dir in sorted(run_root.glob("round_*")):
+            if not round_dir.is_dir():
+                continue
+            for path in sorted(round_dir.glob("*.json")):
+                if path.name.endswith(".tmp"):
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    warnings.append(f"{path.relative_to(run_root)} 读取失败: {exc}")
+                    continue
+                if not isinstance(payload, dict):
+                    warnings.append(f"{path.relative_to(run_root)} 格式不是对象")
+                    continue
+                payload.setdefault("source_path", str(path))
+                rounds.append(payload)
+
+        rounds.sort(key=lambda item: (
+            int(item.get("round") or 0),
+            str(item.get("module_name") or ""),
+            str(item.get("stage") or ""),
+        ))
+        return {
+            "task_id": row.task_id,
+            "status": row.status,
+            "available": bool(summary or rounds),
+            "summary": summary,
+            "rounds": rounds,
+            "warnings": warnings,
         }
 
     def create_task(self, db: Session, *, project_id: str, task_name: str,

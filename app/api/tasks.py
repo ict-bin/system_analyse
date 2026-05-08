@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import Depends, Query
 from pydantic import BaseModel, Field
@@ -103,6 +103,15 @@ class TaskSessionFileResponse(BaseModel):
     line_count: int = 0
 
 
+class TaskEvaluationResponse(BaseModel):
+    task_id: str
+    status: str
+    available: bool
+    summary: Optional[dict[str, Any]] = None
+    rounds: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 @router.post("/tasks", status_code=201)
 async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     prompt = body.prompt_content
@@ -166,6 +175,11 @@ async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
 @router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)
 async def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db)):
     return get_task_service().get_task_session_file(db, task_id, path)
+
+
+@router.get("/tasks/{task_id}/evaluation", response_model=TaskEvaluationResponse)
+async def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_task_evaluation(db, task_id)
 
 
 @router.post("/tasks/{task_id}/cancel")
