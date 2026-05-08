@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM m.daocloud.io/docker.io/library/ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
