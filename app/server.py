@@ -72,9 +72,9 @@ async def lifespan(app: FastAPI):
 
     # --- Recover orphaned tasks from a previous pod instance ---
     try:
-        from datetime import datetime, timezone
         from .db import get_db
         from .db.models import AppSaTask
+        from .time_utils import now_local
         _db = next(get_db())
         orphaned = _db.query(AppSaTask).filter(
             AppSaTask.status.in_(["running", "pending"]),
@@ -84,7 +84,7 @@ async def lifespan(app: FastAPI):
             for t in orphaned:
                 t.status = "error"
                 t.error = "服务重启，任务被中断"
-                t.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                t.finished_at = now_local()
             _db.commit()
             logger.warning("Recovered %d orphaned task(s) from previous pod instance", len(orphaned))
     except Exception as exc:

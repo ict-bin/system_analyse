@@ -8,10 +8,10 @@ import os
 import shutil
 import subprocess
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 from app.logging_utils import configure_container_logging, log_event
+from app.time_utils import isoformat_local, now_local
 
 APP_ROOT = Path(os.environ.get("APP_ROOT", "/app")).resolve()
 RUN_ROOT = APP_ROOT / ".run"
@@ -24,7 +24,7 @@ logger = logging.getLogger("sa.chained")
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return isoformat_local(now_local()) or ""
 
 
 def log(message: str, **fields: object) -> None:

@@ -10,14 +10,16 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
+
+from app.time_utils import UTC_PLUS_8
 
 
 class _JsonFormatter(logging.Formatter):
     """输出 JSON 格式日志行，兼容 chained pipeline 日志收集。"""
 
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        ts = datetime.fromtimestamp(record.created, tz=UTC_PLUS_8).isoformat()
         payload: dict = {
             "ts": ts,
             "level": record.levelname,
