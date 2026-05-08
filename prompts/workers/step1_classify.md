@@ -23,6 +23,7 @@ workspace/
 - **禁止**使用 `analysis_modules/`、`output/`、`classified/` 等其他目录名
 - **禁止**直接在工作目录根下创建模块目录
 - **必须**先 `mkdir -p modules` 再在其下创建子目录
+- **严禁执行 `cd` 命令**：当前工作目录已由系统固定为任务 workspace，任何 `cd` 操作都会导致输出写入错误位置
 
 1. **善用脚本**：**必须**编写 bash 脚本批量处理，**禁止**手动逐文件操作
 2. **一次性处理**：写一个完整的分类脚本一次执行完，不要分多轮交互
@@ -63,12 +64,11 @@ head -10 $SOURCE    # 查看样本
 
 ```bash
 #!/bin/bash
-cd <工作目录>
-
+# 注意：禁止 cd，当前目录即 workspace
 for listfile in prescan/*.list; do
     kw=$(basename "$listfile" .list)
-    mkdir -p "$kw"
-    cp "$listfile" "$kw/files.list"
+    mkdir -p "modules/$kw"
+    cp "$listfile" "modules/$kw/files.list"
 done
 
 # 可以合并相近的关键词（如 dhcp+dhcpv6 → dhcp）
@@ -86,8 +86,8 @@ SOURCE="filtered_files.txt"
 while IFS= read -r rel; do
     kw=$(echo "$rel" | grep -oiE "bgp|ospf|dhcp|ipsec|ssh|mpls|vxlan|evpn|isis|ldp|bfd|lacp|multicast|qos|acl|nat|snmp|ntp|ipsec|ssl|cert" | head -1 | tr '[:upper:]' '[:lower:]')
     [ -z "$kw" ] && kw="unknown"
-    mkdir -p "$kw"
-    echo "$rel" >> "$kw/files.list"
+    mkdir -p "modules/$kw"
+    echo "$rel" >> "modules/$kw/files.list"
 done < "$SOURCE"
 ```
 
@@ -102,8 +102,8 @@ while IFS= read -r rel; do
     f="/data/target/$rel"
     kw=$(strings "$f" 2>/dev/null | head -100 | grep -oiE "bgp|ospf|dhcp|ipsec|ssh|mpls|kernel|driver" | head -1 | tr '[:upper:]' '[:lower:]')
     [ -z "$kw" ] && kw="unknown"
-    mkdir -p "$kw"
-    echo "$rel" >> "$kw/files.list"
+    mkdir -p "modules/$kw"
+    echo "$rel" >> "modules/$kw/files.list"
 done < "$SOURCE"
 ```
 
@@ -114,11 +114,11 @@ SOURCE="filtered_files.txt"
 [ ! -f "$SOURCE" ] && find /data/target -type f | sed 's|^/data/target/||' | sort > /tmp/s.txt && SOURCE=/tmp/s.txt
 
 TOTAL=$(wc -l < "$SOURCE")
-CLASSIFIED=$(cat */files.list 2>/dev/null | sort -u | wc -l)
+CLASSIFIED=$(cat modules/*/files.list 2>/dev/null | sort -u | wc -l)
 echo "总文件: $TOTAL  已分类: $CLASSIFIED"
 
 # 找遗漏
-cat */files.list 2>/dev/null | sort -u > /tmp/c.txt
+cat modules/*/files.list 2>/dev/null | sort -u > /tmp/c.txt
 sort "$SOURCE" > /tmp/a.txt
 comm -23 /tmp/a.txt /tmp/c.txt > /tmp/missing.txt
 echo "遗漏: $(wc -l < /tmp/missing.txt)"

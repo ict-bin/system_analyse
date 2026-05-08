@@ -77,6 +77,29 @@ def _log_info(msg: str) -> None:
     logger.info(msg)
 
 
+# ─── pi-worker 限权运行 ────────────────────────────────────────────────────────
+
+# agent 子进程的运行 uid/gid（可通过环境变量覆盖）
+_PI_WORKER_UID: int = int(os.environ.get("PI_WORKER_UID", "2001"))
+_PI_WORKER_GID: int = int(os.environ.get("PI_WORKER_GID", "2001"))
+
+
+def _drop_to_pi_worker() -> None:
+    """preexec_fn：fork 后、exec 前在子进程中执行，drop root → pi-worker。
+
+    使 pi 及其所有 bash 子进程无法写入 root 所有的输入目录。
+    非 root 环境（开发测试）直接返回，不做任何变更。
+    """
+    if os.getuid() != 0:
+        return  # 已是非 root，无需 drop
+    try:
+        os.setgid(_PI_WORKER_GID)
+        os.setuid(_PI_WORKER_UID)
+        os.umask(0o022)
+    except OSError:
+        pass  # 不应发生；若失败则以当前 uid 继续运行
+
+
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
 
 
@@ -157,8 +180,10 @@ def _write_temp_markdown(
     """将 prompt 写入临时 markdown 文件，返回 (tmp_dir, file_path)。"""
     if tmp_dir is None:
         tmp_dir = tempfile.mkdtemp(prefix=prefix)
+        os.chmod(tmp_dir, 0o755)   # pi-worker 需要进入此目录
     file_path = os.path.join(tmp_dir, filename)
     Path(file_path).write_text(content, encoding="utf-8")
+    os.chmod(file_path, 0o644)     # pi-worker 需要读取此文件
     return tmp_dir, file_path
 
 
@@ -484,7 +509,8 @@ async def _run_with_api_retry(
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,  # RPC: 通过 stdin 发送 prompt
+            stdin=asyncio.subprocess.PIPE,   # RPC: 通过 stdin 发送 prompt
+            preexec_fn=_drop_to_pi_worker,   # 安全隔离：fork 后 drop root → pi-worker
         )
 
         cancel_task = None

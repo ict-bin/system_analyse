@@ -124,6 +124,17 @@ class Orchestrator:
                 except OSError:
                     pass
 
+        # ── chown workspace 目录给 pi-worker（Layer 1 工作目录隔离）────────────
+        # pi 子进程以 pi-worker(uid=2001) 运行；workspace/sess_dir/task_tmp 需可写，
+        # 仅 chown 目录本身，不递归（resume 模式下已有文件由 root 拥有，pi-worker 新建即可）
+        _pw_uid = int(os.environ.get("PI_WORKER_UID", "2001"))
+        _pw_gid = int(os.environ.get("PI_WORKER_GID", "2001"))
+        for _d in (workspace, sess_dir, task_tmp):
+            try:
+                os.chown(_d, _pw_uid, _pw_gid)
+            except OSError:
+                pass  # 非 root 运行时（开发环境）忽略
+
         flag_path = final_out_dir / "flag"
         flag_path.write_text("0", encoding="utf-8")  # 失败默认值，成功时覆盖
 

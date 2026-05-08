@@ -74,6 +74,15 @@ class ClassifyStage(BaseStage):
         for attempt in range(max_iter):
             # 构建 prompt
             prompt_parts = [ctx.task]
+            # ⚠️ 注入工作目录绝对路径，防止 agent cd 到错误目录
+            prompt_parts.append(
+                f"\n\n# ⚠️ 工作目录（绝对禁止离开）\n\n"
+                f"你的工作目录已固定为：`{workspace}`\n\n"
+                f"- `filtered_files.txt` 完整路径：`{workspace}/filtered_files.txt`\n"
+                f"- 预扫描数据目录：`{workspace}/prescan/`\n"
+                f"- 模块输出路径：`{workspace}/modules/<模块名>/files.list`\n\n"
+                f"**严禁执行任何 `cd` 命令**。所有脚本必须使用绝对路径或相对当前工作目录的路径。"
+            )
             if attempt == 0 and prescan_summary:
                 prompt_parts.append(
                     "\n\n# 预扫描摘要（已自动生成，请基于此分类）\n\n"
