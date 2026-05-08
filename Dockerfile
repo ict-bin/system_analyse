@@ -31,13 +31,9 @@ RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/
 
 # ═══ pi 配置目录 ══════════════════════════════════════════════════════════════
 # pi 的全局配置目录，models.json 放这里才能被 pi 识别
-# 使用 /app/.pi/agent 而非 /root/.pi/agent，使 pi-worker 也能读取
-ENV PI_CODING_AGENT_DIR=/app/.pi/agent
-RUN mkdir -p /app/.pi/agent
-
-# ═══ pi-worker 用户（agent 子进程以非 root 身份运行）══════════════════════════
-# uid=2001 无 home 无 shell，仅用于权限隔离
-RUN useradd -u 2001 -M -s /sbin/nologin pi-worker
+# 容器启动脚本会将 /data/config/models.json 链接到此处
+ENV PI_CODING_AGENT_DIR=/root/.pi/agent
+RUN mkdir -p /root/.pi/agent
 
 # ═══ 挂载点 ═══════════════════════════════════════════════════════════════════
 #
