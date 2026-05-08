@@ -34,12 +34,15 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict:
                 "baseUrl": "...",
                 "api": "openai-completions",
                 "apiKey": "<ENV_VAR_NAME>",
-                "models": [{"id": "<model_id>", "reasoning": false}]
+                "models": [{"id": "<model_id>", "reasoning": false, "contextLength": 131072}]
             }
         }
     }
     apiKey 字段是环境变量名，pi 运行时会从 os.environ 中读取实际密钥。
+    contextLength 控制 pi 的上下文自动压缩阈值；若配置中心未提供则默认 131072（128K）。
     """
+    _DEFAULT_CONTEXT_LENGTH = 131072  # 128K tokens
+
     result: dict[str, Any] = {"providers": {}}
     for p in providers:
         if not p.get("enabled"):
@@ -49,13 +52,15 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict:
             continue
         model_id = p.get("model", "").strip()
         api_key_raw = p.get("api_key", "").strip()
-        env_var = _env_var_name(key)
+        context_length = int(p.get("context_length") or 0) or _DEFAULT_CONTEXT_LENGTH
+
+        model_entry: dict[str, Any] = {"id": model_id, "reasoning": False, "contextLength": context_length}
 
         result["providers"][key] = {
             "baseUrl": p.get("api_base", ""),
             "api": "openai-completions",
             "apiKey": api_key_raw,
-            "models": [{"id": model_id, "reasoning": False}] if model_id else [],
+            "models": [model_entry] if model_id else [],
         }
     return result
 
