@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import re
 import shutil
+import time
 from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
+from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
@@ -196,6 +198,8 @@ class FinalReportStage(BaseStage):
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
+            round_started = utc_now_iso()
+            round_start_ts = time.time()
             ctx.emit_event("stage", stage="4b", attempt=attempt + 1)
 
             prompt_parts = [
@@ -218,11 +222,13 @@ class FinalReportStage(BaseStage):
             ctx.emit_event("stage_result", stage="4b", has_report=has_report)
 
             judge_results = []
+            judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
+                j_model = ctx.jm("report", j_item)
                 j_ar = await run_agent_checked(
                     context=f"s4b-judge-j{j_idx}-a{attempt+1}",
                     prompt="评审 final_report.md 的质量和完整性。",
-                    model=ctx.jm("report", j_item),
+                    model=j_model,
                     system_prompt=j_report_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
@@ -231,6 +237,14 @@ class FinalReportStage(BaseStage):
                 ctx.tokens += j_ar.token_usage
                 parsed = parse_eval_md(j_ar.output or "")
                 judge_results.append(parsed)
+                judge_records.append({
+                    "judge_id": f"judge-{j_idx}",
+                    "model": j_model,
+                    "score": parsed["score"],
+                    "passed": parsed["pass"],
+                    "feedback": parsed["feedback"],
+                    "token_usage": j_ar.token_usage,
+                })
                 ctx.emit_event("judge_eval", stage="4b", judge_id=f"judge-{j_idx}",
                                passed=parsed["pass"], score=parsed["score"])
                 archive_file(
@@ -241,6 +255,30 @@ class FinalReportStage(BaseStage):
                 )
 
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
+            final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
+            max_reached = attempt + 1 >= max_iter(s_cfg)
+            ctx.record_evaluation_round(
+                module_name="__task__",
+                stage="final_report",
+                stage_round=attempt + 1,
+                status="passed" if final_pass else "failed" if max_reached else "running",
+                started_at=round_started,
+                ended_at=utc_now_iso(),
+                duration_ms=(time.time() - round_start_ts) * 1000,
+                worker={
+                    "model": ctx.wm("report"),
+                    "session_file": report_session,
+                    "token_usage": ar.token_usage,
+                    "error": ar.error,
+                },
+                judges=judge_records,
+                passed_by_vote=voted_pass,
+                module_completed=final_pass and has_report,
+                completion_reason="passed" if final_pass and has_report else "max_rounds_exceeded" if max_reached else "",
+                needed_reflection=not final_pass,
+                artifact_paths=[str(workspace / "final_report.md")],
+                extra={"has_report": has_report},
+            )
             if voted_pass:
                 if attempt + 1 >= s_cfg.min_rounds:
                     break
@@ -288,4 +326,3 @@ class FinalReportStage(BaseStage):
         strip_target_prefix(modules_out, cfg.target_dir)
         if report_dst.exists():
             strip_target_prefix(report_dst.parent, cfg.target_dir)
-

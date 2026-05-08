@@ -11,6 +11,7 @@ from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..models import TaskConfig, TokenUsage, SwarmEvent, AgentInstanceConfig
+    from .evaluation import EvaluationRecorder
 
 
 @dataclass
@@ -30,6 +31,9 @@ class PipelineContext:
 
     # ── Token 计量 ────────────────────────────────────────────
     tokens: "TokenUsage"
+
+    # ── 多轮评估记录 ────────────────────────────────────────
+    evaluator: "EvaluationRecorder | None" = None
 
     # ── 取消事件 ──────────────────────────────────────────────
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -93,6 +97,20 @@ class PipelineContext:
         """便捷 emit，自动带 task_id"""
         from ..models import SwarmEvent
         self.emit(SwarmEvent(type=event_type, task_id=self.task_id, data=data))
+
+    def record_evaluation_round(self, **kwargs):
+        """Best-effort round evaluation persistence; never breaks analysis."""
+        if not self.evaluator:
+            return None
+        try:
+            return self.evaluator.record_round(**kwargs)
+        except Exception as exc:
+            self.emit_event(
+                "log",
+                level="warn",
+                msg=f"evaluation round write failed: {exc}",
+            )
+            return None
 
     # ── Worker / Judge 参数构建 ────────────────────────────────
 

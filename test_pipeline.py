@@ -15,6 +15,7 @@ test_pipeline.py — pipeline/ 新架构 dry-run 测试
 """
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -47,6 +48,7 @@ from app.pipeline import (
     CompletenessCheckStage, FinalReportStage,
     StageError, PiFatalError,
     parse_eval_md, check_voting, discover_modules, get_modules_root,
+    EvaluationRecorder,
 )
 from app.runner import AgentResult
 
@@ -217,6 +219,96 @@ def test_check_voting_majority():
     assert check_voting([{"pass": True}, {"pass": True}, {"pass": False}], "majority", 3) is True
     assert check_voting([{"pass": False}, {"pass": True}, {"pass": False}], "majority", 3) is False
     print("  ✅ check_voting mode=majority")
+
+
+def test_evaluation_recorder_round_and_summary():
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = EvaluationRecorder("task-test", Path(tmp) / "run")
+        worker_usage = TokenUsage(input=10, output=5, cost=0.1)
+        judge_usage = TokenUsage(input=4, output=2, cost=0.02)
+        recorder.record_round(
+            module_name="network/socket",
+            stage="analyse",
+            stage_round=1,
+            status="passed",
+            started_at="2026-05-08T00:00:00+00:00",
+            ended_at="2026-05-08T00:00:01+00:00",
+            duration_ms=1000,
+            worker={"model": "worker-model", "session_file": "sessions/a.jsonl", "token_usage": worker_usage},
+            judges=[{
+                "judge_id": "judge-0",
+                "model": "judge-model",
+                "score": 90,
+                "passed": True,
+                "feedback": "ok",
+                "token_usage": judge_usage,
+            }],
+            passed_by_vote=True,
+            module_completed=True,
+            completion_reason="passed",
+        )
+        round_path = Path(tmp) / "run" / "round_001" / "network_socket.analyse.json"
+        assert round_path.exists()
+        payload = json.loads(round_path.read_text(encoding="utf-8"))
+        assert payload["metrics"]["review_pass_rate"] == 1.0
+        assert payload["metrics"]["accuracy_proxy"] == 0.9
+        assert payload["metrics"]["token_total"] == 21
+        summary = recorder.write_summary(task_status="passed")
+        assert summary["completed_module_count"] == 1
+        assert summary["total_tokens"] == 21
+        assert (Path(tmp) / "run" / "evaluation_summary.json").exists()
+    print("  ✅ EvaluationRecorder round json + summary")
+
+
+def test_evaluation_recorder_resume_round_numbering():
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "run"
+        worker_usage = TokenUsage(input=1, output=1)
+        judge = {
+            "judge_id": "judge-0",
+            "model": "judge-model",
+            "score": 80,
+            "passed": True,
+            "feedback": "ok",
+            "token_usage": TokenUsage(input=1, output=1),
+        }
+
+        first = EvaluationRecorder("task-test", run_dir)
+        first.record_round(
+            module_name="network",
+            stage="analyse",
+            stage_round=1,
+            status="running",
+            started_at="2026-05-08T00:00:00+00:00",
+            ended_at="2026-05-08T00:00:01+00:00",
+            duration_ms=1000,
+            worker={"model": "worker-model", "session_file": "sessions/a.jsonl", "token_usage": worker_usage},
+            judges=[judge],
+            passed_by_vote=True,
+        )
+
+        resumed = EvaluationRecorder("task-test", run_dir)
+        record = resumed.record_round(
+            module_name="network",
+            stage="analyse",
+            stage_round=2,
+            status="passed",
+            started_at="2026-05-08T00:00:02+00:00",
+            ended_at="2026-05-08T00:00:03+00:00",
+            duration_ms=1000,
+            worker={"model": "worker-model", "session_file": "sessions/a.jsonl", "token_usage": worker_usage},
+            judges=[judge | {"score": 90}],
+            passed_by_vote=True,
+            module_completed=True,
+            completion_reason="passed",
+        )
+        assert record["round"] == 2
+        assert (run_dir / "round_001" / "network.analyse.json").exists()
+        assert (run_dir / "round_002" / "network.analyse.json").exists()
+        assert record["effectiveness"]["score_delta_from_previous_round"] == 10.0
+        summary = resumed.write_summary(task_status="passed")
+        assert summary["round_count"] == 2
+    print("  ✅ EvaluationRecorder resume round numbering")
 
 
 # ─── 3. helpers: discover_modules ──────────────────────────────────────────────
@@ -873,6 +965,8 @@ TESTS = [
     test_check_voting_all,
     test_check_voting_any,
     test_check_voting_majority,
+    test_evaluation_recorder_round_and_summary,
+    test_evaluation_recorder_resume_round_numbering,
     test_discover_modules,
     # context
     test_pipeline_context_methods,

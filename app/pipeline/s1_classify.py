@@ -14,10 +14,12 @@ pipeline/s1_classify.py — Stage 1: 粗分类
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
+from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, StageError,
@@ -72,6 +74,8 @@ class ClassifyStage(BaseStage):
         max_iter = 999 if s_cfg.max_rounds < 0 else s_cfg.max_rounds
 
         for attempt in range(max_iter):
+            round_started = utc_now_iso()
+            round_start_ts = time.time()
             # 构建 prompt
             prompt_parts = [ctx.task]
             # ⚠️ 注入工作目录绝对路径，防止 agent cd 到错误目录
@@ -110,6 +114,7 @@ class ClassifyStage(BaseStage):
 
             # ── Judge ──
             judge_results = []
+            judge_records = []
             for j_idx, j_agent in enumerate(cfg.judges.agents):
                 j_model = cfg.judges.model_for("classify") or j_agent.model
                 j_ar = await run_agent_checked(
@@ -130,6 +135,14 @@ class ClassifyStage(BaseStage):
                 ctx.tokens += j_ar.token_usage
                 parsed = parse_eval_md(j_ar.output or "")
                 judge_results.append(parsed)
+                judge_records.append({
+                    "judge_id": f"judge-{j_idx}",
+                    "model": j_model,
+                    "score": parsed["score"],
+                    "passed": parsed["pass"],
+                    "feedback": parsed["feedback"],
+                    "token_usage": j_ar.token_usage,
+                })
 
                 # 保存 judge 文件
                 j_path = ctx.output_dir / f"s1-a{attempt+1}-j{j_idx}.md"
@@ -144,6 +157,33 @@ class ClassifyStage(BaseStage):
 
             j_count = len(judge_results)
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, j_count)
+            final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
+            max_reached = attempt + 1 >= max_iter
+            ctx.record_evaluation_round(
+                module_name="__task__",
+                stage="classify",
+                stage_round=attempt + 1,
+                status="passed" if final_pass else "failed" if max_reached else "running",
+                started_at=round_started,
+                ended_at=utc_now_iso(),
+                duration_ms=(time.time() - round_start_ts) * 1000,
+                worker={
+                    "model": classify_model,
+                    "session_file": classify_session,
+                    "token_usage": ar.token_usage,
+                    "error": ar.error,
+                },
+                judges=judge_records,
+                passed_by_vote=voted_pass,
+                module_completed=False,
+                completion_reason="passed" if final_pass else "max_rounds_exceeded" if max_reached else "",
+                needed_reflection=not final_pass,
+                artifact_paths=[str(workspace / "modules"), str(workspace / "modules.list")],
+                extra={
+                    "module_count": len(modules),
+                    "modules": modules,
+                },
+            )
 
             if voted_pass and attempt + 1 >= s_cfg.min_rounds:
                 ctx.classified_modules = modules

@@ -19,10 +19,12 @@ from .s1_classify import ClassifyStage
 from .s2_refine import RefineStage
 from .s3_analyse import AnalyseStage
 from .s4_report import CompletenessCheckStage, FinalReportStage
+from .evaluation import EvaluationRecorder
 
 __all__ = [
     # 上下文与基类
     "PipelineContext", "BaseStage", "Pipeline",
+    "EvaluationRecorder",
     # 工具函数与常量
     "StageError", "PiFatalError",
     "run_agent_checked", "check_agent_result",
@@ -39,4 +41,3 @@ __all__ = [
     "AnalyseStage",
     "CompletenessCheckStage", "FinalReportStage",
 ]
-

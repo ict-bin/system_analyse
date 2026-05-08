@@ -19,10 +19,12 @@ pipeline/s3_analyse.py — Stage 3: 模块分析 (STRIDE)
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
+from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
@@ -113,6 +115,27 @@ class AnalyseStage(BaseStage):
         if (mod_dir / "module_report.md").exists():
             ctx.emit_event("log", level="info",
                            msg=f"[跳过 S3] {mod_name} module_report.md 已存在，跳过本轮分析")
+            now = utc_now_iso()
+            ctx.record_evaluation_round(
+                module_name=mod_name,
+                stage="analyse",
+                stage_round=0,
+                status="skipped",
+                started_at=now,
+                ended_at=now,
+                duration_ms=0.0,
+                worker={
+                    "model": ctx.wm("analyse"),
+                    "session_file": str(ctx.sess_dir / sess_name),
+                    "token_usage": None,
+                    "error": None,
+                },
+                judges=[],
+                passed_by_vote=True,
+                module_completed=True,
+                completion_reason="skipped_existing_report",
+                artifact_paths=[str(mod_dir / "module_report.md")],
+            )
             return
 
         # 预读所有文件（Python侧，无需 LLM tool call）
@@ -145,6 +168,8 @@ class AnalyseStage(BaseStage):
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
+            round_started = utc_now_iso()
+            round_start_ts = time.time()
             ctx.emit_event("stage", stage=3, module=mod_name, attempt=attempt + 1)
 
             prompt_parts = [
@@ -172,11 +197,13 @@ class AnalyseStage(BaseStage):
             ctx.emit_event("stage_result", stage=3, module=mod_name)
 
             judge_results = []
+            judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
+                j_model = ctx.jm("analyse", j_item)
                 j_ar = await run_agent_checked(
                     context=f"s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",
                     prompt=f"评审模块 `{mod_name}` 的分析报告。",
-                    model=ctx.jm("analyse", j_item),
+                    model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
@@ -185,6 +212,14 @@ class AnalyseStage(BaseStage):
                 ctx.tokens += j_ar.token_usage
                 parsed = parse_eval_md(j_ar.output or "")
                 judge_results.append(parsed)
+                judge_records.append({
+                    "judge_id": f"judge-{j_idx}",
+                    "model": j_model,
+                    "score": parsed["score"],
+                    "passed": parsed["pass"],
+                    "feedback": parsed["feedback"],
+                    "token_usage": j_ar.token_usage,
+                })
                 ctx.emit_event("judge_eval", stage=3, judge_id=f"judge-{j_idx}",
                                module=mod_name, passed=parsed["pass"], score=parsed["score"])
                 archive_file(
@@ -202,11 +237,61 @@ class AnalyseStage(BaseStage):
                 [{"pass": True}] * reclass_votes + [{"pass": False}] * (ctx.j_count - reclass_votes),
                 s_cfg.pass_mode, ctx.j_count,
             ):
+                ctx.record_evaluation_round(
+                    module_name=mod_name,
+                    stage="analyse",
+                    stage_round=attempt + 1,
+                    status="failed",
+                    started_at=round_started,
+                    ended_at=utc_now_iso(),
+                    duration_ms=(time.time() - round_start_ts) * 1000,
+                    worker={
+                        "model": ctx.wm("analyse"),
+                        "session_file": analyse_session,
+                        "token_usage": ar.token_usage,
+                        "error": ar.error,
+                    },
+                    judges=judge_records,
+                    passed_by_vote=False,
+                    module_completed=False,
+                    completion_reason="reclassify_required",
+                    needed_reflection=True,
+                    triggered_reclassify=True,
+                    artifact_paths=[str(mod_dir / "module_report.md")],
+                )
                 ctx.emit_event("reclassify", module=mod_name)
                 ctx.modules_needing_reclassify.append(mod_name)
                 return  # 交给 _redo_s2_s3 处理
 
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
+            final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
+            max_reached = attempt + 1 >= max_iter(s_cfg)
+            report_exists = (mod_dir / "module_report.md").exists()
+            ctx.record_evaluation_round(
+                module_name=mod_name,
+                stage="analyse",
+                stage_round=attempt + 1,
+                status="passed" if final_pass else "failed" if max_reached else "running",
+                started_at=round_started,
+                ended_at=utc_now_iso(),
+                duration_ms=(time.time() - round_start_ts) * 1000,
+                worker={
+                    "model": ctx.wm("analyse"),
+                    "session_file": analyse_session,
+                    "token_usage": ar.token_usage,
+                    "error": ar.error,
+                },
+                judges=judge_records,
+                passed_by_vote=voted_pass,
+                module_completed=final_pass and report_exists,
+                completion_reason="passed" if final_pass and report_exists else "max_rounds_exceeded" if max_reached else "",
+                needed_reflection=not final_pass,
+                artifact_paths=[str(mod_dir / "module_report.md")],
+                extra={
+                    "report_exists": report_exists,
+                    "has_text_pre_read": has_text,
+                },
+            )
             if voted_pass:
                 if attempt + 1 >= s_cfg.min_rounds:
                     return
@@ -327,4 +412,3 @@ class AnalyseStage(BaseStage):
                     w_sys_analyse, j_sys_analyse, reflect_analyse,
                     session_suffix="-redo",
                 )
-

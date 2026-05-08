@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import time
 from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
+from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
@@ -134,6 +136,8 @@ class RefineStage(BaseStage):
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
+            round_started = utc_now_iso()
+            round_start_ts = time.time()
             ctx.emit_event("stage", stage=2, module=mod_name, attempt=attempt + 1)
 
             mods_before = set(discover_modules(str(workspace)))
@@ -164,11 +168,13 @@ class RefineStage(BaseStage):
 
             # ── Judge ──────────────────────────────────────────────────
             judge_results = []
+            judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
+                j_model = ctx.jm("refine", j_item)
                 j_ar = await run_agent_checked(
                     context=f"s2-judge-{mod_name}-j{j_idx}-a{attempt+1}",
                     prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
-                    model=ctx.jm("refine", j_item),
+                    model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
@@ -177,6 +183,14 @@ class RefineStage(BaseStage):
                 ctx.tokens += j_ar.token_usage
                 parsed = parse_eval_md(j_ar.output or "")
                 judge_results.append(parsed)
+                judge_records.append({
+                    "judge_id": f"judge-{j_idx}",
+                    "model": j_model,
+                    "score": parsed["score"],
+                    "passed": parsed["pass"],
+                    "feedback": parsed["feedback"],
+                    "token_usage": j_ar.token_usage,
+                })
                 ctx.emit_event("judge_eval", stage=2, judge_id=f"judge-{j_idx}",
                                module=mod_name, passed=parsed["pass"], score=parsed["score"])
                 archive_file(
@@ -187,6 +201,34 @@ class RefineStage(BaseStage):
                 )
 
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
+            final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
+            max_reached = attempt + 1 >= max_iter(s_cfg)
+            ctx.record_evaluation_round(
+                module_name=mod_name,
+                stage="refine",
+                stage_round=attempt + 1,
+                status="passed" if final_pass else "failed" if max_reached else "running",
+                started_at=round_started,
+                ended_at=utc_now_iso(),
+                duration_ms=(time.time() - round_start_ts) * 1000,
+                worker={
+                    "model": ctx.wm("refine"),
+                    "session_file": refine_session,
+                    "token_usage": ar.token_usage,
+                    "error": ar.error,
+                },
+                judges=judge_records,
+                passed_by_vote=voted_pass,
+                module_completed=False,
+                completion_reason="passed" if final_pass else "max_rounds_exceeded" if max_reached else "",
+                needed_reflection=not final_pass,
+                artifact_paths=[str(mod_dir / "files.list")],
+                extra={
+                    "file_count": fc,
+                    "split": was_split,
+                    "new_modules": new_ones,
+                },
+            )
 
             if voted_pass:
                 if attempt + 1 >= s_cfg.min_rounds:
@@ -309,4 +351,3 @@ class RefineStage(BaseStage):
                 + "\n".join(missing_files)
                 + f"\n\n{mod_summary}"
             )
-

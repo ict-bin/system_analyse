@@ -36,6 +36,7 @@ from .pipeline.helpers import (
     discover_modules, get_modules_root,
     write_failure_report, generate_modules_list, strip_target_prefix,
 )
+from .pipeline.evaluation import EvaluationRecorder
 
 
 def make_id() -> str:
@@ -138,6 +139,7 @@ class Orchestrator:
 
         # ── 构建 PipelineContext ──────────────────────────────────────────────
         tokens = TokenUsage()
+        evaluator = EvaluationRecorder(task_id=task_id, run_dir=run_dir)
 
         def _emit_event(event: SwarmEvent) -> None:
             if self._on_event:
@@ -157,6 +159,7 @@ class Orchestrator:
             flag_path=flag_path,
             emit=_emit_event,
             tokens=tokens,
+            evaluator=evaluator,
             cancel_event=self._cancel_event,
         )
 
@@ -193,6 +196,16 @@ class Orchestrator:
             self._emit("error", task_id, error=str(e))
 
         result.total_duration_ms = (time.time() - start) * 1000
+        try:
+            evaluator.write_summary(
+                task_status=result.status.value,
+                error=result.error,
+            )
+        except Exception as _eval_exc:
+            import logging as _log
+            _log.getLogger("sa.orchestrator").warning(
+                "evaluation summary write failed: %s", _eval_exc
+            )
 
         # ── 组装输出目录（失败时也执行，写 failure report）────────────────────
         final_mods = discover_modules(str(workspace))
@@ -242,4 +255,3 @@ class Orchestrator:
                    archive=f"{archive_path}.zip")
 
         return result
-
