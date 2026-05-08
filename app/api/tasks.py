@@ -24,6 +24,13 @@ class TaskCreateRequest(BaseModel):
     prompt_content: Optional[str] = None  # If omitted, auto-generated from input_path
     analyse_targets: Optional[list[str]] = None  # Override service-level analyse_targets
     binary_arch: Optional[list[str]] = None      # Override service-level binary_arch
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
 
 
 class GeneratePromptRequest(BaseModel):
@@ -54,6 +61,13 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         prompt_template_id=body.prompt_template_id,
         prompt_content=prompt,
         task_config_json=task_config,
+        task_origin_type=body.task_origin_type,
+        parent_project_id=body.parent_project_id,
+        parent_task_id=body.parent_task_id,
+        parent_task_type=body.parent_task_type,
+        parent_stage_name=body.parent_stage_name,
+        parent_stage_item_id=body.parent_stage_item_id,
+        parent_stage_item_key=body.parent_stage_item_key,
     )
 
 
