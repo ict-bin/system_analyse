@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
-from fastapi import Depends, Query
-from pydantic import BaseModel
+from fastapi import Depends, Query, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.service.task_service import generate_prompt_from_path, get_task_service
+from app.service.task_service import (
+    _parse_session_jsonl_lines,
+    _resolve_session_path,
+    _task_sessions_root,
+    generate_prompt_from_path,
+    get_task_service,
+)
+from app.db.models import AppSaTask
 
 from . import router
 
@@ -80,6 +88,29 @@ class TaskResultResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class TaskSessionMetaResponse(BaseModel):
+    session_id: str
+    session_name: str
+    relative_path: str
+    stage_group: str
+    role_name: str
+    size: int
+    mtime: float
+    event_count: int = 0
+    line_count: int = 0
+    is_active: bool = False
+    display_name: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TaskSessionFileResponse(BaseModel):
+    path: str
+    session_meta: dict = Field(default_factory=dict)
+    events: list[dict] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    line_count: int = 0
+
+
 @router.post("/tasks", status_code=201)
 async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     prompt = body.prompt_content
@@ -135,6 +166,16 @@ async def get_task_result(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task_result(db, task_id)
 
 
+@router.get("/tasks/{task_id}/sessions", response_model=list[TaskSessionMetaResponse])
+async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().list_task_sessions(db, task_id)
+
+
+@router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)
+async def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db)):
+    return get_task_service().get_task_session_file(db, task_id, path)
+
+
 @router.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().cancel_task(db, task_id)
@@ -184,3 +225,151 @@ async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
 async def generate_prompt(body: GeneratePromptRequest):
     """Auto-generate a prompt from an input path."""
     return {"prompt": generate_prompt_from_path(body.input_path)}
+
+
+@router.websocket("/tasks/{task_id}/sessions/ws")
+async def stream_task_session(task_id: str, websocket: WebSocket, db: Session = Depends(get_db)):
+    await websocket.accept()
+    svc = get_task_service()
+    row = db.query(AppSaTask).filter(
+        AppSaTask.task_id == task_id,
+        AppSaTask.is_deleted.is_(False),
+    ).first()
+    if not row:
+        await websocket.send_json({"type": "error", "message": f"任务不存在: {task_id}"})
+        await websocket.close(code=4404)
+        return
+
+    sessions_root = _task_sessions_root(row)
+    if not sessions_root or not sessions_root.is_dir():
+        await websocket.send_json({"type": "error", "message": "会话目录不存在"})
+        await websocket.close(code=4404)
+        return
+
+    try:
+        initial = await websocket.receive_json()
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        await websocket.send_json({"type": "error", "message": "订阅消息格式错误"})
+        await websocket.close(code=4400)
+        return
+
+    if initial.get("type") != "subscribe":
+        await websocket.send_json({"type": "error", "message": "首次消息必须为 subscribe"})
+        await websocket.close(code=4400)
+        return
+
+    try:
+        relative_path = str(initial.get("path") or "")
+        offset = int(initial.get("offset") or 0)
+        target = _resolve_session_path(sessions_root, relative_path)
+    except ValueError as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=4400)
+        return
+
+    if not target.is_file():
+        await websocket.send_json({"type": "error", "message": f"会话文件不存在: {relative_path}"})
+        await websocket.close(code=4404)
+        return
+
+    try:
+        snapshot = svc.get_task_session_file(db, task_id, relative_path)
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=4500)
+        return
+
+    await websocket.send_json({
+        "type": "session_snapshot",
+        "path": snapshot["path"],
+        "session_meta": snapshot["session_meta"],
+        "warnings": snapshot["warnings"],
+        "line_count": snapshot["line_count"],
+        "event_count": len(snapshot["events"]),
+    })
+
+    current_offset = max(0, offset)
+    if current_offset < snapshot["line_count"]:
+        lines = target.read_text("utf-8", errors="replace").splitlines()
+        _, delta_events, delta_warnings, _ = _parse_session_jsonl_lines(lines[current_offset:], start_line=current_offset + 1)
+        if delta_events or delta_warnings:
+            await websocket.send_json({
+                "type": "session_delta",
+                "path": snapshot["path"],
+                "offset": current_offset,
+                "line_count": snapshot["line_count"],
+                "events": delta_events,
+                "warnings": delta_warnings,
+            })
+        current_offset = snapshot["line_count"]
+
+    last_keepalive = asyncio.get_running_loop().time()
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)
+                msg_type = message.get("type")
+                if msg_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+                elif msg_type == "subscribe":
+                    relative_path = str(message.get("path") or relative_path)
+                    offset = int(message.get("offset") or 0)
+                    target = _resolve_session_path(sessions_root, relative_path)
+                    snapshot = svc.get_task_session_file(db, task_id, relative_path)
+                    await websocket.send_json({
+                        "type": "session_snapshot",
+                        "path": snapshot["path"],
+                        "session_meta": snapshot["session_meta"],
+                        "warnings": snapshot["warnings"],
+                        "line_count": snapshot["line_count"],
+                        "event_count": len(snapshot["events"]),
+                    })
+                    current_offset = max(0, offset)
+                    if current_offset < snapshot["line_count"]:
+                        lines = target.read_text("utf-8", errors="replace").splitlines()
+                        _, delta_events, delta_warnings, _ = _parse_session_jsonl_lines(lines[current_offset:], start_line=current_offset + 1)
+                        await websocket.send_json({
+                            "type": "session_delta",
+                            "path": snapshot["path"],
+                            "offset": current_offset,
+                            "line_count": snapshot["line_count"],
+                            "events": delta_events,
+                            "warnings": delta_warnings,
+                        })
+                        current_offset = snapshot["line_count"]
+            except asyncio.TimeoutError:
+                pass
+
+            if not target.exists():
+                await websocket.send_json({"type": "error", "message": f"会话文件不存在: {relative_path}"})
+                return
+
+            lines = target.read_text("utf-8", errors="replace").splitlines()
+            current_line_count = sum(1 for line in lines if line.strip())
+            if current_line_count < current_offset:
+                current_offset = 0
+                await websocket.send_json({
+                    "type": "session_rotated",
+                    "path": relative_path,
+                    "message": "会话文件已重置，请重新加载",
+                })
+            elif current_line_count > current_offset:
+                _, delta_events, delta_warnings, _ = _parse_session_jsonl_lines(lines[current_offset:], start_line=current_offset + 1)
+                await websocket.send_json({
+                    "type": "session_delta",
+                    "path": relative_path,
+                    "offset": current_offset,
+                    "line_count": current_line_count,
+                    "events": delta_events,
+                    "warnings": delta_warnings,
+                })
+                current_offset = current_line_count
+
+            now = asyncio.get_running_loop().time()
+            if now - last_keepalive >= 15:
+                await websocket.send_json({"type": "pong"})
+                last_keepalive = now
+    except WebSocketDisconnect:
+        return

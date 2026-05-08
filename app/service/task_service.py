@@ -7,6 +7,7 @@ Each task is persisted in MySQL and executed asynchronously.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -43,6 +44,7 @@ _SUMMARY_PATTERNS = {
 _RISK_LEVEL_RE = re.compile(r"<!--\s*RISK_LEVEL:\s*([^\-][^>]*)-->")
 _RISK_SCORE_RE = re.compile(r"<!--\s*RISK_SCORE:\s*(\d+)\s*-->")
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,2})\s+(.+)$", re.MULTILINE)
+_SESSION_THINKING_LEVEL_MAP = {"off": "off", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "x-high": "xhigh"}
 
 
 def _read_text_if_exists(path: Path) -> tuple[str | None, str | None]:
@@ -107,6 +109,159 @@ def _infer_risk_score(markdown: str | None) -> int | None:
     if score_match:
         return int(score_match.group(1))
     return None
+
+
+def _task_root(row: AppSaTask) -> Path | None:
+    if not row.output_path:
+        return None
+    return Path(row.output_path) / row.task_id
+
+
+def _task_sessions_root(row: AppSaTask) -> Path | None:
+    root = _task_root(row)
+    if not root:
+        return None
+    return root / "run" / "sessions"
+
+
+def _normalize_relative_session_path(path: str) -> str:
+    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part and part != "."]
+    if not parts:
+        raise ValueError("会话路径不能为空")
+    if any(part == ".." for part in parts):
+        raise ValueError("会话路径非法")
+    return "/".join(parts)
+
+
+def _resolve_session_path(sessions_root: Path, relative_path: str) -> Path:
+    normalized = _normalize_relative_session_path(relative_path)
+    candidate = (sessions_root / normalized).resolve()
+    root_resolved = sessions_root.resolve()
+    if not str(candidate).startswith(str(root_resolved)):
+        raise ValueError("会话路径超出允许范围")
+    if candidate.suffix.lower() != ".jsonl":
+        raise ValueError("仅支持 .jsonl 会话文件")
+    return candidate
+
+
+def _parse_message_parts(content: object) -> list[dict]:
+    parts: list[dict] = []
+    if isinstance(content, str):
+        parts.append({"type": "text", "text": content})
+        return parts
+    if not isinstance(content, list):
+        return parts
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        content_type = item.get("type", "")
+        if content_type == "text":
+            parts.append({"type": "text", "text": item.get("text", "")})
+        elif content_type == "thinking":
+            parts.append({"type": "thinking", "text": item.get("thinking", "")})
+        elif content_type == "toolCall":
+            parts.append({
+                "type": "toolCall",
+                "name": item.get("name", ""),
+                "id": item.get("id", ""),
+                "arguments": item.get("arguments", {}),
+            })
+        elif content_type == "toolResult":
+            parts.append({"type": "toolResult", "text": item.get("text", "")})
+        else:
+            parts.append({"type": "unknown", "detail": str(item)[:200]})
+    return parts
+
+
+def _parse_session_jsonl_lines(lines: list[str], *, start_line: int = 1) -> tuple[dict, list[dict], list[str], int]:
+    events: list[dict] = []
+    warnings: list[str] = []
+    session_meta: dict = {}
+    line_count = 0
+    for index, raw_line in enumerate(lines):
+        line_no = start_line + index
+        line = raw_line.strip()
+        if not line:
+            continue
+        line_count += 1
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            warnings.append(f"第 {line_no} 行 JSON 解析失败")
+            events.append({"type": "raw", "line": line_no, "raw_line": line[:200], "summary": line[:200]})
+            continue
+        if not isinstance(obj, dict):
+            events.append({"type": "raw", "line": line_no, "raw_line": line[:200], "summary": line[:200]})
+            continue
+        event_type = obj.get("type", "")
+        if event_type == "session":
+            session_meta = {
+                "id": obj.get("id", ""),
+                "version": obj.get("version", ""),
+                "timestamp": obj.get("timestamp", ""),
+                "cwd": obj.get("cwd", ""),
+            }
+            continue
+        if event_type == "model_change":
+            events.append({
+                "type": "model_change",
+                "line": line_no,
+                "event_index": line_no,
+                "timestamp": obj.get("timestamp", ""),
+                "display_timestamp": obj.get("timestamp", ""),
+                "provider": obj.get("provider", ""),
+                "modelId": obj.get("modelId", ""),
+                "raw_line": line,
+            })
+            continue
+        if event_type == "thinking_level_change":
+            level = obj.get("thinkingLevel", "")
+            events.append({
+                "type": "thinking_level_change",
+                "line": line_no,
+                "event_index": line_no,
+                "timestamp": obj.get("timestamp", ""),
+                "display_timestamp": obj.get("timestamp", ""),
+                "thinkingLevel": level,
+                "thinkingLevelClass": f"thinking-{_SESSION_THINKING_LEVEL_MAP.get(str(level).lower(), 'off')}",
+                "raw_line": line,
+            })
+            continue
+        if event_type == "message":
+            msg = obj.get("message", {}) if isinstance(obj.get("message"), dict) else {}
+            role = msg.get("role", "")
+            event_data = {
+                "type": "message",
+                "line": line_no,
+                "event_index": line_no,
+                "timestamp": obj.get("timestamp", ""),
+                "display_timestamp": obj.get("timestamp", ""),
+                "role": role,
+                "render_role": role,
+                "parts": _parse_message_parts(msg.get("content", [])),
+                "raw_line": line,
+            }
+            if role == "toolResult":
+                event_data["toolCallId"] = msg.get("toolCallId", msg.get("tool_call_id", ""))
+                event_data["toolName"] = msg.get("toolName", msg.get("tool_name", ""))
+                event_data["isError"] = msg.get("isError", msg.get("is_error", False))
+            events.append(event_data)
+            continue
+        events.append({
+            "type": event_type or "unknown_event",
+            "line": line_no,
+            "event_index": line_no,
+            "display_timestamp": obj.get("timestamp", ""),
+            "summary": str(obj)[:200],
+            "raw_line": line[:200],
+        })
+    return session_meta, events, warnings, line_count
+
+
+def _parse_session_jsonl_file(path: Path) -> tuple[dict, list[dict], list[str], int]:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        lines = handle.readlines()
+    return _parse_session_jsonl_lines(lines)
 
 
 def _origin_payload(row: AppSaTask) -> dict:
@@ -329,6 +484,64 @@ class TaskService:
             "modules": modules,
             "summary": summary,
             "warnings": warnings,
+        }
+
+    def list_task_sessions(self, db: Session, task_id: str) -> list[dict]:
+        row = self._get_or_404(db, task_id)
+        sessions_root = _task_sessions_root(row)
+        if not sessions_root or not sessions_root.is_dir():
+            return []
+        now_ts = _time.time()
+        items: list[dict] = []
+        for session_file in sorted(sessions_root.rglob("*.jsonl")):
+            try:
+                relative_path = str(session_file.relative_to(sessions_root)).replace("\\", "/")
+                relative_parts = relative_path.split("/")
+                stage_group = relative_parts[0] if len(relative_parts) > 1 else "root"
+                session_name = session_file.stem
+                _, events, warnings, line_count = _parse_session_jsonl_file(session_file)
+                stat = session_file.stat()
+                is_active = row.status in ("pending", "running") and (now_ts - stat.st_mtime) <= 120
+                display_name = session_name if stage_group == "root" else f"{stage_group} / {session_name}"
+                items.append({
+                    "session_id": session_name,
+                    "session_name": session_name,
+                    "relative_path": relative_path,
+                    "stage_group": stage_group,
+                    "role_name": session_name,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "event_count": len(events),
+                    "line_count": line_count,
+                    "is_active": is_active,
+                    "display_name": display_name,
+                    "warnings": warnings,
+                })
+            except Exception as exc:
+                logger.warning("list_task_sessions failed to inspect %s: %s", session_file, exc)
+        return sorted(items, key=lambda item: (item["stage_group"], -item["mtime"], item["relative_path"]))
+
+    def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        sessions_root = _task_sessions_root(row)
+        if not sessions_root or not sessions_root.is_dir():
+            from fastapi import HTTPException
+            raise HTTPException(404, "会话目录不存在")
+        try:
+            target = _resolve_session_path(sessions_root, relative_path)
+        except ValueError as exc:
+            from fastapi import HTTPException
+            raise HTTPException(400, str(exc))
+        if not target.is_file():
+            from fastapi import HTTPException
+            raise HTTPException(404, f"会话文件不存在: {relative_path}")
+        session_meta, events, warnings, line_count = _parse_session_jsonl_file(target)
+        return {
+            "path": str(target.relative_to(sessions_root)).replace("\\", "/"),
+            "session_meta": session_meta,
+            "events": events,
+            "warnings": warnings,
+            "line_count": line_count,
         }
 
     def create_task(self, db: Session, *, project_id: str, task_name: str,
