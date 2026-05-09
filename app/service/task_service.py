@@ -33,6 +33,10 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
 
+ANALYSIS_MODE_BINARY = "binary"
+ANALYSIS_MODE_SOURCE = "source"
+SOURCE_MODE_DEFAULT_ANALYSE_TARGETS = ["source", "script", "config"]
+
 _SUMMARY_PATTERNS = {
     "module_count": re.compile(r"\|\s*分析模块数\s*\|\s*(\d+)\s*\|"),
     "total_file_count": re.compile(r"\|\s*总文件数\s*\|\s*(\d+)\s*\|"),
@@ -317,7 +321,34 @@ def _load_svc_config_from_db(db: "Session", project_id: str) -> "ServiceConfig":
         return _load_svc_config()
 
 
-def generate_prompt_from_path(input_path: str) -> str:
+def _normalize_analysis_mode(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    return ANALYSIS_MODE_SOURCE if normalized == ANALYSIS_MODE_SOURCE else ANALYSIS_MODE_BINARY
+
+
+def _infer_analysis_mode(row: AppSaTask) -> str:
+    explicit = str(getattr(row, "analysis_mode", "") or "").strip().lower()
+    if explicit in (ANALYSIS_MODE_BINARY, ANALYSIS_MODE_SOURCE):
+        return explicit
+    if str(row.parent_task_type or "").strip().lower() == ANALYSIS_MODE_SOURCE:
+        return ANALYSIS_MODE_SOURCE
+    targets = (row.task_config_json or {}).get("analyse_targets") if isinstance(row.task_config_json, dict) else None
+    if isinstance(targets, list) and ANALYSIS_MODE_SOURCE in {str(item).strip().lower() for item in targets}:
+        return ANALYSIS_MODE_SOURCE
+    return ANALYSIS_MODE_BINARY
+
+
+def _analysis_mode_label(mode: str) -> str:
+    return "源码模式" if _normalize_analysis_mode(mode) == ANALYSIS_MODE_SOURCE else "二进制模式"
+
+
+def generate_prompt_from_path(input_path: str, analysis_mode: str | None = None) -> str:
+    mode = _normalize_analysis_mode(analysis_mode)
+    if mode == ANALYSIS_MODE_SOURCE:
+        return (
+            f"对路径 `{input_path}` 下的源码项目进行系统性安全分析，"
+            "重点关注：代码模块划分、入口与调用关系、危险 API、配置与脚本风险、敏感信息暴露及风险等级评估。"
+        )
     path_lower = input_path.lower()
     if any(kw in path_lower for kw in ("firmware", "unpacked", "squashfs", "rootfs")):
         subject = "固件解包后的所有文件"
@@ -379,16 +410,24 @@ def _write_models_json_from_db(db: Session) -> None:
 class TaskService:
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
-                   per_page: int = 20, status: Optional[str] = None) -> dict:
+                   per_page: int = 20, status: Optional[str] = None,
+                   analysis_mode: Optional[str] = None) -> dict:
         query = db.query(AppSaTask).filter(
             AppSaTask.project_id == project_id,
             AppSaTask.is_deleted.is_(False),
         )
         if status:
             query = query.filter(AppSaTask.status == status)
-        total = query.count()
-        rows = (query.order_by(AppSaTask.created_at.desc())
-                .offset((page - 1) * per_page).limit(per_page).all())
+        requested_mode = _normalize_analysis_mode(analysis_mode) if analysis_mode else None
+        if requested_mode:
+            all_rows = query.order_by(AppSaTask.created_at.desc()).all()
+            filtered = [row for row in all_rows if _infer_analysis_mode(row) == requested_mode]
+            total = len(filtered)
+            rows = filtered[(page - 1) * per_page:page * per_page]
+        else:
+            total = query.count()
+            rows = (query.order_by(AppSaTask.created_at.desc())
+                    .offset((page - 1) * per_page).limit(per_page).all())
         return {"items": [self._row_to_dict(r) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
 
@@ -616,6 +655,7 @@ class TaskService:
                     prompt_template_id: Optional[str] = None,
                     prompt_content: str, created_by: Optional[str] = None,
                     task_config_json: Optional[dict] = None,
+                    analysis_mode: Optional[str] = None,
                     task_origin_type: Optional[str] = None,
                     parent_project_id: Optional[str] = None,
                     parent_task_id: Optional[str] = None,
@@ -626,13 +666,18 @@ class TaskService:
         task_id = f"sat_{uuid.uuid4().hex[:16]}"
         _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
         effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-system-analyse"
+        mode = _normalize_analysis_mode(analysis_mode or parent_task_type)
+        effective_task_config = dict(task_config_json or {})
+        if mode == ANALYSIS_MODE_SOURCE and "analyse_targets" not in effective_task_config:
+            effective_task_config["analyse_targets"] = list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS)
         row = AppSaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
             task_description=task_description, input_path=input_path,
             output_path=effective_output, prompt_template_id=prompt_template_id,
             prompt_content=prompt_content, status="pending", created_by=created_by,
-            task_config_json=task_config_json,
+            task_config_json=effective_task_config or None,
             task_origin_type=str(task_origin_type or "").strip() or "manual",
+            analysis_mode=mode,
             parent_project_id=parent_project_id,
             parent_task_id=parent_task_id,
             parent_task_type=parent_task_type,
@@ -771,6 +816,8 @@ class TaskService:
             tcfg = row.task_config_json or {}
             if tcfg.get("analyse_targets"):
                 svc.analyse_targets = tcfg["analyse_targets"]
+            elif _infer_analysis_mode(row) == ANALYSIS_MODE_SOURCE:
+                svc.analyse_targets = list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS)
             if tcfg.get("binary_arch"):
                 svc.binary_arch = tcfg["binary_arch"]
             # start_stage / resume_workspace come ONLY from task_config_json
@@ -842,9 +889,12 @@ class TaskService:
     def _row_to_dict(row: AppSaTask) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
+        analysis_mode = _infer_analysis_mode(row)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_origin_payload(row),
+            "analysis_mode": analysis_mode,
+            "analysis_mode_label": _analysis_mode_label(analysis_mode),
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "output_path": row.output_path,
             "prompt_template_id": row.prompt_template_id,

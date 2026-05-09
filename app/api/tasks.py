@@ -22,6 +22,7 @@ class TaskCreateRequest(BaseModel):
     task_description: Optional[str] = None
     prompt_template_id: Optional[str] = None
     prompt_content: Optional[str] = None  # If omitted, auto-generated from input_path
+    analysis_mode: Optional[str] = None
     analyse_targets: Optional[list[str]] = None  # Override service-level analyse_targets
     binary_arch: Optional[list[str]] = None      # Override service-level binary_arch
     task_origin_type: Optional[str] = None
@@ -114,9 +115,10 @@ class TaskEvaluationResponse(BaseModel):
 
 @router.post("/tasks", status_code=201)
 async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
+    analysis_mode = body.analysis_mode or body.parent_task_type
     prompt = body.prompt_content
     if not prompt or not prompt.strip():
-        prompt = generate_prompt_from_path(body.input_path)
+        prompt = generate_prompt_from_path(body.input_path, analysis_mode)
 
     svc = get_task_service()
     task_config: dict | None = None
@@ -136,6 +138,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         prompt_template_id=body.prompt_template_id,
         prompt_content=prompt,
         task_config_json=task_config,
+        analysis_mode=analysis_mode,
         task_origin_type=body.task_origin_type,
         parent_project_id=body.parent_project_id,
         parent_task_id=body.parent_task_id,
@@ -152,9 +155,17 @@ async def list_tasks(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     status: Optional[str] = Query(None),
+    analysis_mode: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    return get_task_service().list_tasks(db, project_id=project_id, page=page, per_page=per_page, status=status)
+    return get_task_service().list_tasks(
+        db,
+        project_id=project_id,
+        page=page,
+        per_page=per_page,
+        status=status,
+        analysis_mode=analysis_mode,
+    )
 
 
 @router.get("/tasks/{task_id}")

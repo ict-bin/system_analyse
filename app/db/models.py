@@ -24,6 +24,7 @@ class AppSaTask(Base):
     task_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     task_origin_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    analysis_mode: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
     parent_project_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
     parent_task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     parent_task_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
