@@ -36,6 +36,14 @@ _running_tasks: dict[str, asyncio.Task] = {}
 ANALYSIS_MODE_BINARY = "binary"
 ANALYSIS_MODE_SOURCE = "source"
 SOURCE_MODE_DEFAULT_ANALYSE_TARGETS = ["source", "script", "config"]
+_TASK_LIST_SORT_COLUMNS = {
+    "created_at": AppSaTask.created_at,
+    "updated_at": AppSaTask.updated_at,
+    "started_at": AppSaTask.started_at,
+    "finished_at": AppSaTask.finished_at,
+    "status": AppSaTask.status,
+    "task_name": AppSaTask.task_name,
+}
 
 _SUMMARY_PATTERNS = {
     "module_count": re.compile(r"\|\s*分析模块数\s*\|\s*(\d+)\s*\|"),
@@ -411,22 +419,26 @@ class TaskService:
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
                    per_page: int = 20, status: Optional[str] = None,
-                   analysis_mode: Optional[str] = None) -> dict:
+                   analysis_mode: Optional[str] = None,
+                   sort_by: str = "created_at",
+                   sort_order: str = "desc") -> dict:
         query = db.query(AppSaTask).filter(
             AppSaTask.project_id == project_id,
             AppSaTask.is_deleted.is_(False),
         )
         if status:
             query = query.filter(AppSaTask.status == status)
+        sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), AppSaTask.created_at)
+        order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         requested_mode = _normalize_analysis_mode(analysis_mode) if analysis_mode else None
         if requested_mode:
-            all_rows = query.order_by(AppSaTask.created_at.desc()).all()
+            all_rows = query.order_by(order_expr, AppSaTask.id.desc()).all()
             filtered = [row for row in all_rows if _infer_analysis_mode(row) == requested_mode]
             total = len(filtered)
             rows = filtered[(page - 1) * per_page:page * per_page]
         else:
             total = query.count()
-            rows = (query.order_by(AppSaTask.created_at.desc())
+            rows = (query.order_by(order_expr, AppSaTask.id.desc())
                     .offset((page - 1) * per_page).limit(per_page).all())
         return {"items": [self._row_to_dict(r) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
