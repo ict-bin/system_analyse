@@ -17,7 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from sqlalchemy.orm import Session, load_only
 
 from app.config import build_task_config, load_service_config
 from app.db.models import AppSaTask
@@ -390,12 +391,14 @@ def _normalize_analysis_mode(value: str | None) -> str:
     return ANALYSIS_MODE_SOURCE if normalized == ANALYSIS_MODE_SOURCE else ANALYSIS_MODE_BINARY
 
 
-def _infer_analysis_mode(row: AppSaTask) -> str:
+def _infer_analysis_mode(row: AppSaTask, *, include_config: bool = True) -> str:
     explicit = str(getattr(row, "analysis_mode", "") or "").strip().lower()
     if explicit in (ANALYSIS_MODE_BINARY, ANALYSIS_MODE_SOURCE):
         return explicit
     if str(row.parent_task_type or "").strip().lower() == ANALYSIS_MODE_SOURCE:
         return ANALYSIS_MODE_SOURCE
+    if not include_config:
+        return ANALYSIS_MODE_BINARY
     targets = (row.task_config_json or {}).get("analyse_targets") if isinstance(row.task_config_json, dict) else None
     if isinstance(targets, list) and ANALYSIS_MODE_SOURCE in {str(item).strip().lower() for item in targets}:
         return ANALYSIS_MODE_SOURCE
@@ -474,7 +477,7 @@ def _write_models_json_from_db(db: Session) -> None:
 class TaskService:
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
-                   per_page: int = 20, status: Optional[str] = None,
+                   per_page: int = 100, status: Optional[str] = None,
                    analysis_mode: Optional[str] = None,
                    sort_by: str = "created_at",
                    sort_order: str = "desc") -> dict:
@@ -488,15 +491,21 @@ class TaskService:
         order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         requested_mode = _normalize_analysis_mode(analysis_mode) if analysis_mode else None
         if requested_mode:
-            all_rows = query.order_by(order_expr, AppSaTask.id.desc()).all()
-            filtered = [row for row in all_rows if _infer_analysis_mode(row) == requested_mode]
+            all_rows = (
+                query.options(*self._list_load_options())
+                .filter(or_(AppSaTask.analysis_mode == requested_mode, AppSaTask.parent_task_type == requested_mode))
+                .order_by(order_expr, AppSaTask.id.desc())
+                .all()
+            )
+            filtered = [row for row in all_rows if _infer_analysis_mode(row, include_config=False) == requested_mode]
             total = len(filtered)
             rows = filtered[(page - 1) * per_page:page * per_page]
         else:
             total = query.count()
-            rows = (query.order_by(order_expr, AppSaTask.id.desc())
+            rows = (query.options(*self._list_load_options())
+                    .order_by(order_expr, AppSaTask.id.desc())
                     .offset((page - 1) * per_page).limit(per_page).all())
-        return {"items": [self._row_to_dict(r) for r in rows],
+        return {"items": [self._row_to_dict(r, include_heavy=False) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
 
     def get_task(self, db: Session, task_id: str) -> dict:
@@ -956,10 +965,41 @@ class TaskService:
         return row
 
     @staticmethod
-    def _row_to_dict(row: AppSaTask) -> dict:
+    @staticmethod
+    def _list_load_options():
+        return (
+            load_only(
+                AppSaTask.id,
+                AppSaTask.task_id,
+                AppSaTask.project_id,
+                AppSaTask.task_origin_type,
+                AppSaTask.analysis_mode,
+                AppSaTask.parent_project_id,
+                AppSaTask.parent_task_id,
+                AppSaTask.parent_task_type,
+                AppSaTask.parent_stage_name,
+                AppSaTask.parent_stage_item_id,
+                AppSaTask.parent_stage_item_key,
+                AppSaTask.task_name,
+                AppSaTask.task_description,
+                AppSaTask.input_path,
+                AppSaTask.output_path,
+                AppSaTask.prompt_template_id,
+                AppSaTask.status,
+                AppSaTask.error,
+                AppSaTask.created_by,
+                AppSaTask.created_at,
+                AppSaTask.updated_at,
+                AppSaTask.started_at,
+                AppSaTask.finished_at,
+            ),
+        )
+
+    @staticmethod
+    def _row_to_dict(row: AppSaTask, *, include_heavy: bool = True) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
-        analysis_mode = _infer_analysis_mode(row)
+        analysis_mode = _infer_analysis_mode(row, include_config=include_heavy)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_origin_payload(row),
@@ -968,10 +1008,11 @@ class TaskService:
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "output_path": row.output_path,
             "prompt_template_id": row.prompt_template_id,
-            "prompt_content": row.prompt_content, "status": row.status,
-            "error": row.error, "result_json": _lightweight_result_json(row, row.result_json),
-            "stages_json": row.stages_json,
-            "task_config_json": row.task_config_json,
+            "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
+            "error": row.error,
+            "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
+            "stages_json": row.stages_json if include_heavy else None,
+            "task_config_json": row.task_config_json if include_heavy else None,
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),

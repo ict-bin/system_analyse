@@ -26,6 +26,10 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
+    "CREATE INDEX ix_sa_tasks_project_deleted_created_id ON secflow_app_sa_tasks (project_id, is_deleted, created_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_created_id ON secflow_app_sa_tasks (project_id, created_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_status_created_id ON secflow_app_sa_tasks (project_id, is_deleted, status, created_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_mode_created_id ON secflow_app_sa_tasks (project_id, is_deleted, analysis_mode, created_at, id)",
 ]
 
 
