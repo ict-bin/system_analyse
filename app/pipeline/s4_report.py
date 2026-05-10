@@ -35,6 +35,163 @@ from .helpers import (
 )
 
 
+FINAL_REPORT_CONTEXT_TOTAL_LIMIT = 70_000
+FINAL_REPORT_CONTEXT_PER_MODULE_LIMIT = 900
+FINAL_REPORT_CONTEXT_HIGH_RISK_LIMIT = 1_800
+
+
+def _extract_report_meta(text: str) -> dict:
+    """Extract lightweight metadata from a module_report.md for final aggregation."""
+    head = text[:4_000]
+    risk_level = "未知"
+    risk_score = 0
+    threat_count = 0
+
+    m = re.search(r"RISK_LEVEL:\s*(.+?)\s*-->", head)
+    if m:
+        risk_level = m.group(1).strip()
+    else:
+        m = re.search(r"风险等级\s*[：:]\s*([^\n|]+)", head)
+        if m:
+            risk_level = m.group(1).strip()
+
+    m = re.search(r"RISK_SCORE:\s*(\d+)", head)
+    if m:
+        risk_score = min(int(m.group(1)), 100)
+    else:
+        m = re.search(r"风险评分\s*[：:]\s*(\d+)", head)
+        if m:
+            risk_score = min(int(m.group(1)), 100)
+
+    threat_count = len(re.findall(r"(?m)^#{2,4}\s+.*(?:威胁|漏洞|风险)", text))
+    if threat_count == 0:
+        threat_count = len(re.findall(r"(?:STRIDE 分类|风险等级|修复建议)", text))
+
+    summary_lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#") or "风险" in line or "威胁" in line or "修复" in line:
+            summary_lines.append(line)
+        if len(summary_lines) >= 40:
+            break
+
+    return {
+        "risk_level": risk_level,
+        "risk_score": risk_score,
+        "threat_count": threat_count,
+        "summary": "\n".join(summary_lines),
+    }
+
+
+def _build_final_report_context(workspace: Path, limit: int = FINAL_REPORT_CONTEXT_TOTAL_LIMIT) -> str:
+    """Build bounded final-report input so Stage 4b cannot read all module reports."""
+    modules_root = get_modules_root(str(workspace))
+    records = []
+    total_files = 0
+
+    for mod_name in discover_modules(str(workspace)):
+        mod_dir = modules_root / mod_name
+        files = []
+        try:
+            files = [l.strip() for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip()]
+        except OSError:
+            files = []
+        report_path = mod_dir / "module_report.md"
+        try:
+            report_text = report_path.read_text("utf-8", errors="replace")
+        except OSError:
+            report_text = ""
+        meta = _extract_report_meta(report_text)
+        total_files += len(files)
+        records.append({
+            "module": mod_name,
+            "file_count": len(files),
+            "report_path": str(report_path.relative_to(workspace)) if report_path.exists() else "",
+            "report_text": report_text,
+            **meta,
+        })
+
+    risk_order = {"严重": 0, "高": 1, "中": 2, "低": 3, "信息": 4, "未知": 5}
+    records.sort(key=lambda r: (risk_order.get(str(r["risk_level"]).replace("🔴", "").replace("🟡", "").replace("🟢", "").strip(), 5), -int(r["risk_score"] or 0), r["module"]))
+
+    counts = {"高": 0, "中": 0, "低": 0, "未知": 0}
+    for r in records:
+        level = str(r["risk_level"])
+        if "高" in level or "严重" in level:
+            counts["高"] += 1
+        elif "中" in level:
+            counts["中"] += 1
+        elif "低" in level:
+            counts["低"] += 1
+        else:
+            counts["未知"] += 1
+
+    parts = [
+        "# final_report.md 生成上下文（已截断汇总）",
+        "",
+        "注意：只能基于以下汇总生成最终报告，不要读取 modules/*/module_report.md 全文。",
+        "必须写入 workspace 根目录下的 final_report.md。",
+        "",
+        "## 任务级统计",
+        f"- 分析模块数: {len(records)}",
+        f"- 总文件数: {total_files}",
+        f"- 高风险模块数: {counts['高']}",
+        f"- 中风险模块数: {counts['中']}",
+        f"- 低风险模块数: {counts['低']}",
+        f"- 未知/信息模块数: {counts['未知']}",
+        "",
+        "## 模块清单",
+        "| 模块名 | 文件数 | 风险等级 | 风险评分 | 关键威胁数 |",
+        "|--------|--------|----------|----------|------------|",
+    ]
+    for r in records:
+        parts.append(
+            f"| {r['module']} | {r['file_count']} | {r['risk_level']} | "
+            f"{r['risk_score']} | {r['threat_count']} |"
+        )
+    parts.append("")
+    parts.append("## 模块报告摘要")
+
+    used = len("\n".join(parts))
+    for r in records:
+        if used >= limit:
+            break
+        risk_text = str(r["risk_level"])
+        per_limit = FINAL_REPORT_CONTEXT_HIGH_RISK_LIMIT if ("高" in risk_text or "严重" in risk_text) else FINAL_REPORT_CONTEXT_PER_MODULE_LIMIT
+        snippet_source = r["summary"] or r["report_text"]
+        snippet = snippet_source[:per_limit]
+        section = [
+            "",
+            f"### {r['module']}",
+            f"- 文件数: {r['file_count']}",
+            f"- 风险等级: {r['risk_level']}",
+            f"- 风险评分: {r['risk_score']}",
+            f"- 关键威胁数: {r['threat_count']}",
+            "- 摘要片段:",
+            "```markdown",
+            snippet,
+            "```",
+        ]
+        section_text = "\n".join(section)
+        if used + len(section_text) > limit:
+            remain = max(0, limit - used - 200)
+            if remain <= 0:
+                break
+            section[-2] = snippet[:remain]
+            section_text = "\n".join(section)
+        parts.append(section_text)
+        used += len(section_text)
+
+    context = "\n".join(parts)
+    try:
+        (workspace / "final_report_context.md").write_text(context, encoding="utf-8")
+    except OSError:
+        pass
+    return context
+
+
 class CompletenessCheckStage(BaseStage):
     """Stage 4a: 完整性检查（缺失模块回 Stage 2+3 补做）"""
 
@@ -190,10 +347,18 @@ class FinalReportStage(BaseStage):
 
         s_cfg = cfg.stages.final_check
         report_sys_prompt = load_prompt(cfg.workers.system_prompt_dir, "step4_final_report")
+        report_sys_prompt = (
+            report_sys_prompt
+            + "\n\n# 强制约束\n"
+            + "本次运行的用户提示会直接提供已截断的模块汇总上下文。"
+            + "不要执行 ls/read，也不要逐个读取 modules/*/module_report.md；"
+            + "只基于用户提示中的上下文生成 final_report.md。"
+        )
         j_report_prompt = load_prompt(cfg.judges.system_prompt_dir, "step4_check_report")
         reflect_report = load_prompt(cfg.workers.system_prompt_dir, "reflect_report")
         report_session = str(ctx.sess_dir / "final_report.jsonl")
         w_base = ctx.make_w_base()
+        report_w_base = {**w_base, "tools": ["write"]}
         j_base = ctx.make_j_base()
 
         feedback = ""
@@ -203,7 +368,10 @@ class FinalReportStage(BaseStage):
             ctx.emit_event("stage", stage="4b", attempt=attempt + 1)
 
             prompt_parts = [
-                "读取所有模块的 module_report.md，生成最终分析总报告 final_report.md。"
+                "基于以下已截断的模块汇总上下文，生成最终分析总报告 final_report.md。",
+                "不要读取 module_report.md 全文；上下文已经包含生成总报告所需的模块清单、风险等级和关键摘要。",
+                "",
+                _build_final_report_context(workspace),
             ]
             if feedback:
                 prompt_parts.append(f"\n\n{feedback}")
@@ -214,7 +382,7 @@ class FinalReportStage(BaseStage):
                 prompt="\n".join(prompt_parts),
                 system_prompt=report_sys_prompt,
                 session_file=report_session,
-                **w_base,
+                **report_w_base,
             )
             ctx.tokens += ar.token_usage
 
