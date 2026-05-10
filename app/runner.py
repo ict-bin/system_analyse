@@ -30,6 +30,7 @@ from .models import TokenUsage
 logger = logging.getLogger("sa.runner")
 
 _MAX_BACKOFF = 300  # 退避上限 5 分钟
+_DEFAULT_STDOUT_IDLE_TIMEOUT_SECONDS = 300.0
 
 
 # ─── 结果类 ───────────────────────────────────────────────────────────────────
@@ -105,6 +106,17 @@ def _cmd_preview(args: list[str]) -> str:
     for a in args:
         parts.append(a[:80] + "…" if len(a) > 100 else a)
     return " ".join(parts)
+
+
+def _stdout_idle_timeout() -> float:
+    raw = os.environ.get("PI_STDOUT_IDLE_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_STDOUT_IDLE_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_STDOUT_IDLE_TIMEOUT_SECONDS
+    return max(30.0, value)
 
 
 def _find_pi_command() -> list[str]:
@@ -514,8 +526,23 @@ async def _run_with_api_retry(
             await proc.stdin.drain()
 
             buffer = b""
+            idle_timeout = _stdout_idle_timeout()
             while True:
-                chunk = await proc.stdout.read(4096)
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=idle_timeout)
+                except asyncio.TimeoutError:
+                    result.error = f"pi stdout idle timeout after {idle_timeout:.0f}s"
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                    result.exit_code = proc.returncode or -1
+                    break
                 if not chunk:
                     break
                 buffer += chunk
