@@ -183,6 +183,9 @@ class ServiceConfig(BaseModel):
     parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1（串行）")
     agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
+    agent_run_timeout_seconds: int = Field(default=3600, description="单次智能体输入最大运行时长（秒），-1=不限制")
+    agent_timeout_retry_enabled: bool = Field(default=True, description="超时后是否自动重新输入并继续")
+    agent_timeout_max_retries: int = Field(default=3, description="超时后最大自动重试次数，-1=无限")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
 
@@ -209,6 +212,9 @@ class TaskConfig(BaseModel):
 
     agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
+    agent_run_timeout_seconds: int = Field(default=3600, description="单次智能体输入最大运行时长（秒），-1=不限制")
+    agent_timeout_retry_enabled: bool = Field(default=True, description="超时后是否自动重新输入并继续")
+    agent_timeout_max_retries: int = Field(default=3, description="超时后最大自动重试次数，-1=无限")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
