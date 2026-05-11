@@ -12,6 +12,7 @@ from typing import Any, Dict
 
 from app.db import get_db
 from app.service.config_service import get_config_service, get_model_config_service
+from app.service.llm_provider_sync import apply_models_config_to_pi
 
 from . import router
 
@@ -59,8 +60,12 @@ async def get_models_config(db: Session = Depends(get_db)):
 @router.put("/models")
 async def save_models_config(body: ModelsConfigSaveRequest, db: Session = Depends(get_db)):
     try:
-        return get_model_config_service().save_models_config(db, body.config)
+        result = get_model_config_service().save_models_config(db, body.config)
+        apply_models_config_to_pi(body.config, source="models_api")
+        return result
     except SQLAlchemyError as exc:
         logger.error("save_models_config failed: %s", exc)
         raise HTTPException(status_code=503, detail="保存失败，数据库暂时不可用") from exc
-
+    except Exception as exc:
+        logger.error("apply models config failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"models.json 应用失败: {exc}") from exc

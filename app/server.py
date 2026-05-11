@@ -42,6 +42,7 @@ from .config import (
 from .logging_utils import configure_container_logging, log_event
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
+from .service.llm_provider_sync import sync_providers_to_pi, validate_pi_models_file
 
 load_dotenv()
 configure_container_logging("01-system_analyse")
@@ -58,6 +59,25 @@ async def lifespan(app: FastAPI):
     # --- startup ---
     svc_yaml = get_service_yaml()
     db_url = svc_yaml.database.url
+
+    try:
+        sync_ok = await sync_providers_to_pi(
+            base_url=svc_yaml.configcenter.base_url,
+            token=svc_yaml.auth_service.service_machine_token,
+            timeout=svc_yaml.configcenter.timeout,
+        )
+        if not sync_ok:
+            logger.warning("Startup LLM Provider sync failed, runtime models.json may be stale")
+        else:
+            validation = validate_pi_models_file()
+            logger.info(
+                "Startup runtime models ready: path=%s providers=%s models=%s",
+                validation["path"],
+                validation["provider_count"],
+                validation["model_count"],
+            )
+    except Exception as exc:
+        logger.warning("Startup LLM Provider sync/validation failed: %s", exc, exc_info=True)
 
     try:
         from .db import init_db

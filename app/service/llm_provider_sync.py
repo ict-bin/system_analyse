@@ -122,6 +122,39 @@ def get_pi_models_path() -> Path:
     return Path(_PI_DIR) / "models.json"
 
 
+def write_pi_models_file(models_json: dict[str, Any], *, source: str) -> dict[str, Any]:
+    pi_dir = Path(_PI_DIR)
+    pi_dir.mkdir(parents=True, exist_ok=True)
+    models_path = get_pi_models_path()
+
+    # 若原来是 symlink（entrypoint.sh 创建），先移除，确保后续写入真实运行时文件
+    if models_path.is_symlink():
+        models_path.unlink()
+
+    models_path.write_text(
+        json.dumps(models_json, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    validation = validate_pi_models_file(models_path)
+    logger.info(
+        "已写入 pi runtime models.json: source=%s path=%s providers=%s models=%s",
+        source,
+        validation["path"],
+        validation["provider_count"],
+        validation["model_count"],
+    )
+    for model_summary in validation["models"]:
+        logger.info(
+            "LLM Provider %s/%s contextWindow=%s contextLength=%s maxTokens=%s",
+            model_summary["provider_key"],
+            model_summary["model_id"],
+            model_summary["contextWindow"],
+            model_summary["contextLength"],
+            model_summary["maxTokens"],
+        )
+    return validation
+
+
 def validate_pi_models_file(
     path: Path | None = None,
     *,
@@ -214,33 +247,7 @@ async def sync_providers_to_pi(
             return False
 
         models_json = build_models_json(items)
-        enabled_count = len(models_json["providers"])
-
-        pi_dir = Path(_PI_DIR)
-        pi_dir.mkdir(parents=True, exist_ok=True)
-        models_path = get_pi_models_path()
-
-        # 若原来是 symlink（entrypoint.sh 创建），先移除
-        if models_path.is_symlink():
-            models_path.unlink()
-
-        models_path.write_text(
-            json.dumps(models_json, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        validation = validate_pi_models_file(models_path)
-        logger.info(
-            "已从配置中心同步 %d 个 Provider 到 %s", enabled_count, models_path
-        )
-        for model_summary in validation["models"]:
-            logger.info(
-                "LLM Provider %s/%s contextWindow=%s contextLength=%s maxTokens=%s",
-                model_summary["provider_key"],
-                model_summary["model_id"],
-                model_summary["contextWindow"],
-                model_summary["contextLength"],
-                model_summary["maxTokens"],
-            )
+        write_pi_models_file(models_json, source="configcenter")
         return True
 
     except aiohttp.ClientError as e:
@@ -248,3 +255,7 @@ async def sync_providers_to_pi(
     except Exception as e:
         logger.exception("同步 LLM Provider 时发生未知错误: %s", e)
     return False
+
+
+def apply_models_config_to_pi(models_json: dict[str, Any], *, source: str = "api") -> dict[str, Any]:
+    return write_pi_models_file(models_json, source=source)
