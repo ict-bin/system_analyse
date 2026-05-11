@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import aiohttp
 
@@ -17,6 +17,7 @@ logger = logging.getLogger("sa.llm_sync")
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
 _DEFAULT_CONTEXT_WINDOW = 128000
 _DEFAULT_MAX_TOKENS = 8192
+_REQUIRED_MODEL_FIELDS = ("contextWindow", "contextLength", "maxTokens")
 
 
 def _env_var_name(provider_key: str) -> str:
@@ -117,6 +118,67 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict:
     return result
 
 
+def get_pi_models_path() -> Path:
+    return Path(_PI_DIR) / "models.json"
+
+
+def validate_pi_models_file(
+    path: Path | None = None,
+    *,
+    required_fields: Iterable[str] = _REQUIRED_MODEL_FIELDS,
+) -> dict[str, Any]:
+    models_path = path or get_pi_models_path()
+    if not models_path.exists():
+        raise RuntimeError(f"pi models.json 不存在: {models_path}")
+    if models_path.is_symlink():
+        raise RuntimeError(f"pi models.json 仍是符号链接，未切换到运行时文件: {models_path}")
+
+    try:
+        payload = json.loads(models_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"pi models.json 读取失败: {models_path}: {exc}") from exc
+
+    providers = payload.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        raise RuntimeError(f"pi models.json provider 配置为空: {models_path}")
+
+    required = tuple(required_fields)
+    provider_count = 0
+    model_count = 0
+    summaries: list[dict[str, Any]] = []
+    for provider_key, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            raise RuntimeError(f"provider 配置格式非法: {provider_key}")
+        models = provider_cfg.get("models")
+        if not isinstance(models, list) or not models:
+            raise RuntimeError(f"provider 未配置 models: {provider_key}")
+        provider_count += 1
+        for model in models:
+            if not isinstance(model, dict):
+                raise RuntimeError(f"model 配置格式非法: {provider_key}")
+            missing = [field for field in required if not model.get(field)]
+            if missing:
+                raise RuntimeError(
+                    f"provider {provider_key}/{model.get('id') or '<unknown>'} 缺少字段: {', '.join(missing)}"
+                )
+            summaries.append(
+                {
+                    "provider_key": provider_key,
+                    "model_id": model.get("id"),
+                    "contextWindow": model.get("contextWindow"),
+                    "contextLength": model.get("contextLength"),
+                    "maxTokens": model.get("maxTokens"),
+                }
+            )
+            model_count += 1
+    return {
+        "path": str(models_path),
+        "provider_count": provider_count,
+        "model_count": model_count,
+        "models": summaries,
+    }
+
+
 async def sync_providers_to_pi(
     base_url: str,
     token: str = "",
@@ -156,7 +218,7 @@ async def sync_providers_to_pi(
 
         pi_dir = Path(_PI_DIR)
         pi_dir.mkdir(parents=True, exist_ok=True)
-        models_path = pi_dir / "models.json"
+        models_path = get_pi_models_path()
 
         # 若原来是 symlink（entrypoint.sh 创建），先移除
         if models_path.is_symlink():
@@ -166,18 +228,19 @@ async def sync_providers_to_pi(
             json.dumps(models_json, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        validation = validate_pi_models_file(models_path)
         logger.info(
             "已从配置中心同步 %d 个 Provider 到 %s", enabled_count, models_path
         )
-        for provider_key, provider_cfg in models_json["providers"].items():
-            for model in provider_cfg.get("models", []):
-                logger.info(
-                    "LLM Provider %s/%s contextWindow=%s maxTokens=%s",
-                    provider_key,
-                    model.get("id"),
-                    model.get("contextWindow"),
-                    model.get("maxTokens"),
-                )
+        for model_summary in validation["models"]:
+            logger.info(
+                "LLM Provider %s/%s contextWindow=%s contextLength=%s maxTokens=%s",
+                model_summary["provider_key"],
+                model_summary["model_id"],
+                model_summary["contextWindow"],
+                model_summary["contextLength"],
+                model_summary["maxTokens"],
+            )
         return True
 
     except aiohttp.ClientError as e:

@@ -456,24 +456,6 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
         logger.warning("_flush_stages failed: %s", _exc, exc_info=True)
 
 
-def _write_models_json_from_db(db: Session) -> None:
-    """从数据库读取 models 配置并写入 pi 的配置目录，使 pi 能识别模型。"""
-    try:
-        from app.service.config_service import get_model_config_service
-        import json as _json
-        pi_dir = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
-        os.makedirs(pi_dir, exist_ok=True)
-        models_cfg = get_model_config_service().get_models_config(db)
-        # strip meta field before writing
-        blob = {k: v for k, v in models_cfg.items() if k != "updated_at"}
-        dest = os.path.join(pi_dir, "models.json")
-        with open(dest, "w", encoding="utf-8") as _f:
-            _json.dump(blob, _f, ensure_ascii=False, indent=2)
-        logger.info("models.json written from DB → %s", dest)
-    except Exception as _exc:
-        logger.warning("_write_models_json_from_db failed: %s", _exc, exc_info=True)
-
-
 class TaskService:
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
@@ -887,7 +869,6 @@ class TaskService:
             if row.started_at is None:
                 row.started_at = now_local()
             db.commit()
-            _write_models_json_from_db(db)
             svc = _load_svc_config_from_db(db, row.project_id)
             # Apply per-task config overrides (analyse_targets, binary_arch, etc.)
             tcfg = row.task_config_json or {}
