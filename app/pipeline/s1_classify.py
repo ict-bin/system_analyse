@@ -27,6 +27,53 @@ from .helpers import (
 )
 
 
+def _build_security_focus_section(sec_cats: list[str]) -> str:
+    if not sec_cats or "all" in sec_cats:
+        return ""
+
+    from app.models import SECURITY_CATEGORIES  # noqa: PLC0415
+
+    cat_lines = []
+    for cat_key in sec_cats:
+        cat_info = SECURITY_CATEGORIES.get(cat_key, {})
+        cat_lines.append(
+            f"- **{cat_key}**（{cat_info.get('name', '')}）：{cat_info.get('desc', '')}"
+        )
+
+    category_specific_rules: list[str] = []
+    if "network_protocol" in sec_cats:
+        category_specific_rules.append(
+            "- 对 `network_protocol`：优先识别**协议解析/编解码/报文处理/会话状态机**相关代码，"
+            "例如 HTTP、DNS、DHCP、TLS、SNMP、MQTT、CoAP、FTP、SSH、BGP、OSPF 等。"
+        )
+        category_specific_rules.append(
+            "- 不要仅因文件名、目录名或少量通用网络关键词就扩大归类范围；"
+            "应优先判断文件是否**直接承担协议语义处理职责**，"
+            "而不是只提供通用通信、调度、封装或外围支撑能力。"
+        )
+        category_specific_rules.append(
+            "- 若一组文件与目标维度存在关联，但其核心职责更偏向通用基础设施、外围控制逻辑"
+            "或跨协议支撑层，应谨慎判断，不要轻易把整组文件并入协议解析模块。"
+        )
+        category_specific_rules.append(
+            "- 模块命名也要体现**协议或解析语义**，优先使用 `http`、`dns`、`dhcp`、`tls`"
+            " 这类名字；只有在无法进一步收敛到具体协议或解析职责时，"
+            "才使用更抽象的名称。"
+        )
+
+    category_rules_text = ""
+    if category_specific_rules:
+        category_rules_text = "\n\n**本次维度的专项判定规则：**\n" + "\n".join(category_specific_rules)
+
+    return (
+        "\n\n# ⚠️ 安全分析范围约束（必须严格执行）\n\n"
+        "**只将与以下安全维度直接相关的文件归入模块**，"
+        "无关文件（测试代码、国际化字符串、构建脚本、样例数据、文档等）"
+        "**绝对不得**创建任何模块——直接丢弃。\n\n"
+        "**指定安全维度：**\n" + "\n".join(cat_lines) + category_rules_text
+    )
+
+
 class ClassifyStage(BaseStage):
     """Stage 1: 粗分类"""
 
@@ -39,11 +86,9 @@ class ClassifyStage(BaseStage):
         task_id = ctx.task_id
         s_cfg = cfg.stages.classify
 
-        w_prompt_dir = cfg.workers.system_prompt_dir
-        j_prompt_dir = cfg.judges.system_prompt_dir
-        classify_prompt = load_prompt(w_prompt_dir, "step1_classify")
-        check_prompt = load_prompt(j_prompt_dir, "step1_check_classify")
-        reflect_prompt = load_prompt(w_prompt_dir, "reflect_classify")
+        classify_prompt = load_prompt(cfg, "step1_classify", "workers")
+        check_prompt = load_prompt(cfg, "step1_check_classify", "judges")
+        reflect_prompt = load_prompt(cfg, "reflect_classify", "workers")
 
         classify_session = str(ctx.sess_dir / "classify.jsonl")
         classify_model = cfg.workers.model_for("classify")
@@ -53,6 +98,15 @@ class ClassifyStage(BaseStage):
         ctx.emit_event("model", stage="classify",
                        worker=classify_model.split("/")[-1],
                        judge=judge_model.split("/")[-1])
+        ctx.emit_event(
+            "log",
+            level="info",
+            msg=(
+                "分类阶段安全过滤配置："
+                f"security_focus_categories={list(cfg.security_focus_categories)}, "
+                f"module_granularity={cfg.module_granularity}"
+            ),
+        )
 
         # ── 构建 prescan 摘要注入 ──
         prescan_summary = ctx.prescan_summary
@@ -100,21 +154,18 @@ class ClassifyStage(BaseStage):
 
             # ── 安全维度过滤约束 ──
             sec_cats = getattr(cfg, "security_focus_categories", ["all"])
-            if attempt == 0 and sec_cats and "all" not in sec_cats:
-                from app.models import SECURITY_CATEGORIES  # noqa: PLC0415
-                cat_lines = []
-                for cat_key in sec_cats:
-                    cat_info = SECURITY_CATEGORIES.get(cat_key, {})
-                    cat_lines.append(
-                        f"- **{cat_key}**（{cat_info.get('name', '')}）：{cat_info.get('desc', '')}"
-                    )
-                prompt_parts.append(
-                    "\n\n# ⚠️ 安全分析范围约束（必须严格执行）\n\n"
-                    "**只将与以下安全维度直接相关的文件归入模块**，"
-                    "无关文件（测试代码、国际化字符串、构建脚本、样例数据、文档等）"
-                    "**绝对不得**创建任何模块——直接丢弃。\n\n"
-                    "**指定安全维度：**\n" + "\n".join(cat_lines)
+            security_focus_section = _build_security_focus_section(sec_cats)
+            if attempt == 0 and security_focus_section:
+                ctx.emit_event(
+                    "log",
+                    level="info",
+                    msg=(
+                        "已启用安全维度分类约束："
+                        f"security_focus_categories={list(sec_cats)}, "
+                        f"module_granularity={getattr(cfg, 'module_granularity', 'fine')}"
+                    ),
                 )
+                prompt_parts.append(security_focus_section)
 
             # ── 模块粒度约束 ──
             granularity = getattr(cfg, "module_granularity", "fine")
@@ -163,9 +214,21 @@ class ClassifyStage(BaseStage):
             judge_records = []
             for j_idx, j_agent in enumerate(cfg.judges.agents):
                 j_model = cfg.judges.model_for("classify") or j_agent.model
+                judge_prompt = [f"审核分类结果。模块数：{len(modules)}。"]
+                if security_focus_section:
+                    judge_prompt.append(
+                        "重点检查：模块是否被错误放大到与指定安全维度无关的功能域。"
+                    )
+                    judge_prompt.append(security_focus_section)
+                if granularity == "coarse":
+                    judge_prompt.append(
+                        "\n\n# 模块粒度要求\n\n"
+                        "当前要求是粗粒度（协议/服务/功能级）。"
+                        "不要把同一协议拆成多个碎片模块，也不要把无关的广义网络管理代码混入协议模块。"
+                    )
                 j_ar = await run_agent_checked(
                     context=f"s1-classify-judge{j_idx}",
-                    prompt=f"审核分类结果。模块数：{len(modules)}。",
+                    prompt="\n\n".join(judge_prompt),
                     model=j_model,
                     tools=cfg.judges.default_tools,
                     system_prompt=check_prompt,

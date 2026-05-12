@@ -13,7 +13,17 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig, normalize_max_rounds_exceeded_action
+from .models import (
+    AgentInstanceConfig,
+    JUDGE_PROMPT_KEYS,
+    PromptOverrideConfig,
+    PromptOverrideItem,
+    RoleConfig,
+    ServiceConfig,
+    TaskConfig,
+    WORKER_PROMPT_KEYS,
+    normalize_max_rounds_exceeded_action,
+)
 
 logger = logging.getLogger("sa.config")
 
@@ -24,6 +34,10 @@ CONFIG_DIR = os.environ.get("CONFIG_DIR", "/data/config")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/data/output")
 
 SERVICE_YAML_PATH = os.environ.get("SERVICE_YAML", "/app/service.yaml")
+SERVICE_ROOT = Path(__file__).resolve().parents[1]
+PROMPTS_ROOT = SERVICE_ROOT / "prompts"
+DEFAULT_WORKER_PROMPT_DIR = str((PROMPTS_ROOT / "workers").resolve())
+DEFAULT_JUDGE_PROMPT_DIR = str((PROMPTS_ROOT / "judges").resolve())
 
 
 # ─── service.yaml 数据类 ─────────────────────────────────────────────────────
@@ -234,11 +248,14 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "") -> TaskCon
         pi_retry_delay=svc.pi_retry_delay,
         analyse_targets=svc.analyse_targets,
         binary_arch=svc.binary_arch,
+        security_focus_categories=svc.security_focus_categories,
+        module_granularity=svc.module_granularity,
         parallel_modules=svc.parallel_modules,
         parallel_sub_workers=svc.parallel_sub_workers,
         stages=svc.stages.model_copy(deep=True),
         workers=svc.workers.model_copy(deep=True),
         judges=svc.judges.model_copy(deep=True),
+        prompt_overrides=svc.prompt_overrides.model_copy(deep=True),
         output_dir=svc.output_dir,
         archive_dir=svc.archive_dir,
         result_dir=svc.result_dir,
@@ -259,6 +276,77 @@ def _backfill_role(role: RoleConfig) -> None:
             agent.tools = role.default_tools[:]
         if agent.thinking_level is None:
             agent.thinking_level = role.default_thinking_level
+
+
+def _load_prompt_file(prompt_dir: str | Path, name: str) -> str:
+    base_dir = Path(prompt_dir)
+    for ext in (".md", ".txt", ""):
+        candidate = base_dir / f"{name}{ext}"
+        if candidate.exists() and candidate.is_file():
+            return candidate.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def get_prompt_dir(role: str, configured_dir: str | None = None) -> str:
+    candidate = str(configured_dir or "").strip()
+    if candidate and Path(candidate).is_dir():
+        return candidate
+    return DEFAULT_WORKER_PROMPT_DIR if role == "workers" else DEFAULT_JUDGE_PROMPT_DIR
+
+
+def load_prompt_defaults(role: str, configured_dir: str | None = None) -> dict[str, str]:
+    prompt_dir = get_prompt_dir(role, configured_dir)
+    keys = WORKER_PROMPT_KEYS if role == "workers" else JUDGE_PROMPT_KEYS
+    return {key: _load_prompt_file(prompt_dir, key) for key in keys}
+
+
+def build_prompt_override_config(
+    prompt_overrides: dict[str, Any] | PromptOverrideConfig | None = None,
+    *,
+    worker_prompt_dir: str | None = None,
+    judge_prompt_dir: str | None = None,
+) -> PromptOverrideConfig:
+    if isinstance(prompt_overrides, PromptOverrideConfig):
+        raw = prompt_overrides.model_dump(mode="json")
+    elif isinstance(prompt_overrides, dict):
+        raw = prompt_overrides
+    else:
+        raw = {}
+
+    defaults = {
+        "workers": load_prompt_defaults("workers", worker_prompt_dir),
+        "judges": load_prompt_defaults("judges", judge_prompt_dir),
+    }
+
+    groups: dict[str, dict[str, PromptOverrideItem]] = {"workers": {}, "judges": {}}
+    for role, default_map in defaults.items():
+        raw_group = raw.get(role) if isinstance(raw.get(role), dict) else {}
+        for key, default_content in default_map.items():
+            raw_item = raw_group.get(key)
+            project_content = ""
+            source = "default"
+            if isinstance(raw_item, dict):
+                project_content = str(raw_item.get("content") or "").strip()
+                source = str(raw_item.get("source") or "").strip().lower() or "default"
+            elif isinstance(raw_item, str):
+                project_content = raw_item.strip()
+                source = "project" if project_content else "default"
+            if source == "project" and project_content:
+                content = project_content
+                effective_source = "project"
+            elif project_content and project_content != default_content:
+                content = project_content
+                effective_source = "project"
+            else:
+                content = default_content
+                effective_source = "default"
+            groups[role][key] = PromptOverrideItem(
+                content=content,
+                source=effective_source,
+                default_content=default_content,
+            )
+
+    return PromptOverrideConfig(workers=groups["workers"], judges=groups["judges"])
 
 
 def load_system_prompts(prompt_dir: str, count: int) -> list[str]:

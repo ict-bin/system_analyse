@@ -121,7 +121,15 @@ def check_voting(results: list[dict], pass_mode: str, judge_count: int) -> bool:
 
 # ── prompt 加载 ────────────────────────────────────────────────────────────────
 
-def load_prompt(prompt_dir: str, name: str) -> str:
+def load_prompt(source, name: str, role: str | None = None) -> str:
+    if role and hasattr(source, "get_prompt"):
+        try:
+            prompt = source.get_prompt(role, name)
+            if isinstance(prompt, str) and prompt.strip():
+                return prompt.strip()
+        except Exception:
+            pass
+    prompt_dir = str(source or "")
     for ext in [".md", ".txt", ""]:
         p = Path(prompt_dir) / f"{name}{ext}"
         if p.exists():

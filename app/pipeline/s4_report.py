@@ -45,8 +45,7 @@ class CompletenessCheckStage(BaseStage):
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        j_completeness_prompt = load_prompt(
-            cfg.judges.system_prompt_dir, "step4_check_completeness")
+        j_completeness_prompt = load_prompt(cfg, "step4_check_completeness", "judges")
         j_base = ctx.make_j_base()
 
         ctx.emit_event("stage", stage="4a")
@@ -94,9 +93,9 @@ class CompletenessCheckStage(BaseStage):
 
         s_cfg_refine = cfg.stages.refine
         s_cfg_analyse = cfg.stages.analyse
-        w_sys_refine = load_prompt(cfg.workers.system_prompt_dir, "step2_refine")
-        w_sys_analyse = load_prompt(cfg.workers.system_prompt_dir, "step3_analyse")
-        j_sys_analyse = load_prompt(cfg.judges.system_prompt_dir, "step3_check_analyse")
+        w_sys_refine = load_prompt(cfg, "step2_refine", "workers")
+        w_sys_analyse = load_prompt(cfg, "step3_analyse", "workers")
+        j_sys_analyse = load_prompt(cfg, "step3_check_analyse", "judges")
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
 
@@ -189,9 +188,9 @@ class FinalReportStage(BaseStage):
         final_out_dir = ctx.final_out_dir
 
         s_cfg = cfg.stages.final_check
-        report_sys_prompt = load_prompt(cfg.workers.system_prompt_dir, "step4_final_report")
-        j_report_prompt = load_prompt(cfg.judges.system_prompt_dir, "step4_check_report")
-        reflect_report = load_prompt(cfg.workers.system_prompt_dir, "reflect_report")
+        report_sys_prompt = load_prompt(cfg, "step4_final_report", "workers")
+        j_report_prompt = load_prompt(cfg, "step4_check_report", "judges")
+        reflect_report = load_prompt(cfg, "reflect_report", "workers")
         report_session = str(ctx.sess_dir / "final_report.jsonl")
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()

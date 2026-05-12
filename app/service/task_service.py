@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import build_task_config, load_service_config
 from app.db.models import AppSaTask
@@ -58,6 +59,17 @@ _RISK_LEVEL_RE = re.compile(r"<!--\s*RISK_LEVEL:\s*([^\-][^>]*)-->")
 _RISK_SCORE_RE = re.compile(r"<!--\s*RISK_SCORE:\s*(\d+)\s*-->")
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,2})\s+(.+)$", re.MULTILINE)
 _SESSION_THINKING_LEVEL_MAP = {"off": "off", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "x-high": "xhigh"}
+
+
+def _security_filter_log_payload(config: dict | None, *, resolved: bool = False) -> dict:
+    cfg = config or {}
+    return {
+        "analyse_targets": cfg.get("analyse_targets"),
+        "binary_arch": cfg.get("binary_arch"),
+        "security_focus_categories": cfg.get("security_focus_categories"),
+        "module_granularity": cfg.get("module_granularity"),
+        "resolved": resolved,
+    }
 
 
 def _read_text_if_exists(path: Path) -> tuple[str | None, str | None]:
@@ -502,6 +514,38 @@ class TaskService:
     def get_task(self, db: Session, task_id: str) -> dict:
         return self._row_to_dict(self._get_or_404(db, task_id))
 
+    def repair_task_origin(self, db: Session, task_id: str, analysis_mode: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        if row.status in ("pending", "running"):
+            from fastapi import HTTPException
+            raise HTTPException(400, "任务处于运行态，不能修改来源信息")
+        if str(row.task_origin_type or "").strip() not in ("", "manual"):
+            from fastapi import HTTPException
+            raise HTTPException(400, "仅手动任务支持修改来源信息")
+
+        normalized_mode = _normalize_analysis_mode(analysis_mode)
+        row.analysis_mode = normalized_mode
+        if isinstance(row.task_config_json, dict) and "resolved_config_snapshot" in row.task_config_json:
+            row.task_config_json = {
+                k: v for k, v in row.task_config_json.items()
+                if k != "resolved_config_snapshot"
+            } or None
+            flag_modified(row, "task_config_json")
+
+        db.commit()
+        db.refresh(row)
+        log_event(
+            logger,
+            logging.INFO,
+            "task origin repaired",
+            event="task_origin_repaired",
+            task_id=task_id,
+            project_id=row.project_id,
+            analysis_mode=normalized_mode,
+            task_origin_type=row.task_origin_type,
+        )
+        return self._row_to_dict(row)
+
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         output_root = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
@@ -758,7 +802,9 @@ class TaskService:
                                             name=f"sa_task_{task_id}")
         _running_tasks[task_id] = asyncio_task
         log_event(logger, logging.INFO, "task created",
-                  event="task_created", task_id=task_id, project_id=project_id)
+                  event="task_created", task_id=task_id, project_id=project_id,
+                  analysis_mode=mode,
+                  **_security_filter_log_payload(effective_task_config))
         return self._row_to_dict(row)
 
     def restart_task(self, db: Session, task_id: str) -> dict:
@@ -769,7 +815,7 @@ class TaskService:
         # Reset in-place — strip any resume overrides from previous resume_task call
         from sqlalchemy.orm.attributes import flag_modified
         clean_config = {k: v for k, v in (row.task_config_json or {}).items()
-                        if k not in ("start_stage", "resume_workspace")} or None
+                        if k not in ("start_stage", "resume_workspace", "resolved_config_snapshot")} or None
         row.task_config_json = clean_config
         row.status = "pending"
         row.started_at = None
@@ -805,7 +851,7 @@ class TaskService:
         svc = _load_svc_config_from_db(db, row.project_id)
         effective_output = row.output_path or svc.output_dir
         resume_workspace = os.path.join(effective_output, task_id, "run", "workspace")
-        tcfg = dict(row.task_config_json or {})
+        tcfg = {k: v for k, v in (row.task_config_json or {}).items() if k != "resolved_config_snapshot"}
         tcfg["start_stage"] = 3
         tcfg["resume_workspace"] = resume_workspace
         row.task_config_json = tcfg
@@ -873,21 +919,19 @@ class TaskService:
             row = db.query(AppSaTask).filter_by(task_id=task_id).first()
             if not row or row.status == "cancelled":
                 return
-            row.status = "running"
-            # 续跑时保留原始 started_at，首次运行才设置
-            if row.started_at is None:
-                row.started_at = now_local()
-            db.commit()
-            _write_models_json_from_db(db)
             svc = _load_svc_config_from_db(db, row.project_id)
-            # Apply per-task config overrides (analyse_targets, binary_arch, etc.)
             tcfg = row.task_config_json or {}
+            # Apply per-task config overrides (analyse_targets, binary_arch, etc.)
             if tcfg.get("analyse_targets"):
                 svc.analyse_targets = tcfg["analyse_targets"]
             elif _infer_analysis_mode(row) == ANALYSIS_MODE_SOURCE:
                 svc.analyse_targets = list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS)
             if tcfg.get("binary_arch"):
                 svc.binary_arch = tcfg["binary_arch"]
+            if tcfg.get("security_focus_categories"):
+                svc.security_focus_categories = tcfg["security_focus_categories"]
+            if tcfg.get("module_granularity"):
+                svc.module_granularity = tcfg["module_granularity"]
             # start_stage / resume_workspace come ONLY from task_config_json
             # (set by resume_task).  Never inherit from project config so that
             # fresh runs and restarts always start from Stage 0.
@@ -901,6 +945,28 @@ class TaskService:
                 svc.archive_dir = row.output_path
                 svc.result_dir = row.output_path
             cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
+            resolved_snapshot = cfg.model_dump(mode="json")
+            log_event(
+                logger,
+                logging.INFO,
+                "security filter resolved",
+                event="security_filter_resolved",
+                task_id=task_id,
+                project_id=row.project_id,
+                analysis_mode=row.analysis_mode,
+                task_origin_type=row.task_origin_type,
+                **_security_filter_log_payload(resolved_snapshot, resolved=True),
+            )
+            row.task_config_json = {
+                **tcfg,
+                "resolved_config_snapshot": resolved_snapshot,
+            }
+            row.status = "running"
+            # 续跑时保留原始 started_at，首次运行才设置
+            if row.started_at is None:
+                row.started_at = now_local()
+            db.commit()
+            _write_models_json_from_db(db)
             orch = Orchestrator(config=cfg, on_event=on_event)
             result = await orch.execute(task_id)
             _flush_stages(task_id, event_buffer)

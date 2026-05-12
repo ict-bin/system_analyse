@@ -117,7 +117,7 @@ class RefineStage(BaseStage):
             shutil.copy2(str(mod_dir / "files.list"), str(snapshot_path))
 
         # 文件数超过阈值时，先用子 Worker 收集文件摘要
-        sub_prompt = load_prompt(cfg.workers.system_prompt_dir, "step2_sub_read")
+        sub_prompt = load_prompt(cfg, "step2_sub_read", "workers")
         file_summary = ""
         if sub_prompt and fc > SUB_WORKER_THRESHOLD:
             file_summary = await collect_file_summaries(
@@ -130,9 +130,9 @@ class RefineStage(BaseStage):
                 target_dir=cfg.target_dir,
             )
 
-        w_sys_prompt = load_prompt(cfg.workers.system_prompt_dir, "step2_refine")
-        j_sys_prompt = load_prompt(cfg.judges.system_prompt_dir, "step2_check_refine")
-        reflect_prompt = load_prompt(cfg.workers.system_prompt_dir, "reflect_refine")
+        w_sys_prompt = load_prompt(cfg, "step2_refine", "workers")
+        j_sys_prompt = load_prompt(cfg, "step2_check_refine", "judges")
+        reflect_prompt = load_prompt(cfg, "reflect_refine", "workers")
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
@@ -325,7 +325,7 @@ class RefineStage(BaseStage):
             mod_summary_lines.append(f"- {mod_name} | {Path(sample).name}")
         mod_summary = "\n".join(mod_summary_lines)
 
-        reclass_prompt_tmpl = load_prompt(cfg.workers.system_prompt_dir, "step2_reclassify")
+        reclass_prompt_tmpl = load_prompt(cfg, "step2_reclassify", "workers")
         max_rc = min(3, max_iter(cfg.stages.refine))
 
         reclass_prompt = (

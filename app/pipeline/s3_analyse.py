@@ -43,9 +43,9 @@ class AnalyseStage(BaseStage):
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        w_sys_prompt = load_prompt(cfg.workers.system_prompt_dir, "step3_analyse")
-        j_sys_prompt = load_prompt(cfg.judges.system_prompt_dir, "step3_check_analyse")
-        reflect_prompt = load_prompt(cfg.workers.system_prompt_dir, "reflect_analyse")
+        w_sys_prompt = load_prompt(cfg, "step3_analyse", "workers")
+        j_sys_prompt = load_prompt(cfg, "step3_check_analyse", "judges")
+        reflect_prompt = load_prompt(cfg, "reflect_analyse", "workers")
 
         final_modules = discover_modules(str(workspace))
         ctx.modules_needing_reclassify = []
@@ -342,9 +342,9 @@ class AnalyseStage(BaseStage):
         ctx.emit_event("stage", stage="2-redo", modules=to_reclassify)
 
         s_cfg_refine = cfg.stages.refine
-        w_sys_refine = load_prompt(cfg.workers.system_prompt_dir, "step2_refine")
-        j_sys_refine = load_prompt(cfg.judges.system_prompt_dir, "step2_check_refine")
-        reflect_refine = load_prompt(cfg.workers.system_prompt_dir, "reflect_refine")
+        w_sys_refine = load_prompt(cfg, "step2_refine", "workers")
+        j_sys_refine = load_prompt(cfg, "step2_check_refine", "judges")
+        reflect_refine = load_prompt(cfg, "reflect_refine", "workers")
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
 

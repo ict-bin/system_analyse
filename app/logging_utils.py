@@ -15,6 +15,14 @@ from datetime import datetime
 from app.time_utils import UTC_PLUS_8
 
 
+_STANDARD_LOG_RECORD_FIELDS = {
+    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+    "created", "msecs", "relativeCreated", "thread", "threadName",
+    "processName", "process", "message", "asctime", "service",
+}
+
+
 class _JsonFormatter(logging.Formatter):
     """输出 JSON 格式日志行，兼容 chained pipeline 日志收集。"""
 
@@ -32,6 +40,16 @@ class _JsonFormatter(logging.Formatter):
             val = getattr(record, key, None)
             if val is not None:
                 payload[key] = val
+        for key, val in record.__dict__.items():
+            if key in _STANDARD_LOG_RECORD_FIELDS or key.startswith("_"):
+                continue
+            if key in payload:
+                continue
+            try:
+                json.dumps(val, ensure_ascii=False)
+                payload[key] = val
+            except TypeError:
+                payload[key] = str(val)
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
