@@ -280,13 +280,37 @@ class RefineStage(BaseStage):
         )
         mods_root = get_modules_root(str(workspace))
         all_classified: set[str] = set()
+        flist_map: dict[str, list[str]] = {}  # flist path → 有效行列表
         for flist in mods_root.glob("*/files.list"):
             if flist.name == "files.list.snapshot":
                 continue
-            for l in flist.read_text("utf-8").splitlines():
-                l = l.strip()
+            lines = [l.strip() for l in flist.read_text("utf-8").splitlines()]
+            flist_map[str(flist)] = lines
+            for l in lines:
                 if l:
                     all_classified.add(l)
+
+        # ── 清理多余文件（all_classified - all_target）────────────────────────
+        extra_files = all_classified - all_target
+        if extra_files:
+            removed_extra = 0
+            for flist_path, lines in flist_map.items():
+                valid = [l for l in lines if not l or l in all_target]
+                removed = [l for l in lines if l and l not in all_target]
+                if removed:
+                    removed_extra += len(removed)
+                    Path(flist_path).write_text(
+                        "\n".join(valid).strip() + "\n", encoding="utf-8")
+                    # 若模块变空则移除整个目录
+                    remaining = [l for l in valid if l]
+                    if not remaining:
+                        shutil.rmtree(str(Path(flist_path).parent), ignore_errors=True)
+            if removed_extra:
+                ctx.emit_event("log", level="warn",
+                               msg=f"Stage2 全局检查: 清理 {removed_extra} 个非过滤文件条目（不在 filtered_files.txt 中）")
+            # 重新计算 all_classified 用于 missing 检查
+            all_classified = all_target & all_classified  # 取交集即剩余有效分类
+
         missing_files = sorted(all_target - all_classified)
 
         if not missing_files:

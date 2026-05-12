@@ -20,10 +20,47 @@ from pathlib import Path
 from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
+import shutil
+
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, StageError,
 )
+
+
+def _enforce_filter_constraint(ctx: PipelineContext, workspace: Path) -> None:
+    """程序化校验：删除 modules/*/files.list 中不属于 filtered_files.txt 的在内条目。
+
+    LLM 可能将目标目录中的其他文件写入 files.list，本函数确保
+    所有 files.list 中的条目都属于过滤后的文件集合。
+    """
+    if not ctx.filtered_files:
+        return
+    allowed: set[str] = set(ctx.filtered_files)
+    mods_root = get_modules_root(str(workspace))
+    removed_total = 0
+    for flist in sorted(mods_root.glob("*/files.list")):
+        lines = [l.strip() for l in flist.read_text("utf-8").splitlines()]
+        valid = [l for l in lines if not l or l.startswith("#") or l in allowed]
+        extra = [l for l in lines if l and not l.startswith("#") and l not in allowed]
+        if extra:
+            removed_total += len(extra)
+            ctx.emit_event("log", level="warn",
+                           msg=(f"[filter-constraint] {flist.parent.name}: 删除 {len(extra)} 个"
+                                f"非过滤文件，示例：{extra[:3]}"))
+            flist.write_text("\n".join(valid).strip() + "\n", encoding="utf-8")
+            # 如果删除后 files.list 为空，移除整个模块目录
+            remaining = [l for l in valid if l and not l.startswith("#")]
+            if not remaining:
+                ctx.emit_event("log", level="warn",
+                               msg=f"[filter-constraint] {flist.parent.name}: 移除空模块")
+                shutil.rmtree(str(flist.parent), ignore_errors=True)
+    if removed_total:
+        ctx.emit_event("log", level="warn",
+                       msg=f"[filter-constraint] 共删除 {removed_total} 个非过滤条目")
+    else:
+        ctx.emit_event("log", level="info",
+                       msg="[filter-constraint] 校验通过：所有 files.list 条目均在过滤集合内 ✅")
 
 
 class ClassifyStage(BaseStage):
@@ -87,6 +124,13 @@ class ClassifyStage(BaseStage):
                 f"- 模块输出路径：`{workspace}/modules/<模块名>/files.list`\n\n"
                 f"**严禁执行任何 `cd` 命令**。所有脚本必须使用绝对路径或相对当前工作目录的路径。"
             )
+            # ⚠️ 过滤约束：始终注入（不依赖 prescan_summary，不依赖轮次）
+            prompt_parts.append(
+                f"\n\n# ⚠️ 文件来源约束（必须严格遵守）\n\n"
+                f"每个模块的 `files.list` **只能包含** `{workspace}/filtered_files.txt` "
+                f"中的相对路径，**禁止写入任何该文件之外的路径**。"
+                f"如有疑问请先读取 `filtered_files.txt` 确认范围。"
+            )
             if attempt == 0 and prescan_summary:
                 prompt_parts.append(
                     "\n\n# 预扫描摘要（已自动生成，请基于此分类）\n\n"
@@ -94,7 +138,6 @@ class ClassifyStage(BaseStage):
                     + "\n\n预扫描已将文件按关键词分组到 `prescan/` 目录下，"
                     "每个 `prescan/<keyword>.list` 包含对应文件列表。\n"
                     "你可以直接用脚本将 prescan/*.list 移入模块目录。"
-                    "\n\n每个模块的 files.list 必须写的是 filtered_files.txt 里的相对路径。"
                 )
 
             # ── 安全维度过滤约束 ──
@@ -115,9 +158,9 @@ class ClassifyStage(BaseStage):
                     "**指定安全维度：**\n" + "\n".join(cat_lines)
                 )
 
-            # ── 模块粒度约束 ──
+            # ── 模块粒度约束（每轮注入，不仅首轮）──
             granularity = getattr(cfg, "module_granularity", "fine")
-            if attempt == 0 and granularity == "coarse":
+            if granularity == "coarse":
                 prompt_parts.append(
                     "\n\n# ⚠️ 模块划分粒度：粗粒度（协议/服务/功能级）\n\n"
                     "模块划分必须以**完整协议 / 完整服务 / 完整安全功能**为边界：\n"
@@ -125,6 +168,7 @@ class ClassifyStage(BaseStage):
                     "统一归入**同一个模块**。\n"
                     "- 例如：`HTTP协议` 是一个模块，**不要**拆分为"
                     " `HTTP请求解析`、`HTTP响应构造`、`HTTP分块传输`。\n"
+                    "- `SSH` 的所有相关实现（协商、认证、通道、密钥交换等）属于**同一个模块**。\n"
                     "- 固件中有多少个协议 / 功能就创建多少个模块，**不限制总模块数量**。"
                 )
 
@@ -160,11 +204,19 @@ class ClassifyStage(BaseStage):
             # ── Judge ──
             judge_results = []
             judge_records = []
+            # ── 构建 judge prompt（含粒度约束） ──
+            granularity_note = ""
+            if granularity == "coarse":
+                granularity_note = (
+                    "\n\n⚠️ 当前为粗粒度模式：请检查是否有同一协议/服务被拆分为多个子模块。"
+                    "例如 ssh_client、ssh_channel、ssh_transport 均属于 SSH 协议，应合并为一个模块。"
+                    "若发现此类拆分，请在评审意见中明确指出并要求合并。"
+                )
             for j_idx, j_agent in enumerate(cfg.judges.agents):
                 j_model = cfg.judges.model_for("classify") or j_agent.model
                 j_ar = await run_agent_checked(
                     context=f"s1-classify-judge{j_idx}",
-                    prompt=f"审核分类结果。模块数：{len(modules)}。",
+                    prompt=f"审核分类结果。模块数：{len(modules)}。{granularity_note}",
                     model=j_model,
                     tools=cfg.judges.default_tools,
                     system_prompt=check_prompt,
@@ -231,7 +283,8 @@ class ClassifyStage(BaseStage):
             )
 
             if voted_pass and attempt + 1 >= s_cfg.min_rounds:
-                ctx.classified_modules = modules
+                _enforce_filter_constraint(ctx, workspace)
+                ctx.classified_modules = discover_modules(str(workspace))
                 return
 
             if voted_pass:

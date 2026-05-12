@@ -180,6 +180,30 @@ class Orchestrator:
             await pipeline.run(ctx, start_stage=cfg.start_stage)
             result.status = TaskStatus.PASSED
             result.total_tokens = ctx.tokens
+            # 过滤结果为 0 文件：流水线已正常终止，写说明报告
+            if ctx.filter_count == 0:
+                _zero_report = (
+                    f"# 分析任务已完成（过滤结果为 0 个文件）\n\n"
+                    f"**任务 ID**：`{task_id}`\n\n"
+                    f"## 原因\n\n"
+                    f"Stage 0 文件过滤阶段未找到符合条件的文件，"
+                    f"流水线已在过滤阶段正常终止，未执行后续分析。\n\n"
+                    f"## 当前配置\n\n"
+                    f"- `binary_arch`：`{cfg.binary_arch}`\n"
+                    f"- `analyse_targets`：`{cfg.analyse_targets}`\n"
+                    f"- `target_dir`：`{cfg.target_dir}`\n\n"
+                    f"## 建议操作\n\n"
+                    f"1. 确认目标固件的实际 ELF 架构（可使用 `readelf -h` 扫描）\n"
+                    f"2. 在任务配置中将 `binary_arch` 调整为实际架构，"
+                    f"例如 `[\"powerpc\"]`、`[\"mips\"]`、`[\"all\"]`\n"
+                    f"3. 确认 `analyse_targets` 包含目标文件类型（如 `binary`、`source`）\n"
+                    f"4. 重新创建任务\n"
+                )
+                (final_out_dir / "final_report.md").write_text(
+                    _zero_report, encoding="utf-8")
+                self._emit("task_zero_files", task_id,
+                           binary_arch=cfg.binary_arch,
+                           analyse_targets=cfg.analyse_targets)
         except (StageError, PiFatalError) as e:
             result.status = TaskStatus.FAILED
             result.error = str(e)
