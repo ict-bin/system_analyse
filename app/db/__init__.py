@@ -26,6 +26,30 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
+    # Add task_config_json column for per-task analysis scope overrides (added 2026-06)
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN task_config_json JSON NULL",
+    # Fallback: create per-project config table if create_all failed (added 2026-06)
+    (
+        "CREATE TABLE IF NOT EXISTS secflow_app_sa_project_configs ("
+        "  id INT NOT NULL AUTO_INCREMENT,"
+        "  project_id VARCHAR(100) NOT NULL,"
+        "  config_json JSON NULL,"
+        "  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+        "  PRIMARY KEY (id),"
+        "  UNIQUE KEY uix_sa_project_cfg_pid (project_id)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    ),
+    # Fallback: create global models config table if create_all failed (added 2026-06)
+    (
+        "CREATE TABLE IF NOT EXISTS secflow_app_sa_models_config ("
+        "  id INT NOT NULL AUTO_INCREMENT,"
+        "  config_key VARCHAR(64) NOT NULL DEFAULT 'global',"
+        "  config_json JSON NULL,"
+        "  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+        "  PRIMARY KEY (id),"
+        "  UNIQUE KEY uix_sa_models_cfg_key (config_key)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    ),
 ]
 
 

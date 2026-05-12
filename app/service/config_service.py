@@ -107,9 +107,11 @@ class ConfigService:
         for role_key in ("workers", "judges"):
             if isinstance(blob.get(role_key), dict):
                 blob[role_key] = {k: v for k, v in blob[role_key].items() if k not in _ROLE_READONLY_FIELDS}
+        from sqlalchemy.orm.attributes import flag_modified
         row = db.query(AppSaProjectConfig).filter_by(project_id=project_id).first()
         if row:
             row.config_json = blob
+            flag_modified(row, "config_json")
         else:
             row = AppSaProjectConfig(project_id=project_id, config_json=blob)
             db.add(row)

@@ -39,6 +39,9 @@ async def save_config(body: ConfigSaveRequest, db: Session = Depends(get_db)):
     except SQLAlchemyError as exc:
         logger.error("save_config failed for project %s: %s", body.project_id, exc)
         raise HTTPException(status_code=503, detail="保存失败，数据库暂时不可用") from exc
+    except Exception as exc:
+        logger.error("save_config unexpected error for project %s: %s", body.project_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"保存失败：{exc}") from exc
 
 
 # ── Models config ─────────────────────────────────────────────────────────────
