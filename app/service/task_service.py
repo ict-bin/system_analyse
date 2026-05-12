@@ -738,6 +738,21 @@ class TaskService:
         effective_task_config = dict(task_config_json or {})
         if mode == ANALYSIS_MODE_SOURCE and "analyse_targets" not in effective_task_config:
             effective_task_config["analyse_targets"] = list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS)
+        # 快照项目配置中的关键字段，确保任务配置自包含，不依赖重跑时项目配置的当前状态
+        # 未显式传入的字段（security_focus_categories / module_granularity / binary_arch）
+        # 从项目配置读取并写入 task_config_json，防止重跑时项目配置变更导致运行参数隐性改变
+        _snap_fields = ("security_focus_categories", "module_granularity", "binary_arch")
+        _missing_snap = [k for k in _snap_fields if k not in effective_task_config]
+        if _missing_snap:
+            try:
+                _proj_svc = _load_svc_config_from_db(db, project_id)
+                for _k in _missing_snap:
+                    _v = getattr(_proj_svc, _k, None)
+                    if _v is not None:
+                        effective_task_config[_k] = _v
+            except Exception as _snap_err:
+                logger.warning("task %s: failed to snapshot project config fields %s: %s",
+                               task_id, _missing_snap, _snap_err)
         row = AppSaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
             task_description=task_description, input_path=input_path,
