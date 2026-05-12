@@ -500,7 +500,31 @@ class TaskService:
                 "total": total, "page": page, "per_page": per_page}
 
     def get_task(self, db: Session, task_id: str) -> dict:
-        return self._row_to_dict(self._get_or_404(db, task_id))
+        row = self._get_or_404(db, task_id)
+        result = self._row_to_dict(row)
+        # 计算实际生效配置：task_config_json 覆盖项目配置
+        # 供前端展示具体配置项而非“使用默认”文字
+        try:
+            from app.service.config_service import get_config_service
+            proj_cfg = get_config_service().get_config(db, row.project_id)
+            tcfg = row.task_config_json or {}
+            _fields = ("analyse_targets", "binary_arch", "security_focus_categories", "module_granularity")
+            effective: dict = {}
+            source: dict = {}   # 每个字段的来源："task"或"project"
+            for _f in _fields:
+                if _f in tcfg and tcfg[_f] is not None:
+                    effective[_f] = tcfg[_f]
+                    source[_f] = "task"
+                elif _f in proj_cfg and proj_cfg[_f] is not None:
+                    effective[_f] = proj_cfg[_f]
+                    source[_f] = "project"
+            result["effective_config_json"] = effective
+            result["effective_config_source"] = source
+        except Exception as _exc:
+            logger.warning("get_task: failed to compute effective_config for %s: %s", task_id, _exc)
+            result["effective_config_json"] = row.task_config_json or {}
+            result["effective_config_source"] = {}
+        return result
 
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
