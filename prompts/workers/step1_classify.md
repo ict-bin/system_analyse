@@ -41,7 +41,8 @@ if [ -f filtered_files.txt ]; then
     SOURCE="filtered_files.txt"
 else
     echo "无过滤文件，扫描全量"
-    find /data/target -type f | sed 's|^/data/target/||' > /tmp/all_files.txt
+    # target/ 是 workspace 下指向实际目标目录的符号链接
+    find target -type f | sed 's|^target/||' > /tmp/all_files.txt
     SOURCE="/tmp/all_files.txt"
 fi
 head -10 $SOURCE    # 查看样本
@@ -51,10 +52,11 @@ head -10 $SOURCE    # 查看样本
 
 # ⚠️ files.list 路径格式
 
-**必须使用相对路径**（相对于 `/data/target`），不含前缀。
+**必须使用相对路径**（相对于目标目录根），不含任何目录前缀。
 
 ✅ 正确：`squashfs_extracted/aarch64/lib/libbgp.so`
 ❌ 错误：`/data/target/squashfs_extracted/aarch64/lib/libbgp.so`
+❌ 错误：`target/squashfs_extracted/aarch64/lib/libbgp.so`
 
 # 分类策略（按优先级）
 
@@ -81,7 +83,7 @@ done
 ```bash
 #!/bin/bash
 SOURCE="filtered_files.txt"
-[ ! -f "$SOURCE" ] && find /data/target -type f | sed 's|^/data/target/||' > /tmp/s.txt && SOURCE=/tmp/s.txt
+[ ! -f "$SOURCE" ] && find target -type f | sed 's|^target/||' > /tmp/s.txt && SOURCE=/tmp/s.txt
 
 while IFS= read -r rel; do
     kw=$(echo "$rel" | grep -oiE "bgp|ospf|dhcp|ipsec|ssh|mpls|vxlan|evpn|isis|ldp|bfd|lacp|multicast|qos|acl|nat|snmp|ntp|ipsec|ssl|cert" | head -1 | tr '[:upper:]' '[:lower:]')
@@ -96,10 +98,11 @@ done < "$SOURCE"
 ```bash
 #!/bin/bash
 SOURCE="filtered_files.txt"
-[ ! -f "$SOURCE" ] && find /data/target -type f | sed 's|^/data/target/||' > /tmp/s.txt && SOURCE=/tmp/s.txt
+[ ! -f "$SOURCE" ] && find target -type f | sed 's|^target/||' > /tmp/s.txt && SOURCE=/tmp/s.txt
 
 while IFS= read -r rel; do
-    f="/data/target/$rel"
+    # target/ 是 workspace 中指向目标目录的符号链接
+    f="target/$rel"
     kw=$(strings "$f" 2>/dev/null | head -100 | grep -oiE "bgp|ospf|dhcp|ipsec|ssh|mpls|kernel|driver" | head -1 | tr '[:upper:]' '[:lower:]')
     [ -z "$kw" ] && kw="unknown"
     mkdir -p "modules/$kw"
@@ -111,7 +114,7 @@ done < "$SOURCE"
 
 ```bash
 SOURCE="filtered_files.txt"
-[ ! -f "$SOURCE" ] && find /data/target -type f | sed 's|^/data/target/||' | sort > /tmp/s.txt && SOURCE=/tmp/s.txt
+[ ! -f "$SOURCE" ] && find target -type f | sed 's|^target/||' | sort > /tmp/s.txt && SOURCE=/tmp/s.txt
 
 TOTAL=$(wc -l < "$SOURCE")
 CLASSIFIED=$(cat modules/*/files.list 2>/dev/null | sort -u | wc -l)

@@ -409,7 +409,7 @@ async def collect_file_summaries(
                 system_prompt=sub_prompt_template,
                 cwd=w_base["cwd"],
                 thinking_level=w_base.get("thinking_level", "off"),
-                session_file=None,
+                session_file=str(ctx.sess_dir / f"sub-{mod_name}-batch{idx+1}.jsonl"),
                 cancel_event=w_base.get("cancel_event"),
                 max_retries=w_base.get("max_retries", 3),
                 retry_delay=w_base.get("retry_delay", 10),

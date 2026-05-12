@@ -7,7 +7,7 @@
 # 步骤
 
 1. 使用 `read final_report.md` 读取报告
-2. 使用 `bash` 运行 `bash /opt/system_analyse/scripts/check_outputs.sh .` 确认所有模块都有 module_report.md
+2. 使用 `bash` 运行 `bash /app/scripts/check_outputs.sh modules` 确认所有模块都有 module_report.md
 3. 逐项检查以下评分维度
 
 # 评分维度

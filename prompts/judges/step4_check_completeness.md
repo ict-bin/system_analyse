@@ -10,7 +10,7 @@
 
 # 步骤
 
-1. 运行：`bash /opt/system_analyse/scripts/check_outputs.sh .`
+1. 运行：`bash /app/scripts/check_outputs.sh modules`
 2. 查看 `RESULT` 行和 `Missing/incomplete` 列表
 
 # 判定标准

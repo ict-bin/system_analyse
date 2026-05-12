@@ -21,7 +21,7 @@
 - **禁止无理由回滚**：不能因为"不确定"就把已拆分的模块合并回去
 - **文件零丢失**：任何修改后必须运行校验：
   ```bash
-  bash /opt/system_analyse/scripts/check_classification.sh /data/target .
+  bash /app/scripts/check_classification.sh target .
   ```
   确认 `Missing files: 0`
 
