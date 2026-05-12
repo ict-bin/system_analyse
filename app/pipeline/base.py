@@ -41,4 +41,12 @@ class Pipeline:
                 )
                 continue
             await stage.execute(ctx)
+            # Stage 0 过滤后无文件 → 终止流水线，避免后续阶段空跑
+            if stage.stage_num == 0 and ctx.filter_count == 0:
+                ctx.emit_event(
+                    "log",
+                    level="warning",
+                    msg="[终止] Stage 0 过滤结果为 0 个文件，请检查 binary_arch / analyse_targets 配置是否与实际固件架构匹配，流水线终止。",
+                )
+                break
         return ctx

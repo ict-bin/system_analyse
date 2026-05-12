@@ -41,7 +41,7 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "analyse_targets": ["binary", "source"],
-    "binary_arch": ["all"],
+    "binary_arch": ["arm", "aarch64"],
     "security_focus_categories": ["all"],
     "module_granularity": "fine",
     "parallel_modules": 4,
