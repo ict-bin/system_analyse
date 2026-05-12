@@ -207,7 +207,7 @@ class AnalyseStage(BaseStage):
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
-                    cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                    cwd=str(workspace),
                     session_file=j_session,
                     **j_base,
                 )
@@ -221,8 +221,7 @@ class AnalyseStage(BaseStage):
                     "passed": parsed["pass"],
                     "feedback": parsed["feedback"],
                     "token_usage": j_ar.token_usage,
-                })
-                ctx.emit_event("judge_eval", stage=3, judge_id=f"judge-{j_idx}",
+                })("judge_eval", stage=3, judge_id=f"judge-{j_idx}",
                                module=mod_name, passed=parsed["pass"], score=parsed["score"])
                 archive_file(
                     ctx.output_dir,
@@ -361,7 +360,6 @@ class AnalyseStage(BaseStage):
                 ctx.tokens += ar.token_usage
 
                 judge_results = []
-                eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
                 for j_idx, j_item in enumerate(ctx.j_cfgs):
                     j_session = str(ctx.sess_dir / f"analyse-redo-{mod_name}-judge{j_idx}-a{attempt+1}.jsonl")
                     j_ar = await run_agent_checked(
@@ -370,7 +368,7 @@ class AnalyseStage(BaseStage):
                         model=ctx.jm("refine", j_item),
                         system_prompt=j_sys_refine,
                         tools=cfg.judges.default_tools,
-                        cwd=eval_cwd,
+                        cwd=str(workspace),
                         session_file=j_session,
                         **j_base,
                     )

@@ -160,7 +160,7 @@ class CompletenessCheckStage(BaseStage):
                         model=ctx.jm("analyse", j_item),
                         system_prompt=j_sys_analyse,
                         tools=cfg.judges.default_tools,
-                        cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                        cwd=str(workspace),
                         **j_base,
                     )
                     ctx.tokens += j_ar.token_usage
@@ -168,7 +168,6 @@ class CompletenessCheckStage(BaseStage):
                     judge_results.append(parsed)
                     ctx.emit_event("judge_eval", stage="3-redo-s4", judge_id=f"judge-{j_idx}",
                                    module=mod_name, passed=parsed["pass"], score=parsed["score"])
-
                 if check_voting(judge_results, s_cfg_analyse.pass_mode, ctx.j_count):
                     break
                 fail_fb = "\n".join(

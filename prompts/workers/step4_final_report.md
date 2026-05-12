@@ -6,8 +6,8 @@
 
 # 步骤
 
-1. 运行 `ls -d */` 列出所有模块目录
-2. 逐个 `read <模块名>/module_report.md` 读取每个模块的报告
+1. 运行 `ls -d modules/*/` 列出所有模块目录
+2. 逐个 `read modules/<模块名>/module_report.md` 读取每个模块的报告
 3. 统计汇总后，将总报告写入 `final_report.md`
 
 # final_report.md 严格格式（必须逐字段填写，不可省略任何章节）

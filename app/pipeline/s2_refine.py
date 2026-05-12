@@ -134,6 +134,18 @@ class RefineStage(BaseStage):
         j_sys_prompt = load_prompt(cfg.judges.system_prompt_dir, "step2_check_refine")
         reflect_prompt = load_prompt(cfg.workers.system_prompt_dir, "reflect_refine")
 
+        granularity = getattr(cfg, "module_granularity", "fine")
+        if granularity == "coarse":
+            # 粗粒度模式：加载专用提示词（服务/协议级划分）；配置体系完全保留，s_cfg 指向 cfg.stages.refine
+            _coarse_w = load_prompt(cfg.workers.system_prompt_dir, "step2_coarse_refine")
+            _coarse_j = load_prompt(cfg.judges.system_prompt_dir, "step2_check_coarse_refine")
+            if _coarse_w:
+                w_sys_prompt = _coarse_w
+            if _coarse_j:
+                j_sys_prompt = _coarse_j
+            ctx.emit_event("log", level="info",
+                           msg=f"[S2-粗粒度] {mod_name}：使用协议/服务级划分提示词")
+
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
             round_started = utc_now_iso()

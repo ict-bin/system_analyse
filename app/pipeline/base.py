@@ -40,18 +40,6 @@ class Pipeline:
                     msg=f"[跳过] Stage {stage.stage_num} ({stage.stage_name})，resume start_stage={start_stage}",
                 )
                 continue
-            # Stage 2（细分类）在粗粒度模式下跳过，直接继承 Stage 1 的分类结果
-            if stage.stage_num == 2 and getattr(ctx.cfg, "module_granularity", "fine") == "coarse":
-                ctx.refined_modules = list(ctx.classified_modules)
-                ctx.emit_event(
-                    "log",
-                    level="info",
-                    msg=(
-                        f"[跳过] Stage 2 ({stage.stage_name})：module_granularity=coarse，"
-                        "粗粒度模式不细分模块，直接继承 Stage 1 分类结果。"
-                    ),
-                )
-                continue
             await stage.execute(ctx)
             # Stage 0 过滤后无文件 → 终止流水线，避免后续阶段空跑
             if stage.stage_num == 0 and ctx.filter_count == 0:
