@@ -32,7 +32,7 @@ class PipelineContext:
     # ── Token 计量 ────────────────────────────────────────────
     tokens: "TokenUsage"
 
-    # ── 多轮评估记录 ────────────────────────────────────────
+    # ── 评测录制器（可选） ────────────────────────────────
     evaluator: "EvaluationRecorder | None" = None
 
     # ── 取消事件 ──────────────────────────────────────────────
@@ -56,6 +56,9 @@ class PipelineContext:
 
     filter_count: int = 0
     """过滤后文件总数"""
+
+    filter_stage_executed: bool = False
+    """FilterStage.execute() 是否已实际运行（区分未运行和0结果）"""
 
     # ══════════════════════════════════════════════════════════
     # Stage 1 输出

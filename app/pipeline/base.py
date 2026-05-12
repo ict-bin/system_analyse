@@ -54,7 +54,7 @@ class Pipeline:
                 continue
             await stage.execute(ctx)
             # Stage 0 过滤后无文件 → 终止流水线，避免后续阶段空跑
-            if stage.stage_num == 0 and ctx.filter_count == 0:
+            if stage.stage_num == 0 and ctx.filter_stage_executed and ctx.filter_count == 0:
                 ctx.emit_event(
                     "log",
                     level="warning",

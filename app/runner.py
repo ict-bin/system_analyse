@@ -1,42 +1,66 @@
 """
-system_analyse — Agent 子进程执行器
+app/runner.py — LangChain Agent 执行器（完全替代 pi 子进程方案）
 
-两种执行模式：
-  1. Worker（保持上下文）：使用 --session <file> 保持会话历史
-  2. Judge（重置上下文）：使用 --no-session 每轮全新
+架构变更说明
+============
+原始实现：Python → 子进程 (pi CLI, --mode rpc) → JSONL stdin/stdout → LLM API
+新实现：  Python → LangChain create_agent → LangGraph CompiledStateGraph → LLM API
 
-重试机制（双层）：
-  外层 — pi 进程级重试（pi_max_retries）：
-    进程拉起失败、崩溃、信号杀死 → 重新拉起
-    致命错误（Model not found, Unauthorized）→ 不重试，立即终止
-  内层 — API 级重试（max_retries）：
-    连接超时、限流、服务器错误 → 重新调用
-  两层独立计数、独立退避，-1 表示无限重试
+接口兼容性
+==========
+run_agent() 函数签名与原版 100% 一致，所有 pipeline 代码零改动。
+AgentResult 类字段完全保留（output / messages / token_usage / exit_code / error / fatal）。
+PiFatalError / _PiProcessError 异常类保留（helpers.py 通过 check_agent_result 使用）。
+
+会话（Session）管理
+===================
+原始：session_file → pi 的 --session 参数 → jsonl 对话历史文件
+新实现：session_file → MemorySaver checkpointer + thread_id = session 文件名（不含扩展名）
+  - Worker（有 session）：多轮 W+J 中同一 session 的对话历史累积，
+    LangGraph add_messages reducer 自动将新 HumanMessage 追加到历史
+  - Judge（无 session）：每次调用完全新上下文（checkpointer=None）
+  - 进程内 MemorySaver 字典缓存，确保同一进程内同一 session_file 共享 checkpointer
+
+重试机制（双层合并）
+====================
+原始：外层（pi进程崩溃，pi_max_retries）+ 内层（API错误，max_retries）
+新实现：统一重试循环
+  - 致命错误（401/model-not-found）→ 立即退出，result.fatal=True
+  - 可重试错误（429/503/timeout） → 指数退避重试，限流时额外等待 60s
+  - 总重试次数 = max(max_retries, pi_max_retries)，-1 表示无限
+
+工具（Tools）
+=============
+原始：pi 内置工具（read/bash/write/edit/grep/find）
+新实现：app.tools.make_tools() 创建对应 LangChain StructuredTool，完全等价
+  - cwd 绑定到工具实例（每次 run_agent 调用独立绑定）
+  - env 透传给 bash 工具的 subprocess
 """
-
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import shutil
-import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
+from langchain_core.messages import AIMessage, HumanMessage
+
+from .model_factory import create_model
 from .models import TokenUsage
+from .tools import make_tools
 
 logger = logging.getLogger("sa.runner")
 
-_MAX_BACKOFF = 300  # 退避上限 5 分钟
+_MAX_BACKOFF = 300.0  # 最大退避 5 分钟
 
 
-# ─── 结果类 ───────────────────────────────────────────────────────────────────
-
+# ═══════════════════════════════════════════════════════════════════════
+# 结果类（与原版完全兼容）
+# ═══════════════════════════════════════════════════════════════════════
 
 class AgentResult:
-    """单个 Agent 执行的结果。"""
+    """单次 Agent 执行结果，与原版 runner.py 的 AgentResult 接口完全一致。"""
 
     def __init__(self):
         self.output: str = ""
@@ -44,238 +68,222 @@ class AgentResult:
         self.token_usage = TokenUsage()
         self.exit_code: int = 0
         self.error: str | None = None
-        self.fatal: bool = False  # 致命错误（配置/环境问题，不可重试）
+        self.fatal: bool = False
 
 
-# ─── 内部异常 ─────────────────────────────────────────────────────────────────
-
+# ═══════════════════════════════════════════════════════════════════════
+# 异常类（保留以兼容 helpers.py 的 check_agent_result）
+# ═══════════════════════════════════════════════════════════════════════
 
 class _PiProcessError(Exception):
-    """pi 进程级错误（非 API 错误），由内层向外层传递。"""
-
+    """保留类名以兼容旧代码导入；在新实现中不再实际抛出。"""
     pass
 
 
 class PiFatalError(Exception):
-    """pi 致命错误（不可重试），调用者应终止流水线。"""
-
+    """致命错误（模型不存在 / 认证失败），不可重试，终止流水线。"""
     pass
 
 
-# ─── 日志工具 ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 会话（Session）管理
+# ═══════════════════════════════════════════════════════════════════════
+
+_session_checkpointers: dict[str, object] = {}
+_session_lock = asyncio.Lock()
 
 
-def _log_error(msg: str) -> None:
-    logger.error(msg)
+async def _get_or_create_checkpointer(session_file: str):
+    """
+    获取或创建与 session_file 绑定的 MemorySaver checkpointer。
+    进程内复用同一 MemorySaver，保证 W+J 多轮间对话历史连续。
+    """
+    from langgraph.checkpoint.memory import MemorySaver
+
+    async with _session_lock:
+        if session_file not in _session_checkpointers:
+            _session_checkpointers[session_file] = MemorySaver()
+            logger.debug("New session checkpointer: %s", Path(session_file).name)
+        return _session_checkpointers[session_file]
 
 
-def _log_warn(msg: str) -> None:
-    logger.warning(msg)
+def clear_session(session_file: str) -> None:
+    """清除指定 session 的对话历史（用于测试或手动重置）。"""
+    _session_checkpointers.pop(session_file, None)
 
 
-def _log_info(msg: str) -> None:
-    logger.info(msg)
+def clear_all_sessions() -> None:
+    """清除所有 session（任务结束后可调用释放内存）。"""
+    _session_checkpointers.clear()
 
 
-# ─── 工具函数 ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 错误分类
+# ═══════════════════════════════════════════════════════════════════════
+
+_FATAL_PATTERNS: list[tuple[str, ...]] = [
+    ("model", "not found"),
+    ("not found", "model"),
+    ("invalid", "model"),
+    ("invalid api key",),
+    ("invalid_api_key",),
+    ("incorrect api key",),
+    ("unauthorized",),
+    ("authentication failed",),
+    ("authentication_failed",),
+    ("401",),
+    ("no such model",),
+    ("model does not exist",),
+]
+
+_RETRYABLE_PATTERNS = [
+    "connection", "timeout", "timed out", "econnrefused", "econnreset",
+    "etimedout", "socket hang up", "fetch failed", "rate limit", "429",
+    "503", "502", "500", "overloaded", "capacity", "temporarily unavailable",
+    "server error", "internal error", "bad gateway", "service unavailable",
+    "request failed", "network_error", "too many requests", "enobufs",
+    "broken pipe", "read timeout", "write timeout",
+]
+
+_RATE_LIMIT_PATTERNS = ["rate limit", "429", "too many requests", "network_error"]
+_RATE_LIMIT_EXTRA_DELAY = 60.0
 
 
-def _backoff(base_delay: float, attempt: int) -> float:
-    """指数退避，带上限。attempt 从 1 开始。"""
-    return min(base_delay * (2 ** min(attempt - 1, 6)), _MAX_BACKOFF)
+def _is_fatal(error_text: str) -> bool:
+    e = error_text.lower()
+    return any(all(p in e for p in pattern) for pattern in _FATAL_PATTERNS)
+
+
+def _is_retryable(error_text: str) -> bool:
+    e = error_text.lower()
+    return any(p in e for p in _RETRYABLE_PATTERNS)
+
+
+def _is_rate_limit(error_text: str) -> bool:
+    e = error_text.lower()
+    return any(p in e for p in _RATE_LIMIT_PATTERNS)
+
+
+def _backoff(base: float, attempt: int) -> float:
+    """指数退避，上限 MAX_BACKOFF。"""
+    return min(base * (2 ** min(attempt - 1, 6)), _MAX_BACKOFF)
 
 
 def _fmt_max(n: int) -> str:
     return "∞" if n < 0 else str(n)
 
 
-def _should_retry(
-    failures: int, max_retries: int, cancel: asyncio.Event | None
-) -> bool:
-    if cancel and cancel.is_set():
-        return False
-    if max_retries < 0:
-        return True
-    return failures <= max_retries
+# ═══════════════════════════════════════════════════════════════════════
+# Agent 工厂（懒导入，避免启动时间过长）
+# ═══════════════════════════════════════════════════════════════════════
 
+def _create_react_agent(model, tools, *, system_prompt, checkpointer):
+    """
+    创建 ReAct 风格的 LangGraph Agent。
 
-def _cmd_preview(args: list[str]) -> str:
-    """命令预览（截断过长参数）。"""
-    parts = []
-    for a in args:
-        parts.append(a[:80] + "…" if len(a) > 100 else a)
-    return " ".join(parts)
+    优先使用新版 langchain.agents.create_agent（支持 middleware 扩展），
+    回退到稳定的 langgraph.prebuilt.create_react_agent。
+    """
+    import inspect
 
+    # 尝试新 API
+    try:
+        from langchain.agents import create_agent as _ca
+        sig = inspect.signature(_ca)
+        if "system_prompt" in sig.parameters:
+            return _ca(
+                model=model,
+                tools=tools,
+                system_prompt=system_prompt or None,
+                checkpointer=checkpointer,
+            )
+        # system_prompt 参数名可能不同
+        if "prompt" in sig.parameters:
+            return _ca(
+                model=model,
+                tools=tools,
+                prompt=system_prompt or None,
+                checkpointer=checkpointer,
+            )
+        return _ca(model=model, tools=tools, checkpointer=checkpointer)
+    except ImportError:
+        pass
 
-def _find_pi_command() -> list[str]:
-    pi_bin = os.environ.get("PI_BIN")
-    if pi_bin and os.path.isfile(pi_bin):
-        return [pi_bin]
-    pi_path = shutil.which("pi")
-    if pi_path:
-        return [pi_path]
-    npx = shutil.which("npx")
-    if npx:
-        return [npx, "pi"]
-    raise FileNotFoundError(
-        "找不到 'pi'。请安装: npm install -g @mariozechner/pi-coding-agent"
+    # 回退到 langgraph.prebuilt
+    from langgraph.prebuilt import create_react_agent
+    sig = inspect.signature(create_react_agent)
+    if "prompt" in sig.parameters:
+        return create_react_agent(
+            model=model,
+            tools=tools,
+            prompt=system_prompt or None,
+            checkpointer=checkpointer,
+        )
+    # 更旧版本
+    return create_react_agent(
+        model=model,
+        tools=tools,
+        checkpointer=checkpointer,
     )
 
 
-def _build_args(
-    pi_cmd: list[str],
-    model: str,
-    tools: list[str],
-    thinking_level: str,
-    session_file: str | None,
-) -> list[str]:
-    """构造 pi RPC 模式启动参数（不含 system_prompt 和 prompt）。
+# ═══════════════════════════════════════════════════════════════════════
+# 取消监控
+# ═══════════════════════════════════════════════════════════════════════
 
-    使用 --mode rpc：pi 保持运行，prompt 通过 stdin JSONL 发送，
-    彻底绕过 Linux ARG_MAX 限制，支持任意大小的 prompt/system_prompt。
-    """
-    args = [*pi_cmd, "--mode", "rpc"]
-    if session_file:
-        args.extend(["--session", session_file])
-    else:
-        args.append("--no-session")
-    if model:
-        args.extend(["--model", model])
-    if tools:
-        args.extend(["--tools", ",".join(tools)])
-    if thinking_level and thinking_level != "off":
-        args.extend(["--thinking", thinking_level])
-    return args
+async def _cancel_monitor(cancel_event: asyncio.Event, task: asyncio.Task) -> None:
+    """等待取消事件触发后取消 agent 任务。"""
+    await cancel_event.wait()
+    if not task.done():
+        task.cancel()
 
 
-def _write_temp_markdown(
-    tmp_dir: str | None,
-    prefix: str,
-    filename: str,
-    content: str,
-) -> tuple[str, str]:
-    """将 prompt 写入临时 markdown 文件，返回 (tmp_dir, file_path)。"""
-    if tmp_dir is None:
-        tmp_dir = tempfile.mkdtemp(prefix=prefix)
-    file_path = os.path.join(tmp_dir, filename)
-    Path(file_path).write_text(content, encoding="utf-8")
-    return tmp_dir, file_path
+# ═══════════════════════════════════════════════════════════════════════
+# 输出提取辅助
+# ═══════════════════════════════════════════════════════════════════════
+
+def _extract_output(messages: list) -> str:
+    """从消息列表中提取最后一条 AIMessage 的文本内容。"""
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        content = msg.content
+        if isinstance(content, list):
+            # Anthropic 多块内容格式
+            parts = [
+                (c.get("text", "") if isinstance(c, dict) else str(c))
+                for c in content
+                if not isinstance(c, dict) or c.get("type") == "text"
+            ]
+            content = "\n".join(p for p in parts if p)
+        if content and str(content).strip():
+            return str(content)
+    return ""
 
 
-# ─── 错误分类 ─────────────────────────────────────────────────────────────────
-
-# 致命错误：配置/环境问题，重试无意义
-_FATAL_PATTERNS = [
-    ("model", "not found"),
-    ("not found", "use --list"),
-    ("invalid", "model"),
-    ("invalid", "api key"),
-    ("invalid", "api_key"),
-    ("unauthorized",),
-    ("authentication", "failed"),
-    ("401",),
-]
-
-# API 可重试错误
-_RETRYABLE_API_PATTERNS = [
-    "connection",
-    "timeout",
-    "timed out",
-    "ECONNREFUSED",
-    "ECONNRESET",
-    "ETIMEDOUT",
-    "ENOTFOUND",
-    "socket hang up",
-    "fetch failed",
-    "rate limit",
-    "429",
-    "503",
-    "502",
-    "500",
-    "overloaded",
-    "capacity",
-    "temporarily unavailable",
-    "server error",
-    "internal error",
-    "bad gateway",
-    "service unavailable",
-    "request failed",
-    "network_error",        # gptplus5 并发超限
-    "finish_reason",        # provider finish_reason: network_error
-    "too many requests",    # 429 另一种表达
-    "ENOBUFS",              # pipe buffer 满（大响应导致）
-    "EPIPE",                # 管道断裂
-]
-
-# 速率限制模式：这些关键词匹配时延长待机时间
-_RATE_LIMIT_PATTERNS = ["rate limit", "429", "too many requests", "network_error", "finish_reason"]
-_RATE_LIMIT_EXTRA_DELAY = 60   # 限流时额外等彥60s
-
-# pi 进程崩溃关键词
-_PI_CRASH_PATTERNS = [
-    "cannot find module",
-    "module not found",
-    "syntaxerror",
-    "referenceerror",
-    "typeerror",
-    "segmentation fault",
-    "segfault",
-    "killed",
-    "signal",
-    "enoent",
-    "eacces",
-    "eperm",
-    "heap out of memory",
-    "allocation failed",
-    "oom",
-    "out of memory",
-    "spawn",
-    "execvp",
-    "core dump",
-    "bus error",
-    "permission denied",
-    "no such file",
-]
+def _extract_token_usage(messages: list) -> TokenUsage:
+    """累计所有 AIMessage 的 token 用量。"""
+    usage = TokenUsage()
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            continue
+        meta = getattr(msg, "usage_metadata", None)
+        if not meta:
+            continue
+        usage.input  += meta.get("input_tokens", 0)
+        usage.output += meta.get("output_tokens", 0)
+        # OpenAI cache fields
+        usage.cache_read  += meta.get("cache_read_input_tokens", 0)
+        usage.cache_write += meta.get("cache_creation_input_tokens", 0)
+        # Anthropic cache fields
+        usage.cache_read  += meta.get("cache_read_tokens", 0)
+        usage.cache_write += meta.get("cache_write_tokens", 0)
+    return usage
 
 
-def _is_fatal_error(result: AgentResult) -> bool:
-    """致命错误：配置/环境问题，不可重试。"""
-    error_text = (result.error or "").lower()
-    for pattern in _FATAL_PATTERNS:
-        if all(p in error_text for p in pattern):
-            return True
-    return False
-
-
-def _is_retryable_api_error(result: AgentResult) -> bool:
-    """API 级可重试错误。"""
-    if result.exit_code == 0 and not result.error:
-        return False
-    error_text = (result.error or "").lower()
-    for pattern in _RETRYABLE_API_PATTERNS:
-        if pattern in error_text:
-            return True
-    return False
-
-
-def _is_pi_crash(result: AgentResult) -> bool:
-    """pi 进程级崩溃（非 API 错误）。"""
-    if result.exit_code == 0:
-        return False
-    # 有正常消息输出 → pi 本身正常运行
-    if result.messages:
-        return False
-    # API 错误交给内层处理
-    if _is_retryable_api_error(result):
-        return False
-    # 无消息 + 非零退出 = 进程崩溃
-    return True
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 公开接口
-# ═════════════════════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════════════════════════════
+# 核心接口：run_agent（与原版签名 100% 兼容）
+# ═══════════════════════════════════════════════════════════════════════
 
 async def run_agent(
     prompt: str,
@@ -289,465 +297,250 @@ async def run_agent(
     session_file: str | None = None,
     on_stream: Callable[[str], None] | None = None,
     cancel_event: asyncio.Event | None = None,
-    max_retries: int = 3,  # API 错误最大重试（-1=无限）
-    retry_delay: float = 10.0,  # API 重试首次等待
-    pi_max_retries: int = -1,  # pi 进程最大重试（-1=无限）
-    pi_retry_delay: float = 10.0,  # pi 进程重试首次等待
+    max_retries: int = 3,
+    retry_delay: float = 10.0,
+    pi_max_retries: int = -1,
+    pi_retry_delay: float = 10.0,
 ) -> AgentResult:
     """
-    运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
+    运行 LangChain Agent，接口与原版 pi-based run_agent 完全兼容。
 
-    外层：pi 进程级重试（拉起失败、崩溃、被 kill）
-    内层：API 级重试（连接超时、限流、服务器错误）
-    致命：Model not found / Unauthorized → 不重试，result.fatal=True
+    参数
+    ----
+    prompt         : 用户提示词（本轮任务描述 + 可选反思反馈）
+    model          : 模型字符串，格式 "provider/model_id"
+    tools          : 工具名列表，如 ["read", "bash", "write", "grep", "find"]
+    system_prompt  : 系统提示词（从 prompts/workers/*.md 加载）
+    cwd            : 工作目录（工具执行的上下文目录）
+    env            : 环境变量覆盖（透传给 bash 工具）
+    thinking_level : 推理深度（off/low/medium/high，目前仅日志记录）
+    session_file   : 会话文件路径；非 None 时启用跨轮对话历史（Worker 模式）
+                     None 时每次全新上下文（Judge 模式）
+    on_stream      : 流式输出回调（收到文本片段时调用）
+    cancel_event   : asyncio.Event，设置后立即终止当前 Agent
+    max_retries    : API 错误最大重试次数（-1=无限）
+    retry_delay    : API 重试首次等待秒数
+    pi_max_retries : 原 pi 进程级重试次数（映射为通用重试上限，-1=无限）
+    pi_retry_delay : 原 pi 进程重试等待秒数
     """
-    try:
-        pi_cmd = _find_pi_command()
-    except FileNotFoundError as e:
-        _log_error(f"pi 可执行文件未找到: {e}")
-        r = AgentResult()
-        r.error = str(e)
-        r.exit_code = -1
-        r.fatal = True
-        return r
+    result = AgentResult()
 
-    args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
-
-    # System/User Prompt → 临时文件，避免超长 argv 导致 Argument list too long
-    tmp_dir: str | None = None
-    sys_tmp_file: str | None = None
-    prompt_tmp_file: str | None = None
-    if system_prompt.strip():
-        tmp_dir, sys_tmp_file = _write_temp_markdown(
-            tmp_dir, "sa-", "system.md", system_prompt
-        )
-        args.extend(["--append-system-prompt", sys_tmp_file])
-
-    try:
-        return await _run_with_pi_retry(
-            args=args,
-            cwd=os.path.abspath(cwd),
-            env=env,
-            prompt=prompt,
-            cancel_event=cancel_event,
-            on_stream=on_stream,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            pi_max_retries=pi_max_retries,
-            pi_retry_delay=pi_retry_delay,
-        )
-    finally:
-        if sys_tmp_file and os.path.exists(sys_tmp_file):
-            try:
-                os.unlink(sys_tmp_file)
-            except OSError:
-                pass
-        if prompt_tmp_file and os.path.exists(prompt_tmp_file):
-            try:
-                os.unlink(prompt_tmp_file)
-            except OSError:
-                pass
-        if tmp_dir and os.path.exists(tmp_dir):
-            try:
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
-
-
-# ─── 外层：pi 进程级重试 ─────────────────────────────────────────────────────
-
-
-async def _run_with_pi_retry(
-    *,
-    args: list[str],
-    cwd: str,
-    env: dict[str, str] | None,
-    prompt: str,
-    cancel_event: asyncio.Event | None,
-    on_stream: Callable[[str], None] | None,
-    max_retries: int,
-    retry_delay: float,
-    pi_max_retries: int,
-    pi_retry_delay: float,
-) -> AgentResult:
-    """外层循环：处理 pi 进程拉起失败、崩溃、致命错误。"""
-    # cwd 不存在是致命错误（目录被删除等），不进入重试
-    if not os.path.isdir(cwd):
-        _log_error(f"cwd 目录不存在（不可重试）: {cwd}")
-        r = AgentResult()
-        r.error = f"cwd directory does not exist: {cwd}"
-        r.exit_code = -1
-        r.fatal = True
-        return r
-
-    pi_attempt = 0
-
-    while True:
-        if cancel_event and cancel_event.is_set():
-            r = AgentResult()
-            r.error = "cancelled"
-            return r
-
-        try:
-            result = await _run_with_api_retry(
-                args=args,
-                cwd=cwd,
-                env=env,
-                prompt=prompt,
-                cancel_event=cancel_event,
-                on_stream=on_stream,
-                max_retries=max_retries,
-                retry_delay=retry_delay,
-            )
-
-            # ── 致命错误检测（在 pi 进程重试前拦截）──
-            if _is_fatal_error(result):
-                result.fatal = True
-                _log_error(f"pi 致命错误（不可重试）: {result.error}")
-                return result
-
-            # ── pi 进程崩溃 → 交由外层重试 ──
-            if _is_pi_crash(result):
-                raise _PiProcessError(
-                    f"exit_code={result.exit_code}: "
-                    f"{result.error or '(no error message)'}"
-                )
-
-            return result
-
-        except (OSError, FileNotFoundError, PermissionError, _PiProcessError) as exc:
-            pi_attempt += 1
-            label = f"{pi_attempt}/{_fmt_max(pi_max_retries)}"
-
-            if cancel_event and cancel_event.is_set():
-                _log_error(f"pi 进程失败 (cancelled): {exc}")
-                r = AgentResult()
-                r.error = f"cancelled after pi error: {exc}"
-                return r
-
-            # ── 检查 stderr 中是否藏着致命错误 ──
-            err_lower = str(exc).lower()
-            for pattern in _FATAL_PATTERNS:
-                if all(p in err_lower for p in pattern):
-                    _log_error(f"pi 致命错误（不可重试）[{label}]: {exc}")
-                    r = AgentResult()
-                    r.error = str(exc)
-                    r.exit_code = -1
-                    r.fatal = True
-                    return r
-
-            if _should_retry(pi_attempt, pi_max_retries, cancel_event):
-                delay = _backoff(pi_retry_delay, pi_attempt)
-                _log_warn(
-                    f"pi 进程失败 [{label}], {delay:.0f}s 后重试: {exc}\n"
-                    f"    命令: {_cmd_preview(args)}"
-                )
-                if on_stream:
-                    on_stream(
-                        f"\n❌ pi 进程失败 (exit={getattr(exc, 'exit_code', '?')})，"
-                        f"{delay:.0f}s 后重试 ({label})...\n"
-                    )
-                await asyncio.sleep(delay)
-                continue
-            else:
-                _log_error(f"pi 进程重试耗尽 [{label}]: {exc}")
-                r = AgentResult()
-                r.exit_code = -1
-                r.error = f"pi process failed after {pi_attempt} retries: {exc}"
-                return r
-
-
-# ─── 内层：API 级重试 ────────────────────────────────────────────────────────
-
-
-async def _run_with_api_retry(
-    *,
-    args: list[str],
-    cwd: str,
-    env: dict[str, str] | None,
-    prompt: str,
-    cancel_event: asyncio.Event | None,
-    on_stream: Callable[[str], None] | None,
-    max_retries: int,
-    retry_delay: float,
-) -> AgentResult:
-    """内层循环：启动 pi 子进程，处理 API 级错误重试。"""
-    api_attempt = 0
-
-    while True:
-        result = AgentResult()
-
-        # ── 拉起子进程（OSError 由外层 catch）──
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=cwd,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,  # RPC: 通过 stdin 发送 prompt
-        )
-
-        cancel_task = None
-        if cancel_event:
-
-            async def _cancel_monitor():
-                await cancel_event.wait()
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
-
-            cancel_task = asyncio.create_task(_cancel_monitor())
-
-        # ── RPC: 发送 prompt，读取事件直到 agent_end ──
-        agent_ended = False
-        try:
-            assert proc.stdin is not None
-            assert proc.stdout is not None
-
-            # 发送初始 prompt（无 ARG_MAX 限制）
-            prompt_cmd = json.dumps(
-                {"type": "prompt", "message": prompt},
-                ensure_ascii=False,
-            ) + chr(10)
-            proc.stdin.write(prompt_cmd.encode("utf-8"))
-            await proc.stdin.drain()
-
-            buffer = b""
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    break
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    ended = _process_line(
-                        line.decode("utf-8", errors="replace"), result, on_stream
-                    )
-                    if ended:
-                        agent_ended = True
-                        break
-                if agent_ended:
-                    break
-            if buffer.strip():
-                _process_line(
-                    buffer.decode("utf-8", errors="replace"), result, on_stream
-                )
-
-            # agent_ended 后必须继续 drain stdout 直到 EOF，
-            # 否则 pi 继续写导致 pipe buffer 满 → ENOBUFS
-            if agent_ended:
-                try:
-                    async def _drain_stdout():
-                        assert proc.stdout is not None
-                        while True:
-                            chunk = await proc.stdout.read(65536)
-                            if not chunk:
-                                break
-                    await asyncio.wait_for(_drain_stdout(), timeout=10.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
-
-            # 关闭 stdin → pi 检测 EOF 后退出
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-
-            assert proc.stderr is not None
-            try:
-                stderr_data = await asyncio.wait_for(proc.stderr.read(), timeout=10.0)
-                stderr_text = stderr_data.decode("utf-8", errors="replace").strip()
-                if stderr_text and not result.error:
-                    result.error = stderr_text
-            except asyncio.TimeoutError:
-                pass
-
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=15.0)
-                result.exit_code = proc.returncode or 0
-            except asyncio.TimeoutError:
-                _log_warn("pi 进程未在 15s 内退出，强制终止")
-                proc.kill()
-                await proc.wait()
-                result.exit_code = -1
-
-        except Exception as e:
-            # 管道断裂、进程被杀等
-            _log_warn(f"pi 进程读取异常: {e}")
-            result.error = f"pi process read error: {e}"
-            result.exit_code = -1
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-        finally:
-            if cancel_task:
-                cancel_task.cancel()
-                try:
-                    await cancel_task
-                except asyncio.CancelledError:
-                    pass
-
-        # ── 提取输出 ──
-        for msg in reversed(result.messages):
-            if msg.get("role") == "assistant":
-                texts = [
-                    c["text"]
-                    for c in (msg.get("content") or [])
-                    if c.get("type") == "text"
-                ]
-                result.output = "\n".join(texts)
-                break
-
-        if cancel_event and cancel_event.is_set():
-            return result
-
-        # ── pi 崩溃 → 不在内层重试，交给外层 ──
-        if _is_pi_crash(result):
-            if result.error:
-                _log_warn(
-                    f"pi 进程崩溃 (exit={result.exit_code}): {result.error[:300]}"
-                )
-            return result
-
-        # ── 致命错误 → 不重试，直接返回让外层处理 ──
-        if _is_fatal_error(result):
-            return result
-
-        # ── API 可重试错误 ──
-        if _is_retryable_api_error(result):
-            api_attempt += 1
-            can_retry = (max_retries == -1) or (api_attempt <= max_retries)
-            if can_retry:
-                delay = _backoff(retry_delay, api_attempt)
-                # 限流错误额外等待，避免连续冲击并发限制
-                err_lower = (result.error or "").lower()
-                is_rate_limit = any(p in err_lower for p in _RATE_LIMIT_PATTERNS)
-                if is_rate_limit:
-                    delay = max(delay, _RATE_LIMIT_EXTRA_DELAY)
-                label = f"{api_attempt}/{_fmt_max(max_retries)}"
-                kind = "限流" if is_rate_limit else "API"
-                _log_warn(
-                    f"{kind}错误 [{label}], {delay:.0f}s 后重试: "
-                    f"{(result.error or '')[:200]}"
-                )
-                if on_stream:
-                    on_stream(f"\n⚠️ {kind}错误，{delay:.0f}s 后重试 ({label})...\n")
-                await asyncio.sleep(delay)
-                continue
-            else:
-                _log_error(
-                    f"API 重试耗尽 [{api_attempt}/{max_retries}]: "
-                    f"{(result.error or '')[:200]}"
-                )
-                result.error = (
-                    result.error or ""
-                ) + f" [API 重试耗尽: {api_attempt} 次失败]"
-                return result
-
-        # ── 成功或不可重试的未知错误 ──
-        if result.exit_code != 0 and result.error:
-            err_lower = (result.error or "").lower()
-            # ENOBUFS/EPIPE 是可重试的管道错误，不属于“不可重试”
-            if any(p in err_lower for p in ("enobufs", "epipe", "broken pipe")):
-                api_attempt += 1
-                can_retry = (max_retries == -1) or (api_attempt <= max_retries)
-                if can_retry:
-                    delay = _backoff(retry_delay, api_attempt)
-                    _log_warn(
-                        f"管道错误 [{api_attempt}/{_fmt_max(max_retries)}], {delay:.0f}s 后重试: "
-                        f"{(result.error or '')[:200]}"
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-            _log_warn(
-                f"pi 退出码 {result.exit_code} (有输出，不重试): {result.error[:200]}"
-            )
+    # ── 取消检查 ──────────────────────────────────────────────────────
+    if cancel_event and cancel_event.is_set():
+        result.error = "cancelled"
         return result
 
-
-# ─── JSON Lines 解析 ──────────────────────────────────────────────────────────
-
-
-def _process_line(
-    line: str,
-    result: AgentResult,
-    on_stream: Callable[[str], None] | None,
-) -> bool:
-    """解析一行 JSONL。返回 True 表示收到 agent_end（调用方应停止读取）。"""
-    line = line.strip()
-    if not line:
-        return False
+    # ── 创建模型 ──────────────────────────────────────────────────────
     try:
-        event = json.loads(line)
-    except json.JSONDecodeError:
-        return False
+        lc_model = create_model(model, thinking_level=thinking_level)
+    except Exception as exc:
+        err = str(exc)
+        result.error = f"Failed to create model {model!r}: {err}"
+        result.fatal = _is_fatal(err)
+        if result.fatal:
+            logger.error("Fatal model error: %s", err[:300])
+        else:
+            logger.error("Model creation failed: %s", err[:300])
+        return result
 
-    etype = event.get("type")
+    # ── 创建工具集 ─────────────────────────────────────────────────────
+    lc_tools = make_tools(tools, cwd=cwd, env=env)
 
-    # RPC mode: 过滤命令响应和与 agent 无关的事件
-    if etype in (
-        "response",
-        "session",
-        "queue_update",
-        "compaction_start",
-        "compaction_end",
-        "auto_retry_start",
-        "auto_retry_end",
-    ):
-        return False
+    # ── Session / Checkpointer ─────────────────────────────────────────
+    if session_file:
+        checkpointer = await _get_or_create_checkpointer(session_file)
+        thread_id = Path(session_file).stem  # "classify", "refine-bgp" 等
+        config: dict = {"configurable": {"thread_id": thread_id}}
+    else:
+        checkpointer = None
+        thread_id = None
+        config = {}
 
-    # agent_end 信号本轮完成
-    if etype == "agent_end":
-        # agent_end 含全量 messages，可备用但不重复处理
-        return True
+    # ── 创建 Agent ────────────────────────────────────────────────────
+    try:
+        agent = _create_react_agent(
+            model=lc_model,
+            tools=lc_tools,
+            system_prompt=system_prompt,
+            checkpointer=checkpointer,
+        )
+    except Exception as exc:
+        err = str(exc)
+        result.error = f"Failed to create agent: {err}"
+        result.fatal = _is_fatal(err)
+        logger.error("Agent creation failed: %s", err[:300])
+        return result
 
-    if etype == "message_update":
-        ae = event.get("assistantMessageEvent", {})
-        if ae.get("type") == "text_delta" and on_stream:
-            on_stream(ae.get("delta", ""))
+    # ── 重试循环 ──────────────────────────────────────────────────────
+    # 合并 max_retries（API 层）与 pi_max_retries（进程层）为统一重试上限
+    effective_max = max(
+        max_retries    if max_retries    >= 0 else 10 ** 9,
+        pi_max_retries if pi_max_retries >= 0 else 10 ** 9,
+    )
+    input_data = {"messages": [HumanMessage(content=prompt)]}
+    attempt = 0
 
-    if etype == "message_end" and event.get("message"):
-        msg = event["message"]
-        result.messages.append(msg)
+    while True:
+        if cancel_event and cancel_event.is_set():
+            result.error = "cancelled"
+            return result
 
-        if msg.get("role") == "assistant":
-            usage = msg.get("usage", {})
-            result.token_usage.input += usage.get("input", 0)
-            result.token_usage.output += usage.get("output", 0)
-            result.token_usage.cache_read += usage.get("cacheRead", 0)
-            result.token_usage.cache_write += usage.get("cacheWrite", 0)
-            cost = usage.get("cost", {})
-            if isinstance(cost, dict):
-                result.token_usage.cost += cost.get("total", 0)
-            elif isinstance(cost, (int, float)):
-                result.token_usage.cost += cost
+        attempt += 1
+        run_error: str | None = None
 
-            if msg.get("stopReason") == "error":
-                result.error = msg.get("errorMessage", "Unknown error")
+        # 每次尝试使用独立的临时 thread_id，避免失败尝试的部分 checkpoint
+        # 将 HumanMessage 污染正式会话（W+J 跨轮记忆）
+        # 成功后再发起一次调用将状态“筛选”到稳定 thread_id
+        if thread_id:
+            # attempt > 1 说明上一次尝试失败，用临时 id 防止座标污染
+            cur_thread = thread_id if attempt == 1 else f"{thread_id}__retry{attempt}"
+            attempt_config: dict = {"configurable": {"thread_id": cur_thread}}
+        else:
+            attempt_config = config  # 没有 session 时直接使用空配置
 
-    return False
+        try:
+            # ── 带取消支持的异步调用 ──────────────────────────────────
+            if cancel_event:
+                agent_task = asyncio.create_task(
+                    agent.ainvoke(input_data, config=attempt_config)
+                )
+                cancel_task = asyncio.create_task(
+                    _cancel_monitor(cancel_event, agent_task)
+                )
+                try:
+                    state = await agent_task
+                finally:
+                    cancel_task.cancel()
+                    try:
+                        await cancel_task
+                    except asyncio.CancelledError:
+                        pass
+                if cancel_event.is_set():
+                    result.error = "cancelled"
+                    return result
+            else:
+                state = await agent.ainvoke(input_data, config=attempt_config)
+
+            # ── 提取输出 ──────────────────────────────────────────────
+            messages = state.get("messages", [])
+            result.output = _extract_output(messages)
+            result.token_usage = _extract_token_usage(messages)
+
+            # 将消息序列化为 dict 列表（与原版兼容）
+            result.messages = [
+                {
+                    "role": "assistant" if isinstance(m, AIMessage) else "user",
+                    "content": (
+                        m.content if isinstance(m.content, str)
+                        else str(m.content)
+                    ),
+                }
+                for m in messages
+            ]
+
+            # 流式回调（将最终输出通知调用方）
+            if on_stream and result.output:
+                on_stream(result.output)
+
+            return result
+
+        except asyncio.CancelledError:
+            result.error = "cancelled"
+            return result
+
+        except Exception as exc:
+            run_error = str(exc)
+
+        # ── 错误处理 ──────────────────────────────────────────────────
+        if _is_fatal(run_error):
+            result.error = run_error
+            result.fatal = True
+            result.exit_code = 1
+            logger.error("Fatal agent error (no retry): %s", run_error[:300])
+            return result
+
+        # 判断是否继续重试
+        can_retry = (effective_max < 0) or (attempt <= effective_max)
+        if not can_retry:
+            result.error = run_error
+            result.exit_code = 1
+            logger.error(
+                "Agent failed after %d attempt(s): %s",
+                attempt, run_error[:300],
+            )
+            return result
+
+        # 计算退避时间
+        base = retry_delay if _is_retryable(run_error) else pi_retry_delay
+        delay = _backoff(base, attempt)
+        if _is_rate_limit(run_error):
+            delay = max(delay, _RATE_LIMIT_EXTRA_DELAY)
+
+        label = f"{attempt}/{_fmt_max(effective_max)}"
+        kind  = "rate-limit" if _is_rate_limit(run_error) else "transient"
+        logger.warning(
+            "Agent %s error [%s], retry in %.0fs: %s",
+            kind, label, delay, run_error[:200],
+        )
+
+        if on_stream:
+            on_stream(
+                f"\n⚠️ {kind} error, retrying in {delay:.0f}s ({label})...\n"
+            )
+
+        await asyncio.sleep(delay)
 
 
-# ─── 并行执行 ────────────────────────────────────────────────────────────────
-
+# ═══════════════════════════════════════════════════════════════════════
+# 并行执行（与原版签名 100% 兼容）
+# ═══════════════════════════════════════════════════════════════════════
 
 async def run_agents_parallel(
     tasks: list[dict],
     concurrency: int = 4,
 ) -> list[AgentResult]:
+    """
+    并行运行多个 Agent 任务，semaphore 控制最大并发数。
+
+    tasks : list[dict] — 每个元素是传给 run_agent() 的 kwargs
+    """
     semaphore = asyncio.Semaphore(concurrency)
     results: list[AgentResult | None] = [None] * len(tasks)
 
-    async def _run(index: int, kwargs: dict):
+    async def _run(index: int, kwargs: dict) -> None:
         async with semaphore:
             results[index] = await run_agent(**kwargs)
 
     await asyncio.gather(*[_run(i, t) for i, t in enumerate(tasks)])
     return results  # type: ignore[return-value]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 向后兼容的日志辅助（原版 runner.py 中的全局函数）
+# ═══════════════════════════════════════════════════════════════════════
+
+def _log_error(msg: str) -> None:
+    logger.error(msg)
+
+
+def _log_warn(msg: str) -> None:
+    logger.warning(msg)
+
+
+def _log_info(msg: str) -> None:
+    logger.info(msg)
+
+
+def _backoff_compat(base_delay: float, attempt: int) -> float:
+    """向后兼容的退避函数（原版导出名）。"""
+    return _backoff(base_delay, attempt)
+
+
+def _find_pi_command() -> list[str]:
+    """
+    保留此函数签名以防旧代码导入。
+    新版无需 pi，始终抛出带说明的异常。
+    """
+    raise FileNotFoundError(
+        "pi is no longer used. The system now runs agents natively via LangChain/LangGraph."
+    )

@@ -52,8 +52,6 @@ fi
 
 BEFORE=$(wc -l < "$OUTPUT_FILE")
 echo "类型过滤后: $BEFORE 个文件"
-# 备份类型过滤结果，架构过滤失效时回退用
-cp "$OUTPUT_FILE" /tmp/_typefilter_backup.txt 2>/dev/null || true
 
 # ── 架构过滤（仅对 ELF 有效）──
 if [ "$ARCH_FILTER" = "all" ] || [ -z "$ARCH_FILTER" ]; then
@@ -61,6 +59,8 @@ if [ "$ARCH_FILTER" = "all" ] || [ -z "$ARCH_FILTER" ]; then
     echo "过滤结果: $BEFORE 个文件"
     exit 0
 fi
+# 备份类型过滤结果，架构过滤失效时回退用
+cp "$OUTPUT_FILE" /tmp/_typefilter_backup.txt 2>/dev/null || true
 
 # ELF e_machine 值 → 架构名映射（十进制）
 # 3=x86  40=arm  62=x86_64  183=aarch64  8=mips  20=ppc  243=riscv  22=s390
@@ -162,7 +162,6 @@ echo "架构过滤: $BEFORE → $AFTER 个文件（过滤掉 $((BEFORE - AFTER))
 # 安全网：架构过滤不应把所有文件清空。若发生，回退到类型过滤结果并告警
 if [ "$AFTER" -eq 0 ] && [ "$BEFORE" -gt 0 ]; then
     echo "警告: 架构过滤后结果为0，配置可能与实际文件不符，回退至类型过滤结果($BEFORE 个文件)" >&2
-    # 重新生成类型过滤结果作为回退
     cp /tmp/_typefilter_backup.txt "$OUTPUT_FILE" 2>/dev/null && AFTER=$BEFORE || true
 fi
 echo "过滤结果: $AFTER 个文件"
