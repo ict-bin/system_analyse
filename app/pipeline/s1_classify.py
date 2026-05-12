@@ -189,7 +189,7 @@ class ClassifyStage(BaseStage):
             # ── Judge ──
             judge_results = []
             judge_records = []
-            # ── 构建 judge prompt（含粒度约束） ──
+            # ── 构建 judge prompt（含粒度约束 + 动态路径注入） ──
             granularity_note = ""
             if granularity == "coarse":
                 granularity_note = (
@@ -197,17 +197,29 @@ class ClassifyStage(BaseStage):
                     "例如 ssh_client、ssh_channel、ssh_transport 均属于 SSH 协议，应合并为一个模块。"
                     "若发现此类拆分，请在评审意见中明确指出并要求合并。"
                 )
+            # 注入实际 target_dir 和脚本路径，避免 judge 使用硬编码的 /data/target
+            judge_tool_hint = (
+                f"\n\n# 检查工具\n\n"
+                f"- **脚本路径**：`/app/scripts/check_classification.sh`\n"
+                f"- **实际 target_dir**：`{cfg.target_dir}`\n"
+                f"- **运行命令**（请严格使用此命令）：\n"
+                f"  ```\n"
+                f"  bash /app/scripts/check_classification.sh '{cfg.target_dir}' .\n"
+                f"  ```\n"
+                f"- 当前工作目录已设为 workspace，直接用 `.` 即可。"
+            )
             for j_idx, j_agent in enumerate(cfg.judges.agents):
                 j_model = cfg.judges.model_for("classify") or j_agent.model
+                j_session = str(ctx.sess_dir / f"classify-judge{j_idx}-a{attempt+1}.jsonl")
                 j_ar = await run_agent_checked(
                     context=f"s1-classify-judge{j_idx}",
-                    prompt=f"审核分类结果。模块数：{len(modules)}。{granularity_note}",
+                    prompt=f"审核分类结果。模块数：{len(modules)}。{granularity_note}{judge_tool_hint}",
                     model=j_model,
                     tools=cfg.judges.default_tools,
                     system_prompt=check_prompt,
                     cwd=str(workspace),
                     thinking_level="off",
-                    session_file=None,
+                    session_file=j_session,
                     cancel_event=ctx.cancel_event,
                     max_retries=cfg.agent_max_retries,
                     retry_delay=cfg.agent_retry_delay,
@@ -226,10 +238,11 @@ class ClassifyStage(BaseStage):
                     "token_usage": j_ar.token_usage,
                 })
 
-                # 保存 judge 文件
+                # 保存 judge 评审文件
                 j_path = ctx.output_dir / f"s1-a{attempt+1}-j{j_idx}.md"
                 j_path.write_text(
-                    f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
+                    f"Score: {parsed['score']}\nPass: {parsed['pass']}\n"
+                    f"Session: {j_session}\n\n"
                     f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{j_ar.output[:3000]}",
                     encoding="utf-8"
                 )

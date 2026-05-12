@@ -10,7 +10,8 @@
 
 # 步骤
 
-1. 运行：`bash /opt/system_analyse/scripts/check_classification.sh /data/target .`
+1. 运行用户消息中提供的完整命令（包含实际 target_dir），格式如下：
+   `bash /app/scripts/check_classification.sh <target_dir> .`
 2. 查看输出中的 `Missing files` 和 `RESULT` 行
 
 # 判定标准

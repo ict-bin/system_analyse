@@ -156,7 +156,7 @@ class PipelineContext:
         }
 
     def make_j_base(self) -> dict:
-        """构建 Judge 的公共 kwargs（无 tools/cwd）。"""
+        """构建 Judge 的公共 kwargs（无 tools/cwd）。session_file 由各阶段按需单独传入。"""
         return {
             "thinking_level": self.cfg.judges.default_thinking_level or "off",
             "cancel_event": self.cancel_event,
@@ -164,5 +164,4 @@ class PipelineContext:
             "retry_delay": self.cfg.agent_retry_delay,
             "pi_max_retries": self.cfg.pi_max_retries,
             "pi_retry_delay": self.cfg.pi_retry_delay,
-            "session_file": None,
         }

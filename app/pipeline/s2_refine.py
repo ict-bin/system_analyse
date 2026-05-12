@@ -167,17 +167,30 @@ class RefineStage(BaseStage):
                            split=was_split, new_modules=new_ones)
 
             # ── Judge ──────────────────────────────────────────────────
+            # 注入实际 target_dir + 脚本路径，避免 judge 使用硬编码 /data/target
+            judge_tool_hint = (
+                f"\n\n# 检查工具\n\n"
+                f"- **脚本路径**：`/app/scripts/check_module.sh`\n"
+                f"- **实际 target_dir**：`{cfg.target_dir}`\n"
+                f"- **运行命令**（请严格使用此命令）：\n"
+                f"  ```\n"
+                f"  bash /app/scripts/check_module.sh '{cfg.target_dir}' modules {mod_name}\n"
+                f"  ```\n"
+                f"- 当前工作目录已设为 workspace，直接用 `.` 即可。"
+            )
             judge_results = []
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("refine", j_item)
+                j_session = str(ctx.sess_dir / f"refine-{mod_name}-judge{j_idx}-a{attempt+1}.jsonl")
                 j_ar = await run_agent_checked(
                     context=f"s2-judge-{mod_name}-j{j_idx}-a{attempt+1}",
-                    prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
+                    prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。{judge_tool_hint}",
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
+                    session_file=j_session,
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -196,7 +209,8 @@ class RefineStage(BaseStage):
                 archive_file(
                     ctx.output_dir,
                     f"s2-{mod_name}-a{attempt+1}-j{j_idx}.md",
-                    f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
+                    f"Score: {parsed['score']}\nPass: {parsed['pass']}\n"
+                    f"Session: {j_session}\n\n"
                     f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{j_ar.output[:3000]}",
                 )
 
@@ -349,7 +363,7 @@ class RefineStage(BaseStage):
                 system_prompt=reclass_prompt_tmpl,
                 cwd=str(workspace),
                 thinking_level=w_base.get("thinking_level", "off"),
-                session_file=None,
+                session_file=str(ctx.sess_dir / f"reclassify-a{rc_attempt+1}.jsonl"),
                 cancel_event=w_base.get("cancel_event"),
                 max_retries=w_base.get("max_retries", 3),
                 retry_delay=w_base.get("retry_delay", 10),

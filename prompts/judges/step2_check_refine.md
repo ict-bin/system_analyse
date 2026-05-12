@@ -19,10 +19,10 @@ Stage 2 负责两件事：
 
 ## 1. 运行拆分完整性校验（必做）
 
-先确认当前模块名，然后运行：
+先确认当前模块名，然后运行（使用用户消息中提供的完整命令，包含实际 target_dir）：
 
 ```bash
-bash /opt/system_analyse/scripts/check_module.sh /data/target modules <当前模块名>
+bash /app/scripts/check_module.sh <target_dir> modules <当前模块名>
 ```
 
 **原理**：快照 vs (子模块文件 + 已迁移到其他模块的文件)，确保零丢失。

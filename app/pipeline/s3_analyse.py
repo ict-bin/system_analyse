@@ -200,6 +200,7 @@ class AnalyseStage(BaseStage):
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("analyse", j_item)
+                j_session = str(ctx.sess_dir / f"analyse-{mod_name}-judge{j_idx}-a{attempt+1}.jsonl")
                 j_ar = await run_agent_checked(
                     context=f"s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",
                     prompt=f"评审模块 `{mod_name}` 的分析报告。",
@@ -207,6 +208,7 @@ class AnalyseStage(BaseStage):
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                    session_file=j_session,
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -361,6 +363,7 @@ class AnalyseStage(BaseStage):
                 judge_results = []
                 eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
                 for j_idx, j_item in enumerate(ctx.j_cfgs):
+                    j_session = str(ctx.sess_dir / f"analyse-redo-{mod_name}-judge{j_idx}-a{attempt+1}.jsonl")
                     j_ar = await run_agent_checked(
                         context=f"s2-redo-judge-{mod_name}-j{j_idx}-a{attempt+1}",
                         prompt=f"评审模块 `{mod_name}` 的重新细分。",
@@ -368,6 +371,7 @@ class AnalyseStage(BaseStage):
                         system_prompt=j_sys_refine,
                         tools=cfg.judges.default_tools,
                         cwd=eval_cwd,
+                        session_file=j_session,
                         **j_base,
                     )
                     ctx.tokens += j_ar.token_usage

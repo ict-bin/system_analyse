@@ -54,6 +54,7 @@ class CompletenessCheckStage(BaseStage):
         missing_modules: list[str] = []
 
         for j_idx, j_item in enumerate(ctx.j_cfgs):
+            j_session = str(ctx.sess_dir / f"completeness-judge{j_idx}.jsonl")
             j_ar = await run_agent_checked(
                 context=f"s4a-judge-j{j_idx}",
                 prompt="运行 check_outputs.sh 检查所有模块是否都有 module_report.md。",
@@ -61,6 +62,7 @@ class CompletenessCheckStage(BaseStage):
                 system_prompt=j_completeness_prompt,
                 tools=cfg.judges.default_tools,
                 cwd=str(workspace),
+                session_file=j_session,
                 **j_base,
             )
             ctx.tokens += j_ar.token_usage
@@ -225,6 +227,7 @@ class FinalReportStage(BaseStage):
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("report", j_item)
+                j_session = str(ctx.sess_dir / f"report-judge{j_idx}-a{attempt+1}.jsonl")
                 j_ar = await run_agent_checked(
                     context=f"s4b-judge-j{j_idx}-a{attempt+1}",
                     prompt="评审 final_report.md 的质量和完整性。",
@@ -232,6 +235,7 @@ class FinalReportStage(BaseStage):
                     system_prompt=j_report_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
+                    session_file=j_session,
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
