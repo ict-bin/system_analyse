@@ -9,13 +9,3 @@ sqlalchemy
 pymysql
 cryptography
 aiohttp
-
-# ── LangChain / LangGraph 核心依赖 ───────────────────────────────────
-# 替代 pi CLI 子进程方案，实现原生 LangChain Agent 调用
-langchain>=0.3.0
-langchain-core>=0.3.0
-langchain-openai>=0.2.0
-langgraph>=0.2.60
-
-# langchain-community 按需安装（如需其他工具或集成）
-# langchain-community>=0.3.0

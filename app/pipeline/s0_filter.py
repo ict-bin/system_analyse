@@ -59,7 +59,6 @@ class FilterStage(BaseStage):
             lines = [l.strip() for l in filtered_path.read_text("utf-8", errors="replace").splitlines() if l.strip()]
             ctx.filtered_files = lines
             ctx.filter_count = len(lines)
-            ctx.filter_stage_executed = True
             # 备份过滤结果，防止后续 agent 步骤覆盖
             (workspace / ".filtered_backup.txt").write_text(
                 filtered_path.read_text("utf-8"), encoding="utf-8")
