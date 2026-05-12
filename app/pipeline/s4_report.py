@@ -31,7 +31,7 @@ from .helpers import (
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module,
     generate_modules_list, strip_target_prefix,
-    StageError, PiFatalError,
+    StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
 )
 
 
@@ -257,11 +257,12 @@ class FinalReportStage(BaseStage):
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter(s_cfg)
+            forced_pass = max_reached and has_report and max_rounds_exceeded_treated_as_passed(cfg)
             ctx.record_evaluation_round(
                 module_name="__task__",
                 stage="final_report",
                 stage_round=attempt + 1,
-                status="passed" if final_pass else "failed" if max_reached else "running",
+                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -273,8 +274,16 @@ class FinalReportStage(BaseStage):
                 },
                 judges=judge_records,
                 passed_by_vote=voted_pass,
-                module_completed=final_pass and has_report,
-                completion_reason="passed" if final_pass and has_report else "max_rounds_exceeded" if max_reached else "",
+                module_completed=(final_pass or forced_pass) and has_report,
+                completion_reason=(
+                    "passed"
+                    if final_pass and has_report
+                    else "max_rounds_exceeded_treated_as_passed"
+                    if forced_pass
+                    else "max_rounds_exceeded"
+                    if max_reached
+                    else ""
+                ),
                 needed_reflection=not final_pass,
                 artifact_paths=[str(workspace / "final_report.md")],
                 extra={"has_report": has_report},
@@ -295,6 +304,8 @@ class FinalReportStage(BaseStage):
                     for i, r in enumerate(judge_results) if not r["pass"])
                 feedback = (f"# 评审意见（未通过）\n\n{fail_fb}"
                             "\n\n请根据意见修正 final_report.md。")
+            if forced_pass:
+                break
         else:
             raise StageError(f"Stage 4b 最终报告未通过，已达最大轮数 {s_cfg.max_rounds}")
 

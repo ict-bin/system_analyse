@@ -29,7 +29,7 @@ from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module,
-    StageError, PiFatalError,
+    StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
 )
 
 
@@ -267,11 +267,12 @@ class AnalyseStage(BaseStage):
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter(s_cfg)
             report_exists = (mod_dir / "module_report.md").exists()
+            forced_pass = max_reached and report_exists and max_rounds_exceeded_treated_as_passed(cfg)
             ctx.record_evaluation_round(
                 module_name=mod_name,
                 stage="analyse",
                 stage_round=attempt + 1,
-                status="passed" if final_pass else "failed" if max_reached else "running",
+                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -283,8 +284,16 @@ class AnalyseStage(BaseStage):
                 },
                 judges=judge_records,
                 passed_by_vote=voted_pass,
-                module_completed=final_pass and report_exists,
-                completion_reason="passed" if final_pass and report_exists else "max_rounds_exceeded" if max_reached else "",
+                module_completed=(final_pass or forced_pass) and report_exists,
+                completion_reason=(
+                    "passed"
+                    if final_pass and report_exists
+                    else "max_rounds_exceeded_treated_as_passed"
+                    if forced_pass
+                    else "max_rounds_exceeded"
+                    if max_reached
+                    else ""
+                ),
                 needed_reflection=not final_pass,
                 artifact_paths=[str(mod_dir / "module_report.md")],
                 extra={
@@ -310,6 +319,8 @@ class AnalyseStage(BaseStage):
                     f"judge-{i}: {r['feedback'][:500]}"
                     for i, r in enumerate(judge_results) if not r["pass"])
                 feedback = "# 评审意见（未通过）\n\n" + fail_fb + "\n\n请根据意见修正分析。"
+            if forced_pass:
+                return
 
         if mod_name not in ctx.modules_needing_reclassify:
             raise StageError(f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")

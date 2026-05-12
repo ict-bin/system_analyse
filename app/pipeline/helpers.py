@@ -136,6 +136,11 @@ def max_iter(s_cfg) -> int:
     return s_cfg.max_rounds if s_cfg.max_rounds > 0 else 999_999
 
 
+def max_rounds_exceeded_treated_as_passed(cfg) -> bool:
+    action = str(getattr(cfg, "max_rounds_exceeded_action", "treat_as_passed") or "treat_as_passed").strip().lower()
+    return action == "treat_as_passed"
+
+
 def extract_result(output: str) -> str:
     """从 <result>…</result> 提取结果，否则返回原始输出。"""
     m = re.search(r"<result>(.*?)</result>", output, re.DOTALL)

@@ -12,6 +12,19 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+MAX_ROUNDS_EXCEEDED_ACTIONS = {
+    "treat_as_passed",
+    "treat_as_failed",
+}
+
+
+def normalize_max_rounds_exceeded_action(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in MAX_ROUNDS_EXCEEDED_ACTIONS:
+        return candidate
+    return "treat_as_passed"
+
+
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
 
 # Worker/Judge 可配置的阶段名（用于 stage_models 键）
@@ -237,6 +250,10 @@ def get_analyse_filter(types: list[str]) -> dict:
 # ─── 服务配置 ───────────────────────────────────────────────────────
 
 class ServiceConfig(BaseModel):
+    max_rounds_exceeded_action: str = Field(
+        default="treat_as_passed",
+        description="达到最大轮次且评审仍未通过时的处理策略：treat_as_passed/treat_as_failed",
+    )
     analyse_targets: list[str] = Field(
         default=["all"],
         description="分析目标文件类型，可组合: binary/script/source/config/firmware/crypto/database/web/network_model/document/archive/all"
@@ -288,6 +305,7 @@ class TaskConfig(BaseModel):
     function_name: str = Field(default="", description="兼容字段：用于归档命名")
     cwd: str = Field(default="/data/target")
 
+    max_rounds_exceeded_action: str = Field(default="treat_as_passed")
     agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")

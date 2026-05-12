@@ -31,7 +31,7 @@ from .helpers import (
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter,
     SUB_WORKER_THRESHOLD, collect_file_summaries,
-    StageError, PiFatalError,
+    StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
 )
 
 
@@ -203,11 +203,12 @@ class RefineStage(BaseStage):
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter(s_cfg)
+            forced_pass = max_reached and max_rounds_exceeded_treated_as_passed(cfg)
             ctx.record_evaluation_round(
                 module_name=mod_name,
                 stage="refine",
                 stage_round=attempt + 1,
-                status="passed" if final_pass else "failed" if max_reached else "running",
+                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -220,7 +221,15 @@ class RefineStage(BaseStage):
                 judges=judge_records,
                 passed_by_vote=voted_pass,
                 module_completed=False,
-                completion_reason="passed" if final_pass else "max_rounds_exceeded" if max_reached else "",
+                completion_reason=(
+                    "passed"
+                    if final_pass
+                    else "max_rounds_exceeded_treated_as_passed"
+                    if forced_pass
+                    else "max_rounds_exceeded"
+                    if max_reached
+                    else ""
+                ),
                 needed_reflection=not final_pass,
                 artifact_paths=[str(mod_dir / "files.list")],
                 extra={
@@ -261,6 +270,15 @@ class RefineStage(BaseStage):
                 else:
                     guidance = "\n\n请根据评审意见调整拆分策略。"
                 feedback = "# 评审意见（未通过）\n\n" + fail_fb + guidance
+
+            if forced_pass:
+                if was_split and new_ones:
+                    for nm in new_ones:
+                        if nm not in self._refined and nm not in self._in_progress:
+                            self._in_progress.add(nm)
+                            await self._queue.put(nm)
+                self._refined.add(mod_name)
+                return
 
         raise StageError(f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
 

@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
+from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig, normalize_max_rounds_exceeded_action
 
 logger = logging.getLogger("sa.config")
 
@@ -225,6 +225,9 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "") -> TaskCon
         cwd=effective_cwd,
         source_file="firmware",
         function_name="analyse",
+        max_rounds_exceeded_action=normalize_max_rounds_exceeded_action(
+            getattr(svc, "max_rounds_exceeded_action", None)
+        ),
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
         pi_max_retries=svc.pi_max_retries,

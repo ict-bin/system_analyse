@@ -23,6 +23,7 @@ from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, StageError,
+    max_rounds_exceeded_treated_as_passed,
 )
 
 
@@ -204,11 +205,12 @@ class ClassifyStage(BaseStage):
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, j_count)
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter
+            forced_pass = max_reached and max_rounds_exceeded_treated_as_passed(cfg)
             ctx.record_evaluation_round(
                 module_name="__task__",
                 stage="classify",
                 stage_round=attempt + 1,
-                status="passed" if final_pass else "failed" if max_reached else "running",
+                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -221,7 +223,15 @@ class ClassifyStage(BaseStage):
                 judges=judge_records,
                 passed_by_vote=voted_pass,
                 module_completed=False,
-                completion_reason="passed" if final_pass else "max_rounds_exceeded" if max_reached else "",
+                completion_reason=(
+                    "passed"
+                    if final_pass
+                    else "max_rounds_exceeded_treated_as_passed"
+                    if forced_pass
+                    else "max_rounds_exceeded"
+                    if max_reached
+                    else ""
+                ),
                 needed_reflection=not final_pass,
                 artifact_paths=[str(workspace / "modules"), str(workspace / "modules.list")],
                 extra={
@@ -231,6 +241,9 @@ class ClassifyStage(BaseStage):
             )
 
             if voted_pass and attempt + 1 >= s_cfg.min_rounds:
+                ctx.classified_modules = modules
+                return
+            if forced_pass:
                 ctx.classified_modules = modules
                 return
 

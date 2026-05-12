@@ -9,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.models import AppSaModelsConfig, AppSaProjectConfig
+from app.models import normalize_max_rounds_exceeded_action
 
 logger = logging.getLogger("sa.config_service")
 
@@ -40,6 +41,7 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return result
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
+    "max_rounds_exceeded_action": "treat_as_passed",
     "analyse_targets": ["binary", "source"],
     "binary_arch": ["all"],
     "security_focus_categories": ["all"],
@@ -93,6 +95,9 @@ class ConfigService:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
             data = dict(_DEFAULT_CONFIG)
+        data["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            data.get("max_rounds_exceeded_action")
+        )
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
@@ -103,6 +108,9 @@ class ConfigService:
         # resume_task / restart_task; they must never be persisted in project config.
         _STRIP = {"project_id", "updated_at", "start_stage", "resume_workspace"}
         blob = {k: v for k, v in config_data.items() if k not in _STRIP}
+        blob["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            blob.get("max_rounds_exceeded_action")
+        )
         # Strip read-only role fields so they always fall back to defaults
         for role_key in ("workers", "judges"):
             if isinstance(blob.get(role_key), dict):
@@ -119,6 +127,9 @@ class ConfigService:
         db.refresh(row)
         # Return fully-merged config (same shape as get_config)
         result = _deep_merge(_DEFAULT_CONFIG, blob)
+        result["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            result.get("max_rounds_exceeded_action")
+        )
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result
