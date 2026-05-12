@@ -177,6 +177,41 @@ def _fmt_max(n: int) -> str:
 # Agent 工厂（懒导入，避免启动时间过长）
 # ═══════════════════════════════════════════════════════════════════════
 
+# ===========================================================================
+# Context Summarization Middleware (replaces pi auto context compression)
+# ===========================================================================
+
+_DEFAULT_SUMMARIZE_TRIGGER_TOKENS = 50_000
+_DEFAULT_SUMMARIZE_KEEP_MESSAGES  = 20
+
+
+def _build_summarization_middleware(model, context_limit_tokens=None):
+    """
+    Build SummarizationMiddleware to compress history when context approaches limit.
+    Equivalent to pi's contextLength auto-compression.
+    pi:    models.json["contextLength"] -> pi built-in compression
+    New:   SummarizationMiddleware -> LLM actively summarizes old messages
+    Triggers at _DEFAULT_SUMMARIZE_TRIGGER_TOKENS (default 50K tokens).
+    Falls back to empty list if middleware unavailable.
+    """
+    try:
+        from langchain.agents.middleware import SummarizationMiddleware
+        trigger_tokens = context_limit_tokens or _DEFAULT_SUMMARIZE_TRIGGER_TOKENS
+        return [
+            SummarizationMiddleware(
+                model=model,
+                trigger=("tokens", trigger_tokens),
+                keep=("messages", _DEFAULT_SUMMARIZE_KEEP_MESSAGES),
+                trim_tokens_to_summarize=4000,
+            )
+        ]
+    except Exception as exc:
+        logger.warning(
+            "SummarizationMiddleware unavailable, no context compression: %s", exc
+        )
+        return []
+
+
 def _create_react_agent(model, tools, *, system_prompt, checkpointer):
     """
     创建 ReAct 风格的 LangGraph Agent。
@@ -301,6 +336,7 @@ async def run_agent(
     retry_delay: float = 10.0,
     pi_max_retries: int = -1,
     pi_retry_delay: float = 10.0,
+    context_limit_tokens: int | None = None,
 ) -> AgentResult:
     """
     运行 LangChain Agent，接口与原版 pi-based run_agent 完全兼容。
@@ -363,6 +399,7 @@ async def run_agent(
             tools=lc_tools,
             system_prompt=system_prompt,
             checkpointer=checkpointer,
+            context_limit_tokens=context_limit_tokens,
         )
     except Exception as exc:
         err = str(exc)

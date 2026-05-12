@@ -156,16 +156,20 @@ def create_model(model_string: str, thinking_level: str = "off"):
             kwargs["base_url"] = base_url
         kwargs["api_key"] = api_key
 
-        # 检查 reasoning 标志（后续可扩展为 extra_body 参数）
+        # 检查 reasoning 标志 —— 若模型支持且 thinking 未关闭，注入 extra_body
         model_cfg = next(
             (m for m in pconfig.get("models", []) if m.get("id") == model_id),
             {},
         )
         if model_cfg.get("reasoning") and thinking_level not in ("off", ""):
-            logger.debug(
-                "Model %s supports reasoning; thinking_level=%s (reserved for future use)",
-                model_id, thinking_level,
-            )
+            # GLM-5 / Qwen3 via vLLM: chat_template_kwargs.enable_thinking
+            # MiniMax / others: generic thinking=true
+            kwargs.setdefault("model_kwargs", {})
+            kwargs["model_kwargs"].setdefault("extra_body", {})
+            kwargs["model_kwargs"]["extra_body"]["chat_template_kwargs"] = {
+                "enable_thinking": True
+            }
+            logger.debug("Model %s: thinking enabled (thinking_level=%s)", model_id, thinking_level)
     else:
         # 无 provider 配置，回退到环境变量
         api_key  = (

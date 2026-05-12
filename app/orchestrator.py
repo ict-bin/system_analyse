@@ -20,6 +20,8 @@ from typing import Callable
 
 from .config import get_service_yaml
 from .service.llm_provider_sync import sync_providers_to_pi
+from .runner import clear_all_sessions
+from .runner import clear_all_sessions
 from .models import (
     TaskConfig, TaskResult, TaskStatus, TokenUsage, SwarmEvent,
 )
@@ -221,6 +223,14 @@ class Orchestrator:
             self._emit("error", task_id, error=str(e))
 
         result.total_duration_ms = (time.time() - start) * 1000
+
+        # Release MemorySaver sessions to prevent OOM accumulation
+        clear_all_sessions()
+        logger.debug("Sessions cleared after task %s", task_id)
+
+        # ── 释放 Session 内存（MemorySaver 进程级累积，任务结束必须清理）────
+        clear_all_sessions()
+        logger.debug("Sessions cleared after task %s", task_id)
         try:
             evaluator.write_summary(
                 task_status=result.status.value,
