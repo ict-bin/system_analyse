@@ -54,7 +54,7 @@ BEFORE=$(wc -l < "$OUTPUT_FILE")
 echo "类型过滤后: $BEFORE 个文件"
 
 # ── 架构过滤（仅对 ELF 有效）──
-if [ "$ARCH_FILTER" = "all" ]; then
+if [ "$ARCH_FILTER" = "all" ] || [ -z "$ARCH_FILTER" ]; then
     echo "架构: 不过滤"
     echo "过滤结果: $BEFORE 个文件"
     exit 0
