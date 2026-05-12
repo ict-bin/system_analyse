@@ -15,6 +15,7 @@ from .helpers import (
     write_failure_report, generate_modules_list, strip_target_prefix,
 )
 from .s0_filter import FilterStage, ExploreStage, PrescanStage
+from .s0_path_group import PathGroupStage
 from .s1_classify import ClassifyStage
 from .s2_refine import RefineStage
 from .s3_analyse import AnalyseStage
@@ -36,6 +37,7 @@ __all__ = [
     "write_failure_report", "generate_modules_list", "strip_target_prefix",
     # 阶段
     "FilterStage", "ExploreStage", "PrescanStage",
+    "PathGroupStage",
     "ClassifyStage",
     "RefineStage",
     "AnalyseStage",

@@ -25,6 +25,8 @@ class TaskCreateRequest(BaseModel):
     analysis_mode: Optional[str] = None
     analyse_targets: Optional[list[str]] = None  # Override service-level analyse_targets
     binary_arch: Optional[list[str]] = None      # Override service-level binary_arch
+    security_focus_categories: Optional[list[str]] = None  # Override S1 category filter
+    module_granularity: Optional[str] = None               # Override module split granularity
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None
@@ -122,12 +124,20 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
 
     svc = get_task_service()
     task_config: dict | None = None
-    if body.analyse_targets is not None or body.binary_arch is not None:
+    _override_fields = (
+        body.analyse_targets, body.binary_arch,
+        body.security_focus_categories, body.module_granularity,
+    )
+    if any(f is not None for f in _override_fields):
         task_config = {}
         if body.analyse_targets is not None:
             task_config["analyse_targets"] = body.analyse_targets
         if body.binary_arch is not None:
             task_config["binary_arch"] = body.binary_arch
+        if body.security_focus_categories is not None:
+            task_config["security_focus_categories"] = body.security_focus_categories
+        if body.module_granularity is not None:
+            task_config["module_granularity"] = body.module_granularity
     return svc.create_task(
         db,
         project_id=body.project_id,

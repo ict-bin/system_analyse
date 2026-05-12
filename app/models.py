@@ -151,6 +151,72 @@ ANALYSE_TYPES = {
 }
 
 
+# ─── 安全分析维度 ──────────────────────────────────────────────────────────────
+
+SECURITY_CATEGORIES: dict[str, dict] = {
+    "network_protocol": {
+        "name": "网络协议解析",
+        "desc": "TCP/IP 协议栈、报文解析与编解码、socket 通信、TLS/SSL、MQTT/CoAP/QUIC 等协议实现",
+        "keywords": ["socket", "tcp", "udp", "ip", "tls", "ssl", "mqtt", "coap", "quic", "dhcp",
+                     "dns", "http", "ftp", "snmp", "netlink", "packet", "proto", "protocol"],
+    },
+    "file_parsing": {
+        "name": "文件格式处理",
+        "desc": "文件读写、格式解析（ZIP/Image/PDF/XML/JSON）、上传下载处理、文件系统操作",
+        "keywords": ["parse", "unzip", "extract", "file", "read", "write", "stream",
+                     "xml", "json", "pdf", "image", "upload", "download", "fs", "inode"],
+    },
+    "auth_access": {
+        "name": "认证与访问控制",
+        "desc": "登录认证、token/session 管理、权限校验、ACL、证书处理、PAM",
+        "keywords": ["auth", "login", "token", "session", "acl", "permission", "role",
+                     "cert", "pam", "credential", "passwd", "user", "access"],
+    },
+    "crypto": {
+        "name": "密码学操作",
+        "desc": "加解密、签名验签、密钥管理、随机数生成、哈希运算",
+        "keywords": ["aes", "rsa", "ecc", "hmac", "sha", "md5", "encrypt", "decrypt",
+                     "sign", "verify", "key", "cipher", "random", "prng", "hash"],
+    },
+    "ipc": {
+        "name": "进程间通信",
+        "desc": "Unix socket、管道、消息队列、共享内存、D-Bus、RPC/gRPC",
+        "keywords": ["pipe", "fifo", "mqueue", "shm", "shmem", "dbus", "rpc", "grpc",
+                     "ipc", "socket", "uds", "semaphore", "mutex", "signal"],
+    },
+    "config_parsing": {
+        "name": "配置与脚本解析",
+        "desc": "XML/JSON/YAML/INI 配置解析器、命令行参数处理、环境变量读取、脚本解释器",
+        "keywords": ["config", "conf", "ini", "yaml", "yml", "toml", "environ", "getenv",
+                     "argv", "optarg", "getopt", "cmdline", "param"],
+    },
+    "input_handling": {
+        "name": "输入处理与验证",
+        "desc": "用户输入边界、命令注入点、缓冲区操作、格式化字符串、输入校验",
+        "keywords": ["input", "scanf", "gets", "fgets", "sprintf", "snprintf", "strcat",
+                     "strcpy", "memcpy", "memmove", "sscanf", "format", "sanitize", "validate"],
+    },
+    "privilege_process": {
+        "name": "权限与进程管理",
+        "desc": "setuid/setgid、特权提升、进程创建与控制、信号处理、能力管理",
+        "keywords": ["setuid", "setgid", "seteuid", "setegid", "fork", "exec", "spawn",
+                     "prctl", "capability", "cap_set", "signal", "sigaction", "chroot"],
+    },
+    "web_api": {
+        "name": "Web 与 API 接口",
+        "desc": "HTTP 请求/响应处理、REST/SOAP 接口、CGI/FastCGI、URL 路由、Web 框架",
+        "keywords": ["http", "https", "url", "uri", "rest", "api", "cgi", "fastcgi",
+                     "request", "response", "route", "header", "cookie", "web"],
+    },
+    "memory_manage": {
+        "name": "内存管理",
+        "desc": "malloc/free、内存映射、引用计数、内存池、与溢出相关的低层操作",
+        "keywords": ["malloc", "free", "calloc", "realloc", "mmap", "munmap", "brk",
+                     "alloc", "heap", "pool", "refcount", "overflow", "buffer"],
+    },
+}
+
+
 def get_analyse_filter(types: list[str]) -> dict:
     """根据分析类型列表生成过滤规则。
     返回 {"extensions": [".so", ...], "magic": ["ELF", ...], "all": False}
@@ -178,6 +244,21 @@ class ServiceConfig(BaseModel):
     binary_arch: list[str] = Field(
         default=["all"],
         description="binary 类型的架构过滤，只在 analyse_targets 含 binary 时生效: all/x86/x86_64/arm/aarch64/mips/mips64/ppc/ppc64/riscv/s390"
+    )
+    security_focus_categories: list[str] = Field(
+        default=["all"],
+        description=(
+            "安全分析维度过滤，S1 分类时只保留与指定维度相关的模块。"
+            "可选: all(不过滤)/network_protocol/file_parsing/auth_access/crypto/"
+            "ipc/config_parsing/input_handling/privilege_process/web_api/memory_manage"
+        ),
+    )
+    module_granularity: str = Field(
+        default="fine",
+        description=(
+            "模块划分粒度: fine=子组件级（当前默认），"
+            "coarse=协议/服务/功能级（同一协议/功能的所有代码归为一个模块）"
+        ),
     )
     parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1（串行）")
     parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1（串行）")
@@ -213,6 +294,14 @@ class TaskConfig(BaseModel):
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
     binary_arch: list[str] = Field(default=["all"], description="binary 架构过滤")
+    security_focus_categories: list[str] = Field(
+        default=["all"],
+        description="安全分析维度过滤，S1 分类时只保留相关模块。all=不过滤",
+    )
+    module_granularity: str = Field(
+        default="fine",
+        description="模块划分粒度: fine=子组件级，coarse=协议/服务/功能级",
+    )
     parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1（串行）")
     parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1（串行）")
     stages: StagesConfig = Field(default_factory=StagesConfig)

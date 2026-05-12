@@ -25,7 +25,7 @@ from .models import (
 )
 from .pipeline import (
     PipelineContext, Pipeline,
-    FilterStage, ExploreStage, PrescanStage,
+    FilterStage, ExploreStage, PrescanStage, PathGroupStage,
     ClassifyStage,
     RefineStage,
     AnalyseStage,
@@ -168,6 +168,7 @@ class Orchestrator:
             FilterStage(),
             ExploreStage(),
             PrescanStage(),
+            PathGroupStage(),
             ClassifyStage(),
             RefineStage(),
             AnalyseStage(),

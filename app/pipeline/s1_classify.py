@@ -96,6 +96,51 @@ class ClassifyStage(BaseStage):
                     "你可以直接用脚本将 prescan/*.list 移入模块目录。"
                     "\n\n每个模块的 files.list 必须写的是 filtered_files.txt 里的相对路径。"
                 )
+
+            # ── 安全维度过滤约束 ──
+            sec_cats = getattr(cfg, "security_focus_categories", ["all"])
+            if attempt == 0 and sec_cats and "all" not in sec_cats:
+                from app.models import SECURITY_CATEGORIES  # noqa: PLC0415
+                cat_lines = []
+                for cat_key in sec_cats:
+                    cat_info = SECURITY_CATEGORIES.get(cat_key, {})
+                    cat_lines.append(
+                        f"- **{cat_key}**（{cat_info.get('name', '')}）：{cat_info.get('desc', '')}"
+                    )
+                prompt_parts.append(
+                    "\n\n# ⚠️ 安全分析范围约束（必须严格执行）\n\n"
+                    "**只将与以下安全维度直接相关的文件归入模块**，"
+                    "无关文件（测试代码、国际化字符串、构建脚本、样例数据、文档等）"
+                    "**绝对不得**创建任何模块——直接丢弃。\n\n"
+                    "**指定安全维度：**\n" + "\n".join(cat_lines)
+                )
+
+            # ── 模块粒度约束 ──
+            granularity = getattr(cfg, "module_granularity", "fine")
+            if attempt == 0 and granularity == "coarse":
+                prompt_parts.append(
+                    "\n\n# ⚠️ 模块划分粒度：粗粒度（协议/服务/功能级）\n\n"
+                    "模块划分必须以**完整协议 / 完整服务 / 完整安全功能**为边界：\n"
+                    "- 某个网络协议的所有实现代码（解析器、编码器、状态机、会话管理等）"
+                    "统一归入**同一个模块**。\n"
+                    "- 例如：`HTTP协议` 是一个模块，**不要**拆分为"
+                    " `HTTP请求解析`、`HTTP响应构造`、`HTTP分块传输`。\n"
+                    "- 固件中有多少个协议 / 功能就创建多少个模块，**不限制总模块数量**。"
+                )
+
+            # ── 路径先验分组指引（path_groups.md 由 PathGroupStage 生成）──
+            if attempt == 0 and (workspace / "prescan" / "path_groups.md").exists():
+                prompt_parts.append(
+                    "\n\n# 路径先验分组（已由工具自动生成，请优先采用）\n\n"
+                    "prescan_summary 中包含路径先验分组结果（path_groups.md）。\n"
+                    "「直接路径组」的文件归属已按目录路径推断完毕，"
+                    "**请优先直接写入对应模块的 files.list**，无需重新分析路径。\n"
+                    "「特殊路径文件」已按 lib 名前缀二次分组，"
+                    "请根据功能语义判断归入哪个模块。\n"
+                    "`__unmatched_shared__` 文件若无法判断归属，"
+                    "统一归入 `misc_shared_libs` 模块。"
+                )
+
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
