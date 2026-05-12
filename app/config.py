@@ -231,6 +231,8 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "") -> TaskCon
         pi_retry_delay=svc.pi_retry_delay,
         analyse_targets=svc.analyse_targets,
         binary_arch=svc.binary_arch,
+        security_focus_categories=svc.security_focus_categories,
+        module_granularity=svc.module_granularity,
         parallel_modules=svc.parallel_modules,
         parallel_sub_workers=svc.parallel_sub_workers,
         stages=svc.stages.model_copy(deep=True),

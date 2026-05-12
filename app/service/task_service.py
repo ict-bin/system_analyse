@@ -888,6 +888,13 @@ class TaskService:
                 svc.analyse_targets = list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS)
             if tcfg.get("binary_arch"):
                 svc.binary_arch = tcfg["binary_arch"]
+            # [修复] security_focus_categories 和 module_granularity 需要同样从 task_config_json 覆盖到 svc，
+            # 原先遗漏导致这两个配置项始终无法生效。
+            # 注意：security_focus_categories 用 is not None 而非 bool，因为 ["all"] 也是有效配置。
+            if tcfg.get("security_focus_categories") is not None:
+                svc.security_focus_categories = tcfg["security_focus_categories"]
+            if tcfg.get("module_granularity"):
+                svc.module_granularity = tcfg["module_granularity"]
             # start_stage / resume_workspace come ONLY from task_config_json
             # (set by resume_task).  Never inherit from project config so that
             # fresh runs and restarts always start from Stage 0.

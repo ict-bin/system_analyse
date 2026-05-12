@@ -11,12 +11,15 @@ orchestrator.py — 薄层流水线编排器 v3
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import Callable
+
+_log = logging.getLogger("sa.orchestrator")
 
 from .config import get_service_yaml
 from .service.llm_provider_sync import sync_providers_to_pi
@@ -71,6 +74,58 @@ class Orchestrator:
     # ── 向后兼容旧接口 ──────────────────────────────────────────────────────
     def abort(self) -> None:
         self.stop()
+
+    def _print_task_config(self, cfg: "TaskConfig", task_id: str) -> None:
+        """任务启动前将完整运行配置逐行打印到日志，并发射 task_config_print 事件。"""
+        # ── 构建配置行列表 ────────────────────────────────────────────────────
+        w_agents = [
+            {"model": a.model, "tools": a.tools, "thinking_level": a.thinking_level}
+            for a in (cfg.workers.agents or [])
+        ]
+        j_agents = [
+            {"model": a.model, "tools": a.tools, "thinking_level": a.thinking_level}
+            for a in (cfg.judges.agents or [])
+        ]
+
+        def _stage_str(sc) -> str:
+            return f"min_rounds={sc.min_rounds}, max_rounds={sc.max_rounds}, pass_mode={sc.pass_mode}"
+
+        lines: list[str] = [
+            f"task_id                    = {task_id}",
+            f"target_dir                 = {cfg.target_dir}",
+            f"output_dir                 = {cfg.output_dir}",
+            f"start_stage                = {cfg.start_stage}",
+            f"resume_workspace           = {cfg.resume_workspace or '（无）'}",
+            f"analyse_targets            = {cfg.analyse_targets}",
+            f"binary_arch                = {cfg.binary_arch}",
+            f"security_focus_categories  = {cfg.security_focus_categories}",
+            f"module_granularity         = {cfg.module_granularity}",
+            f"parallel_modules           = {cfg.parallel_modules}",
+            f"parallel_sub_workers       = {cfg.parallel_sub_workers}",
+            f"stages.classify            = {_stage_str(cfg.stages.classify)}",
+            f"stages.refine              = {_stage_str(cfg.stages.refine)}",
+            f"stages.analyse             = {_stage_str(cfg.stages.analyse)}",
+            f"stages.final_check         = {_stage_str(cfg.stages.final_check)}",
+            f"workers.agents             = {w_agents}",
+            f"workers.stage_models       = {dict(cfg.workers.stage_models)}",
+            f"workers.default_tools      = {cfg.workers.default_tools}",
+            f"workers.default_thinking   = {cfg.workers.default_thinking_level}",
+            f"judges.agents              = {j_agents}",
+            f"judges.stage_models        = {dict(cfg.judges.stage_models)}",
+            f"agent_max_retries          = {cfg.agent_max_retries}",
+            f"agent_retry_delay          = {cfg.agent_retry_delay}s",
+            f"pi_max_retries             = {cfg.pi_max_retries}",
+            f"pi_retry_delay             = {cfg.pi_retry_delay}s",
+        ]
+
+        # ── 逐行写入日志 ─────────────────────────────────────────────────────
+        _log.info("[任务配置] ══════════════════════════════ 任务运行配置 ══════════════════════════════")
+        for line in lines:
+            _log.info("[任务配置] %s", line)
+        _log.info("[任务配置] ══════════════════════════════════════════════════════════════════════════")
+
+        # ── 发射 task_config_print 事件（供 stages_json 记录） ────────────────
+        self._emit("task_config_print", task_id, lines=lines)
 
     async def execute(self, task_id: str | None = None) -> TaskResult:
         cfg = self.cfg
@@ -136,6 +191,9 @@ class Orchestrator:
         )
 
         self._emit("task_start", task_id, task=cfg.task)
+
+        # ── 打印运行配置 ──────────────────────────────────────────────────────
+        self._print_task_config(cfg, task_id)
 
         # ── 构建 PipelineContext ──────────────────────────────────────────────
         tokens = TokenUsage()
