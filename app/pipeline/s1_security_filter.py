@@ -12,9 +12,12 @@ stage_num=1（与 ClassifyStage 相同），Pipeline stable-sort 保证顺序。
 核心流程:
   1. 备份 modules/ → modules_pre_filter_backup/
   2. W+J 循环：
-       每轮开始从备份还原 modules/，确保幂等
-       Worker 直接删除 modules/ 中无关模块目录
-       Judge 对比 modules_pre_filter_backup/ 与 modules/ 验证过滤质量
+       第 1 轮：Worker 全量审查并直接删除无关模块目录
+       第 2+ 轮：Worker 按 Judge 意见增量修正：
+                  • 恢复误删的模块（cp -r backup/<name> modules/<name>）
+                  • 删除漏删的模块（rm -rf modules/<name>）
+       Judge 对比 modules_pre_filter_backup/ 与 modules/ 验证过滤质量，
+       输出结构化修正列表（恢复列表 / 删除列表）供下轮 Worker 使用
   3. 通过后删除备份目录
 
 跳过条件:
@@ -46,18 +49,14 @@ def _backup_modules(modules_root: Path, workspace: Path) -> Path:
     return backup
 
 
-def _restore_from_backup(modules_root: Path, backup: Path) -> None:
-    """将 modules_pre_filter_backup/ 还原到 modules/（每轮重试前调用）。"""
-    if modules_root.exists():
-        shutil.rmtree(str(modules_root))
-    shutil.copytree(str(backup), str(modules_root))
-
-
 class SecurityFocusFilterStage(BaseStage):
     """Stage 1.5: 安全维度过滤 — 丢弃与指定安全维度无关的模块。
 
-    Worker 直接删除 modules/ 下的无关模块目录；Judge 对比备份核查。
-    每轮重试前从备份还原，保证幂等。通过后删除备份。
+    第 1 轮：Worker 全量审查，直接 rm -rf 无关模块目录。
+    重试轮：Worker 按 Judge 结构化意见增量修正
+            （恢复误删：cp -r backup/<name> modules/<name>；
+              删除漏删：rm -rf modules/<name>）。
+    通过后删除备份。
     """
 
     stage_num = 1       # 与 ClassifyStage 相同；Pipeline stable-sort 保证本阶段在其之后
@@ -112,7 +111,7 @@ class SecurityFocusFilterStage(BaseStage):
                        msg=(f"[安全维度过滤] 启动：{len(all_modules)} 个模块，"
                             f"维度：{sec_cats}"))
 
-        # ── 第一步：备份 ──────────────────────────────────────────────────────
+        # ── 备份（仅一次，不在重试时覆盖） ───────────────────────────────────
         backup = _backup_modules(modules_root, workspace)
         ctx.emit_event("log", level="info",
                        msg=f"[安全维度过滤] 备份已创建：{backup}")
@@ -131,40 +130,59 @@ class SecurityFocusFilterStage(BaseStage):
             pi_retry_delay=cfg.pi_retry_delay,
         )
 
-        feedback = ""
+        # judge_corrections: 由 Judge 输出的结构化修正指令，注入下轮 Worker prompt
+        judge_corrections: str = ""
         max_iter = 999 if s_cfg.max_rounds < 0 else s_cfg.max_rounds
 
         for attempt in range(max_iter):
             round_started = utc_now_iso()
             round_start_ts = time.time()
 
-            # 每轮从备份还原，保证 Worker 每次都面对完整的原始集合
-            _restore_from_backup(modules_root, backup)
             current_modules = discover_modules(str(workspace))
-
             ctx.emit_event("log", level="info",
                            msg=(f"[安全维度过滤] 第{attempt+1}轮开始，"
-                                f"还原后模块数：{len(current_modules)}"))
+                                f"当前模块数：{len(current_modules)}"))
 
             # ── Worker Prompt ─────────────────────────────────────────────────
-            prompt_parts = [
-                f"# 安全维度过滤任务（第 {attempt+1} 轮）\n\n"
-                f"## 指定安全维度（只保留与此相关的模块）\n\n{cat_desc}\n\n"
-                f"## 当前模块（共 {len(current_modules)} 个，已从备份还原）\n\n"
-                + "\n".join(f"- `{m}`" for m in sorted(current_modules))
-                + f"\n\n## 目录路径\n\n"
-                f"- 工作目录：`{workspace}`\n"
-                f"- 模块目录：`{modules_root}`\n"
-                f"- 备份目录：`{backup}`（**只读，不要修改**）\n\n"
-                f"## 操作要求\n\n"
-                f"逐模块判断相关性，对每个**无关**模块执行删除：\n"
-                f"```bash\n"
-                f"rm -rf {modules_root}/<模块名>\n"
-                f"```\n"
-                f"完成后输出 `<result>` 摘要（保留/删除了哪些模块及原因）。"
-            ]
-            if feedback:
-                prompt_parts.append(f"\n\n---\n\n# 上轮评审意见（请据此修正）\n\n{feedback}")
+            if attempt == 0:
+                # 第 1 轮：全量审查
+                prompt_parts = [
+                    f"# 安全维度过滤任务（第 1 轮 — 全量审查）\n\n"
+                    f"## 指定安全维度（只保留与此相关的模块）\n\n{cat_desc}\n\n"
+                    f"## 当前全部模块（共 {len(current_modules)} 个）\n\n"
+                    + "\n".join(f"- `{m}`" for m in sorted(current_modules))
+                    + f"\n\n## 目录路径\n\n"
+                    f"- 模块目录：`{modules_root}`\n"
+                    f"- 备份目录：`{backup}`（**只读，不要修改**）\n\n"
+                    f"逐模块判断相关性，对每个**无关**模块执行删除：\n"
+                    f"```bash\n"
+                    f"rm -rf {modules_root}/<模块名>\n"
+                    f"```\n"
+                    f"完成后输出 `<result>` 摘要。"
+                ]
+            else:
+                # 第 2+ 轮：按 Judge 意见增量修正
+                prompt_parts = [
+                    f"# 安全维度过滤修正（第 {attempt+1} 轮 — 增量修正）\n\n"
+                    f"## 指定安全维度\n\n{cat_desc}\n\n"
+                    f"## 当前模块状态（共 {len(current_modules)} 个）\n\n"
+                    + "\n".join(f"- `{m}`" for m in sorted(current_modules))
+                    + f"\n\n## 目录路径\n\n"
+                    f"- 模块目录：`{modules_root}`\n"
+                    f"- 备份目录：`{backup}`（可从此处恢复误删模块）\n\n"
+                    f"## Judge 要求的修正操作\n\n"
+                    f"{judge_corrections}\n\n"
+                    f"**操作指令：**\n\n"
+                    f"恢复误删的模块（从备份复制回来）：\n"
+                    f"```bash\n"
+                    f"cp -r {backup}/<模块名> {modules_root}/<模块名>\n"
+                    f"```\n\n"
+                    f"删除漏删的模块：\n"
+                    f"```bash\n"
+                    f"rm -rf {modules_root}/<模块名>\n"
+                    f"```\n\n"
+                    f"完成后输出 `<result>` 摘要（执行了哪些恢复/删除操作）。"
+                ]
 
             ar = await run_agent_checked(
                 context=f"s1-security-filter-a{attempt+1}",
@@ -177,10 +195,11 @@ class SecurityFocusFilterStage(BaseStage):
 
             # Worker 执行后发现剩余模块
             kept_modules  = discover_modules(str(workspace))
-            removed_count = len(current_modules) - len(kept_modules)
+            removed_count = len(all_modules) - len(kept_modules)
             ctx.emit_event("log", level="info",
                            msg=(f"[安全维度过滤] 第{attempt+1}轮 Worker 完成："
-                                f"保留 {len(kept_modules)}，删除 {removed_count}"))
+                                f"当前保留 {len(kept_modules)}，"
+                                f"累计删除 {removed_count}"))
 
             # ── Judge ─────────────────────────────────────────────────────────
             judge_results = []
@@ -188,14 +207,11 @@ class SecurityFocusFilterStage(BaseStage):
             for j_idx, j_agent in enumerate(cfg.judges.agents):
                 j_model = cfg.judges.model_for("classify") or j_agent.model
 
-                # 列出被删除的模块（备份有但 modules/ 没有的）
-                backup_mods = {
-                    p.name for p in backup.iterdir() if p.is_dir()
-                }
+                backup_mods = {p.name for p in backup.iterdir() if p.is_dir()}
                 removed_mods = sorted(backup_mods - set(kept_modules))
 
                 j_prompt = (
-                    f"# 安全维度过滤评审\n\n"
+                    f"# 安全维度过滤评审（第 {attempt+1} 轮）\n\n"
                     f"## 指定安全维度\n\n{cat_desc}\n\n"
                     f"## 过滤前（备份）：{len(backup_mods)} 个模块\n\n"
                     + "\n".join(f"- `{m}`" for m in sorted(backup_mods))
@@ -203,8 +219,14 @@ class SecurityFocusFilterStage(BaseStage):
                     + "\n".join(f"- `{m}`" for m in sorted(kept_modules))
                     + f"\n\n## 被删除：{len(removed_mods)} 个\n\n"
                     + "\n".join(f"- `{m}`" for m in removed_mods)
-                    + f"\n\n备份目录 `{backup}` 可供读取详细 files.list 核查。\n\n"
-                    f"请验证：删除的模块是否确实无关？保留的是否都相关？"
+                    + f"\n\n备份目录 `{backup}` 可供读取 files.list 核查。\n\n"
+                    f"请验证过滤质量，并在意见末尾输出结构化修正列表（即使全部正确也要输出空列表）：\n\n"
+                    f"```\n"
+                    f"## 需恢复（误删）:\n"
+                    f"- <模块名>  # 原因说明\n\n"
+                    f"## 需删除（漏删）:\n"
+                    f"- <模块名>  # 原因说明\n"
+                    f"```"
                 )
                 j_ar = await run_agent_checked(
                     context=f"s1-security-filter-judge{j_idx}-a{attempt+1}",
@@ -230,6 +252,7 @@ class SecurityFocusFilterStage(BaseStage):
                     "score": parsed["score"],
                     "passed": parsed["pass"],
                     "feedback": parsed["feedback"],
+                    "raw_output": (j_ar.output or "")[:2000],
                 })
                 j_path = ctx.output_dir / f"s1-sec-filter-a{attempt+1}-j{j_idx}.md"
                 j_path.write_text(
@@ -254,32 +277,25 @@ class SecurityFocusFilterStage(BaseStage):
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
-                worker={
-                    "model": filter_model,
-                    "session_file": filter_session,
-                    "token_usage": ar.token_usage,
-                },
+                worker={"model": filter_model, "session_file": filter_session,
+                        "token_usage": ar.token_usage},
                 judges=judge_records,
                 passed_by_vote=voted_pass,
                 module_completed=False,
                 completion_reason=(
                     "passed" if final_pass
-                    else "max_rounds_exceeded" if max_reached
-                    else ""
+                    else "max_rounds_exceeded" if max_reached else ""
                 ),
                 extra={
-                    "before_count": len(current_modules),
+                    "original_count": len(all_modules),
                     "after_count": len(kept_modules),
                     "removed_count": removed_count,
                     "kept_modules": sorted(kept_modules),
-                    "removed_modules": sorted(
-                        set(current_modules) - set(kept_modules)
-                    ),
+                    "removed_modules": sorted(backup_mods - set(kept_modules)),
                 },
             )
 
             if final_pass:
-                # ── 删除备份目录 ──────────────────────────────────────────────
                 shutil.rmtree(str(backup), ignore_errors=True)
                 ctx.emit_event("log", level="info",
                                msg=(f"[安全维度过滤] 完成：保留 {len(kept_modules)} 个，"
@@ -287,19 +303,16 @@ class SecurityFocusFilterStage(BaseStage):
                 ctx.classified_modules = discover_modules(str(workspace))
                 return
 
-            # ── 未通过：收集 Judge 意见用于下轮 Worker ────────────────────────
+            # ── 未通过：从 Judge 输出中提取结构化修正列表注入下轮 ────────────
             if not max_reached:
-                fail_fb = "\n\n".join(
-                    f"**Judge-{i}（分数 {r['score']}）：**\n{r['feedback'][:500]}"
-                    for i, r in enumerate(judge_results)
-                )
-                feedback = (
-                    f"评审意见（共 {j_count} 个 Judge）：\n\n{fail_fb}\n\n"
-                    f"请根据上述意见重新判断每个模块的相关性，"
-                    f"下轮将从备份重新还原所有模块后再执行。"
-                )
+                corrections_parts: list[str] = []
+                for i, rec in enumerate(judge_records):
+                    raw = rec.get("raw_output", "")
+                    corrections_parts.append(
+                        f"### Judge-{i}（分数 {rec['score']}）修正列表\n\n{raw}"
+                    )
+                judge_corrections = "\n\n".join(corrections_parts)
 
-        # 达到最大轮数仍未通过——保留备份供排查，抛出异常
         raise StageError(
             f"安全维度过滤阶段未通过，已达最大轮数 {s_cfg.max_rounds}。"
             f"备份保留于 {backup} 供人工排查。"
