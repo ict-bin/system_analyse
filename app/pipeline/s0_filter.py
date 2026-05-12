@@ -56,7 +56,7 @@ class FilterStage(BaseStage):
 
         filtered_path = workspace / "filtered_files.txt"
         if filtered_path.exists():
-            lines = [l.strip() for l in filtered_path.read_text("utf-8").splitlines() if l.strip()]
+            lines = [l.strip() for l in filtered_path.read_text("utf-8", errors="replace").splitlines() if l.strip()]
             ctx.filtered_files = lines
             ctx.filter_count = len(lines)
             # 备份过滤结果，防止后续 agent 步骤覆盖

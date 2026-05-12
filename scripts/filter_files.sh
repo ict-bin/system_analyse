@@ -52,6 +52,8 @@ fi
 
 BEFORE=$(wc -l < "$OUTPUT_FILE")
 echo "类型过滤后: $BEFORE 个文件"
+# 备份类型过滤结果，架构过滤失效时回退用
+cp "$OUTPUT_FILE" /tmp/_typefilter_backup.txt 2>/dev/null || true
 
 # ── 架构过滤（仅对 ELF 有效）──
 if [ "$ARCH_FILTER" = "all" ] || [ -z "$ARCH_FILTER" ]; then
@@ -64,8 +66,11 @@ fi
 # 3=x86  40=arm  62=x86_64  183=aarch64  8=mips  20=ppc  243=riscv  22=s390
 elf_arch_match() {
     local filepath="$1"
+    local _out
     # 读 ELF magic (4字节) + e_machine (偏移0x12, 2字节 little-endian)
-    python3 - "$filepath" << 'PYEOF'
+    # 注意：必须把 python3 输出先捕获再加默认值，防止 python3 崩溃/找不到时
+    # 返回空字符串导致既不匹配 noelf 也不匹配任何架构，把文件误过滤掉
+    _out=$(python3 - "$filepath" 2>/dev/null << 'PYEOF'
 import sys, struct, os
 
 path = sys.argv[1]
@@ -92,6 +97,9 @@ try:
 except Exception:
     print("noelf")
 PYEOF
+)
+    # python3 未输出任何内容（崩溃/找不到）→ 当作非 ELF，保留文件
+    echo "${_out:-noelf}"
 }
 
 # 构建目标架构集合
@@ -134,8 +142,8 @@ while IFS= read -r rel; do
         continue
     fi
 
-    # 2. 读 ELF header 判断
-    arch=$(elf_arch_match "$TARGET_DIR/$rel" 2>/dev/null)
+    # 2. 读 ELF header 判断（elf_arch_match 保证非空）
+    arch=$(elf_arch_match "$TARGET_DIR/$rel")
     if [ "$arch" = "noelf" ]; then
         # 非 ELF（脚本/配置等），直接保留
         echo "$rel" >> /tmp/_arch_pass.txt
@@ -151,4 +159,10 @@ done < "$OUTPUT_FILE"
 mv /tmp/_arch_pass.txt "$OUTPUT_FILE"
 AFTER=$(wc -l < "$OUTPUT_FILE")
 echo "架构过滤: $BEFORE → $AFTER 个文件（过滤掉 $((BEFORE - AFTER)) 个）"
+# 安全网：架构过滤不应把所有文件清空。若发生，回退到类型过滤结果并告警
+if [ "$AFTER" -eq 0 ] && [ "$BEFORE" -gt 0 ]; then
+    echo "警告: 架构过滤后结果为0，配置可能与实际文件不符，回退至类型过滤结果($BEFORE 个文件)" >&2
+    # 重新生成类型过滤结果作为回退
+    cp /tmp/_typefilter_backup.txt "$OUTPUT_FILE" 2>/dev/null && AFTER=$BEFORE || true
+fi
 echo "过滤结果: $AFTER 个文件"
