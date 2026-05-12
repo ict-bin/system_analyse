@@ -62,6 +62,10 @@ class StageLoopConfig(BaseModel):
 
 class StagesConfig(BaseModel):
     classify: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=5))
+    security_filter: StageLoopConfig = Field(
+        default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=3, pass_mode="all"),
+        description="安全维度过滤阶段（S1后），security_focus_categories != ['all'] 时生效",
+    )
     refine: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=3))
     analyse: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=5))
     final_check: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=1))

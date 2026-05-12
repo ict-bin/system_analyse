@@ -140,23 +140,8 @@ class ClassifyStage(BaseStage):
                     "你可以直接用脚本将 prescan/*.list 移入模块目录。"
                 )
 
-            # ── 安全维度过滤约束 ──
-            sec_cats = getattr(cfg, "security_focus_categories", ["all"])
-            if attempt == 0 and sec_cats and "all" not in sec_cats:
-                from app.models import SECURITY_CATEGORIES  # noqa: PLC0415
-                cat_lines = []
-                for cat_key in sec_cats:
-                    cat_info = SECURITY_CATEGORIES.get(cat_key, {})
-                    cat_lines.append(
-                        f"- **{cat_key}**（{cat_info.get('name', '')}）：{cat_info.get('desc', '')}"
-                    )
-                prompt_parts.append(
-                    "\n\n# ⚠️ 安全分析范围约束（必须严格执行）\n\n"
-                    "**只将与以下安全维度直接相关的文件归入模块**，"
-                    "无关文件（测试代码、国际化字符串、构建脚本、样例数据、文档等）"
-                    "**绝对不得**创建任何模块——直接丢弃。\n\n"
-                    "**指定安全维度：**\n" + "\n".join(cat_lines)
-                )
+            # ── 安全维度过滤约束已移至独立的 SecurityFocusFilterStage（S1之后）──
+            # （原注入逻辑已删除）
 
             # ── 模块粒度约束（每轮注入，不仅首轮）──
             granularity = getattr(cfg, "module_granularity", "fine")

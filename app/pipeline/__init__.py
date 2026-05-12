@@ -17,6 +17,7 @@ from .helpers import (
 from .s0_filter import FilterStage, ExploreStage, PrescanStage
 from .s0_path_group import PathGroupStage
 from .s1_classify import ClassifyStage
+from .s1_security_filter import SecurityFocusFilterStage
 from .s2_refine import RefineStage
 from .s3_analyse import AnalyseStage
 from .s4_report import CompletenessCheckStage, FinalReportStage
@@ -39,6 +40,7 @@ __all__ = [
     "FilterStage", "ExploreStage", "PrescanStage",
     "PathGroupStage",
     "ClassifyStage",
+    "SecurityFocusFilterStage",
     "RefineStage",
     "AnalyseStage",
     "CompletenessCheckStage", "FinalReportStage",

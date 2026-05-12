@@ -30,6 +30,7 @@ from .pipeline import (
     PipelineContext, Pipeline,
     FilterStage, ExploreStage, PrescanStage, PathGroupStage,
     ClassifyStage,
+    SecurityFocusFilterStage,
     RefineStage,
     AnalyseStage,
     CompletenessCheckStage, FinalReportStage,
@@ -228,6 +229,7 @@ class Orchestrator:
             PrescanStage(),
             PathGroupStage(),
             ClassifyStage(),
+            SecurityFocusFilterStage(),   # S1.5: 安全维度过滤（属 于 stage_num=1，stable-sort 保证在 Classify 之后）
             RefineStage(),
             AnalyseStage(),
             CompletenessCheckStage(),
