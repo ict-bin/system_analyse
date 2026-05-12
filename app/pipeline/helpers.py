@@ -278,12 +278,19 @@ def pre_read_module(target_dir: str, mod_dir: Path) -> str:
     truncated_files: list[str] = []
 
     parts = []
+    # 头部说明：所有路径均为 workspace 中的 target/<relpath>
+    # 工作目录中 target/ 是指向实际目标目录的符号链接
+    parts.append(
+        "\n> 文件路径格式说明：以下每个文件路径均为 `target/<相对路径>`，"
+        "如需用 read 工具读取文件内容，请直接使用此路径格式。"
+        "**严禁访问 prescan/ 目录**，它是预扫描中间产物而非模块文件清单。\n"
+    )
     for rp, fut in futs:
         try:
             _, ftype, data = fut.result(timeout=20)
         except Exception:
             ftype, data = 'unknown', {}
-        parts.append(f"### {rp}")
+        parts.append(f"### target/{rp}")
         if ftype == 'ELF':
             exports = data.get('exports', [])
             imports = data.get('imports', [])
@@ -336,9 +343,9 @@ def pre_read_module(target_dir: str, mod_dir: Path) -> str:
     if truncated_files:
         parts.append("")
         parts.append(f"⚠️ 以下 {len(truncated_files)} 个文件因总内容超限未展示，"
-                     f"可用 read 工具直接读取：")
+                     f"可用 read 工具直接读取（路径格式：`target/<相对路径>`）：")
         for tf in truncated_files:
-            parts.append(f"  - /data/target/{tf}")
+            parts.append(f"  - target/{tf}")
 
     result_str = '\n'.join(parts)
     prefix = '__HAS_TEXT__\n' if has_text_files else ''

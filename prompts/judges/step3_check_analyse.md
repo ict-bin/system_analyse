@@ -4,10 +4,16 @@
 
 评审 Worker 对一个模块的详细分析是否准确完整。
 
+# 文件访问说明
+
+- 模块文件在 `modules/<模块名>/` 下：`module_report.md`、`files.list`
+- 如需抽查实际源文件，路径格式为 `target/<files.list中的相对路径>`，例如 `target/src/foo.c`
+- **严禁使用 `prescan/` 目录判断文件完整性**：prescan 是预扫描的关键词匹配中间产物，
+  其内文件数量与模块 `files.list` 必然不同；**模块所包含的文件以 `modules/<模块名>/files.list` 为唯一标准**
 # 步骤
 
-1. 使用 `read` 读取 `module_report.md`
-2. 使用 `read` 读取 `files.list`，按绝对路径抽查几个文件验证分析准确性
+1. 使用 `read` 读取 `modules/<模块名>/module_report.md`
+2. 使用 `read` 读取 `modules/<模块名>/files.list`，按需抽查少数关键文件（路径格式：`target/<files.list中的路径>`）
 3. 检查以下维度：
 
 ## 评分维度
