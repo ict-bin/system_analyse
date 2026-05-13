@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time as _time
 from typing import Any
 
@@ -7,9 +8,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.models import AppSaModelsConfig
-from app.logging_utils import get_logger
 
-logger = get_logger("sa.runtime_control")
+logger = logging.getLogger("sa.runtime_control")
 
 RUNTIME_CONTROL_CONFIG_KEY = "runtime_control"
 _DEFAULT_RUNTIME_CONTROL = {
