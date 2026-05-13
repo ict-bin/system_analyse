@@ -160,20 +160,11 @@ class ClassifyStage(BaseStage):
                     "\n\n每个模块的 files.list 必须写的是 filtered_files.txt 里的相对路径。"
                 )
 
-            # ── 安全维度过滤约束 ──
-            sec_cats = getattr(cfg, "security_focus_categories", ["all"])
-            security_focus_section = _build_security_focus_section(sec_cats)
-            if attempt == 0 and security_focus_section:
-                ctx.emit_event(
-                    "log",
-                    level="info",
-                    msg=(
-                        "已启用安全维度分类约束："
-                        f"security_focus_categories={list(sec_cats)}, "
-                        f"module_granularity={getattr(cfg, 'module_granularity', 'fine')}"
-                    ),
-                )
-                prompt_parts.append(security_focus_section)
+            # ── 注意：S1 不进行安全维度过滤──
+            # 安全维度过滤是 S1.5 (SecurityFocusFilterStage) 的职责。
+            # S1 应对 filtered_files.txt 中的全量文件按功能分组，不限安全维度。
+            # 如果在 S1 注入 security_focus_section，Judge 会错误拒绝非安全相关的模块，
+            # 导致任务无限卡死在 S1 评审轮。
 
             # ── 模块粒度约束 ──
             granularity = getattr(cfg, "module_granularity", "fine")
@@ -223,16 +214,13 @@ class ClassifyStage(BaseStage):
             for j_idx, j_agent in enumerate(cfg.judges.agents):
                 j_model = cfg.judges.model_for("classify") or j_agent.model
                 judge_prompt = [f"审核分类结果。模块数：{len(modules)}。"]
-                if security_focus_section:
-                    judge_prompt.append(
-                        "重点检查：模块是否被错误放大到与指定安全维度无关的功能域。"
-                    )
-                    judge_prompt.append(security_focus_section)
+                # 注意：Judge 不应检查安全维度相关性，那是 S1.5 的职责。
+                # S1 Judge 只检查：所有 filtered_files.txt 中的文件是否已全部分类。
                 if granularity == "coarse":
                     judge_prompt.append(
                         "\n\n# 模块粒度要求\n\n"
                         "当前要求是粗粒度（协议/服务/功能级）。"
-                        "不要把同一协议拆成多个碎片模块，也不要把无关的广义网络管理代码混入协议模块。"
+                        "不要把同一协议拆成多个碎片模块。"
                     )
                 j_ar = await run_agent_checked(
                     context=f"s1-classify-judge{j_idx}",
