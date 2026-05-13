@@ -4,4 +4,4 @@ from fastapi import APIRouter
 
 router = APIRouter(prefix="/api/app/system-analyse")
 
-from . import tasks, prompts, config  # noqa: E402, F401
+from . import admin, tasks, prompts, config  # noqa: E402, F401

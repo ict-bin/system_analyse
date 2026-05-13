@@ -90,7 +90,7 @@ class AnalyseStage(BaseStage):
 
         ctx.analysed_modules = [
             d.name for d in ctx.modules_root().iterdir()
-            if d.is_dir() and (d / "module_report.md").exists()
+            if d.is_dir() and (d / "module_report.md").exists() and module_has_nonempty_files(d)
         ]
 
     # ── 单模块分析（W+J 多轮）────────────────────────────────────────────────
@@ -111,9 +111,31 @@ class AnalyseStage(BaseStage):
         mod_dir = get_modules_root(str(workspace)) / mod_name
         sess_name = f"analyse{session_suffix}-{mod_name}.jsonl"
         analyse_session = str(ctx.sess_dir / sess_name)
+        report_path = mod_dir / "module_report.md"
+        has_files = module_has_nonempty_files(mod_dir)
 
-        # 如果 module_report.md 已存在（如 Pod 重启后续跑），直接跳过重新分析
-        if (mod_dir / "module_report.md").exists():
+        if report_path.exists() and not has_files:
+            ctx.emit_event(
+                "log",
+                level="warn",
+                msg=f"[清理 S3 脏模块] {mod_name} 存在旧 module_report.md，但 files.list 为空，移除陈旧报告并跳过",
+            )
+            try:
+                report_path.unlink()
+            except OSError:
+                pass
+            return
+
+        if not has_files:
+            ctx.emit_event(
+                "log",
+                level="warn",
+                msg=f"[跳过 S3] {mod_name} files.list 为空，视为无效空壳模块",
+            )
+            return
+
+        # 如果 module_report.md 已存在且 files.list 非空（如 Pod 重启后续跑），直接跳过重新分析
+        if report_path.exists():
             ctx.emit_event("log", level="info",
                            msg=f"[跳过 S3] {mod_name} module_report.md 已存在，跳过本轮分析")
             now = utc_now_iso()

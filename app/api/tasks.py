@@ -40,6 +40,10 @@ class GeneratePromptRequest(BaseModel):
     input_path: str
 
 
+class TaskOriginRepairRequest(BaseModel):
+    analysis_mode: str
+
+
 class TaskResultSummaryResponse(BaseModel):
     module_count: int = 0
     high_risk_module_count: int = 0
@@ -185,6 +189,11 @@ async def list_tasks(
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task(db, task_id)
+
+
+@router.put("/tasks/{task_id}/origin")
+async def repair_task_origin(task_id: str, body: TaskOriginRepairRequest, db: Session = Depends(get_db)):
+    return get_task_service().repair_task_origin(db, task_id, body.analysis_mode)
 
 
 @router.get("/tasks/{task_id}/result", response_model=TaskResultResponse)

@@ -51,6 +51,10 @@ class AppSaTask(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    dispatcher_instance_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    dispatch_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    lease_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
 
     task_config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 

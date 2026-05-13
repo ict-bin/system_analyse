@@ -8,7 +8,9 @@ from typing import Any, Dict
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.config import build_prompt_override_config, load_prompt_defaults
 from app.db.models import AppSaModelsConfig, AppSaProjectConfig
+from app.models import normalize_max_rounds_exceeded_action
 
 logger = logging.getLogger("sa.config_service")
 
@@ -40,15 +42,16 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return result
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
+    "max_rounds_exceeded_action": "treat_as_passed",
     "analyse_targets": ["binary", "source"],
     "binary_arch": ["arm", "aarch64"],
     "security_focus_categories": ["all"],
     "module_granularity": "fine",
-    "parallel_modules": 4,
+    "parallel_modules": 20,
     "parallel_sub_workers": 4,
-    "agent_max_retries": 100,
+    "agent_max_retries": 5,
     "agent_retry_delay": 60,
-    "pi_max_retries": -1,
+    "pi_max_retries": 3,
     "pi_retry_delay": 5,
     "stages": {
         "classify":    {"min_rounds": 1, "max_rounds": 8,  "pass_mode": "all"},
@@ -78,6 +81,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         ],
         "stage_models": {},
     },
+    "prompt_overrides": {},
     "output_dir": "/data/output",
     "archive_dir": "/data/output",
     "result_dir": "/data/output",
@@ -93,12 +97,57 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
 
 
 class ConfigService:
+    @staticmethod
+    def _extract_stored_prompt_overrides(raw: Any) -> Dict[str, Dict[str, str]]:
+        result: Dict[str, Dict[str, str]] = {"workers": {}, "judges": {}}
+        if not isinstance(raw, dict):
+            return result
+        for role in ("workers", "judges"):
+            group = raw.get(role)
+            if not isinstance(group, dict):
+                continue
+            for key, value in group.items():
+                if isinstance(value, dict):
+                    content = str(value.get("content") or "").strip()
+                else:
+                    content = str(value or "").strip()
+                if content:
+                    result[role][str(key)] = content
+        return result
+
+    @staticmethod
+    def _project_prompt_override_blob(raw: Any) -> Dict[str, Dict[str, str]]:
+        incoming = ConfigService._extract_stored_prompt_overrides(raw)
+        defaults = {
+            "workers": load_prompt_defaults("workers"),
+            "judges": load_prompt_defaults("judges"),
+        }
+        cleaned: Dict[str, Dict[str, str]] = {}
+        for role in ("workers", "judges"):
+            for key, content in incoming.get(role, {}).items():
+                if content and content != defaults[role].get(key, ""):
+                    cleaned.setdefault(role, {})[key] = content
+        return cleaned
+
     def get_config(self, db: Session, project_id: str) -> dict:
         row = db.query(AppSaProjectConfig).filter_by(project_id=project_id).first()
         if row and row.config_json:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
             data = dict(_DEFAULT_CONFIG)
+        stored_prompt_overrides = (
+            row.config_json.get("prompt_overrides")
+            if row and isinstance(row.config_json, dict)
+            else None
+        )
+        data["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            data.get("max_rounds_exceeded_action")
+        )
+        data["prompt_overrides"] = build_prompt_override_config(
+            stored_prompt_overrides,
+            worker_prompt_dir=data.get("workers", {}).get("system_prompt_dir"),
+            judge_prompt_dir=data.get("judges", {}).get("system_prompt_dir"),
+        ).model_dump(mode="json")
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
@@ -109,6 +158,14 @@ class ConfigService:
         # resume_task / restart_task; they must never be persisted in project config.
         _STRIP = {"project_id", "updated_at", "start_stage", "resume_workspace"}
         blob = {k: v for k, v in config_data.items() if k not in _STRIP}
+        blob["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            blob.get("max_rounds_exceeded_action")
+        )
+        prompt_overrides_blob = self._project_prompt_override_blob(blob.get("prompt_overrides"))
+        if prompt_overrides_blob:
+            blob["prompt_overrides"] = prompt_overrides_blob
+        else:
+            blob.pop("prompt_overrides", None)
         # Strip read-only role fields so they always fall back to defaults
         for role_key in ("workers", "judges"):
             if isinstance(blob.get(role_key), dict):
@@ -125,6 +182,14 @@ class ConfigService:
         db.refresh(row)
         # Return fully-merged config (same shape as get_config)
         result = _deep_merge(_DEFAULT_CONFIG, blob)
+        result["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
+            result.get("max_rounds_exceeded_action")
+        )
+        result["prompt_overrides"] = build_prompt_override_config(
+            prompt_overrides_blob,
+            worker_prompt_dir=result.get("workers", {}).get("system_prompt_dir"),
+            judge_prompt_dir=result.get("judges", {}).get("system_prompt_dir"),
+        ).model_dump(mode="json")
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result

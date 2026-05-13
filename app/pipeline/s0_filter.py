@@ -35,7 +35,25 @@ class FilterStage(BaseStage):
 
         types_str = " ".join(cfg.analyse_targets)
         arch_str = " ".join(cfg.binary_arch)
-        ctx.emit_event("stage", stage="filter", types=types_str, arch=arch_str)
+        ctx.emit_event(
+            "stage",
+            stage="filter",
+            types=types_str,
+            arch=arch_str,
+            security_focus_categories=list(cfg.security_focus_categories),
+            module_granularity=cfg.module_granularity,
+        )
+        ctx.emit_event(
+            "log",
+            level="info",
+            msg=(
+                "安全过滤配置："
+                f"analyse_targets={cfg.analyse_targets}, "
+                f"binary_arch={cfg.binary_arch}, "
+                f"security_focus_categories={cfg.security_focus_categories}, "
+                f"module_granularity={cfg.module_granularity}"
+            ),
+        )
 
         task_tmp = ctx.task_tmp
         proc = await asyncio.create_subprocess_exec(
@@ -65,7 +83,9 @@ class FilterStage(BaseStage):
 
         ctx.emit_event("stage_result", stage="filter",
                        types=cfg.analyse_targets, file_count=ctx.filter_count,
-                       arch=arch_str)
+                       arch=arch_str,
+                       security_focus_categories=list(cfg.security_focus_categories),
+                       module_granularity=cfg.module_granularity)
 
 
 class ExploreStage(BaseStage):
@@ -78,8 +98,7 @@ class ExploreStage(BaseStage):
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        w_prompt_dir = cfg.workers.system_prompt_dir
-        explore_prompt = load_prompt(w_prompt_dir, "step1_explore")
+        explore_prompt = load_prompt(cfg, "step1_explore", "workers")
         if not explore_prompt:
             return
 
@@ -182,4 +201,3 @@ class PrescanStage(BaseStage):
 
         ctx.emit_event("stage_result", stage="prescan",
                        summary_lines=ctx.prescan_summary.count("\n"))
-

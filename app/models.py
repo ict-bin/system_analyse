@@ -12,6 +12,19 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+MAX_ROUNDS_EXCEEDED_ACTIONS = {
+    "treat_as_passed",
+    "treat_as_failed",
+}
+
+
+def normalize_max_rounds_exceeded_action(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in MAX_ROUNDS_EXCEEDED_ACTIONS:
+        return candidate
+    return "treat_as_passed"
+
+
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
 
 # Worker/Judge 可配置的阶段名（用于 stage_models 键）
@@ -20,6 +33,29 @@ from pydantic import BaseModel, Field
 
 WORKER_STAGES = ["explore", "classify", "refine", "sub_read", "analyse", "report"]
 JUDGE_STAGES  = ["classify", "refine", "analyse", "completeness", "report"]
+
+WORKER_PROMPT_KEYS = [
+    "default",
+    "step1_explore",
+    "step1_classify",
+    "reflect_classify",
+    "step2_sub_read",
+    "step2_refine",
+    "reflect_refine",
+    "step2_reclassify",
+    "step3_analyse",
+    "reflect_analyse",
+    "step4_final_report",
+    "reflect_report",
+]
+JUDGE_PROMPT_KEYS = [
+    "default",
+    "step1_check_classify",
+    "step2_check_refine",
+    "step3_check_analyse",
+    "step4_check_completeness",
+    "step4_check_report",
+]
 
 
 class AgentInstanceConfig(BaseModel):
@@ -49,6 +85,24 @@ class RoleConfig(BaseModel):
         if stage in self.stage_models:
             return self.stage_models[stage]
         return self.agents[0].model if self.agents else self.default_model
+
+
+class PromptOverrideItem(BaseModel):
+    content: str = Field(default="", description="Prompt 文本内容")
+    source: str = Field(default="default", description="default|project")
+    default_content: str = Field(default="", description="默认 Prompt 文本内容")
+
+
+class PromptOverrideConfig(BaseModel):
+    workers: dict[str, PromptOverrideItem] = Field(default_factory=dict)
+    judges: dict[str, PromptOverrideItem] = Field(default_factory=dict)
+
+    def get_prompt(self, role: str, key: str) -> str:
+        group = self.workers if role == "workers" else self.judges
+        item = group.get(key)
+        if not item:
+            return ""
+        return str(item.content or "")
 
 
 # ─── 服务配置 ─────────────────────────────────────────────────────────────────
@@ -348,6 +402,10 @@ class SelfReflectionConfig(BaseModel):
 
 
 class ServiceConfig(BaseModel):
+    max_rounds_exceeded_action: str = Field(
+        default="treat_as_passed",
+        description="达到最大轮次且评审仍未通过时的处理策略：treat_as_passed/treat_as_failed",
+    )
     analyse_targets: list[str] = Field(
         default=["all"],
         description="分析目标文件类型，可组合: binary/script/source/config/firmware/crypto/database/web/network_model/document/archive/all"
@@ -371,17 +429,18 @@ class ServiceConfig(BaseModel):
             "coarse=协议/服务/功能级（同一协议/功能的所有代码归为一个模块）"
         ),
     )
-    parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1（串行）")
-    parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1（串行）")
-    agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
+    parallel_modules: int = Field(default=20, description="Stage 2/3 并行处理的模块数，默认 20")
+    parallel_sub_workers: int = Field(default=4, description="单模块内子 Worker 并行数，默认 4")
+    agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
-    pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
+    pi_max_retries: int = Field(default=3, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
 
     stages: StagesConfig = Field(default_factory=StagesConfig)
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
+    prompt_overrides: PromptOverrideConfig = Field(default_factory=PromptOverrideConfig)
 
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
@@ -403,9 +462,10 @@ class TaskConfig(BaseModel):
     function_name: str = Field(default="", description="兼容字段：用于归档命名")
     cwd: str = Field(default="/data/target")
 
-    agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
+    max_rounds_exceeded_action: str = Field(default="treat_as_passed")
+    agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
-    pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
+    pi_max_retries: int = Field(default=3, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
     binary_arch: list[str] = Field(default=["all"], description="binary 架构过滤")
@@ -417,11 +477,12 @@ class TaskConfig(BaseModel):
         default="fine",
         description="模块划分粒度: fine=子组件级，coarse=协议/服务/功能级",
     )
-    parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1（串行）")
-    parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1（串行）")
+    parallel_modules: int = Field(default=20, description="Stage 2/3 并行处理的模块数，默认 20")
+    parallel_sub_workers: int = Field(default=4, description="单模块内子 Worker 并行数，默认 4")
     stages: StagesConfig = Field(default_factory=StagesConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
+    prompt_overrides: PromptOverrideConfig = Field(default_factory=PromptOverrideConfig)
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
@@ -441,6 +502,9 @@ class TaskConfig(BaseModel):
     @property
     def judge_count(self) -> int:
         return len(self.judges.agents)
+
+    def get_prompt(self, role: str, key: str) -> str:
+        return self.prompt_overrides.get_prompt(role, key)
 
 
 # ─── Token 统计 ───────────────────────────────────────────────────────────────
