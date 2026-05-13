@@ -61,6 +61,7 @@ class CompletenessCheckStage(BaseStage):
                 system_prompt=j_completeness_prompt,
                 tools=cfg.judges.default_tools,
                 cwd=str(workspace),
+                session_file=str(ctx.sess_dir / f"completeness-j{j_idx}.jsonl"),
                 **j_base,
             )
             ctx.tokens += j_ar.token_usage
@@ -166,6 +167,9 @@ class CompletenessCheckStage(BaseStage):
                         system_prompt=j_sys_analyse,
                         tools=cfg.judges.default_tools,
                         cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                        session_file=str(
+                            ctx.sess_dir / f"s4redo-judge-{mod_name}-j{j_idx}-a{attempt+1}.jsonl"
+                        ),
                         **j_base,
                     )
                     ctx.tokens += j_ar.token_usage
@@ -239,6 +243,7 @@ class FinalReportStage(BaseStage):
                     system_prompt=j_report_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
+                    session_file=str(ctx.sess_dir / f"report-judge-j{j_idx}-a{attempt+1}.jsonl"),
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage

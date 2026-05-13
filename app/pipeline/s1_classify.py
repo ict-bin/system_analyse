@@ -183,13 +183,10 @@ class ClassifyStage(BaseStage):
             if attempt == 0 and (workspace / "prescan" / "path_groups.md").exists():
                 prompt_parts.append(
                     "\n\n# 路径先验分组（已由工具自动生成，请优先采用）\n\n"
-                    "prescan_summary 中包含路径先验分组结果（path_groups.md）。\n"
-                    "「直接路径组」的文件归属已按目录路径推断完毕，"
-                    "**请优先直接写入对应模块的 files.list**，无需重新分析路径。\n"
-                    "「特殊路径文件」已按 lib 名前缀二次分组，"
-                    "请根据功能语义判断归入哪个模块。\n"
-                    "`__unmatched_shared__` 文件若无法判断归属，"
-                    "统一归入 `misc_shared_libs` 模块。"
+                    "上方摘要显示了各路径组的文件数量。"
+                    "完整文件列表已写入 `prescan/path_groups.md`，"
+                    "直接通过 `read prescan/path_groups.md` 读取。\n"
+                    "请根据模块名直接将对应路径组写入模块的 files.list，无需重新分析路径。"
                 )
 
             if feedback:

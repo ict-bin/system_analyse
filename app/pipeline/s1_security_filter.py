@@ -236,7 +236,7 @@ class SecurityFocusFilterStage(BaseStage):
                     system_prompt=judge_system_prompt,
                     cwd=str(workspace),
                     thinking_level="off",
-                    session_file=None,
+                    session_file=str(ctx.sess_dir / f"sec-filter-j{j_idx}-a{attempt+1}.jsonl"),
                     cancel_event=ctx.cancel_event,
                     max_retries=cfg.agent_max_retries,
                     retry_delay=cfg.agent_retry_delay,

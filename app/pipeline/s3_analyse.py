@@ -230,6 +230,7 @@ class AnalyseStage(BaseStage):
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                    session_file=str(ctx.sess_dir / f"analyse-judge-{mod_name}-j{j_idx}-a{attempt+1}.jsonl"),
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -415,6 +416,9 @@ class AnalyseStage(BaseStage):
                         system_prompt=j_sys_refine,
                         tools=cfg.judges.default_tools,
                         cwd=eval_cwd,
+                        session_file=str(
+                            ctx.sess_dir / f"s2redo-judge-{mod_name}-j{j_idx}-a{attempt+1}.jsonl"
+                        ),
                         **j_base,
                     )
                     ctx.tokens += j_ar.token_usage

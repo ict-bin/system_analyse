@@ -173,8 +173,17 @@ class PathGroupStage(BaseStage):
         out_path.write_text(md, encoding="utf-8")
 
         # 追加到 prescan_summary（ClassifyStage 会注入进 prompt）
+        # ⚠️ 只追加统计摘要，不追加完整文件列表，避免 prompt 过大（38KB → token 爆炸）
+        # path_groups.md 完整内容已写入磁盘，Worker 可通过 read 工具按需获取
+        # 这里只注入「模块名 → 文件数」的极简摘要，而非完整路径列表
+        group_summary_lines: list[str] = ["### 路径先验分组摘要（完整文件列表见 prescan/path_groups.md）\n"]
+        for group_name, files in sorted(normal_groups.items(), key=lambda x: -len(x[1])):
+            group_summary_lines.append(f"- [{group_name}] {len(files)} 个文件")
+        for group_name, files in sorted(special_groups.items(), key=lambda x: -len(x[1])):
+            group_summary_lines.append(f"- [{group_name}] {len(files)} 个文件（特殊路径组）")
+        group_summary = "\n".join(group_summary_lines)
         separator = "\n\n---\n\n" if ctx.prescan_summary else ""
-        ctx.prescan_summary = ctx.prescan_summary + separator + md
+        ctx.prescan_summary = ctx.prescan_summary + separator + group_summary
 
         ctx.emit_event(
             "stage_result",
