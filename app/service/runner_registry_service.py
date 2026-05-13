@@ -7,6 +7,7 @@ from typing import Callable
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.db.models import AppSaModelsConfig
 from app.service.service_role import is_runner_role
@@ -79,10 +80,12 @@ class RunnerRegistryService:
                 "capacity": WORKER_TASK_CONCURRENCY,
                 "running_tasks": self._get_running_tasks_count(),
                 "role": "runner",
+                "heartbeat_ts": now_local().isoformat(),
             }
             row = db.query(AppSaModelsConfig).filter_by(config_key=key).first()
             if row:
                 row.config_json = payload
+                flag_modified(row, "config_json")
             else:
                 row = AppSaModelsConfig(config_key=key, config_json=payload)
                 db.add(row)
