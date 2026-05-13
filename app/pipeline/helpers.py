@@ -61,13 +61,28 @@ def get_modules_root(workspace: str | Path) -> Path:
 
 
 def discover_modules(workspace: str | Path) -> list[str]:
-    """返回 workspace 下所有有 files.list 的目录名（叶节点模块）。"""
+    """返回 workspace 下所有 files.list 非空的目录名（叶节点模块）。"""
     root = get_modules_root(str(workspace))
     result = []
     for d in sorted(root.iterdir()):
-        if d.is_dir() and not d.name.startswith(".") and (d / "files.list").exists():
+        if d.is_dir() and not d.name.startswith(".") and module_has_nonempty_files(d):
             result.append(d.name)
     return result
+
+
+def read_module_files(mod_dir: str | Path) -> list[str]:
+    """读取模块 files.list，返回去空白后的相对路径列表。"""
+    mod_dir = Path(mod_dir)
+    try:
+        raw = (mod_dir / "files.list").read_text("utf-8").splitlines()
+    except OSError:
+        return []
+    return [line.strip() for line in raw if line.strip()]
+
+
+def module_has_nonempty_files(mod_dir: str | Path) -> bool:
+    """模块是否存在非空 files.list。"""
+    return bool(read_module_files(mod_dir))
 
 
 # ── Judge 输出解析 ─────────────────────────────────────────────────────────────

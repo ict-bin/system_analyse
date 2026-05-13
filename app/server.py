@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import time as _time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -65,6 +66,28 @@ def _is_worker_role() -> bool:
     return _service_role() in {"worker", "all"}
 
 
+def _require_api_role() -> None:
+    if not _is_api_role():
+        raise HTTPException(status_code=503, detail="当前实例为 worker-only，不提供 API 服务")
+
+
+def _db_pool_overrides(svc_yaml) -> tuple[int, int, int, int]:
+    role = _service_role()
+    default_pool = int(svc_yaml.database.pool_size)
+    default_overflow = int(svc_yaml.database.max_overflow)
+    default_timeout = int(svc_yaml.database.pool_timeout)
+    default_recycle = int(svc_yaml.database.pool_recycle)
+    pool_env = "SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_WORKER" if role == "worker" else "SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_API"
+    overflow_env = "SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_WORKER" if role == "worker" else "SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_API"
+    timeout_env = "SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_WORKER" if role == "worker" else "SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_API"
+    recycle_env = "SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_WORKER" if role == "worker" else "SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_API"
+    pool_size = int(os.environ.get(pool_env, str(default_pool)))
+    max_overflow = int(os.environ.get(overflow_env, str(default_overflow)))
+    pool_timeout = int(os.environ.get(timeout_env, str(default_timeout)))
+    pool_recycle = int(os.environ.get(recycle_env, str(default_recycle)))
+    return max(1, pool_size), max(0, max_overflow), max(1, pool_timeout), max(60, pool_recycle)
+
+
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -75,12 +98,19 @@ async def lifespan(app: FastAPI):
 
     try:
         from .db import init_db
+        pool_size, max_overflow, pool_timeout, pool_recycle = _db_pool_overrides(svc_yaml)
         init_db(
             db_url,
-            pool_size=svc_yaml.database.pool_size,
-            max_overflow=svc_yaml.database.max_overflow,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+            pool_recycle=pool_recycle,
         )
-        logger.info("DB initialized: %s:%s/%s", svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name)
+        logger.info(
+            "DB initialized: %s:%s/%s (role=%s pool_size=%s max_overflow=%s pool_timeout=%s pool_recycle=%s)",
+            svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name,
+            _service_role(), pool_size, max_overflow, pool_timeout, pool_recycle,
+        )
     except Exception as exc:
         logger.warning("DB init failed (management APIs will be unavailable): %s", exc)
 
@@ -148,6 +178,34 @@ def _get_svc_config():
     return _svc_config
 
 
+def _health_status() -> dict:
+    from .db import ping_db
+    from .service.task_service import get_worker_runtime_health
+
+    role = _service_role()
+    worker_health = get_worker_runtime_health()
+    db_ok = ping_db()
+    worker_claim_paused = bool(
+        worker_health.get("worker_pause_claim_until_ts")
+        and float(worker_health["worker_pause_claim_until_ts"]) > _time.time()
+    )
+    worker_ok = worker_health.get("worker_loop_fresh", True) and not worker_claim_paused
+    if role == "api":
+        ready = db_ok
+    elif role == "worker":
+        ready = db_ok and worker_ok
+    else:
+        ready = db_ok and worker_ok
+    return {
+        "status": "ok" if ready else "degraded",
+        "role": role,
+        "db_ok": db_ok,
+        "worker_ok": worker_ok,
+        "worker_claim_paused": worker_claim_paused,
+        **worker_health,
+    }
+
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 class AnalyseRequest(BaseModel):
@@ -159,20 +217,38 @@ class AnalyseRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/app/system-analyse/health")
 async def health():
-    from .service.task_service import _running_tasks
+    base = _health_status()
+    return {
+        **base,
+        "active": sum(1 for t in _tasks.values() if t.result is None),
+        "completed": sum(1 for t in _tasks.values() if t.result is not None),
+    }
 
+
+@app.get("/livez")
+@app.get("/api/app/system-analyse/livez")
+async def livez():
     return {
         "status": "ok",
         "role": _service_role(),
-        "active": sum(1 for t in _tasks.values() if t.result is None),
-        "completed": sum(1 for t in _tasks.values() if t.result is not None),
-        "worker_running_tasks": len(_running_tasks),
     }
+
+
+@app.get("/readyz")
+@app.get("/api/app/system-analyse/readyz")
+async def readyz():
+    from fastapi import HTTPException
+
+    payload = _health_status()
+    if payload["status"] != "ok":
+        raise HTTPException(status_code=503, detail=payload)
+    return payload
 
 
 @app.post("/analyse", status_code=202)
 async def submit_analyse(body: AnalyseRequest):
     """直接提交分析任务（CLI 兼容路由）。"""
+    _require_api_role()
     svc = _get_svc_config()
     cwd = body.cwd or TARGET_DIR
     cfg = build_task_config(svc, body.prompt, cwd=cwd)
@@ -256,6 +332,7 @@ async def _notify(entry: TaskEntry):
 
 @app.get("/task/{task_id}")
 async def get_task(task_id: str):
+    _require_api_role()
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404, "Task not found")
@@ -266,6 +343,7 @@ async def get_task(task_id: str):
 
 @app.get("/task/{task_id}/stream")
 async def stream_task(task_id: str):
+    _require_api_role()
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404, "Task not found")
@@ -297,6 +375,7 @@ async def stream_task(task_id: str):
 @app.post("/task/{task_id}/stop")
 @app.post("/task/{task_id}/abort")  # alias kept for compatibility
 async def stop_task(task_id: str):
+    _require_api_role()
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404)
@@ -308,6 +387,7 @@ async def stop_task(task_id: str):
 
 @app.get("/tasks")
 async def list_engine_tasks():
+    _require_api_role()
     return {"tasks": [
         {"task_id": tid, "prompt": e.prompt[:100],
          "status": e.result.status.value if e.result else "running"}

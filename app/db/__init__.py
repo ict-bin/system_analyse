@@ -30,6 +30,9 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN dispatch_started_at DATETIME NULL",
     "CREATE INDEX ix_sa_tasks_dispatcher_instance_id ON secflow_app_sa_tasks (dispatcher_instance_id)",
     "CREATE INDEX ix_sa_tasks_dispatch_started_at ON secflow_app_sa_tasks (dispatch_started_at)",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN lease_epoch INT NOT NULL DEFAULT 0",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN lease_expires_at DATETIME NULL",
+    "CREATE INDEX ix_sa_tasks_lease_expires_at ON secflow_app_sa_tasks (lease_expires_at)",
     # Add task_config_json column for per-task analysis scope overrides (added 2026-06)
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN task_config_json JSON NULL",
     # Fallback: create per-project config table if create_all failed (added 2026-06)
@@ -69,15 +72,23 @@ def _run_migrations(engine) -> None:
                 conn.rollback()
 
 
-def init_db(db_url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
+def init_db(
+    db_url: str,
+    pool_size: int = 5,
+    max_overflow: int = 10,
+    pool_timeout: int = 30,
+    pool_recycle: int = 3600,
+) -> None:
     """Initialize the database engine and create tables."""
     global _engine, _SessionLocal
     _engine = create_engine(
         db_url,
         pool_size=pool_size,
         max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
         pool_pre_ping=True,
-        pool_recycle=3600,
+        pool_recycle=pool_recycle,
+        pool_use_lifo=True,
     )
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
     Base.metadata.create_all(bind=_engine)
@@ -94,3 +105,15 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def ping_db() -> bool:
+    """Return True when the configured DB is reachable and can serve a trivial query."""
+    if _engine is None:
+        return False
+    try:
+        with _engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False

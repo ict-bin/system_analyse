@@ -11,39 +11,42 @@ import json
 import logging
 import os
 import re
-import time as _time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.config import build_task_config, load_service_config
+from app.config import load_service_config
 from app.db.models import AppSaTask
 from app.logging_utils import log_event
-from app.models import SwarmEvent, TaskStatus
-from app.orchestrator import Orchestrator
+from app.service.task_query_service import TaskQueryService
+from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
+from app.service.task_repository import TaskRepository
+from app.service.worker_dispatcher import (
+    WORKER_INSTANCE_ID,
+    get_worker_runtime_health as _get_dispatcher_runtime_health,
+    lease_deadline as _lease_deadline,
+    WorkerDispatcher,
+)
 from app.time_utils import isoformat_local, now_local
 
 logger = logging.getLogger("sa.task_service")
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
-WORKER_POLL_INTERVAL_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_POLL_INTERVAL", "2"))
-WORKER_TASK_CONCURRENCY = max(1, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_TASK_CONCURRENCY", "1")))
 TASK_CANCEL_POLL_INTERVAL_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_CANCEL_POLL_INTERVAL", "2"))
-TASK_LEASE_TIMEOUT_SECONDS = max(30, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_LEASE_TIMEOUT_SECONDS", "300")))
 TASK_LEASE_HEARTBEAT_SECONDS = max(5, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_LEASE_HEARTBEAT_SECONDS", "15")))
-WORKER_INSTANCE_ID = (
-    str(os.environ.get("SECFLOW_SYSTEM_ANALYSE_INSTANCE_ID") or "").strip()
-    or str(os.environ.get("POD_NAME") or "").strip()
-    or f"sa-worker-{uuid.uuid4().hex[:8]}"
+TASK_STAGE_FLUSH_BATCH_SIZE = max(5, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_STAGE_FLUSH_BATCH_SIZE", "20")))
+TASK_STAGE_FLUSH_MIN_INTERVAL_SECONDS = max(
+    1.0,
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_STAGE_FLUSH_MIN_INTERVAL", "10")),
 )
 
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
+_running_task_epochs: dict[str, int] = {}
 
 ANALYSIS_MODE_BINARY = "binary"
 ANALYSIS_MODE_SOURCE = "source"
@@ -70,6 +73,25 @@ _RISK_LEVEL_RE = re.compile(r"<!--\s*RISK_LEVEL:\s*([^\-][^>]*)-->")
 _RISK_SCORE_RE = re.compile(r"<!--\s*RISK_SCORE:\s*(\d+)\s*-->")
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,2})\s+(.+)$", re.MULTILINE)
 _SESSION_THINKING_LEVEL_MAP = {"off": "off", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "x-high": "xhigh"}
+
+def get_worker_runtime_health() -> dict:
+    return _get_dispatcher_runtime_health(len(_running_tasks))
+
+
+def _task_execution_lock_path(output_path: str | None, task_id: str) -> Path | None:
+    if not output_path:
+        return None
+    return Path(output_path) / task_id / "run" / "task.execution.lock"
+
+
+def _clear_task_execution_lock(output_path: str | None, task_id: str) -> None:
+    lock_path = _task_execution_lock_path(output_path, task_id)
+    if not lock_path:
+        return
+    try:
+        lock_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _security_filter_log_payload(config: dict | None, *, resolved: bool = False) -> dict:
@@ -496,8 +518,52 @@ def _write_models_json_from_db(db: Session) -> None:
 
 class TaskService:
     def __init__(self) -> None:
-        self._worker_loop_task: asyncio.Task | None = None
-        self._worker_running = False
+        from app.db import get_db
+
+        self._task_repository = TaskRepository()
+        self._runner = TaskRunner(
+            deps=TaskRunnerDependencies(
+                get_db=get_db,
+                acquire_execution_lock=self._acquire_execution_lock,
+                clear_task_execution_lock=_clear_task_execution_lock,
+                flush_stages=_flush_stages,
+                load_svc_config_from_db=_load_svc_config_from_db,
+                infer_analysis_mode=_infer_analysis_mode,
+                security_filter_log_payload_resolved=lambda payload: _security_filter_log_payload(payload, resolved=True),
+                write_models_json_from_db=_write_models_json_from_db,
+                write_task_result_json=_write_task_result_json,
+                lightweight_result_json=_lightweight_result_json,
+                remove_running_task=self._remove_running_task,
+                task_repository=self._task_repository,
+            ),
+            settings=TaskRunnerSettings(
+                source_mode_default_analyse_targets=list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS),
+                task_stage_flush_batch_size=TASK_STAGE_FLUSH_BATCH_SIZE,
+                task_stage_flush_min_interval_seconds=TASK_STAGE_FLUSH_MIN_INTERVAL_SECONDS,
+                task_cancel_poll_interval_seconds=TASK_CANCEL_POLL_INTERVAL_SECONDS,
+                task_lease_heartbeat_seconds=TASK_LEASE_HEARTBEAT_SECONDS,
+            ),
+        )
+        self._dispatcher = WorkerDispatcher(
+            get_db=get_db,
+            clear_task_execution_lock=_clear_task_execution_lock,
+            claim_task_lease=self._claim_task_lease,
+            spawn_task=self._run_task_locally,
+            get_running_tasks_count=lambda: len(_running_tasks),
+            task_repository=self._task_repository,
+        )
+        self._query = TaskQueryService(
+            get_or_404=self._get_or_404,
+            read_text_if_exists=_read_text_if_exists,
+            infer_risk_level=_infer_risk_level,
+            infer_risk_score=_infer_risk_score,
+            parse_report_sections=_parse_report_sections,
+            parse_summary=_parse_summary,
+            task_sessions_root=_task_sessions_root,
+            task_run_root=_task_run_root,
+            resolve_session_path=_resolve_session_path,
+            parse_session_jsonl_file=_parse_session_jsonl_file,
+        )
 
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
@@ -562,219 +628,16 @@ class TaskService:
         return self._row_to_dict(row)
 
     def get_task_result(self, db: Session, task_id: str) -> dict:
-        row = self._get_or_404(db, task_id)
-        output_root = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
-        final_report_path = output_root / "final_report.md" if output_root else None
-        modules_list_path = output_root / "modules.list" if output_root else None
-        modules_root = output_root / "modules" if output_root else None
-        warnings: list[str] = []
-
-        final_report_markdown: str | None = None
-        if final_report_path:
-            final_report_markdown, err = _read_text_if_exists(final_report_path)
-            if err:
-                warnings.append(err)
-
-        modules_order: list[str] = []
-        if modules_list_path:
-            modules_list_markdown, err = _read_text_if_exists(modules_list_path)
-            if err:
-                warnings.append(err)
-            elif modules_list_markdown:
-                modules_order = [line.strip() for line in modules_list_markdown.splitlines() if line.strip()]
-
-        available = bool(final_report_markdown or (modules_root and modules_root.exists()))
-        if row.status not in ("passed", "failed", "error", "cancelled"):
-            available = False
-
-        modules: list[dict] = []
-        total_files_counted = 0
-        high_risk_modules_counted = 0
-        if modules_root and modules_root.exists():
-            discovered = {
-                path.name
-                for path in modules_root.iterdir()
-                if path.is_dir() and not path.name.startswith(".")
-            }
-            ordered_names = modules_order + sorted(discovered - set(modules_order))
-            for rank, module_name in enumerate(ordered_names, start=1):
-                module_dir = modules_root / module_name
-                if not module_dir.exists() or not module_dir.is_dir():
-                    warnings.append(f"模块目录不存在: {module_name}")
-                    continue
-                files_list_path = module_dir / "files.list"
-                module_report_path = module_dir / "module_report.md"
-                if not module_report_path.exists():
-                    fallback_report_path = module_dir / "modules_report.md"
-                    if fallback_report_path.exists():
-                        module_report_path = fallback_report_path
-
-                files_list_content, files_err = _read_text_if_exists(files_list_path)
-                if files_err:
-                    warnings.append(f"{module_name}: {files_err}")
-                module_report_markdown, report_err = _read_text_if_exists(module_report_path)
-                if report_err:
-                    warnings.append(f"{module_name}: {report_err}")
-
-                files = [line.strip() for line in (files_list_content or "").splitlines() if line.strip()]
-                file_count = len(files)
-                total_files_counted += file_count
-                risk_level = _infer_risk_level(module_report_markdown)
-                risk_score = _infer_risk_score(module_report_markdown)
-                if risk_level == "高":
-                    high_risk_modules_counted += 1
-                report_lines = [line for line in (module_report_markdown or "").splitlines() if line.strip()]
-                modules.append({
-                    "module_name": module_name,
-                    "rank": rank,
-                    "module_dir_path": str(module_dir),
-                    "files_list_path": str(files_list_path),
-                    "module_report_path": str(module_report_path),
-                    "module_report_markdown": module_report_markdown,
-                    "files": files,
-                    "file_count": file_count,
-                    "risk_level": risk_level,
-                    "risk_score": risk_score,
-                    "report_sections": _parse_report_sections(module_report_markdown),
-                    "report_preview": "\n".join(report_lines[:12]) if report_lines else None,
-                })
-
-        summary = _parse_summary(final_report_markdown)
-        if summary["module_count"] == 0 and modules:
-            summary["module_count"] = len(modules)
-        if summary["high_risk_module_count"] == 0 and high_risk_modules_counted:
-            summary["high_risk_module_count"] = high_risk_modules_counted
-        if summary["total_file_count"] == 0 and total_files_counted:
-            summary["total_file_count"] = total_files_counted
-
-        return {
-            "task_id": row.task_id,
-            "available": available,
-            "status": row.status,
-            "output_root": str(output_root) if output_root else None,
-            "final_report_path": str(final_report_path) if final_report_path else None,
-            "modules_list_path": str(modules_list_path) if modules_list_path else None,
-            "final_report_markdown": final_report_markdown,
-            "modules": modules,
-            "summary": summary,
-            "warnings": warnings,
-        }
+        return self._query.get_task_result(db, task_id)
 
     def list_task_sessions(self, db: Session, task_id: str) -> list[dict]:
-        row = self._get_or_404(db, task_id)
-        sessions_root = _task_sessions_root(row)
-        if not sessions_root or not sessions_root.is_dir():
-            return []
-        now_ts = _time.time()
-        items: list[dict] = []
-        for session_file in sorted(sessions_root.rglob("*.jsonl")):
-            try:
-                relative_path = str(session_file.relative_to(sessions_root)).replace("\\", "/")
-                relative_parts = relative_path.split("/")
-                stage_group = relative_parts[0] if len(relative_parts) > 1 else "root"
-                session_name = session_file.stem
-                _, events, warnings, line_count = _parse_session_jsonl_file(session_file)
-                stat = session_file.stat()
-                is_active = row.status in ("pending", "running") and (now_ts - stat.st_mtime) <= 120
-                display_name = session_name if stage_group == "root" else f"{stage_group} / {session_name}"
-                items.append({
-                    "session_id": session_name,
-                    "session_name": session_name,
-                    "relative_path": relative_path,
-                    "stage_group": stage_group,
-                    "role_name": session_name,
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "event_count": len(events),
-                    "line_count": line_count,
-                    "is_active": is_active,
-                    "display_name": display_name,
-                    "warnings": warnings,
-                })
-            except Exception as exc:
-                logger.warning("list_task_sessions failed to inspect %s: %s", session_file, exc)
-        return sorted(items, key=lambda item: (item["stage_group"], -item["mtime"], item["relative_path"]))
+        return self._query.list_task_sessions(db, task_id)
 
     def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
-        row = self._get_or_404(db, task_id)
-        sessions_root = _task_sessions_root(row)
-        if not sessions_root or not sessions_root.is_dir():
-            from fastapi import HTTPException
-            raise HTTPException(404, "会话目录不存在")
-        try:
-            target = _resolve_session_path(sessions_root, relative_path)
-        except ValueError as exc:
-            from fastapi import HTTPException
-            raise HTTPException(400, str(exc))
-        if not target.is_file():
-            from fastapi import HTTPException
-            raise HTTPException(404, f"会话文件不存在: {relative_path}")
-        session_meta, events, warnings, line_count = _parse_session_jsonl_file(target)
-        return {
-            "path": str(target.relative_to(sessions_root)).replace("\\", "/"),
-            "session_meta": session_meta,
-            "events": events,
-            "warnings": warnings,
-            "line_count": line_count,
-        }
+        return self._query.get_task_session_file(db, task_id, relative_path)
 
     def get_task_evaluation(self, db: Session, task_id: str) -> dict:
-        row = self._get_or_404(db, task_id)
-        run_root = _task_run_root(row)
-        warnings: list[str] = []
-        if not run_root or not run_root.is_dir():
-            return {
-                "task_id": row.task_id,
-                "status": row.status,
-                "available": False,
-                "summary": None,
-                "rounds": [],
-                "warnings": warnings,
-            }
-
-        summary: dict | None = None
-        summary_path = run_root / "evaluation_summary.json"
-        if summary_path.exists():
-            try:
-                loaded = json.loads(summary_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    summary = loaded
-                else:
-                    warnings.append("evaluation_summary.json 格式不是对象")
-            except Exception as exc:
-                warnings.append(f"evaluation_summary.json 读取失败: {exc}")
-
-        rounds: list[dict] = []
-        for round_dir in sorted(run_root.glob("round_*")):
-            if not round_dir.is_dir():
-                continue
-            for path in sorted(round_dir.glob("*.json")):
-                if path.name.endswith(".tmp"):
-                    continue
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                except Exception as exc:
-                    warnings.append(f"{path.relative_to(run_root)} 读取失败: {exc}")
-                    continue
-                if not isinstance(payload, dict):
-                    warnings.append(f"{path.relative_to(run_root)} 格式不是对象")
-                    continue
-                payload.setdefault("source_path", str(path))
-                rounds.append(payload)
-
-        rounds.sort(key=lambda item: (
-            int(item.get("round") or 0),
-            str(item.get("module_name") or ""),
-            str(item.get("stage") or ""),
-        ))
-        return {
-            "task_id": row.task_id,
-            "status": row.status,
-            "available": bool(summary or rounds),
-            "summary": summary,
-            "rounds": rounds,
-            "warnings": warnings,
-        }
+        return self._query.get_task_evaluation(db, task_id)
 
     def create_task(self, db: Session, *, project_id: str, task_name: str,
                     input_path: str, output_path: Optional[str] = None,
@@ -811,6 +674,7 @@ class TaskService:
             parent_stage_name=parent_stage_name,
             parent_stage_item_id=parent_stage_item_id,
             parent_stage_item_key=parent_stage_item_key,
+            lease_epoch=0,
         )
         db.add(row); db.commit(); db.refresh(row)
         log_event(logger, logging.INFO, "task created",
@@ -824,19 +688,7 @@ class TaskService:
         if row.status in ("pending", "running"):
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
-        # Reset in-place — strip any resume overrides from previous resume_task call
-        from sqlalchemy.orm.attributes import flag_modified
-        clean_config = {k: v for k, v in (row.task_config_json or {}).items()
-                        if k not in ("start_stage", "resume_workspace", "resolved_config_snapshot")} or None
-        row.task_config_json = clean_config
-        row.status = "pending"
-        row.started_at = None
-        row.finished_at = None
-        row.stages_json = None
-        row.result_json = None
-        row.error = None
-        flag_modified(row, "task_config_json")
-        db.commit(); db.refresh(row)
+        row = self._task_repository.restart_task_in_place(db, row)
         # Clean up previous run directory so fresh execution starts from scratch
         if row.output_path:
             import shutil as _shutil
@@ -846,6 +698,7 @@ class TaskService:
                     _shutil.rmtree(task_root)
                 except Exception as _e:
                     logger.warning("Failed to clean task dir %s: %s", task_root, _e)
+        _clear_task_execution_lock(row.output_path, task_id)
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
@@ -856,21 +709,11 @@ class TaskService:
         if row.status in ("pending", "running"):
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
-        from sqlalchemy.orm.attributes import flag_modified
         svc = _load_svc_config_from_db(db, row.project_id)
         effective_output = row.output_path or svc.output_dir
         resume_workspace = os.path.join(effective_output, task_id, "run", "workspace")
-        tcfg = {k: v for k, v in (row.task_config_json or {}).items() if k != "resolved_config_snapshot"}
-        tcfg["start_stage"] = 3
-        tcfg["resume_workspace"] = resume_workspace
-        row.task_config_json = tcfg
-        row.status = "pending"
-        # 保留 started_at 和 stages_json，使续跑后仍能看到前序阶段的时间与事件
-        row.finished_at = None
-        row.result_json = None
-        row.error = None
-        flag_modified(row, "task_config_json")
-        db.commit(); db.refresh(row)
+        row = self._task_repository.resume_task_in_place(db, row, resume_workspace=resume_workspace)
+        _clear_task_execution_lock(row.output_path, task_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id, resume_workspace=resume_workspace)
         return self._row_to_dict(row)
@@ -882,101 +725,58 @@ class TaskService:
         at = _running_tasks.get(task_id)
         if at and not at.done():
             at.cancel()
-        row.status = "cancelled"
-        row.finished_at = now_local()
-        db.commit(); db.refresh(row)
+        row = self._task_repository.cancel_task_in_place(db, row)
+        _clear_task_execution_lock(row.output_path, task_id)
         return self._row_to_dict(row)
 
-    async def start_worker_loop(self) -> None:
-        if self._worker_loop_task and not self._worker_loop_task.done():
-            return
-        self._worker_running = True
-        self._worker_loop_task = asyncio.create_task(self._worker_loop(), name="sa_worker_loop")
-        logger.info(
-            "system analyse worker loop started (poll_interval=%ss, task_concurrency=%s)",
-            WORKER_POLL_INTERVAL_SECONDS,
-            WORKER_TASK_CONCURRENCY,
+    @staticmethod
+    def _claim_task_lease(db: Session, row: AppSaTask) -> int | None:
+        return TaskRepository.claim_task_lease(
+            db,
+            row,
+            worker_instance_id=WORKER_INSTANCE_ID,
+            lease_deadline=_lease_deadline,
         )
 
+    async def start_worker_loop(self) -> None:
+        await self._dispatcher.start()
+
     async def stop_worker_loop(self) -> None:
-        self._worker_running = False
-        task = self._worker_loop_task
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        self._worker_loop_task = None
+        await self._dispatcher.stop()
 
-    async def _worker_loop(self) -> None:
-        from app.db import get_db
-
-        while self._worker_running:
-            try:
-                available_slots = max(0, WORKER_TASK_CONCURRENCY - len(_running_tasks))
-                if available_slots > 0:
-                    db_gen = get_db()
-                    db: Session = next(db_gen)
-                    try:
-                        stale_rows = db.query(AppSaTask).filter(
-                            AppSaTask.is_deleted.is_(False),
-                            AppSaTask.status == "running",
-                            AppSaTask.dispatch_started_at.is_not(None),
-                            AppSaTask.dispatch_started_at < now_local() - timedelta(seconds=TASK_LEASE_TIMEOUT_SECONDS),
-                        ).all()
-                        for stale in stale_rows:
-                            stale.status = "pending"
-                            stale.error = "任务租约过期，已重新排队"
-                            stale.dispatcher_instance_id = None
-                            stale.dispatch_started_at = None
-                            stale.finished_at = None
-                        if stale_rows:
-                            db.commit()
-                        pending_rows = db.query(AppSaTask).filter(
-                            AppSaTask.is_deleted.is_(False),
-                            AppSaTask.status == "pending",
-                        ).order_by(AppSaTask.created_at.asc()).limit(available_slots).all()
-                        for row in pending_rows:
-                            if len(_running_tasks) >= WORKER_TASK_CONCURRENCY:
-                                break
-                            claimed = db.query(AppSaTask).filter(
-                                AppSaTask.task_id == row.task_id,
-                                AppSaTask.is_deleted.is_(False),
-                                AppSaTask.status == "pending",
-                            ).update(
-                                {
-                                    "status": "running",
-                                    "started_at": row.started_at or now_local(),
-                                    "finished_at": None,
-                                    "error": None,
-                                    "dispatcher_instance_id": WORKER_INSTANCE_ID,
-                                    "dispatch_started_at": now_local(),
-                                },
-                                synchronize_session=False,
-                            )
-                            if not claimed:
-                                db.rollback()
-                                continue
-                            db.commit()
-                            self._run_task_locally(row.task_id)
-                    finally:
-                        try:
-                            next(db_gen)
-                        except StopIteration:
-                            pass
-                await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.exception("system analyse worker loop failed: %s", exc)
-                await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
-
-    def _run_task_locally(self, task_id: str) -> None:
+    def _run_task_locally(self, task_id: str, lease_epoch: int) -> None:
         if task_id in _running_tasks and not _running_tasks[task_id].done():
             return
-        asyncio_task = asyncio.create_task(self._execute_task(task_id), name=f"sa_task_{task_id}")
+        asyncio_task = asyncio.create_task(self._runner.execute_task(task_id, lease_epoch), name=f"sa_task_{task_id}")
         _running_tasks[task_id] = asyncio_task
+        _running_task_epochs[task_id] = lease_epoch
+
+    @staticmethod
+    def _remove_running_task(task_id: str) -> None:
+        _running_tasks.pop(task_id, None)
+        _running_task_epochs.pop(task_id, None)
+
+    @staticmethod
+    def _acquire_execution_lock(output_path: str | None, task_id: str, lease_epoch: int) -> Path | None:
+        lock_path = _task_execution_lock_path(output_path, task_id)
+        if not lock_path:
+            return None
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "task_id": task_id,
+            "worker_instance_id": WORKER_INSTANCE_ID,
+            "lease_epoch": lease_epoch,
+            "acquired_at": isoformat_local(now_local()),
+        }
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            raise RuntimeError(f"task execution lock already exists: {lock_path}")
+        try:
+            os.write(fd, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        finally:
+            os.close(fd)
+        return lock_path
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
         """软删除任务记录，并可选删除输出目录下的任务文件。运行中任务不允许删除。"""
@@ -996,227 +796,10 @@ class TaskService:
                 except Exception as _e:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
         # 软删除
-        row.is_deleted = True
-        db.commit()
-
-    async def _execute_task(self, task_id: str) -> None:
-        from app.db import get_db
-        event_buffer: list[dict] = []
-
-        def on_event(event: SwarmEvent) -> None:
-            event_buffer.append({"ts": _time.time(), "type": event.type,
-                                  "data": dict(event.data)})
-            n = len(event_buffer)
-            if n == 1 or n % 3 == 0:
-                _flush_stages(task_id, event_buffer)
-
-        try:
-            db_gen = get_db()
-            db: Session = next(db_gen)
-            try:
-                row = db.query(AppSaTask).filter_by(task_id=task_id).first()
-                if not row or row.status == "cancelled":
-                    return
-                if row.dispatcher_instance_id and row.dispatcher_instance_id != WORKER_INSTANCE_ID:
-                    logger.warning(
-                        "skip task %s because it is leased by another worker: %s",
-                        task_id,
-                        row.dispatcher_instance_id,
-                    )
-                    return
-                svc = _load_svc_config_from_db(db, row.project_id)
-                tcfg = dict(row.task_config_json or {})
-                if tcfg.get("analyse_targets"):
-                    svc.analyse_targets = tcfg["analyse_targets"]
-                elif _infer_analysis_mode(row) == ANALYSIS_MODE_SOURCE:
-                    svc.analyse_targets = list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS)
-                if tcfg.get("binary_arch"):
-                    svc.binary_arch = tcfg["binary_arch"]
-                if tcfg.get("security_focus_categories"):
-                    svc.security_focus_categories = tcfg["security_focus_categories"]
-                if tcfg.get("module_granularity"):
-                    svc.module_granularity = tcfg["module_granularity"]
-                svc.start_stage = tcfg["start_stage"] if tcfg.get("start_stage") else 0
-                svc.resume_workspace = tcfg.get("resume_workspace") or ""
-                if row.output_path:
-                    svc.output_dir = row.output_path
-                    svc.archive_dir = row.output_path
-                    svc.result_dir = row.output_path
-                task_snapshot = SimpleNamespace(
-                    task_id=row.task_id,
-                    project_id=row.project_id,
-                    prompt_content=row.prompt_content,
-                    input_path=row.input_path,
-                    output_path=row.output_path,
-                    analysis_mode=row.analysis_mode,
-                    task_origin_type=row.task_origin_type,
-                    task_config_json=tcfg,
-                    result_json=row.result_json,
-                    stages_json=row.stages_json,
-                )
-            finally:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
-            cfg = build_task_config(svc, task_snapshot.prompt_content, cwd=task_snapshot.input_path)
-            resolved_snapshot = cfg.model_dump(mode="json")
-            log_event(
-                logger,
-                logging.INFO,
-                "security filter resolved",
-                event="security_filter_resolved",
-                task_id=task_id,
-                project_id=task_snapshot.project_id,
-                analysis_mode=task_snapshot.analysis_mode,
-                task_origin_type=task_snapshot.task_origin_type,
-                **_security_filter_log_payload(resolved_snapshot, resolved=True),
-            )
-            db_gen = get_db()
-            db = next(db_gen)
-            try:
-                row = db.query(AppSaTask).filter_by(task_id=task_id).first()
-                if not row or row.status == "cancelled":
-                    return
-                row.task_config_json = {
-                    **tcfg,
-                    "resolved_config_snapshot": resolved_snapshot,
-                }
-                row.status = "running"
-                if row.started_at is None:
-                    row.started_at = now_local()
-                row.dispatcher_instance_id = WORKER_INSTANCE_ID
-                row.dispatch_started_at = now_local()
-                db.commit()
-                _write_models_json_from_db(db)
-            finally:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
-            orch = Orchestrator(config=cfg, on_event=on_event)
-            cancel_monitor = asyncio.create_task(self._monitor_task_cancellation(task_id, orch), name=f"sa_cancel_{task_id}")
-            lease_heartbeat = asyncio.create_task(self._heartbeat_task_lease(task_id), name=f"sa_lease_{task_id}")
-            try:
-                result = await orch.execute(task_id)
-            finally:
-                cancel_monitor.cancel()
-                lease_heartbeat.cancel()
-                try:
-                    await cancel_monitor
-                except asyncio.CancelledError:
-                    pass
-                try:
-                    await lease_heartbeat
-                except asyncio.CancelledError:
-                    pass
-            _flush_stages(task_id, event_buffer)
-            db_gen = get_db()
-            db = next(db_gen)
-            try:
-                row = db.query(AppSaTask).filter_by(task_id=task_id).first()
-                if not row or row.status == "cancelled":
-                    return
-                row.status = result.status.value if result else "error"
-                row.finished_at = now_local()
-                row.dispatcher_instance_id = None
-                row.dispatch_started_at = None
-                _prev = row.stages_json
-                _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
-                row.stages_json = {"events": _prev_events + event_buffer, "final": True}
-                if result:
-                    result_payload = result.model_dump(mode="json")
-                    result_file = _write_task_result_json(task_snapshot, result_payload)
-                    row.result_json = _lightweight_result_json(task_snapshot, result_payload, result_file)
-                    if result.error:
-                        row.error = result.error
-                db.commit()
-            finally:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            log_event(logger, logging.ERROR, "task execution failed",
-                      event="task_error", task_id=task_id, error=str(exc))
-            try:
-                db_gen = get_db()
-                db = next(db_gen)
-                try:
-                    db.rollback()
-                    r = db.query(AppSaTask).filter_by(task_id=task_id).first()
-                    if r and r.status == "running":
-                        r.status = "error"
-                        r.error = str(exc)
-                        r.finished_at = now_local()
-                        r.dispatcher_instance_id = None
-                        r.dispatch_started_at = None
-                        _prev2 = r.stages_json
-                        _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
-                        r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
-                        db.commit()
-                finally:
-                    try:
-                        next(db_gen)
-                    except StopIteration:
-                        pass
-            except Exception:
-                pass
-        finally:
-            _running_tasks.pop(task_id, None)
-
-    async def _monitor_task_cancellation(self, task_id: str, orch: Orchestrator) -> None:
-        from app.db import get_db
-
-        while True:
-            await asyncio.sleep(TASK_CANCEL_POLL_INTERVAL_SECONDS)
-            db_gen = get_db()
-            db: Session = next(db_gen)
-            try:
-                row = db.query(AppSaTask).filter(
-                    AppSaTask.task_id == task_id,
-                    AppSaTask.is_deleted.is_(False),
-                ).first()
-                if not row or row.status == "cancelled":
-                    orch.stop()
-                    return
-            finally:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
-
-    async def _heartbeat_task_lease(self, task_id: str) -> None:
-        from app.db import get_db
-
-        while True:
-            await asyncio.sleep(TASK_LEASE_HEARTBEAT_SECONDS)
-            db_gen = get_db()
-            db = next(db_gen)
-            try:
-                db.query(AppSaTask).filter(
-                    AppSaTask.task_id == task_id,
-                    AppSaTask.is_deleted.is_(False),
-                    AppSaTask.status == "running",
-                    AppSaTask.dispatcher_instance_id == WORKER_INSTANCE_ID,
-                ).update(
-                    {"dispatch_started_at": now_local()},
-                    synchronize_session=False,
-                )
-                db.commit()
-            finally:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
+        self._task_repository.soft_delete_task(db, row)
 
     def _get_or_404(self, db: Session, task_id: str) -> AppSaTask:
-        row = db.query(AppSaTask).filter(
-            AppSaTask.task_id == task_id,
-            AppSaTask.is_deleted.is_(False),
-        ).first()
+        row = self._task_repository.get_task_not_deleted(db, task_id)
         if not row:
             from fastapi import HTTPException
             raise HTTPException(404, f"任务不存在: {task_id}")

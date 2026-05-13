@@ -318,11 +318,11 @@ class ServiceConfig(BaseModel):
             "coarse=协议/服务/功能级（同一协议/功能的所有代码归为一个模块）"
         ),
     )
-    parallel_modules: int = Field(default=40, description="Stage 2/3 并行处理的模块数，默认 40")
-    parallel_sub_workers: int = Field(default=40, description="单模块内子 Worker 并行数，默认 40")
-    agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
+    parallel_modules: int = Field(default=20, description="Stage 2/3 并行处理的模块数，默认 20")
+    parallel_sub_workers: int = Field(default=4, description="单模块内子 Worker 并行数，默认 4")
+    agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
-    pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
+    pi_max_retries: int = Field(default=3, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
 
     stages: StagesConfig = Field(default_factory=StagesConfig)
@@ -348,9 +348,9 @@ class TaskConfig(BaseModel):
     cwd: str = Field(default="/data/target")
 
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")
-    agent_max_retries: int = Field(default=100, description="API 错误最大重试次数，-1=无限")
+    agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
-    pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
+    pi_max_retries: int = Field(default=3, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
     binary_arch: list[str] = Field(default=["all"], description="binary 架构过滤")
@@ -362,8 +362,8 @@ class TaskConfig(BaseModel):
         default="fine",
         description="模块划分粒度: fine=子组件级，coarse=协议/服务/功能级",
     )
-    parallel_modules: int = Field(default=40, description="Stage 2/3 并行处理的模块数，默认 40")
-    parallel_sub_workers: int = Field(default=40, description="单模块内子 Worker 并行数，默认 40")
+    parallel_modules: int = Field(default=20, description="Stage 2/3 并行处理的模块数，默认 20")
+    parallel_sub_workers: int = Field(default=4, description="单模块内子 Worker 并行数，默认 4")
     stages: StagesConfig = Field(default_factory=StagesConfig)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)

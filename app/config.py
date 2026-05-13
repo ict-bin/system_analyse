@@ -52,6 +52,8 @@ class DbConfig:
     table_prefix: str = "secflow_"
     pool_size: int = 5
     max_overflow: int = 10
+    pool_timeout: int = 30
+    pool_recycle: int = 3600
 
     @property
     def url(self) -> str:
@@ -166,6 +168,8 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> ServiceYaml:
         table_prefix=db_raw.get("table_prefix", "secflow_"),
         pool_size=int(db_raw.get("pool_size", 5)),
         max_overflow=int(db_raw.get("max_overflow", 10)),
+        pool_timeout=int(db_raw.get("pool_timeout", 30)),
+        pool_recycle=int(db_raw.get("pool_recycle", 3600)),
     )
 
     auth_raw = raw.get("auth_service", {})

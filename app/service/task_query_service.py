@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import json
+import time as _time
+from pathlib import Path
+from typing import Callable
+
+from sqlalchemy.orm import Session
+
+from app.db.models import AppSaTask
+
+
+class TaskQueryService:
+    def __init__(
+        self,
+        *,
+        get_or_404: Callable[[Session, str], AppSaTask],
+        read_text_if_exists: Callable[[Path], tuple[str | None, str | None]],
+        infer_risk_level: Callable[[str | None], str | None],
+        infer_risk_score: Callable[[str | None], int | None],
+        parse_report_sections: Callable[[str | None], list[dict]],
+        parse_summary: Callable[[str | None], dict],
+        task_sessions_root: Callable[[AppSaTask], Path | None],
+        task_run_root: Callable[[AppSaTask], Path | None],
+        resolve_session_path: Callable[[Path, str], Path],
+        parse_session_jsonl_file: Callable[[Path], tuple[dict, list[dict], list[str], int]],
+    ) -> None:
+        self._get_or_404 = get_or_404
+        self._read_text_if_exists = read_text_if_exists
+        self._infer_risk_level = infer_risk_level
+        self._infer_risk_score = infer_risk_score
+        self._parse_report_sections = parse_report_sections
+        self._parse_summary = parse_summary
+        self._task_sessions_root = task_sessions_root
+        self._task_run_root = task_run_root
+        self._resolve_session_path = resolve_session_path
+        self._parse_session_jsonl_file = parse_session_jsonl_file
+
+    def get_task_result(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        output_root = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
+        final_report_path = output_root / "final_report.md" if output_root else None
+        modules_list_path = output_root / "modules.list" if output_root else None
+        modules_root = output_root / "modules" if output_root else None
+        warnings: list[str] = []
+
+        final_report_markdown: str | None = None
+        if final_report_path:
+            final_report_markdown, err = self._read_text_if_exists(final_report_path)
+            if err:
+                warnings.append(err)
+
+        modules_order: list[str] = []
+        if modules_list_path:
+            modules_list_markdown, err = self._read_text_if_exists(modules_list_path)
+            if err:
+                warnings.append(err)
+            elif modules_list_markdown:
+                modules_order = [line.strip() for line in modules_list_markdown.splitlines() if line.strip()]
+
+        available = bool(final_report_markdown or (modules_root and modules_root.exists()))
+        if row.status not in ("passed", "failed", "error", "cancelled"):
+            available = False
+
+        modules: list[dict] = []
+        total_files_counted = 0
+        high_risk_modules_counted = 0
+        if modules_root and modules_root.exists():
+            discovered = {
+                path.name
+                for path in modules_root.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            }
+            ordered_names = modules_order + sorted(discovered - set(modules_order))
+            for rank, module_name in enumerate(ordered_names, start=1):
+                module_dir = modules_root / module_name
+                if not module_dir.exists() or not module_dir.is_dir():
+                    warnings.append(f"模块目录不存在: {module_name}")
+                    continue
+                files_list_path = module_dir / "files.list"
+                module_report_path = module_dir / "module_report.md"
+                if not module_report_path.exists():
+                    fallback_report_path = module_dir / "modules_report.md"
+                    if fallback_report_path.exists():
+                        module_report_path = fallback_report_path
+
+                files_list_content, files_err = self._read_text_if_exists(files_list_path)
+                if files_err:
+                    warnings.append(f"{module_name}: {files_err}")
+                module_report_markdown, report_err = self._read_text_if_exists(module_report_path)
+                if report_err:
+                    warnings.append(f"{module_name}: {report_err}")
+
+                files = [line.strip() for line in (files_list_content or "").splitlines() if line.strip()]
+                file_count = len(files)
+                if file_count == 0:
+                    warnings.append(f"{module_name}: files.list 为空，跳过该无效模块")
+                    continue
+                total_files_counted += file_count
+                risk_level = self._infer_risk_level(module_report_markdown)
+                risk_score = self._infer_risk_score(module_report_markdown)
+                if risk_level == "高":
+                    high_risk_modules_counted += 1
+                report_lines = [line for line in (module_report_markdown or "").splitlines() if line.strip()]
+                modules.append({
+                    "module_name": module_name,
+                    "rank": rank,
+                    "module_dir_path": str(module_dir),
+                    "files_list_path": str(files_list_path),
+                    "module_report_path": str(module_report_path),
+                    "module_report_markdown": module_report_markdown,
+                    "files": files,
+                    "file_count": file_count,
+                    "risk_level": risk_level,
+                    "risk_score": risk_score,
+                    "report_sections": self._parse_report_sections(module_report_markdown),
+                    "report_preview": "\n".join(report_lines[:12]) if report_lines else None,
+                })
+
+        summary = self._parse_summary(final_report_markdown)
+        if summary["module_count"] == 0 and modules:
+            summary["module_count"] = len(modules)
+        if summary["high_risk_module_count"] == 0 and high_risk_modules_counted:
+            summary["high_risk_module_count"] = high_risk_modules_counted
+        if summary["total_file_count"] == 0 and total_files_counted:
+            summary["total_file_count"] = total_files_counted
+
+        return {
+            "task_id": row.task_id,
+            "available": available,
+            "status": row.status,
+            "output_root": str(output_root) if output_root else None,
+            "final_report_path": str(final_report_path) if final_report_path else None,
+            "modules_list_path": str(modules_list_path) if modules_list_path else None,
+            "final_report_markdown": final_report_markdown,
+            "modules": modules,
+            "summary": summary,
+            "warnings": warnings,
+        }
+
+    def list_task_sessions(self, db: Session, task_id: str) -> list[dict]:
+        row = self._get_or_404(db, task_id)
+        sessions_root = self._task_sessions_root(row)
+        if not sessions_root or not sessions_root.is_dir():
+            return []
+        now_ts = _time.time()
+        items: list[dict] = []
+        for session_file in sorted(sessions_root.rglob("*.jsonl")):
+            try:
+                relative_path = str(session_file.relative_to(sessions_root)).replace("\\", "/")
+                relative_parts = relative_path.split("/")
+                stage_group = relative_parts[0] if len(relative_parts) > 1 else "root"
+                session_name = session_file.stem
+                _, events, warnings, line_count = self._parse_session_jsonl_file(session_file)
+                stat = session_file.stat()
+                is_active = row.status in ("pending", "running") and (now_ts - stat.st_mtime) <= 120
+                display_name = session_name if stage_group == "root" else f"{stage_group} / {session_name}"
+                items.append({
+                    "session_id": session_name,
+                    "session_name": session_name,
+                    "relative_path": relative_path,
+                    "stage_group": stage_group,
+                    "role_name": session_name,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "event_count": len(events),
+                    "line_count": line_count,
+                    "is_active": is_active,
+                    "display_name": display_name,
+                    "warnings": warnings,
+                })
+            except Exception:
+                continue
+        return sorted(items, key=lambda item: (item["stage_group"], -item["mtime"], item["relative_path"]))
+
+    def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        sessions_root = self._task_sessions_root(row)
+        if not sessions_root or not sessions_root.is_dir():
+            from fastapi import HTTPException
+            raise HTTPException(404, "会话目录不存在")
+        try:
+            target = self._resolve_session_path(sessions_root, relative_path)
+        except ValueError as exc:
+            from fastapi import HTTPException
+            raise HTTPException(400, str(exc))
+        if not target.is_file():
+            from fastapi import HTTPException
+            raise HTTPException(404, f"会话文件不存在: {relative_path}")
+        session_meta, events, warnings, line_count = self._parse_session_jsonl_file(target)
+        return {
+            "path": str(target.relative_to(sessions_root)).replace("\\", "/"),
+            "session_meta": session_meta,
+            "events": events,
+            "warnings": warnings,
+            "line_count": line_count,
+        }
+
+    def get_task_evaluation(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        run_root = self._task_run_root(row)
+        warnings: list[str] = []
+        if not run_root or not run_root.is_dir():
+            return {
+                "task_id": row.task_id,
+                "status": row.status,
+                "available": False,
+                "summary": None,
+                "rounds": [],
+                "warnings": warnings,
+            }
+
+        summary: dict | None = None
+        summary_path = run_root / "evaluation_summary.json"
+        if summary_path.exists():
+            try:
+                loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    summary = loaded
+                else:
+                    warnings.append("evaluation_summary.json 格式不是对象")
+            except Exception as exc:
+                warnings.append(f"evaluation_summary.json 读取失败: {exc}")
+
+        rounds: list[dict] = []
+        for round_dir in sorted(run_root.glob("round_*")):
+            if not round_dir.is_dir():
+                continue
+            for path in sorted(round_dir.glob("*.json")):
+                if path.name.endswith(".tmp"):
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    warnings.append(f"{path.relative_to(run_root)} 读取失败: {exc}")
+                    continue
+                if not isinstance(payload, dict):
+                    warnings.append(f"{path.relative_to(run_root)} 格式不是对象")
+                    continue
+                payload.setdefault("source_path", str(path))
+                rounds.append(payload)
+
+        rounds.sort(key=lambda item: (
+            int(item.get("round") or 0),
+            str(item.get("module_name") or ""),
+            str(item.get("stage") or ""),
+        ))
+        return {
+            "task_id": row.task_id,
+            "status": row.status,
+            "available": bool(summary or rounds),
+            "summary": summary,
+            "rounds": rounds,
+            "warnings": warnings,
+        }
