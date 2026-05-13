@@ -79,7 +79,10 @@ class WorkerRuntimeState:
 
     def snapshot(self, running_tasks_count: int) -> dict:
         now_ts = _time.time()
-        max_gap = max(10.0, WORKER_POLL_INTERVAL_SECONDS + WORKER_POLL_JITTER_SECONDS + 10.0)
+        max_gap = max(
+            10.0,
+            WORKER_IDLE_BACKOFF_MAX_SECONDS + WORKER_POLL_JITTER_SECONDS + 10.0,
+        )
         loop_fresh = (self.last_tick_ts > 0.0) and ((now_ts - self.last_tick_ts) <= max_gap)
         return {
             "worker_running_tasks": running_tasks_count,
