@@ -78,6 +78,7 @@ def init_db(
     max_overflow: int = 10,
     pool_timeout: int = 30,
     pool_recycle: int = 3600,
+    run_migrations: bool = True,
 ) -> None:
     """Initialize the database engine and create tables."""
     global _engine, _SessionLocal
@@ -91,8 +92,9 @@ def init_db(
         pool_use_lifo=True,
     )
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
-    Base.metadata.create_all(bind=_engine)
-    _run_migrations(_engine)
+    if run_migrations:
+        Base.metadata.create_all(bind=_engine)
+        _run_migrations(_engine)
     logger.info("Database initialized")
 
 

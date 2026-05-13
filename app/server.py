@@ -88,6 +88,13 @@ def _db_pool_overrides(svc_yaml) -> tuple[int, int, int, int]:
     return max(1, pool_size), max(0, max_overflow), max(1, pool_timeout), max(60, pool_recycle)
 
 
+def _should_run_db_migrations() -> bool:
+    raw = os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_AUTO_MIGRATE")
+    if raw is None:
+        return _service_role() == "all"
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -105,11 +112,12 @@ async def lifespan(app: FastAPI):
             max_overflow=max_overflow,
             pool_timeout=pool_timeout,
             pool_recycle=pool_recycle,
+            run_migrations=_should_run_db_migrations(),
         )
         logger.info(
-            "DB initialized: %s:%s/%s (role=%s pool_size=%s max_overflow=%s pool_timeout=%s pool_recycle=%s)",
+            "DB initialized: %s:%s/%s (role=%s pool_size=%s max_overflow=%s pool_timeout=%s pool_recycle=%s run_migrations=%s)",
             svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name,
-            _service_role(), pool_size, max_overflow, pool_timeout, pool_recycle,
+            _service_role(), pool_size, max_overflow, pool_timeout, pool_recycle, _should_run_db_migrations(),
         )
     except Exception as exc:
         logger.warning("DB init failed (management APIs will be unavailable): %s", exc)
