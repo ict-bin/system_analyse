@@ -234,6 +234,61 @@ async def delete_task(
     get_task_service().delete_task(db, task_id, delete_files=delete_files)
 
 
+@router.get("/tasks/{task_id}/reflection")
+async def get_task_reflection(task_id: str, db: Session = Depends(get_db)):
+    """返回任务的自省分析报告列表和最新报告内容。"""
+    from app.db.models import AppSaTask
+    from fastapi import HTTPException
+    row = db.query(AppSaTask).filter(
+        AppSaTask.task_id == task_id,
+        AppSaTask.is_deleted.is_(False),
+    ).first()
+    if not row:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+
+    # 获取 self_reflection.output_dir 配置
+    from app.db import get_db as _get_db
+    from app.service.config_service import get_config_service
+    reflection_dir = "/data/self-reflection"  # default
+    try:
+        cfg_data = get_config_service().get_config(db, row.project_id)
+        reflection_dir = (
+            cfg_data.get("self_reflection", {}).get("output_dir", "/data/self-reflection")
+            or "/data/self-reflection"
+        )
+    except Exception:
+        pass
+
+    from pathlib import Path
+    import os
+    out_dir = Path(reflection_dir)
+    reports: list[dict] = []
+    latest_content = ""
+    if out_dir.is_dir():
+        for p in sorted(out_dir.glob(f"{task_id}_*.md"), reverse=True):
+            stat = p.stat()
+            reports.append({
+                "filename": p.name,
+                "created_at": __import__('datetime').datetime.fromtimestamp(
+                    stat.st_mtime
+                ).isoformat(),
+                "size_bytes": stat.st_size,
+            })
+        if reports:
+            try:
+                latest_content = (out_dir / reports[0]["filename"]).read_text(
+                    "utf-8", errors="replace"
+                )
+            except Exception:
+                pass
+    return {
+        "task_id": task_id,
+        "reflection_dir": str(out_dir),
+        "reports": reports,
+        "content": latest_content,
+    }
+
+
 @router.get("/tasks/{task_id}/logs")
 async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
     """Return stages_json for the task (stage events used as structured log stream)."""

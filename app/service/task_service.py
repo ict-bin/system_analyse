@@ -1,4 +1,4 @@
-﻿"""Task management service for secflow-app-system-analyse.
+"""Task management service for secflow-app-system-analyse.
 
 Bridges the FastAPI management layer with the existing Orchestrator engine.
 Each task is persisted in MySQL and executed asynchronously.
@@ -966,6 +966,22 @@ class TaskService:
                 if result.error:
                     row.error = result.error
             db.commit()
+            # —— 自省分析（异步后台，不阻塞任务完成） ——
+            try:
+                from app.pipeline.self_reflection import get_self_reflection_service
+                _sr_run_dir = Path(row.output_path or "") / row.task_id / "run" if row.output_path else None
+                _sr_out_dir = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
+                _sr_status = result.status.value if result else "error"
+                if _sr_run_dir and _sr_out_dir:
+                    await get_self_reflection_service().trigger_async(
+                        task_id=task_id,
+                        run_dir=_sr_run_dir,
+                        output_dir=_sr_out_dir,
+                        cfg=cfg,
+                        task_status=_sr_status,
+                    )
+            except Exception as _sr_exc:
+                logger.warning("self-reflection trigger failed: %s", _sr_exc)
         except asyncio.CancelledError:
             pass
         except Exception as exc:

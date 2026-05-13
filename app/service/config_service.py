@@ -83,6 +83,12 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "result_dir": "/data/output",
     "start_stage": 0,
     "resume_workspace": "",
+    "self_reflection": {
+        "enabled": False,
+        "model": "",
+        "output_dir": "/data/self-reflection",
+        "max_session_lines": 1000,
+    },
 }
 
 

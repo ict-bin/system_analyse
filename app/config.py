@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
+from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig, SelfReflectionConfig  # noqa: F401
 
 logger = logging.getLogger("sa.config")
 
@@ -243,6 +243,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "") -> TaskCon
         result_dir=svc.result_dir,
         start_stage=svc.start_stage,
         resume_workspace=svc.resume_workspace,
+        self_reflection=svc.self_reflection.model_copy(deep=True),
     )
 
     _backfill_role(cfg.workers)

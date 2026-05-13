@@ -330,6 +330,23 @@ def get_analyse_filter(types: list[str]) -> dict:
 
 # ─── 服务配置 ───────────────────────────────────────────────────────
 
+class SelfReflectionConfig(BaseModel):
+    """Self-reflection 自省分析配置。"""
+    enabled: bool = Field(default=False, description="任务结束后自动触发自省分析")
+    model: str = Field(
+        default="",
+        description="自省分析使用的 LLM 模型，留空时使用 workers.agents[0].model"
+    )
+    output_dir: str = Field(
+        default="/data/self-reflection",
+        description="自省报告存储目录（容器内绝对路径）"
+    )
+    max_session_lines: int = Field(
+        default=1000,
+        description="每个 session jsonl 最多读取的行数，防止 context 过大"
+    )
+
+
 class ServiceConfig(BaseModel):
     analyse_targets: list[str] = Field(
         default=["all"],
@@ -371,6 +388,10 @@ class ServiceConfig(BaseModel):
     result_dir: str = Field(default="/data/output")
     start_stage: int = Field(default=0, description="从指定阶段开始（0=全流程，3=跳过S0/S1/S2直接S3）")
     resume_workspace: str = Field(default="", description="已有的 workspace 路径，start_stage>0 时使用")
+    self_reflection: SelfReflectionConfig = Field(
+        default_factory=SelfReflectionConfig,
+        description="自省分析配置"
+    )
 
 
 # ─── 运行时任务 ───────────────────────────────────────────────────────────────
@@ -408,6 +429,10 @@ class TaskConfig(BaseModel):
     # start_stage=3 时必须同时指定 resume_workspace 指向已有 workspace 路径
     start_stage: int = Field(default=0, description="从指定阶段开始（0=全流程，3=跳过S0/S1/S2直接S3）")
     resume_workspace: str = Field(default="", description="已有的 workspace 路径，start_stage>0 时使用")
+    self_reflection: SelfReflectionConfig = Field(
+        default_factory=SelfReflectionConfig,
+        description="自省分析配置"
+    )
 
     @property
     def worker_count(self) -> int:
