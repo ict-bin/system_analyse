@@ -77,3 +77,28 @@
 2. **不臆造**：只报告确实存在的问题
 3. **不遗漏**：使用 `read` 逐个读取文件后再分析（二进制文件根据文件名推断即可）
 4. **可操作**：修复建议必须具体
+
+---
+
+# ⚠️ 文件路径规范（所有阶段通用）
+
+## 读取目标文件
+使用 `target/<相对路径>` 格式（通过 workspace 下的 `target/` 符号链接）：
+- ✅ `read target/lib/libbgp.so`
+- ❌ `read /data/target/lib/libbgp.so`（绝对路径，运行时可能不可达）
+
+## files.list 中的路径格式
+- ✅ `squashfs-root/lib/libbgp.so`（相对于目标目录根，**不含任何前缀**）
+- ❌ `/data/target/squashfs-root/lib/libbgp.so`
+- ❌ `target/squashfs-root/lib/libbgp.so`
+
+## 禁止访问的目录
+- `prescan/` — 关键词预扫描中间产物，不代表模块文件内容
+- `modules_pre_filter_backup/` — S1.5 安全过滤备份，只读
+- `.s2_snapshots/` — 快照备份，只读
+- `filtered_files.txt` — 只读，禁止写入或修改
+
+## deleted/ 子文件夹（S2 专用）
+仅当 `security_focus_categories` 非 all 时，允许在模块目录下创建 `deleted/` 子文件夹：
+- `modules/<模块>/deleted/files.list` — 提议排除的文件（由 Judge 审查后由 Python 确认）
+- deleted/ 中的路径格式与 files.list 相同（相对路径，无前缀）

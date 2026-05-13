@@ -32,7 +32,12 @@ workspace/
 
 # ⚠️ 待分类文件来源
 
-**优先使用 `filtered_files.txt`**（如果存在），这是经过类型/架构过滤后的文件列表（相对路径）：
+**`filtered_files.txt` 是唆一合法文件来源**：
+
+- 必须从 `filtered_files.txt`（如果存在）读取文件列表
+- **禁止使用 `find target/` 获取超出此列表范围的文件**
+- 对于路径相似但不在列表中的文件：直接忽略，不归类
+- 仅当 `filtered_files.txt` 不存在时，才使用 `find target -type f`（居底）
 
 ```bash
 # 检查是否有过滤文件

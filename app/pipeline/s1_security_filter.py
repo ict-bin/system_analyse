@@ -296,6 +296,24 @@ class SecurityFocusFilterStage(BaseStage):
             )
 
             if final_pass:
+                # 归档被删模块的文件到 workspace/deleted.list
+                kept_modules = discover_modules(str(workspace))
+                removed_mod_names = sorted(backup_mods - set(kept_modules))
+                all_deleted_files: list[str] = []
+                for rm_mod in removed_mod_names:
+                    mod_flist = backup / rm_mod / "files.list"
+                    if mod_flist.exists():
+                        lines = [ln.strip() for ln in
+                                 mod_flist.read_text("utf-8", errors="replace").splitlines()
+                                 if ln.strip()]
+                        all_deleted_files.extend(lines)
+                if all_deleted_files:
+                    with open(str(ctx.deleted_list_path), "a", encoding="utf-8") as _f:
+                        for fp in all_deleted_files:
+                            _f.write(fp + "\n")
+                    ctx.emit_event("log", level="info",
+                                   msg=(f"[S1.5] 归档 {len(all_deleted_files)} 个排除文件 "
+                                        f"(来自 {len(removed_mod_names)} 个删除模块)"))
                 shutil.rmtree(str(backup), ignore_errors=True)
                 ctx.emit_event("log", level="info",
                                msg=(f"[安全维度过滤] 完成：保留 {len(kept_modules)} 个，"

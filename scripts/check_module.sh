@@ -43,13 +43,18 @@ fi
 sort -u "$SNAPSHOT" > /tmp/cm_snap_$$.txt
 SNAP_COUNT=$(wc -l < /tmp/cm_snap_$$.txt)
 
-# Step 1: 收集本模块 + 子模块的文件
+# Step 1: 收集本模块 + 子模块的文件 + 本模块 deleted/ 子文件夹
 > /tmp/cm_local_$$.txt
 [ -f "$MODULES_ROOT/$MOD_NAME/files.list" ] && \
     grep -v "^$" "$MODULES_ROOT/$MOD_NAME/files.list" >> /tmp/cm_local_$$.txt 2>/dev/null
 for sub in "$MODULES_ROOT"/${MOD_NAME}_*/files.list; do
     [ -f "$sub" ] && grep -v "^$" "$sub" >> /tmp/cm_local_$$.txt
 done
+# ★ 将 deleted/ 子文件夹中的文件也视为已处理（待归档的排除文件）
+if [ -f "$MODULES_ROOT/$MOD_NAME/deleted/files.list" ]; then
+    grep -v "^$" "$MODULES_ROOT/$MOD_NAME/deleted/files.list" >> /tmp/cm_local_$$.txt
+    echo "  + deleted/ 提议排除: $(wc -l < "$MODULES_ROOT/$MOD_NAME/deleted/files.list") 个文件"
+fi
 sort -u /tmp/cm_local_$$.txt > /tmp/cm_local_sorted_$$.txt
 LOCAL_COUNT=$(wc -l < /tmp/cm_local_sorted_$$.txt)
 
@@ -64,6 +69,13 @@ if [ "$MAYBE_MIGRATED" -gt 0 ]; then
     # 收集所有其他模块的文件
     cat "$MODULES_ROOT"/*/files.list 2>/dev/null \
         | grep -v "^$" | sort -u > /tmp/cm_all_mods_$$.txt
+
+    # ★ 将 workspace/deleted.list（已确认排除）也纳入计算
+    WORKSPACE=$(dirname "$MODULES_ROOT")
+    if [ -f "$WORKSPACE/deleted.list" ]; then
+        sort -u "$WORKSPACE/deleted.list" >> /tmp/cm_all_mods_$$.txt
+        sort -u /tmp/cm_all_mods_$$.txt -o /tmp/cm_all_mods_$$.txt
+    fi
 
     while IFS= read -r rel; do
         [ -z "$rel" ] && continue

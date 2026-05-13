@@ -150,6 +150,13 @@ class CompletenessCheckStage(BaseStage):
                 )
                 ctx.tokens += ar.token_usage
 
+                # enforce 在 Judge 前运行，Judge 看到清洁数据
+                if ctx.filtered_files:
+                    _rm = enforce_filter_constraint(workspace, set(ctx.filtered_files))
+                    if _rm:
+                        ctx.emit_event("log", level="warn",
+                                       msg=f"[S4-redo过滤] 补先移除 {_rm} 个越界条目")
+
                 judge_results = []
                 for j_idx, j_item in enumerate(ctx.j_cfgs):
                     j_ar = await run_agent_checked(
@@ -175,13 +182,6 @@ class CompletenessCheckStage(BaseStage):
                 feedback = f"# 评审意见\n\n{fail_fb}"
             else:
                 raise StageError(f"Stage 4a 补做模块 {mod_name} 分析未通过")
-
-        # 补做完成后强制过滤约束
-        if ctx.filtered_files:
-            removed = enforce_filter_constraint(workspace, set(ctx.filtered_files))
-            if removed:
-                ctx.emit_event("log", level="warn",
-                               msg=f"[S4-redo过滤约束] 删除 {removed} 个超出 filtered_files.txt 的越界条目")
 
 
 class FinalReportStage(BaseStage):

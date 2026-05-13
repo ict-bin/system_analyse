@@ -13,6 +13,7 @@ Stage 2 做两件事：
 # ⚠️ 铁律
 
 1. **文件零丢失**：拆分前后该模块下的文件总数必须完全一致
+   - `快照文件数` = `子模块文件数` + `deleted/files.list 文件数` + `迁移到其他模块的文件数`
 2. **子模块命名规则**：
    - **父模块名有语义**（如 `openthread`、`mbedtls`、`nrf5_sdk`）→ 可用 `<父名>_<功能>` 作前缀（如 `openthread_core`、`mbedtls_ssl`）
    - **父模块名无语义**（`unknown`、`misc`、`other`、`shared_libraries` 等占位符）→ **必须**直接用功能名，禁止以无语义词做前缀
@@ -20,7 +21,35 @@ Stage 2 做两件事：
      - ❌ `unknown_core`、`misc_crypto`（无语义前缀）
    - 若子模块名与已有模块重名，才加最短必要前缀区分
 3. **所有文件操作必须用 bash 脚本**
-4. 拆分完成后**必须删除原模块目录**（文件已分散到子模块）
+4. **原模块目录清理规则（重要变更）**：
+   - 若**未创建** `deleted/` 子文件夹：拆分完成后正常 `rm -rf modules/$MOD`
+   - 若**已创建** `deleted/` 子文件夹：**不要自行 rm -rf 原模块目录**——只需删除 `modules/$MOD/files.list`，Python 将在 Judge 通过后清理
+
+# ⚠️ 边界违规文件处理（security_focus 模块下专用）
+
+**仅当任务配置了 `security_focus_categories`（非 all）时**，如果模块中存在**与指定安全维度完全无关**的文件（纺测试代码、绺 UI、与安全无交魔的配置等），**不要强行归入某模块**——将它们移入本模块的 `deleted/` 子文件夹：
+
+```bash
+#!/bin/bash
+set -e
+MOD="<当前模块名>"
+mkdir -p modules/$MOD/deleted
+
+# 将不符合边界的文件移入 deleted/
+for f in "<不相关文件路径>"; do
+    echo "$f" >> modules/$MOD/deleted/files.list
+    # 同时从 files.list 中删除
+    grep -vxF "$f" modules/$MOD/files.list > /tmp/fl_new.txt \
+        && mv /tmp/fl_new.txt modules/$MOD/files.list
+done
+echo "已移入 deleted/: $(wc -l < modules/$MOD/deleted/files.list) 个"
+echo "剩余 files.list: $(wc -l < modules/$MOD/files.list) 个"
+```
+
+**deleted/ 使用规则**：
+- 每个文件只能在 `files.list` 和 `deleted/files.list` 之一中，不得重复
+- deleted/ 中的文件不计入子模块文件数，但计入快照校验：`快照数 = 子模块数 + deleted数`
+- 若未配置安全维度过滤（all 模式）：**所有文件必须归入模块**，不得使用 deleted/
 
 # 步骤
 
@@ -101,44 +130,19 @@ echo "拆分后: $AFTER 个文件"
 [ "$BEFORE" -eq "$AFTER" ] && echo "✅ 完整" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
 
 # 删除原模块目录（快照已保存在 .s2_snapshots/ 中）
-rm -rf modules/$MOD
-```
-
-> ⚠️ **第二轮重试时**（原模块目录已被上轮删除）：
-> 从 `.s2_snapshots/<模块名>.snapshot` 重建，并先清理上轮生成的子模块：
-
-```bash
-#!/bin/bash
-set -e
-MOD="<当前模块名>"
-
-# 清理上轮失败的子模块（按实际命名，非父模块前缀）
-rm -rf modules/mbedtls_* modules/openthread_*  # 根据实际情况调整
-
-# 从快照恢复文件列表
-BEFORE=$(wc -l < .s2_snapshots/$MOD.snapshot)
-echo "从快照重建: $BEFORE 个文件"
-
-# 重新按功能拆分（参考上轮 Judge 意见改进）
-mkdir -p modules/<功能1> modules/<功能2>
-grep -iE '<关键词1>' .s2_snapshots/$MOD.snapshot > modules/<功能1>/files.list || true
-# ... 其余分组 ...
-
-# 兜底未匹配
-cat modules/${MOD}_*/files.list | sort > /tmp/moved.txt
-sort .s2_snapshots/$MOD.snapshot > /tmp/orig.txt
-comm -23 /tmp/orig.txt /tmp/moved.txt > /tmp/remaining.txt
-if [ -s /tmp/remaining.txt ]; then
-    mkdir -p modules/${MOD}_core
-    cat /tmp/remaining.txt > modules/${MOD}_core/files.list
+# 若已创建 deleted/，只删 files.list （不要 rm -rf 整个目录）。若无 deleted/，可直接 rm -rf
+if [ -d "modules/$MOD/deleted" ]; then
+    rm -f modules/$MOD/files.list
+    echo "已删除 files.list，deleted/ 由 Python 安排归档和清理"
+else
+    rm -rf modules/$MOD
 fi
-
-for f in modules/${MOD}_*/files.list; do sort -u "$f" -o "$f"; done
-AFTER=$(cat modules/${MOD}_*/files.list | sort -u | wc -l)
-[ "$BEFORE" -eq "$AFTER" ] && echo "✅ $AFTER 个文件" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
 ```
 
-## 4. 不需要拆分时
+> ⚠️ **第二轮重试时**：Python 已自动从快照恢复 `files.list` 并删除上轮子模块，你只需按新策略重新拆分即可。无需手动清理上轮残留文件。
+
+
+## 4. 不需要拆分时 不需要拆分时
 
 直接输出说明理由，**不执行任何文件操作**。
 

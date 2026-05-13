@@ -17,6 +17,16 @@ else
     TOTAL=$(wc -l < /tmp/all_files.txt)
 fi
 
+# ★ 减去已确认排除的文件（workspace/deleted.list）
+if [ -f "$WORKSPACE_DIR/deleted.list" ]; then
+    sort "$WORKSPACE_DIR/deleted.list" > /tmp/confirmed_deleted.txt
+    DELETED_COUNT=$(wc -l < /tmp/confirmed_deleted.txt)
+    comm -23 /tmp/all_files.txt /tmp/confirmed_deleted.txt > /tmp/all_files_adj.txt
+    mv /tmp/all_files_adj.txt /tmp/all_files.txt
+    TOTAL=$(wc -l < /tmp/all_files.txt)
+    echo "已排除确认删除文件: $DELETED_COUNT 个，剩余工作集: $TOTAL 个"
+fi
+
 # ── 收集 files.list（兼容 */files.list 和 modules/*/files.list）──
 # 统一去掉可能残留的绝对路径前缀
 cat "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list 2>/dev/null \

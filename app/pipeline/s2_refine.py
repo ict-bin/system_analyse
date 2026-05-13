@@ -33,6 +33,7 @@ from .helpers import (
     SUB_WORKER_THRESHOLD, collect_file_summaries,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
+    archive_module_deletions, get_module_deleted_files, restore_module_for_retry,
 )
 
 
@@ -49,6 +50,7 @@ class RefineStage(BaseStage):
         self._errors: list[BaseException] = []
         self._queue: asyncio.Queue = asyncio.Queue()
         self._ctx: PipelineContext | None = None
+        self._deleted_lock: asyncio.Lock = asyncio.Lock()  # 保护 workspace/deleted.list 写入
 
     # ── 主入口 ─────────────────────────────────────────────────────────────
     async def execute(self, ctx: PipelineContext) -> None:
@@ -139,6 +141,13 @@ class RefineStage(BaseStage):
         for attempt in range(max_iter(s_cfg)):
             round_started = utc_now_iso()
             round_start_ts = time.time()
+
+            # 重试前由 Python 恢复状态（不靠 Worker bash 自清理）
+            if attempt > 0:
+                restore_module_for_retry(
+                    mod_name, mod_dir, workspace, self._refined
+                )
+
             ctx.emit_event("stage", stage=2, module=mod_name, attempt=attempt + 1)
 
             mods_before = set(discover_modules(str(workspace)))
@@ -168,17 +177,31 @@ class RefineStage(BaseStage):
                            split=was_split, new_modules=new_ones)
 
             # ── Judge ──────────────────────────────────────────────────
+            # 生成 deleted/ 摘要注入 Judge prompt
+            del_files = get_module_deleted_files(mod_dir)
+            deleted_summary = ""
+            if del_files:
+                preview = sorted(del_files)[:30]
+                more = f"\n  ...(共 {len(del_files)} 个)" if len(del_files) > 30 else ""
+                deleted_summary = (
+                    f"\n\n## \u26a0\ufe0f 本轮提议排除文件\uff08modules/{mod_name}/deleted/files.list\uff09"
+                    f"\n共 {len(del_files)} 个，请审查是否确实不属于任何安全维度相关模块："
+                    + "".join(f"\n  - {f}" for f in preview) + more
+                )
             judge_results = []
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("refine", j_item)
                 j_ar = await run_agent_checked(
                     context=f"s2-judge-{mod_name}-j{j_idx}-a{attempt+1}",
-                    prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
+                    prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。{deleted_summary}",
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
+                    session_file=str(
+                        ctx.sess_dir / f"refine-judge-{mod_name}-j{j_idx}-a{attempt+1}.jsonl"
+                    ),
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -242,6 +265,14 @@ class RefineStage(BaseStage):
 
             if voted_pass:
                 if attempt + 1 >= s_cfg.min_rounds:
+                    # 归档 modules/<mod>/deleted/ → workspace/deleted.list
+                    await archive_module_deletions(
+                        workspace, mod_name, mod_dir, self._deleted_lock, ctx
+                    )
+                    # 若原模块已被拆分（files.list 已移除），Python 做 rm -rf
+                    if mod_dir.exists() and not (mod_dir / "files.list").exists():
+                        import shutil as _shutil
+                        _shutil.rmtree(str(mod_dir), ignore_errors=True)
                     if was_split and new_ones:
                         for nm in new_ones:
                             if nm not in self._refined and nm not in self._in_progress:
@@ -273,6 +304,12 @@ class RefineStage(BaseStage):
                 feedback = "# 评审意见（未通过）\n\n" + fail_fb + guidance
 
             if forced_pass:
+                await archive_module_deletions(
+                    workspace, mod_name, mod_dir, self._deleted_lock, ctx
+                )
+                if mod_dir.exists() and not (mod_dir / "files.list").exists():
+                    import shutil as _shutil2
+                    _shutil2.rmtree(str(mod_dir), ignore_errors=True)
                 if was_split and new_ones:
                     for nm in new_ones:
                         if nm not in self._refined and nm not in self._in_progress:
@@ -297,6 +334,13 @@ class RefineStage(BaseStage):
         all_target = set(
             l.strip() for l in filtered_txt.read_text("utf-8").splitlines() if l.strip()
         )
+        # 工作集 = filtered_files − 已确认排除文件
+        confirmed_deleted = ctx.load_confirmed_deleted()
+        if confirmed_deleted:
+            all_target -= confirmed_deleted
+            ctx.emit_event("log", level="info",
+                           msg=f"[S2全局检查] 工作集: {len(all_target)} 个 "
+                               f"(已排除 {len(confirmed_deleted)} 个已确认排除文件)")
         mods_root = get_modules_root(str(workspace))
         all_classified: set[str] = set()
         for flist in mods_root.glob("*/files.list"):
@@ -359,7 +403,7 @@ class RefineStage(BaseStage):
                     l = l.strip()
                     if l:
                         all_classified2.add(l)
-            still_missing = sorted(all_target - all_classified2)
+            still_missing = sorted(all_target - all_classified2 - ctx.load_confirmed_deleted())
             ctx.emit_event("log", level="info",
                            msg=f"补分类第{rc_attempt+1}轮: 剩余 {len(still_missing)} 个未归类")
             if not still_missing:

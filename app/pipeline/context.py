@@ -85,6 +85,19 @@ class PipelineContext:
     """最终报告路径"""
 
     # ── 辅助方法 ──────────────────────────────────────────────
+
+    @property
+    def deleted_list_path(self) -> Path:
+        """workspace/deleted.list：全局已确认排除文件（append-only，asyncio.Lock 保护）。"""
+        return self.workspace / "deleted.list"
+
+    def load_confirmed_deleted(self) -> set[str]:
+        """从 workspace/deleted.list 读取已确认排除文件集合；文件不存在返回空集合。"""
+        p = self.deleted_list_path
+        if not p.exists():
+            return set()
+        return {ln.strip() for ln in p.read_text("utf-8", errors="replace").splitlines() if ln.strip()}
+
     def modules_root(self) -> Path:
         """返回 modules 目录（workspace/modules 或 workspace）"""
         m = self.workspace / "modules"

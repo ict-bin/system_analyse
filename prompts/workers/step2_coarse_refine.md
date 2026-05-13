@@ -18,7 +18,22 @@
 1. **文件零丢失**：拆分前后该模块下的文件总数完全一致
 2. **按服务/协议命名模块**：如 `tcp`、`http`、`dns`、`ssh`、`dhcp`、`tls`、`auth`、`snmp`
 3. **所有文件操作必须用 bash 脚本**
-4. 拆分完成后**必须删除原模块目录**（快照已保存在 `.s2_snapshots/` 中）
+
+
+# ⚠️ 边界违规文件处理（security_focus 模式下专用）
+
+**仅当任务配置了 `security_focus_categories`（非 all）时**：若模块中存在与指定安全维度完全无关的文件，**不要强行归入任何子模块**——移入本模块的 `deleted/` 子文件夹：
+
+```bash
+mkdir -p modules/$MOD/deleted
+echo "<越界文件路径>" >> modules/$MOD/deleted/files.list
+grep -vxF "<越界文件路径>" modules/$MOD/files.list > /tmp/fl_new.txt     && mv /tmp/fl_new.txt modules/$MOD/files.list
+```
+
+**铁律修订**：快照文件数 = 子模块文件数 + `deleted/files.list` 文件数（+ 迁移到其他模块的文件数）
+4. **原模块目录清理规则（重要变更）**：
+   - 若**未创建** `deleted/` 子文件夹：拆分完成后正常 `rm -rf modules/$MOD`
+   - 若**已创建** `deleted/` 子文件夹：**不要自行 rm -rf 原模块目录**——只需删除 `modules/$MOD/files.list`，Python 将在 Judge 通过后清理
 
 # 步骤
 
@@ -92,41 +107,6 @@ rm -rf modules/$MOD
 echo "已完成拆分：$MOD → tcp / http / dns"
 ```
 
-### 重试轮（原模块目录已被上轮删除，从快照重建）
-
-```bash
-#!/bin/bash
-set -e
-MOD="<模块名>"
-SNAP=".s2_snapshots/$MOD.snapshot"
-
-# ── 清理上轮生成的子模块 ──
-# 根据实际情况替换要清理的模块名
-rm -rf modules/tcp modules/http modules/dns
-
-BEFORE=$(wc -l < "$SNAP")
-echo "从快照重建: $BEFORE 个文件"
-
-# ── 按修正后的策略重新拆分（参考 Judge 上轮意见）──
-mkdir -p modules/tcp modules/http modules/dns
-
-grep -iE 'tcp|socket' "$SNAP" > modules/tcp/files.list  || true
-grep -iE 'http|request' "$SNAP" > modules/http/files.list || true
-grep -iE 'dns|resolve' "$SNAP" > modules/dns/files.list  || true
-
-cat modules/tcp/files.list modules/http/files.list modules/dns/files.list \
-    2>/dev/null | sort -u > /tmp/moved.txt
-sort "$SNAP" > /tmp/orig.txt
-comm -23 /tmp/orig.txt /tmp/moved.txt >> modules/tcp/files.list
-
-for f in modules/tcp/files.list modules/http/files.list modules/dns/files.list; do
-    [ -f "$f" ] && sort -u "$f" -o "$f"
-done
-
-AFTER=$(cat modules/tcp/files.list modules/http/files.list modules/dns/files.list \
-        2>/dev/null | sort -u | wc -l)
-echo "重建后: $AFTER 个文件"
-[ "$BEFORE" -eq "$AFTER" ] && echo "✅ 完整" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
-```
+> ⚠️ **第二轮重试时**：Python 已自动从快照恢复 `files.list` 并删除上轮子模块，你只需按新策略重新拆分即可。无需手动清理上轮残留文件。
 
 用 `<result>操作摘要：[拆分为N个子模块（名称列表）/ 无需拆分（理由）] + 文件数校验结果</result>` 结束。

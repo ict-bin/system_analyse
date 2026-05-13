@@ -149,6 +149,87 @@ def max_rounds_exceeded_treated_as_passed(cfg) -> bool:
     return action == "treat_as_passed"
 
 
+def get_module_deleted_files(mod_dir: Path) -> set[str]:
+    """Read modules/<mod>/deleted/files.list; return set. Empty if absent."""
+    p = mod_dir / "deleted" / "files.list"
+    if not p.exists():
+        return set()
+    return {ln.strip() for ln in p.read_text("utf-8", errors="replace").splitlines() if ln.strip()}
+
+
+async def archive_module_deletions(
+    workspace: "Path",
+    mod_name: str,
+    mod_dir: "Path",
+    lock: "asyncio.Lock",
+    ctx: "PipelineContext",
+) -> int:
+    """Archive modules/<mod>/deleted/files.list → workspace/deleted.list (lock-protected).
+
+    删除 deleted/ 子目录。返回归档文件数（无 deleted/ 时返回 0）。
+    """
+    deleted_dir = mod_dir / "deleted"
+    if not deleted_dir.exists():
+        return 0
+    deleted_flist = deleted_dir / "files.list"
+    files: list[str] = []
+    if deleted_flist.exists():
+        files = [ln.strip() for ln in
+                 deleted_flist.read_text("utf-8", errors="replace").splitlines()
+                 if ln.strip()]
+    if files:
+        async with lock:
+            with open(str(workspace / "deleted.list"), "a", encoding="utf-8") as f:
+                for fp in files:
+                    f.write(fp + "\n")
+        ctx.emit_event("log", level="info",
+                       msg=f"[deleted] 模块 {mod_name}: 归档 {len(files)} 个排除文件")
+    shutil.rmtree(str(deleted_dir), ignore_errors=True)
+    return len(files)
+
+
+def restore_module_for_retry(
+    mod_name: str,
+    mod_dir: "Path",
+    workspace: "Path",
+    refined_set: set[str],
+) -> None:
+    """重试前恢复模块状态（Python 接管，不靠 Worker bash 自清理）。
+
+    1. 恢复快照 → mod_dir/files.list
+    2. rm -rf 上一轮 Worker 新建的子模块（不在 refined_set 中的新增模块）
+    3. 清空 mod_dir/deleted/（如存在）
+    """
+    mods_root = get_modules_root(str(workspace))
+    snapshot_path = workspace / ".s2_snapshots" / f"{mod_name}.snapshot"
+
+    # 1. 恢复快照
+    if snapshot_path.exists():
+        mod_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(snapshot_path), str(mod_dir / "files.list"))
+
+    # 2. 删除上一轮新建的子模块
+    current_mods = set(discover_modules(str(workspace)))
+    for m in current_mods:
+        if m == mod_name:
+            continue
+        if m in refined_set:
+            continue
+        # 任何不属于已完成模块的模块——如果它是上一轮这个模块的拆分产物就删除
+        # 简单判断：迎合 mod_name 前缀，或者它的快照不存在（说明是本轮新建）
+        sub_snap = workspace / ".s2_snapshots" / f"{m}.snapshot"
+        is_new_sub = (m.startswith(mod_name + "_")
+                      or m.startswith(mod_name)
+                      or not sub_snap.exists())
+        if is_new_sub:
+            shutil.rmtree(str(mods_root / m), ignore_errors=True)
+
+    # 3. 清空 deleted/
+    deleted_dir = mod_dir / "deleted"
+    if deleted_dir.exists():
+        shutil.rmtree(str(deleted_dir), ignore_errors=True)
+
+
 def enforce_filter_constraint(workspace: "Path", filtered_files: set[str]) -> int:
     """删除所有 modules/*/files.list 中不属于 filtered_files 白名单的行。
 
@@ -375,7 +456,7 @@ def pre_read_module(target_dir: str, mod_dir: Path) -> str:
         parts.append(f"⚠️ 以下 {len(truncated_files)} 个文件因总内容超限未展示，"
                      f"可用 read 工具直接读取：")
         for tf in truncated_files:
-            parts.append(f"  - /data/target/{tf}")
+            parts.append(f"  - target/{tf}")
 
     result_str = '\n'.join(parts)
     prefix = '__HAS_TEXT__\n' if has_text_files else ''

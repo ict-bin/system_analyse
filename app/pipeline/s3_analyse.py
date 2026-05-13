@@ -376,6 +376,13 @@ class AnalyseStage(BaseStage):
                 )
                 ctx.tokens += ar.token_usage
 
+                # enforce 在 Judge 前运行，Judge 看到清洁数据
+                if ctx.filtered_files:
+                    _rm = enforce_filter_constraint(workspace, set(ctx.filtered_files))
+                    if _rm:
+                        ctx.emit_event("log", level="warn",
+                                       msg=f"[S3-2redo过滤] 补先移除 {_rm} 个越界条目")
+
                 judge_results = []
                 eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
                 for j_idx, j_item in enumerate(ctx.j_cfgs):
@@ -410,13 +417,6 @@ class AnalyseStage(BaseStage):
                     feedback = f"# 评审意见\n\n{fail_fb}"
             else:
                 raise StageError(f"Stage 2-redo 模块 {mod_name} 重分类未通过")
-
-        # Stage 3-redo 前强制过滤约束：删除重分类引入的越界文件
-        if ctx.filtered_files:
-            removed = enforce_filter_constraint(workspace, set(ctx.filtered_files))
-            if removed:
-                ctx.emit_event("log", level="warn",
-                               msg=f"[S3-redo过滤约束] 删除 {removed} 个超出 filtered_files.txt 的越界条目")
 
         # Stage 3-redo: 只处理新子模块 + 原始模块（files.list 非空）
         new_mods = discover_modules(str(workspace))
