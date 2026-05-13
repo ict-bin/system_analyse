@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
-from .helpers import run_agent_checked, load_prompt
+from .helpers import run_agent_with_stage_guard, load_prompt
 
 
 class FilterStage(BaseStage):
@@ -130,8 +130,14 @@ class ExploreStage(BaseStage):
         )
 
         explore_session = str(ctx.sess_dir / "explore.jsonl")
-        ar = await run_agent_checked(
+        ar = await run_agent_with_stage_guard(
+            ctx=ctx,
+            stage="explore",
             context="explore",
+            heartbeat_payload_factory=lambda beat: {
+                "heartbeat": beat,
+                "session_file": explore_session,
+            },
             prompt=explore_user_prompt,
             model=explore_model,
             system_prompt=explore_prompt,

@@ -1,13 +1,38 @@
 from __future__ import annotations
 
 import json
-import time as _time
 from pathlib import Path
 from typing import Callable
 
 from sqlalchemy.orm import Session
 
 from app.db.models import AppSaTask
+from app.service.session_index import build_session_catalog
+
+
+def _normalize_evaluation_round_status(payload: dict) -> dict:
+    normalized = dict(payload)
+    raw_status = str(normalized.get("status") or "").strip()
+    ended_at = normalized.get("ended_at")
+    completion_reason = str(normalized.get("completion_reason") or "").strip()
+    module_completed = bool(normalized.get("module_completed"))
+    metrics = normalized.get("metrics") if isinstance(normalized.get("metrics"), dict) else {}
+    passed_by_vote = bool(metrics.get("passed_by_vote"))
+
+    effective_status = raw_status
+    if raw_status == "running" and ended_at:
+        if completion_reason == "reclassify_required":
+            effective_status = "reclassify_required"
+        elif module_completed or completion_reason in {"passed", "max_rounds_exceeded_treated_as_passed"}:
+            effective_status = "passed"
+        elif passed_by_vote:
+            effective_status = "needs_reflection"
+        else:
+            effective_status = "needs_retry"
+
+    normalized["raw_status"] = raw_status
+    normalized["status"] = effective_status
+    return normalized
 
 
 class TaskQueryService:
@@ -24,6 +49,7 @@ class TaskQueryService:
         task_run_root: Callable[[AppSaTask], Path | None],
         resolve_session_path: Callable[[Path, str], Path],
         parse_session_jsonl_file: Callable[[Path], tuple[dict, list[dict], list[str], int]],
+        write_json_atomic: Callable[[Path, dict], None],
     ) -> None:
         self._get_or_404 = get_or_404
         self._read_text_if_exists = read_text_if_exists
@@ -35,6 +61,7 @@ class TaskQueryService:
         self._task_run_root = task_run_root
         self._resolve_session_path = resolve_session_path
         self._parse_session_jsonl_file = parse_session_jsonl_file
+        self._write_json_atomic = write_json_atomic
 
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -138,40 +165,48 @@ class TaskQueryService:
             "warnings": warnings,
         }
 
+    def _build_session_catalog(self, row: AppSaTask) -> dict:
+        sessions_root = self._task_sessions_root(row)
+        run_root = self._task_run_root(row)
+        if not sessions_root or not sessions_root.is_dir() or not run_root or not run_root.is_dir():
+            return {
+                "task_id": row.task_id,
+                "status": row.status,
+                "sessions_root": str(sessions_root) if sessions_root else None,
+                "index_path": str((sessions_root / "index.json")) if sessions_root else None,
+                "generated_at": None,
+                "items": [],
+                "index": None,
+                "warnings": [],
+            }
+        return build_session_catalog(
+            task_id=row.task_id,
+            row_status=row.status,
+            sessions_root=sessions_root,
+            run_root=run_root,
+            parse_session_jsonl_file=self._parse_session_jsonl_file,
+            write_json_atomic=self._write_json_atomic,
+        )
+
     def list_task_sessions(self, db: Session, task_id: str) -> list[dict]:
         row = self._get_or_404(db, task_id)
-        sessions_root = self._task_sessions_root(row)
-        if not sessions_root or not sessions_root.is_dir():
-            return []
-        now_ts = _time.time()
-        items: list[dict] = []
-        for session_file in sorted(sessions_root.rglob("*.jsonl")):
-            try:
-                relative_path = str(session_file.relative_to(sessions_root)).replace("\\", "/")
-                relative_parts = relative_path.split("/")
-                stage_group = relative_parts[0] if len(relative_parts) > 1 else "root"
-                session_name = session_file.stem
-                _, events, warnings, line_count = self._parse_session_jsonl_file(session_file)
-                stat = session_file.stat()
-                is_active = row.status in ("pending", "running") and (now_ts - stat.st_mtime) <= 120
-                display_name = session_name if stage_group == "root" else f"{stage_group} / {session_name}"
-                items.append({
-                    "session_id": session_name,
-                    "session_name": session_name,
-                    "relative_path": relative_path,
-                    "stage_group": stage_group,
-                    "role_name": session_name,
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "event_count": len(events),
-                    "line_count": line_count,
-                    "is_active": is_active,
-                    "display_name": display_name,
-                    "warnings": warnings,
-                })
-            except Exception:
-                continue
-        return sorted(items, key=lambda item: (item["stage_group"], -item["mtime"], item["relative_path"]))
+        return self._build_session_catalog(row).get("items") or []
+
+    def get_task_session_index(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        catalog = self._build_session_catalog(row)
+        return {
+            "task_id": catalog.get("task_id"),
+            "status": catalog.get("status"),
+            "sessions_root": catalog.get("sessions_root"),
+            "index_path": catalog.get("index_path"),
+            "generated_at": catalog.get("generated_at"),
+            "summary": (catalog.get("index") or {}).get("summary") or {},
+            "nodes": (catalog.get("index") or {}).get("nodes") or [],
+            "edges": (catalog.get("index") or {}).get("edges") or [],
+            "groups": (catalog.get("index") or {}).get("groups") or [],
+            "warnings": list(dict.fromkeys((catalog.get("warnings") or []) + (((catalog.get("index") or {}).get("warnings")) or []))),
+        }
 
     def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -237,6 +272,7 @@ class TaskQueryService:
                 if not isinstance(payload, dict):
                     warnings.append(f"{path.relative_to(run_root)} 格式不是对象")
                     continue
+                payload = _normalize_evaluation_round_status(payload)
                 payload.setdefault("source_path", str(path))
                 rounds.append(payload)
 

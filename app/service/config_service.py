@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import build_prompt_override_config, load_prompt_defaults
 from app.db.models import AppSaModelsConfig, AppSaProjectConfig
@@ -16,6 +17,11 @@ logger = logging.getLogger("sa.config_service")
 
 # Fields in workers/judges that must NOT be stored in DB — always use fixed defaults
 _ROLE_READONLY_FIELDS = {"system_prompt_dir"}
+_RUNTIME_SETTINGS_CONFIG_KEY = "runtime_settings"
+_DEFAULT_RUNTIME_SETTINGS: Dict[str, Any] = {
+    "worker_task_concurrency": 4,
+    "agent_timeout_seconds": 1800.0,
+}
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -43,21 +49,24 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds_exceeded_action": "treat_as_passed",
+    "enable_final_check": False,
     "analyse_targets": ["binary", "source"],
     "binary_arch": ["all"],
     "security_focus_categories": ["all"],
     "module_granularity": "fine",
-    "parallel_modules": 20,
-    "parallel_sub_workers": 4,
+    "worker_task_concurrency": 4,
+    "parallel_modules": 1,
+    "parallel_sub_workers": 1,
     "agent_max_retries": 5,
     "agent_retry_delay": 60,
+    "agent_timeout_seconds": 1800.0,
     "pi_max_retries": 3,
     "pi_retry_delay": 5,
     "stages": {
-        "classify":    {"min_rounds": 1, "max_rounds": 8,  "pass_mode": "all"},
-        "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
-        "analyse":     {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
-        "final_check": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "classify":    {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
+        "refine":      {"min_rounds": 2, "max_rounds": 3, "pass_mode": "majority"},
+        "analyse":     {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
+        "final_check": {"min_rounds": 1, "max_rounds": 1, "pass_mode": "all"},
     },
     "workers": {
         "default_model": "",
@@ -91,6 +100,50 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
 
 
 class ConfigService:
+    @staticmethod
+    def _sanitize_runtime_settings(raw: Any, *, updated_at: str | None = None) -> dict:
+        payload = dict(_DEFAULT_RUNTIME_SETTINGS)
+        if isinstance(raw, dict):
+            payload.update(raw)
+        try:
+            worker_task_concurrency = int(payload.get("worker_task_concurrency") or 4)
+        except (TypeError, ValueError):
+            worker_task_concurrency = 4
+        try:
+            agent_timeout_seconds = float(payload.get("agent_timeout_seconds") or 1800.0)
+        except (TypeError, ValueError):
+            agent_timeout_seconds = 1800.0
+        return {
+            "worker_task_concurrency": max(1, worker_task_concurrency),
+            "agent_timeout_seconds": max(60.0, agent_timeout_seconds),
+            "updated_at": updated_at,
+        }
+
+    def get_runtime_settings(self, db: Session) -> dict:
+        row = db.query(AppSaModelsConfig).filter_by(config_key=_RUNTIME_SETTINGS_CONFIG_KEY).first()
+        payload = dict(row.config_json) if row and isinstance(row.config_json, dict) else None
+        return self._sanitize_runtime_settings(
+            payload,
+            updated_at=row.updated_at.isoformat() if row and row.updated_at else None,
+        )
+
+    def save_runtime_settings(self, db: Session, config_data: dict | None) -> dict:
+        sanitized = self._sanitize_runtime_settings(config_data)
+        blob = {k: v for k, v in sanitized.items() if k != "updated_at"}
+        row = db.query(AppSaModelsConfig).filter_by(config_key=_RUNTIME_SETTINGS_CONFIG_KEY).first()
+        if row:
+            row.config_json = blob
+            flag_modified(row, "config_json")
+        else:
+            row = AppSaModelsConfig(config_key=_RUNTIME_SETTINGS_CONFIG_KEY, config_json=blob)
+            db.add(row)
+        db.commit()
+        db.refresh(row)
+        return self._sanitize_runtime_settings(
+            blob,
+            updated_at=row.updated_at.isoformat() if row.updated_at else None,
+        )
+
     @staticmethod
     def _extract_stored_prompt_overrides(raw: Any) -> Dict[str, Dict[str, str]]:
         result: Dict[str, Dict[str, str]] = {"workers": {}, "judges": {}}
@@ -129,6 +182,7 @@ class ConfigService:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
             data = dict(_DEFAULT_CONFIG)
+        runtime_settings = self.get_runtime_settings(db)
         stored_prompt_overrides = (
             row.config_json.get("prompt_overrides")
             if row and isinstance(row.config_json, dict)
@@ -142,6 +196,8 @@ class ConfigService:
             worker_prompt_dir=data.get("workers", {}).get("system_prompt_dir"),
             judge_prompt_dir=data.get("judges", {}).get("system_prompt_dir"),
         ).model_dump(mode="json")
+        data["worker_task_concurrency"] = int(runtime_settings["worker_task_concurrency"])
+        data["agent_timeout_seconds"] = float(runtime_settings["agent_timeout_seconds"])
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
@@ -150,8 +206,19 @@ class ConfigService:
         # Strip meta-fields and task-execution-only overrides from the stored blob
         # start_stage / resume_workspace are ephemeral per-run values set by
         # resume_task / restart_task; they must never be persisted in project config.
-        _STRIP = {"project_id", "updated_at", "start_stage", "resume_workspace"}
+        _STRIP = {"project_id", "updated_at", "start_stage", "resume_workspace", "worker_task_concurrency", "agent_timeout_seconds"}
         blob = {k: v for k, v in config_data.items() if k not in _STRIP}
+        current_runtime_settings = self.get_runtime_settings(db)
+        runtime_settings_payload = {
+            "worker_task_concurrency": config_data.get(
+                "worker_task_concurrency",
+                current_runtime_settings["worker_task_concurrency"],
+            ),
+            "agent_timeout_seconds": config_data.get(
+                "agent_timeout_seconds",
+                current_runtime_settings["agent_timeout_seconds"],
+            ),
+        }
         blob["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
             blob.get("max_rounds_exceeded_action")
         )
@@ -164,7 +231,6 @@ class ConfigService:
         for role_key in ("workers", "judges"):
             if isinstance(blob.get(role_key), dict):
                 blob[role_key] = {k: v for k, v in blob[role_key].items() if k not in _ROLE_READONLY_FIELDS}
-        from sqlalchemy.orm.attributes import flag_modified
         row = db.query(AppSaProjectConfig).filter_by(project_id=project_id).first()
         if row:
             row.config_json = blob
@@ -174,6 +240,7 @@ class ConfigService:
             db.add(row)
         db.commit()
         db.refresh(row)
+        runtime_settings = self.save_runtime_settings(db, runtime_settings_payload)
         # Return fully-merged config (same shape as get_config)
         result = _deep_merge(_DEFAULT_CONFIG, blob)
         result["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
@@ -184,6 +251,8 @@ class ConfigService:
             worker_prompt_dir=result.get("workers", {}).get("system_prompt_dir"),
             judge_prompt_dir=result.get("judges", {}).get("system_prompt_dir"),
         ).model_dump(mode="json")
+        result["worker_task_concurrency"] = int(runtime_settings["worker_task_concurrency"])
+        result["agent_timeout_seconds"] = float(runtime_settings["agent_timeout_seconds"])
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result
@@ -197,6 +266,13 @@ def get_config_service() -> ConfigService:
     if _config_service is None:
         _config_service = ConfigService()
     return _config_service
+
+
+def get_worker_task_concurrency(db: Session) -> int:
+    try:
+        return int(get_config_service().get_runtime_settings(db).get("worker_task_concurrency") or 4)
+    except Exception:
+        return 4
 
 
 _DEFAULT_MODELS_CONFIG: Dict[str, Any] = {

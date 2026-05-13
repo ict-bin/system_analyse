@@ -21,7 +21,7 @@ from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
-    run_agent_checked, parse_eval_md, check_voting,
+    run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, StageError,
     max_rounds_exceeded_treated_as_passed,
 )
@@ -90,7 +90,7 @@ class ClassifyStage(BaseStage):
         check_prompt = load_prompt(cfg, "step1_check_classify", "judges")
         reflect_prompt = load_prompt(cfg, "reflect_classify", "workers")
 
-        classify_session = str(ctx.sess_dir / "classify.jsonl")
+        classify_session = ctx.session_path("classify.jsonl")
         classify_model = cfg.workers.model_for("classify")
         judge_model = cfg.judges.agents[0].model if cfg.judges.agents else classify_model
 
@@ -196,8 +196,15 @@ class ClassifyStage(BaseStage):
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
-            ar = await run_agent_checked(
+            ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="classify",
                 context=f"s1-classify-a{attempt+1}",
+                heartbeat_payload_factory=lambda beat, attempt_no=attempt + 1: {
+                    "attempt": attempt_no,
+                    "heartbeat": beat,
+                    "session_file": classify_session,
+                },
                 prompt="\n".join(prompt_parts),
                 model=classify_model,
                 system_prompt=classify_prompt,
@@ -214,6 +221,11 @@ class ClassifyStage(BaseStage):
             judge_records = []
             for j_idx, j_agent in enumerate(cfg.judges.agents):
                 j_model = cfg.judges.model_for("classify") or j_agent.model
+                judge_session = ctx.session_path(
+                    "judges",
+                    "classify",
+                    f"classify-a{attempt + 1}-j{j_idx}.jsonl",
+                )
                 judge_prompt = [f"审核分类结果。模块数：{len(modules)}。"]
                 if security_focus_section:
                     judge_prompt.append(
@@ -226,15 +238,23 @@ class ClassifyStage(BaseStage):
                         "当前要求是粗粒度（协议/服务/功能级）。"
                         "不要把同一协议拆成多个碎片模块，也不要把无关的广义网络管理代码混入协议模块。"
                     )
-                j_ar = await run_agent_checked(
+                j_ar = await run_agent_with_stage_guard(
+                    ctx=ctx,
+                    stage="classify",
                     context=f"s1-classify-judge{j_idx}",
+                    heartbeat_payload_factory=lambda beat, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
+                        "attempt": attempt_no,
+                        "heartbeat": beat,
+                        "judge_id": f"judge-{judge_id}",
+                        "session_file": session,
+                    },
                     prompt="\n\n".join(judge_prompt),
                     model=j_model,
                     tools=cfg.judges.default_tools,
                     system_prompt=check_prompt,
                     cwd=str(workspace),
                     thinking_level="off",
-                    session_file=None,
+                    session_file=judge_session,
                     cancel_event=ctx.cancel_event,
                     max_retries=cfg.agent_max_retries,
                     retry_delay=cfg.agent_retry_delay,
@@ -250,6 +270,7 @@ class ClassifyStage(BaseStage):
                     "score": parsed["score"],
                     "passed": parsed["pass"],
                     "feedback": parsed["feedback"],
+                    "session_file": judge_session,
                     "token_usage": j_ar.token_usage,
                 })
 
@@ -273,7 +294,15 @@ class ClassifyStage(BaseStage):
                 module_name="__task__",
                 stage="classify",
                 stage_round=attempt + 1,
-                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
+                status=(
+                    "passed"
+                    if (final_pass or forced_pass)
+                    else "failed"
+                    if max_reached
+                    else "needs_reflection"
+                    if voted_pass
+                    else "needs_retry"
+                ),
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,

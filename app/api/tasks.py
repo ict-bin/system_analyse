@@ -27,6 +27,7 @@ class TaskCreateRequest(BaseModel):
     binary_arch: Optional[list[str]] = None      # Override service-level binary_arch
     security_focus_categories: Optional[list[str]] = None  # Override S1 category filter
     module_granularity: Optional[str] = None               # Override module split granularity
+    enable_final_check: Optional[bool] = None              # Override service-level final_check enable flag
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None
@@ -102,6 +103,75 @@ class TaskSessionMetaResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class TaskSessionIndexNodeResponse(BaseModel):
+    node_id: str
+    relative_path: str
+    session_name: str
+    display_name: str
+    role: str
+    role_label: str
+    status: str
+    is_active: bool = False
+    stage_key: str
+    stage_label: str
+    stage_order: int
+    stage_group: str
+    module_name: Optional[str] = None
+    attempt: Optional[int] = None
+    judge_index: Optional[int] = None
+    batch_index: Optional[int] = None
+    parent_relative_path: Optional[str] = None
+    parallel_group: Optional[str] = None
+    family_key: Optional[str] = None
+    flow_kind: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    started_ts: Optional[float] = None
+    last_event_at: Optional[str] = None
+    last_event_ts: Optional[float] = None
+    mtime: float
+    size: int
+    event_count: int = 0
+    line_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
+    session_header: dict = Field(default_factory=dict)
+    cwd: Optional[str] = None
+    model: Optional[str] = None
+    latest_round_ref: Optional[dict[str, Any]] = None
+    round_refs: list[dict[str, Any]] = Field(default_factory=list)
+    attempts_seen: list[int] = Field(default_factory=list)
+
+
+class TaskSessionIndexEdgeResponse(BaseModel):
+    edge_id: str
+    source_node_id: str
+    target_node_id: str
+    kind: str
+    label: str
+
+
+class TaskSessionIndexGroupResponse(BaseModel):
+    group_id: str
+    kind: str
+    label: str
+    stage_key: Optional[str] = None
+    module_name: Optional[str] = None
+    node_ids: list[str] = Field(default_factory=list)
+
+
+class TaskSessionIndexResponse(BaseModel):
+    task_id: str
+    status: str
+    sessions_root: Optional[str] = None
+    index_path: Optional[str] = None
+    generated_at: Optional[str] = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    nodes: list[TaskSessionIndexNodeResponse] = Field(default_factory=list)
+    edges: list[TaskSessionIndexEdgeResponse] = Field(default_factory=list)
+    groups: list[TaskSessionIndexGroupResponse] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TaskSessionFileResponse(BaseModel):
     path: str
     session_meta: dict = Field(default_factory=dict)
@@ -130,7 +200,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     task_config: dict | None = None
     _override_fields = (
         body.analyse_targets, body.binary_arch,
-        body.security_focus_categories, body.module_granularity,
+        body.security_focus_categories, body.module_granularity, body.enable_final_check,
     )
     if any(f is not None for f in _override_fields):
         task_config = {}
@@ -142,6 +212,8 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
             task_config["security_focus_categories"] = body.security_focus_categories
         if body.module_granularity is not None:
             task_config["module_granularity"] = body.module_granularity
+        if body.enable_final_check is not None:
+            task_config["enable_final_check"] = bool(body.enable_final_check)
     return svc.create_task(
         db,
         project_id=body.project_id,
@@ -204,6 +276,11 @@ async def get_task_result(task_id: str, db: Session = Depends(get_db)):
 @router.get("/tasks/{task_id}/sessions", response_model=list[TaskSessionMetaResponse])
 async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().list_task_sessions(db, task_id)
+
+
+@router.get("/tasks/{task_id}/sessions/index", response_model=TaskSessionIndexResponse)
+async def get_task_session_index(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_task_session_index(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)

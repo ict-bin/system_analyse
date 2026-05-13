@@ -23,6 +23,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.config import load_service_config
 from app.db.models import AppSaTask
 from app.logging_utils import log_event
+from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
 from app.service.task_query_service import TaskQueryService
 from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
 from app.service.task_repository import TaskRepository
@@ -100,9 +101,24 @@ def get_worker_runtime_health() -> dict:
 
 
 def get_worker_runtime_settings() -> dict:
+    configured_concurrency = WORKER_TASK_CONCURRENCY
+    try:
+        from app.db import get_db as _get_db
+
+        _db_gen = _get_db()
+        _db = next(_db_gen)
+        try:
+            configured_concurrency = max(1, int(_get_worker_task_concurrency_from_db(_db)))
+        finally:
+            try:
+                next(_db_gen)
+            except StopIteration:
+                pass
+    except Exception:
+        configured_concurrency = WORKER_TASK_CONCURRENCY
     return {
         "worker_instance_id": WORKER_INSTANCE_ID,
-        "worker_task_concurrency": WORKER_TASK_CONCURRENCY,
+        "worker_task_concurrency": configured_concurrency,
         "worker_poll_interval_seconds": WORKER_POLL_INTERVAL_SECONDS,
         "worker_poll_jitter_seconds": WORKER_POLL_JITTER_SECONDS,
         "worker_idle_backoff_max_seconds": WORKER_IDLE_BACKOFF_MAX_SECONDS,
@@ -607,6 +623,7 @@ class TaskService:
             task_run_root=_task_run_root,
             resolve_session_path=_resolve_session_path,
             parse_session_jsonl_file=_parse_session_jsonl_file,
+            write_json_atomic=_write_json_atomic,
         )
 
 
@@ -676,6 +693,9 @@ class TaskService:
 
     def list_task_sessions(self, db: Session, task_id: str) -> list[dict]:
         return self._query.list_task_sessions(db, task_id)
+
+    def get_task_session_index(self, db: Session, task_id: str) -> dict:
+        return self._query.get_task_session_index(db, task_id)
 
     def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
         return self._query.get_task_session_file(db, task_id, relative_path)
@@ -917,12 +937,13 @@ class TaskService:
             await asyncio.sleep(RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS)
 
     def _poll_runner_assignments_once(self) -> None:
-        available_slots = max(0, WORKER_TASK_CONCURRENCY - len(_running_tasks))
-        if available_slots <= 0:
-            return
         db_gen = self._runner._deps.get_db()
         db: Session = next(db_gen)
         try:
+            current_concurrency = max(1, int(_get_worker_task_concurrency_from_db(db)))
+            available_slots = max(0, current_concurrency - len(_running_tasks))
+            if available_slots <= 0:
+                return
             rows = self._task_repository.list_tasks_assigned_to_instance(
                 db,
                 instance_id=WORKER_INSTANCE_ID,

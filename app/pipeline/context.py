@@ -93,6 +93,12 @@ class PipelineContext:
     def module_dir(self, mod_name: str) -> Path:
         return self.modules_root() / mod_name
 
+    def session_path(self, *parts: str) -> str:
+        """返回 session 文件路径，并确保父目录存在。"""
+        path = self.sess_dir.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
     def emit_event(self, event_type: str, **data):
         """便捷 emit，自动带 task_id"""
         from ..models import SwarmEvent
@@ -164,5 +170,4 @@ class PipelineContext:
             "retry_delay": self.cfg.agent_retry_delay,
             "pi_max_retries": self.cfg.pi_max_retries,
             "pi_retry_delay": self.cfg.pi_retry_delay,
-            "session_file": None,
         }
