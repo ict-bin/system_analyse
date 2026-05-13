@@ -327,22 +327,14 @@ class SelfReflectionService:
         output_dir: Path,
         cfg: "TaskConfig",
         task_status: str,
-        sr_dir: "Path | None" = None,
     ) -> None:
-        """非阻塞入口 — 在独立 asyncio.Task 中运行，不影响主流水线。
-
-        sr_dir: 自省报告存储目录（优先于 cfg.self_reflection.output_dir）。
-            由 task_service 根据任务的 output_path 动态计算，格式为
-            /data/files/{project_id}/app/secflow-app-system-analyse/self-reflection。
-            若为 None 且 cfg.self_reflection.output_dir 非空，则使用配置值；
-            两者均为空时回退到 /data/self-reflection。
-        """
+        """非阻塞入口 — 在独立 asyncio.Task 中运行，不影响主流水线。"""
         if not cfg.self_reflection.enabled:
             return
         if task_status == "cancelled":
             return  # 取消任务不做自省
         asyncio.create_task(
-            self._run_reflection(task_id, run_dir, output_dir, cfg, task_status, sr_dir=sr_dir),
+            self._run_reflection(task_id, run_dir, output_dir, cfg, task_status),
             name=f"self-reflection-{task_id}",
         )
 
@@ -353,8 +345,6 @@ class SelfReflectionService:
         output_dir: Path,
         cfg: "TaskConfig",
         task_status: str,
-        *,
-        sr_dir: "Path | None" = None,
     ) -> None:
         """实际的自省分析逻辑。"""
         from app.runner import run_agent  # 延迟导入避免循环
@@ -377,14 +367,8 @@ class SelfReflectionService:
                 lambda: _collect_task_data(run_dir, output_dir, max_lines),
             )
 
-            # 准备输出路径
-            # 优先级：sr_dir 参数 > cfg.self_reflection.output_dir 配置 > 默认回退
-            if sr_dir is not None:
-                out_dir = sr_dir
-            elif sr_cfg.output_dir:
-                out_dir = Path(sr_cfg.output_dir)
-            else:
-                out_dir = Path("/data/self-reflection")
+            # 准备输出路径（由 config_service.get_config 已填充为项目级路径）
+            out_dir = Path(sr_cfg.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             report_path = out_dir / f"{task_id}_{ts}.md"

@@ -150,6 +150,12 @@ class ConfigService:
         ).model_dump(mode="json")
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
+        # self_reflection.output_dir 空时自动填充项目级路径
+        sr = data.setdefault("self_reflection", {})
+        if not sr.get("output_dir"):
+            sr["output_dir"] = (
+                f"/data/files/{project_id}/app/secflow-app-system-analyse/self-reflection"
+            )
         return data
 
     def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
