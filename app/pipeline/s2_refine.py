@@ -171,6 +171,17 @@ class RefineStage(BaseStage):
             new_ones = sorted(
                 (mods_after - mods_before) - self._refined - self._in_progress
             )
+
+            # 清理孤儿子模块目录：Worker 创建了目录但未写入 files.list
+            # （常见于 Worker 询问用户确认而中途退出）
+            import shutil as _shutil_orphan
+            for _nm in list(new_ones):
+                _sub_dir = get_modules_root(str(workspace)) / _nm
+                if _sub_dir.exists() and not (_sub_dir / "files.list").exists():
+                    _shutil_orphan.rmtree(str(_sub_dir), ignore_errors=True)
+                    new_ones = [m for m in new_ones if m != _nm]
+                    mods_after.discard(_nm)
+
             was_split = (mod_name not in mods_after
                          and bool(mods_after - mods_before - self._refined - self._in_progress))
             ctx.emit_event("stage_result", stage=2, module=mod_name,
