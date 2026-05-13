@@ -51,6 +51,20 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", f"{CONFIG_DIR}/config.jso
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 
 
+def _service_role() -> str:
+    raw_role = os.environ.get("SECFLOW_SYSTEM_ANALYSE_ROLE") or ""
+    normalized = str(raw_role).strip().lower()
+    return normalized if normalized in {"api", "worker"} else "all"
+
+
+def _is_api_role() -> bool:
+    return _service_role() in {"api", "all"}
+
+
+def _is_worker_role() -> bool:
+    return _service_role() in {"worker", "all"}
+
+
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -70,43 +84,32 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("DB init failed (management APIs will be unavailable): %s", exc)
 
-    # --- Recover orphaned tasks from a previous pod instance ---
-    try:
-        from .db import get_db
-        from .db.models import AppSaTask
-        from .time_utils import now_local
-        _db = next(get_db())
-        orphaned = _db.query(AppSaTask).filter(
-            AppSaTask.status.in_(["running", "pending"]),
-            AppSaTask.is_deleted.is_(False),
-        ).all()
-        if orphaned:
-            for t in orphaned:
-                t.status = "error"
-                t.error = "服务重启，任务被中断"
-                t.finished_at = now_local()
-            _db.commit()
-            logger.warning("Recovered %d orphaned task(s) from previous pod instance", len(orphaned))
-    except Exception as exc:
-        logger.warning("Orphan task recovery failed: %s", exc)
+    if _is_api_role():
+        try:
+            from .service.registry_service import get_registry_service
+            registry = get_registry_service()
+            await registry.register()
+            registry.start()
+        except Exception as exc:
+            logger.warning("Registry startup failed: %s", exc)
 
-    try:
-        from .service.registry_service import get_registry_service
-        registry = get_registry_service()
-        await registry.register()
-        registry.start()
-    except Exception as exc:
-        logger.warning("Registry startup failed: %s", exc)
+        from .api import router as mgmt_router
+        app.include_router(mgmt_router)
 
-    from .api import router as mgmt_router
-    app.include_router(mgmt_router)
+    if _is_worker_role():
+        from .service.task_service import get_task_service
+        await get_task_service().start_worker_loop()
 
     yield
 
     # --- shutdown ---
     try:
-        from .service.registry_service import get_registry_service
-        get_registry_service().stop()
+        if _is_worker_role():
+            from .service.task_service import get_task_service
+            await get_task_service().stop_worker_loop()
+        if _is_api_role():
+            from .service.registry_service import get_registry_service
+            get_registry_service().stop()
     except Exception:
         pass
 
@@ -156,10 +159,14 @@ class AnalyseRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/app/system-analyse/health")
 async def health():
+    from .service.task_service import _running_tasks
+
     return {
         "status": "ok",
+        "role": _service_role(),
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
+        "worker_running_tasks": len(_running_tasks),
     }
 
 

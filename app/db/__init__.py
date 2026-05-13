@@ -26,6 +26,10 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN dispatcher_instance_id VARCHAR(128) NULL",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN dispatch_started_at DATETIME NULL",
+    "CREATE INDEX ix_sa_tasks_dispatcher_instance_id ON secflow_app_sa_tasks (dispatcher_instance_id)",
+    "CREATE INDEX ix_sa_tasks_dispatch_started_at ON secflow_app_sa_tasks (dispatch_started_at)",
     # Add task_config_json column for per-task analysis scope overrides (added 2026-06)
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN task_config_json JSON NULL",
     # Fallback: create per-project config table if create_all failed (added 2026-06)

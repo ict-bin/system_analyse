@@ -13,8 +13,9 @@ import os
 import re
 import time as _time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -30,6 +31,16 @@ from app.time_utils import isoformat_local, now_local
 logger = logging.getLogger("sa.task_service")
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
+WORKER_POLL_INTERVAL_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_POLL_INTERVAL", "2"))
+WORKER_TASK_CONCURRENCY = max(1, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_TASK_CONCURRENCY", "1")))
+TASK_CANCEL_POLL_INTERVAL_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_CANCEL_POLL_INTERVAL", "2"))
+TASK_LEASE_TIMEOUT_SECONDS = max(30, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_LEASE_TIMEOUT_SECONDS", "300")))
+TASK_LEASE_HEARTBEAT_SECONDS = max(5, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_LEASE_HEARTBEAT_SECONDS", "15")))
+WORKER_INSTANCE_ID = (
+    str(os.environ.get("SECFLOW_SYSTEM_ANALYSE_INSTANCE_ID") or "").strip()
+    or str(os.environ.get("POD_NAME") or "").strip()
+    or f"sa-worker-{uuid.uuid4().hex[:8]}"
+)
 
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
@@ -484,6 +495,10 @@ def _write_models_json_from_db(db: Session) -> None:
 
 
 class TaskService:
+    def __init__(self) -> None:
+        self._worker_loop_task: asyncio.Task | None = None
+        self._worker_running = False
+
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
                    per_page: int = 20, status: Optional[str] = None,
@@ -798,9 +813,6 @@ class TaskService:
             parent_stage_item_key=parent_stage_item_key,
         )
         db.add(row); db.commit(); db.refresh(row)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"sa_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id,
                   analysis_mode=mode,
@@ -834,9 +846,6 @@ class TaskService:
                     _shutil.rmtree(task_root)
                 except Exception as _e:
                     logger.warning("Failed to clean task dir %s: %s", task_root, _e)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"sa_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
@@ -862,9 +871,6 @@ class TaskService:
         row.error = None
         flag_modified(row, "task_config_json")
         db.commit(); db.refresh(row)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"sa_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id, resume_workspace=resume_workspace)
         return self._row_to_dict(row)
@@ -880,6 +886,97 @@ class TaskService:
         row.finished_at = now_local()
         db.commit(); db.refresh(row)
         return self._row_to_dict(row)
+
+    async def start_worker_loop(self) -> None:
+        if self._worker_loop_task and not self._worker_loop_task.done():
+            return
+        self._worker_running = True
+        self._worker_loop_task = asyncio.create_task(self._worker_loop(), name="sa_worker_loop")
+        logger.info(
+            "system analyse worker loop started (poll_interval=%ss, task_concurrency=%s)",
+            WORKER_POLL_INTERVAL_SECONDS,
+            WORKER_TASK_CONCURRENCY,
+        )
+
+    async def stop_worker_loop(self) -> None:
+        self._worker_running = False
+        task = self._worker_loop_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._worker_loop_task = None
+
+    async def _worker_loop(self) -> None:
+        from app.db import get_db
+
+        while self._worker_running:
+            try:
+                available_slots = max(0, WORKER_TASK_CONCURRENCY - len(_running_tasks))
+                if available_slots > 0:
+                    db_gen = get_db()
+                    db: Session = next(db_gen)
+                    try:
+                        stale_rows = db.query(AppSaTask).filter(
+                            AppSaTask.is_deleted.is_(False),
+                            AppSaTask.status == "running",
+                            AppSaTask.dispatch_started_at.is_not(None),
+                            AppSaTask.dispatch_started_at < now_local() - timedelta(seconds=TASK_LEASE_TIMEOUT_SECONDS),
+                        ).all()
+                        for stale in stale_rows:
+                            stale.status = "pending"
+                            stale.error = "任务租约过期，已重新排队"
+                            stale.dispatcher_instance_id = None
+                            stale.dispatch_started_at = None
+                            stale.finished_at = None
+                        if stale_rows:
+                            db.commit()
+                        pending_rows = db.query(AppSaTask).filter(
+                            AppSaTask.is_deleted.is_(False),
+                            AppSaTask.status == "pending",
+                        ).order_by(AppSaTask.created_at.asc()).limit(available_slots).all()
+                        for row in pending_rows:
+                            if len(_running_tasks) >= WORKER_TASK_CONCURRENCY:
+                                break
+                            claimed = db.query(AppSaTask).filter(
+                                AppSaTask.task_id == row.task_id,
+                                AppSaTask.is_deleted.is_(False),
+                                AppSaTask.status == "pending",
+                            ).update(
+                                {
+                                    "status": "running",
+                                    "started_at": row.started_at or now_local(),
+                                    "finished_at": None,
+                                    "error": None,
+                                    "dispatcher_instance_id": WORKER_INSTANCE_ID,
+                                    "dispatch_started_at": now_local(),
+                                },
+                                synchronize_session=False,
+                            )
+                            if not claimed:
+                                db.rollback()
+                                continue
+                            db.commit()
+                            self._run_task_locally(row.task_id)
+                    finally:
+                        try:
+                            next(db_gen)
+                        except StopIteration:
+                            pass
+                await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("system analyse worker loop failed: %s", exc)
+                await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
+
+    def _run_task_locally(self, task_id: str) -> None:
+        if task_id in _running_tasks and not _running_tasks[task_id].done():
+            return
+        asyncio_task = asyncio.create_task(self._execute_task(task_id), name=f"sa_task_{task_id}")
+        _running_tasks[task_id] = asyncio_task
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
         """软删除任务记录，并可选删除输出目录下的任务文件。运行中任务不允许删除。"""
@@ -904,8 +1001,6 @@ class TaskService:
 
     async def _execute_task(self, task_id: str) -> None:
         from app.db import get_db
-        db_gen = get_db()
-        db: Session = next(db_gen)
         event_buffer: list[dict] = []
 
         def on_event(event: SwarmEvent) -> None:
@@ -916,35 +1011,55 @@ class TaskService:
                 _flush_stages(task_id, event_buffer)
 
         try:
-            row = db.query(AppSaTask).filter_by(task_id=task_id).first()
-            if not row or row.status == "cancelled":
-                return
-            svc = _load_svc_config_from_db(db, row.project_id)
-            tcfg = row.task_config_json or {}
-            # Apply per-task config overrides (analyse_targets, binary_arch, etc.)
-            if tcfg.get("analyse_targets"):
-                svc.analyse_targets = tcfg["analyse_targets"]
-            elif _infer_analysis_mode(row) == ANALYSIS_MODE_SOURCE:
-                svc.analyse_targets = list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS)
-            if tcfg.get("binary_arch"):
-                svc.binary_arch = tcfg["binary_arch"]
-            if tcfg.get("security_focus_categories"):
-                svc.security_focus_categories = tcfg["security_focus_categories"]
-            if tcfg.get("module_granularity"):
-                svc.module_granularity = tcfg["module_granularity"]
-            # start_stage / resume_workspace come ONLY from task_config_json
-            # (set by resume_task).  Never inherit from project config so that
-            # fresh runs and restarts always start from Stage 0.
-            svc.start_stage = tcfg["start_stage"] if tcfg.get("start_stage") else 0
-            svc.resume_workspace = tcfg.get("resume_workspace") or ""
-            # Use row.output_path as the working root so the Orchestrator writes to
-            # the user-specified location ({output_path}/{task_id}/workspace/) rather
-            # than the global /data/output directory from config.json.
-            if row.output_path:
-                svc.output_dir = row.output_path
-                svc.archive_dir = row.output_path
-                svc.result_dir = row.output_path
-            cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
+            db_gen = get_db()
+            db: Session = next(db_gen)
+            try:
+                row = db.query(AppSaTask).filter_by(task_id=task_id).first()
+                if not row or row.status == "cancelled":
+                    return
+                if row.dispatcher_instance_id and row.dispatcher_instance_id != WORKER_INSTANCE_ID:
+                    logger.warning(
+                        "skip task %s because it is leased by another worker: %s",
+                        task_id,
+                        row.dispatcher_instance_id,
+                    )
+                    return
+                svc = _load_svc_config_from_db(db, row.project_id)
+                tcfg = dict(row.task_config_json or {})
+                if tcfg.get("analyse_targets"):
+                    svc.analyse_targets = tcfg["analyse_targets"]
+                elif _infer_analysis_mode(row) == ANALYSIS_MODE_SOURCE:
+                    svc.analyse_targets = list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS)
+                if tcfg.get("binary_arch"):
+                    svc.binary_arch = tcfg["binary_arch"]
+                if tcfg.get("security_focus_categories"):
+                    svc.security_focus_categories = tcfg["security_focus_categories"]
+                if tcfg.get("module_granularity"):
+                    svc.module_granularity = tcfg["module_granularity"]
+                svc.start_stage = tcfg["start_stage"] if tcfg.get("start_stage") else 0
+                svc.resume_workspace = tcfg.get("resume_workspace") or ""
+                if row.output_path:
+                    svc.output_dir = row.output_path
+                    svc.archive_dir = row.output_path
+                    svc.result_dir = row.output_path
+                task_snapshot = SimpleNamespace(
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    prompt_content=row.prompt_content,
+                    input_path=row.input_path,
+                    output_path=row.output_path,
+                    analysis_mode=row.analysis_mode,
+                    task_origin_type=row.task_origin_type,
+                    task_config_json=tcfg,
+                    result_json=row.result_json,
+                    stages_json=row.stages_json,
+                )
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+            cfg = build_task_config(svc, task_snapshot.prompt_content, cwd=task_snapshot.input_path)
             resolved_snapshot = cfg.model_dump(mode="json")
             log_event(
                 logger,
@@ -952,64 +1067,150 @@ class TaskService:
                 "security filter resolved",
                 event="security_filter_resolved",
                 task_id=task_id,
-                project_id=row.project_id,
-                analysis_mode=row.analysis_mode,
-                task_origin_type=row.task_origin_type,
+                project_id=task_snapshot.project_id,
+                analysis_mode=task_snapshot.analysis_mode,
+                task_origin_type=task_snapshot.task_origin_type,
                 **_security_filter_log_payload(resolved_snapshot, resolved=True),
             )
-            row.task_config_json = {
-                **tcfg,
-                "resolved_config_snapshot": resolved_snapshot,
-            }
-            row.status = "running"
-            # 续跑时保留原始 started_at，首次运行才设置
-            if row.started_at is None:
-                row.started_at = now_local()
-            db.commit()
-            _write_models_json_from_db(db)
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                row = db.query(AppSaTask).filter_by(task_id=task_id).first()
+                if not row or row.status == "cancelled":
+                    return
+                row.task_config_json = {
+                    **tcfg,
+                    "resolved_config_snapshot": resolved_snapshot,
+                }
+                row.status = "running"
+                if row.started_at is None:
+                    row.started_at = now_local()
+                row.dispatcher_instance_id = WORKER_INSTANCE_ID
+                row.dispatch_started_at = now_local()
+                db.commit()
+                _write_models_json_from_db(db)
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
             orch = Orchestrator(config=cfg, on_event=on_event)
-            result = await orch.execute(task_id)
+            cancel_monitor = asyncio.create_task(self._monitor_task_cancellation(task_id, orch), name=f"sa_cancel_{task_id}")
+            lease_heartbeat = asyncio.create_task(self._heartbeat_task_lease(task_id), name=f"sa_lease_{task_id}")
+            try:
+                result = await orch.execute(task_id)
+            finally:
+                cancel_monitor.cancel()
+                lease_heartbeat.cancel()
+                try:
+                    await cancel_monitor
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await lease_heartbeat
+                except asyncio.CancelledError:
+                    pass
             _flush_stages(task_id, event_buffer)
-            db.expire(row); db.refresh(row)
-            if row.status == "cancelled":
-                return
-            row.status = result.status.value if result else "error"
-            row.finished_at = now_local()
-            # 合并历史事件（续跑场景保留前序阶段记录）
-            _prev = row.stages_json
-            _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
-            row.stages_json = {"events": _prev_events + event_buffer, "final": True}
-            if result:
-                result_payload = result.model_dump(mode="json")
-                result_file = _write_task_result_json(row, result_payload)
-                row.result_json = _lightweight_result_json(row, result_payload, result_file)
-                if result.error:
-                    row.error = result.error
-            db.commit()
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                row = db.query(AppSaTask).filter_by(task_id=task_id).first()
+                if not row or row.status == "cancelled":
+                    return
+                row.status = result.status.value if result else "error"
+                row.finished_at = now_local()
+                row.dispatcher_instance_id = None
+                row.dispatch_started_at = None
+                _prev = row.stages_json
+                _prev_events = _prev["events"] if isinstance(_prev, dict) and isinstance(_prev.get("events"), list) else []
+                row.stages_json = {"events": _prev_events + event_buffer, "final": True}
+                if result:
+                    result_payload = result.model_dump(mode="json")
+                    result_file = _write_task_result_json(task_snapshot, result_payload)
+                    row.result_json = _lightweight_result_json(task_snapshot, result_payload, result_file)
+                    if result.error:
+                        row.error = result.error
+                db.commit()
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             log_event(logger, logging.ERROR, "task execution failed",
                       event="task_error", task_id=task_id, error=str(exc))
             try:
-                db.rollback()
-                r = db.query(AppSaTask).filter_by(task_id=task_id).first()
-                if r and r.status == "running":
-                    r.status = "error"
-                    r.error = str(exc)
-                    r.finished_at = now_local()
-                    _prev2 = r.stages_json
-                    _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
-                    r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
-                    db.commit()
+                db_gen = get_db()
+                db = next(db_gen)
+                try:
+                    db.rollback()
+                    r = db.query(AppSaTask).filter_by(task_id=task_id).first()
+                    if r and r.status == "running":
+                        r.status = "error"
+                        r.error = str(exc)
+                        r.finished_at = now_local()
+                        r.dispatcher_instance_id = None
+                        r.dispatch_started_at = None
+                        _prev2 = r.stages_json
+                        _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
+                        r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
+                        db.commit()
+                finally:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
             except Exception:
                 pass
         finally:
             _running_tasks.pop(task_id, None)
+
+    async def _monitor_task_cancellation(self, task_id: str, orch: Orchestrator) -> None:
+        from app.db import get_db
+
+        while True:
+            await asyncio.sleep(TASK_CANCEL_POLL_INTERVAL_SECONDS)
+            db_gen = get_db()
+            db: Session = next(db_gen)
             try:
-                next(db_gen)
-            except StopIteration:
-                pass
+                row = db.query(AppSaTask).filter(
+                    AppSaTask.task_id == task_id,
+                    AppSaTask.is_deleted.is_(False),
+                ).first()
+                if not row or row.status == "cancelled":
+                    orch.stop()
+                    return
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+
+    async def _heartbeat_task_lease(self, task_id: str) -> None:
+        from app.db import get_db
+
+        while True:
+            await asyncio.sleep(TASK_LEASE_HEARTBEAT_SECONDS)
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                db.query(AppSaTask).filter(
+                    AppSaTask.task_id == task_id,
+                    AppSaTask.is_deleted.is_(False),
+                    AppSaTask.status == "running",
+                    AppSaTask.dispatcher_instance_id == WORKER_INSTANCE_ID,
+                ).update(
+                    {"dispatch_started_at": now_local()},
+                    synchronize_session=False,
+                )
+                db.commit()
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
 
     def _get_or_404(self, db: Session, task_id: str) -> AppSaTask:
         row = db.query(AppSaTask).filter(
