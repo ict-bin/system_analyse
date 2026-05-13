@@ -31,7 +31,8 @@ from .helpers import (
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter,
     SUB_WORKER_THRESHOLD, collect_file_summaries,
-    StageError, PiFatalError,
+    StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
+    enforce_filter_constraint,
 )
 
 
@@ -117,7 +118,7 @@ class RefineStage(BaseStage):
             shutil.copy2(str(mod_dir / "files.list"), str(snapshot_path))
 
         # 文件数超过阈值时，先用子 Worker 收集文件摘要
-        sub_prompt = load_prompt(cfg.workers.system_prompt_dir, "step2_sub_read")
+        sub_prompt = load_prompt(cfg, "step2_sub_read", "workers")
         file_summary = ""
         if sub_prompt and fc > SUB_WORKER_THRESHOLD:
             file_summary = await collect_file_summaries(
@@ -130,21 +131,9 @@ class RefineStage(BaseStage):
                 target_dir=cfg.target_dir,
             )
 
-        w_sys_prompt = load_prompt(cfg.workers.system_prompt_dir, "step2_refine")
-        j_sys_prompt = load_prompt(cfg.judges.system_prompt_dir, "step2_check_refine")
-        reflect_prompt = load_prompt(cfg.workers.system_prompt_dir, "reflect_refine")
-
-        granularity = getattr(cfg, "module_granularity", "fine")
-        if granularity == "coarse":
-            # 粗粒度模式：加载专用提示词（服务/协议级划分）；配置体系完全保留，s_cfg 指向 cfg.stages.refine
-            _coarse_w = load_prompt(cfg.workers.system_prompt_dir, "step2_coarse_refine")
-            _coarse_j = load_prompt(cfg.judges.system_prompt_dir, "step2_check_coarse_refine")
-            if _coarse_w:
-                w_sys_prompt = _coarse_w
-            if _coarse_j:
-                j_sys_prompt = _coarse_j
-            ctx.emit_event("log", level="info",
-                           msg=f"[S2-粗粒度] {mod_name}：使用协议/服务级划分提示词")
+        w_sys_prompt = load_prompt(cfg, "step2_refine", "workers")
+        j_sys_prompt = load_prompt(cfg, "step2_check_refine", "judges")
+        reflect_prompt = load_prompt(cfg, "reflect_refine", "workers")
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
@@ -179,30 +168,17 @@ class RefineStage(BaseStage):
                            split=was_split, new_modules=new_ones)
 
             # ── Judge ──────────────────────────────────────────────────
-            # 注入实际 target_dir + 脚本路径，避免 judge 使用硬编码 /data/target
-            judge_tool_hint = (
-                f"\n\n# 检查工具\n\n"
-                f"- **脚本路径**：`/app/scripts/check_module.sh`\n"
-                f"- **实际 target_dir**：`{cfg.target_dir}`\n"
-                f"- **运行命令**（请严格使用此命令）：\n"
-                f"  ```\n"
-                f"  bash /app/scripts/check_module.sh '{cfg.target_dir}' modules {mod_name}\n"
-                f"  ```\n"
-                f"- 当前工作目录已设为 workspace，直接用 `.` 即可。"
-            )
             judge_results = []
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("refine", j_item)
-                j_session = str(ctx.sess_dir / f"refine-{mod_name}-judge{j_idx}-a{attempt+1}.jsonl")
                 j_ar = await run_agent_checked(
                     context=f"s2-judge-{mod_name}-j{j_idx}-a{attempt+1}",
-                    prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。{judge_tool_hint}",
+                    prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
-                    session_file=j_session,
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -221,19 +197,19 @@ class RefineStage(BaseStage):
                 archive_file(
                     ctx.output_dir,
                     f"s2-{mod_name}-a{attempt+1}-j{j_idx}.md",
-                    f"Score: {parsed['score']}\nPass: {parsed['pass']}\n"
-                    f"Session: {j_session}\n\n"
+                    f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
                     f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{j_ar.output[:3000]}",
                 )
 
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter(s_cfg)
+            forced_pass = max_reached and max_rounds_exceeded_treated_as_passed(cfg)
             ctx.record_evaluation_round(
                 module_name=mod_name,
                 stage="refine",
                 stage_round=attempt + 1,
-                status="passed" if final_pass else "failed" if max_reached else "running",
+                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -246,7 +222,15 @@ class RefineStage(BaseStage):
                 judges=judge_records,
                 passed_by_vote=voted_pass,
                 module_completed=False,
-                completion_reason="passed" if final_pass else "max_rounds_exceeded" if max_reached else "",
+                completion_reason=(
+                    "passed"
+                    if final_pass
+                    else "max_rounds_exceeded_treated_as_passed"
+                    if forced_pass
+                    else "max_rounds_exceeded"
+                    if max_reached
+                    else ""
+                ),
                 needed_reflection=not final_pass,
                 artifact_paths=[str(mod_dir / "files.list")],
                 extra={
@@ -288,6 +272,15 @@ class RefineStage(BaseStage):
                     guidance = "\n\n请根据评审意见调整拆分策略。"
                 feedback = "# 评审意见（未通过）\n\n" + fail_fb + guidance
 
+            if forced_pass:
+                if was_split and new_ones:
+                    for nm in new_ones:
+                        if nm not in self._refined and nm not in self._in_progress:
+                            self._in_progress.add(nm)
+                            await self._queue.put(nm)
+                self._refined.add(mod_name)
+                return
+
         raise StageError(f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
 
     # ── Stage 2 后：全局完整性检查 + 遗漏文件补分类 ───────────────────────
@@ -306,37 +299,13 @@ class RefineStage(BaseStage):
         )
         mods_root = get_modules_root(str(workspace))
         all_classified: set[str] = set()
-        flist_map: dict[str, list[str]] = {}  # flist path → 有效行列表
         for flist in mods_root.glob("*/files.list"):
             if flist.name == "files.list.snapshot":
                 continue
-            lines = [l.strip() for l in flist.read_text("utf-8").splitlines()]
-            flist_map[str(flist)] = lines
-            for l in lines:
+            for l in flist.read_text("utf-8").splitlines():
+                l = l.strip()
                 if l:
                     all_classified.add(l)
-
-        # ── 清理多余文件（all_classified - all_target）────────────────────────
-        extra_files = all_classified - all_target
-        if extra_files:
-            removed_extra = 0
-            for flist_path, lines in flist_map.items():
-                valid = [l for l in lines if not l or l in all_target]
-                removed = [l for l in lines if l and l not in all_target]
-                if removed:
-                    removed_extra += len(removed)
-                    Path(flist_path).write_text(
-                        "\n".join(valid).strip() + "\n", encoding="utf-8")
-                    # 若模块变空则移除整个目录
-                    remaining = [l for l in valid if l]
-                    if not remaining:
-                        shutil.rmtree(str(Path(flist_path).parent), ignore_errors=True)
-            if removed_extra:
-                ctx.emit_event("log", level="warn",
-                               msg=f"Stage2 全局检查: 清理 {removed_extra} 个非过滤文件条目（不在 filtered_files.txt 中）")
-            # 重新计算 all_classified 用于 missing 检查
-            all_classified = all_target & all_classified  # 取交集即剩余有效分类
-
         missing_files = sorted(all_target - all_classified)
 
         if not missing_files:
@@ -357,7 +326,7 @@ class RefineStage(BaseStage):
             mod_summary_lines.append(f"- {mod_name} | {Path(sample).name}")
         mod_summary = "\n".join(mod_summary_lines)
 
-        reclass_prompt_tmpl = load_prompt(cfg.workers.system_prompt_dir, "step2_reclassify")
+        reclass_prompt_tmpl = load_prompt(cfg, "step2_reclassify", "workers")
         max_rc = min(3, max_iter(cfg.stages.refine))
 
         reclass_prompt = (
@@ -401,3 +370,10 @@ class RefineStage(BaseStage):
                 + "\n".join(missing_files)
                 + f"\n\n{mod_summary}"
             )
+
+        # 全局过滤约束：删除各 files.list 中不属于 filtered_files.txt 的越界条目
+        if ctx.filtered_files:
+            removed = enforce_filter_constraint(workspace, set(ctx.filtered_files))
+            if removed:
+                ctx.emit_event("log", level="warn",
+                               msg=f"[S2过滤约束] 删除 {removed} 个超出 filtered_files.txt 范围的文件条目")

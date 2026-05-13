@@ -121,7 +121,15 @@ def check_voting(results: list[dict], pass_mode: str, judge_count: int) -> bool:
 
 # ── prompt 加载 ────────────────────────────────────────────────────────────────
 
-def load_prompt(prompt_dir: str, name: str) -> str:
+def load_prompt(source, name: str, role: str | None = None) -> str:
+    if role and hasattr(source, "get_prompt"):
+        try:
+            prompt = source.get_prompt(role, name)
+            if isinstance(prompt, str) and prompt.strip():
+                return prompt.strip()
+        except Exception:
+            pass
+    prompt_dir = str(source or "")
     for ext in [".md", ".txt", ""]:
         p = Path(prompt_dir) / f"{name}{ext}"
         if p.exists():
@@ -134,6 +142,35 @@ def load_prompt(prompt_dir: str, name: str) -> str:
 def max_iter(s_cfg) -> int:
     """max_rounds=-1 时返回一个很大的数（≈无限）。"""
     return s_cfg.max_rounds if s_cfg.max_rounds > 0 else 999_999
+
+
+def max_rounds_exceeded_treated_as_passed(cfg) -> bool:
+    action = str(getattr(cfg, "max_rounds_exceeded_action", "treat_as_passed") or "treat_as_passed").strip().lower()
+    return action == "treat_as_passed"
+
+
+def enforce_filter_constraint(workspace: "Path", filtered_files: set[str]) -> int:
+    """删除所有 modules/*/files.list 中不属于 filtered_files 白名单的行。
+
+    返回删除的行数。若 filtered_files 为空（未配置过滤）则跳过。
+    """
+    if not filtered_files:
+        return 0
+    removed = 0
+    mods_root = get_modules_root(str(workspace))
+    for flist_path in mods_root.glob("*/files.list"):
+        lines = [l.strip() for l in flist_path.read_text("utf-8", errors="replace").splitlines()]
+        kept = [l for l in lines if not l or l in filtered_files]
+        if len(kept) < len(lines):
+            extra = len(lines) - len(kept)
+            removed += extra
+            # 删除空模块目录
+            if not any(l for l in kept):
+                import shutil as _shutil
+                _shutil.rmtree(str(flist_path.parent), ignore_errors=True)
+            else:
+                flist_path.write_text("\n".join(kept).strip() + "\n", encoding="utf-8")
+    return removed
 
 
 def extract_result(output: str) -> str:
@@ -278,19 +315,12 @@ def pre_read_module(target_dir: str, mod_dir: Path) -> str:
     truncated_files: list[str] = []
 
     parts = []
-    # 头部说明：所有路径均为 workspace 中的 target/<relpath>
-    # 工作目录中 target/ 是指向实际目标目录的符号链接
-    parts.append(
-        "\n> 文件路径格式说明：以下每个文件路径均为 `target/<相对路径>`，"
-        "如需用 read 工具读取文件内容，请直接使用此路径格式。"
-        "**严禁访问 prescan/ 目录**，它是预扫描中间产物而非模块文件清单。\n"
-    )
     for rp, fut in futs:
         try:
             _, ftype, data = fut.result(timeout=20)
         except Exception:
             ftype, data = 'unknown', {}
-        parts.append(f"### target/{rp}")
+        parts.append(f"### {rp}")
         if ftype == 'ELF':
             exports = data.get('exports', [])
             imports = data.get('imports', [])
@@ -343,9 +373,9 @@ def pre_read_module(target_dir: str, mod_dir: Path) -> str:
     if truncated_files:
         parts.append("")
         parts.append(f"⚠️ 以下 {len(truncated_files)} 个文件因总内容超限未展示，"
-                     f"可用 read 工具直接读取（路径格式：`target/<相对路径>`）：")
+                     f"可用 read 工具直接读取：")
         for tf in truncated_files:
-            parts.append(f"  - target/{tf}")
+            parts.append(f"  - /data/target/{tf}")
 
     result_str = '\n'.join(parts)
     prefix = '__HAS_TEXT__\n' if has_text_files else ''

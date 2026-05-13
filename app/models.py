@@ -156,6 +156,12 @@ ANALYSE_TYPES = {
 
 
 # ─── 安全分析维度 ──────────────────────────────────────────────────────────────
+# 每个类别包含：
+#   name        - 显示名称
+#   desc        - 简短描述
+#   keywords    - 预扫描关键词
+#   includes    - 目标范围：哪些代码属于此维度（用于生成分类提示词）
+#   boundary_note - 边界判断规则（通用语言，替代场景化硬编码规则）
 
 SECURITY_CATEGORIES: dict[str, dict] = {
     "network_protocol": {
@@ -163,60 +169,144 @@ SECURITY_CATEGORIES: dict[str, dict] = {
         "desc": "TCP/IP 协议栈、报文解析与编解码、socket 通信、TLS/SSL、MQTT/CoAP/QUIC 等协议实现",
         "keywords": ["socket", "tcp", "udp", "ip", "tls", "ssl", "mqtt", "coap", "quic", "dhcp",
                      "dns", "http", "ftp", "snmp", "netlink", "packet", "proto", "protocol"],
+        "includes": (
+            "HTTP/gRPC/REST/TLS 等网络通信框架及其客户端/服务端实现、"
+            "协议解析与编解码、socket 封装层、会话状态机、"
+            "网络连接管理模块、协议驱动层、网络 API 接口定义"
+        ),
+        "boundary_note": (
+            "凡直接实现或调用网络协议的代码均属于目标范围，"
+            "包括框架调用层（如 gRPC 客户端/服务端、REST API 层），"
+            "不限于底层协议解析器本身。"
+            "排除：与网络完全无关的纯内存操作、纯本地存储、纯 UI 渲染代码。"
+        ),
     },
     "file_parsing": {
         "name": "文件格式处理",
         "desc": "文件读写、格式解析（ZIP/Image/PDF/XML/JSON）、上传下载处理、文件系统操作",
         "keywords": ["parse", "unzip", "extract", "file", "read", "write", "stream",
                      "xml", "json", "pdf", "image", "upload", "download", "fs", "inode"],
+        "includes": (
+            "文件格式解析库（ZIP/tar/image/OCI层）、压缩/解压缩、"
+            "序列化/反序列化、文件上传下载处理、文件系统挂载与操作"
+        ),
+        "boundary_note": (
+            "凡读写或解析文件内容（含容器镜像层、压缩包、配置文件）的代码均属于目标范围。"
+            "排除：与文件无关的纯网络收发、纯计算逻辑。"
+        ),
     },
     "auth_access": {
         "name": "认证与访问控制",
         "desc": "登录认证、token/session 管理、权限校验、ACL、证书处理、PAM",
         "keywords": ["auth", "login", "token", "session", "acl", "permission", "role",
                      "cert", "pam", "credential", "passwd", "user", "access"],
+        "includes": (
+            "认证与授权库、权限校验模块、TLS 证书管理、"
+            "RBAC/ACL 实现、凭证存储与验证、身份令牌处理"
+        ),
+        "boundary_note": (
+            "凡直接实现身份验证、权限校验或凭证管理的代码属于目标范围。"
+            "排除：与认证无关的业务逻辑、纯 UI 渲染。"
+        ),
     },
     "crypto": {
         "name": "密码学操作",
         "desc": "加解密、签名验签、密钥管理、随机数生成、哈希运算",
         "keywords": ["aes", "rsa", "ecc", "hmac", "sha", "md5", "encrypt", "decrypt",
                      "sign", "verify", "key", "cipher", "random", "prng", "hash"],
+        "includes": (
+            "密码算法实现（对称/非对称/哈希）、密钥生成与存储、"
+            "证书生成与验证、安全随机数生成器、密钥派生函数"
+        ),
+        "boundary_note": (
+            "凡直接调用密码算法或进行密钥生命周期管理的代码属于目标范围。"
+            "排除：仅使用加密结果的业务逻辑（如验证成功后的流程控制）。"
+        ),
     },
     "ipc": {
         "name": "进程间通信",
         "desc": "Unix socket、管道、消息队列、共享内存、D-Bus、RPC/gRPC",
         "keywords": ["pipe", "fifo", "mqueue", "shm", "shmem", "dbus", "rpc", "grpc",
                      "ipc", "socket", "uds", "semaphore", "mutex", "signal"],
+        "includes": (
+            "IPC 通信框架、Unix Domain Socket 封装、消息队列与序列化、"
+            "共享内存管理、D-Bus/gRPC 服务接口定义、进程间同步原语"
+        ),
+        "boundary_note": (
+            "凡实现进程间数据传递或同步的代码属于目标范围，"
+            "包括 gRPC 服务接口（当以进程间通信视角使用时）。"
+            "排除：网络层协议（归 network_protocol）、纯业务逻辑。"
+        ),
     },
     "config_parsing": {
         "name": "配置与脚本解析",
         "desc": "XML/JSON/YAML/INI 配置解析器、命令行参数处理、环境变量读取、脚本解释器",
         "keywords": ["config", "conf", "ini", "yaml", "yml", "toml", "environ", "getenv",
                      "argv", "optarg", "getopt", "cmdline", "param"],
+        "includes": (
+            "配置文件解析器（JSON/YAML/INI/TOML）、"
+            "命令行参数处理、环境变量读取、配置热重载机制"
+        ),
+        "boundary_note": (
+            "凡解析外部配置输入的代码属于目标范围。"
+            "排除：使用配置值的业务逻辑（如根据配置项决定行为的代码）。"
+        ),
     },
     "input_handling": {
         "name": "输入处理与验证",
         "desc": "用户输入边界、命令注入点、缓冲区操作、格式化字符串、输入校验",
         "keywords": ["input", "scanf", "gets", "fgets", "sprintf", "snprintf", "strcat",
                      "strcpy", "memcpy", "memmove", "sscanf", "format", "sanitize", "validate"],
+        "includes": (
+            "用户输入接收与校验层、命令参数解析、"
+            "字符串格式化操作、缓冲区边界检查逻辑"
+        ),
+        "boundary_note": (
+            "凡接收并处理外部（用户/网络/文件）输入且存在注入/溢出风险点的代码属于目标范围。"
+        ),
     },
     "privilege_process": {
         "name": "权限与进程管理",
         "desc": "setuid/setgid、特权提升、进程创建与控制、信号处理、能力管理",
         "keywords": ["setuid", "setgid", "seteuid", "setegid", "fork", "exec", "spawn",
                      "prctl", "capability", "cap_set", "signal", "sigaction", "chroot"],
+        "includes": (
+            "特权操作实现（setuid/capability）、进程 fork/exec 逻辑、"
+            "命名空间管理、cgroup 控制、沙箱隔离机制"
+        ),
+        "boundary_note": (
+            "凡涉及特权操作、进程隔离或系统调用边界的代码属于目标范围。"
+            "排除：无特权的普通业务逻辑。"
+        ),
     },
     "web_api": {
         "name": "Web 与 API 接口",
         "desc": "HTTP 请求/响应处理、REST/SOAP 接口、CGI/FastCGI、URL 路由、Web 框架",
         "keywords": ["http", "https", "url", "uri", "rest", "api", "cgi", "fastcgi",
                      "request", "response", "route", "header", "cookie", "web"],
+        "includes": (
+            "HTTP 服务端路由与中间件、REST API 控制器、"
+            "请求鉴权/限流/过滤、Web 框架集成层"
+        ),
+        "boundary_note": (
+            "凡实现对外 HTTP/REST/Web 服务的代码属于目标范围，"
+            "包括 API 路由定义、请求处理器、响应序列化。"
+            "排除：纯后端业务逻辑（无 HTTP 接口暴露）。"
+        ),
     },
     "memory_manage": {
         "name": "内存管理",
         "desc": "malloc/free、内存映射、引用计数、内存池、与溢出相关的低层操作",
         "keywords": ["malloc", "free", "calloc", "realloc", "mmap", "munmap", "brk",
                      "alloc", "heap", "pool", "refcount", "overflow", "buffer"],
+        "includes": (
+            "自定义内存分配器、内存池实现、引用计数管理、"
+            "内存映射操作、与堆溢出直接相关的缓冲区操作"
+        ),
+        "boundary_note": (
+            "凡直接管理内存分配/释放或存在内存安全风险（溢出/UAF）的底层代码属于目标范围。"
+            "排除：仅使用标准 malloc/free 的普通业务代码。"
+        ),
     },
 }
 

@@ -29,7 +29,8 @@ from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module,
-    StageError, PiFatalError,
+    StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
+    enforce_filter_constraint,
 )
 
 
@@ -43,9 +44,9 @@ class AnalyseStage(BaseStage):
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        w_sys_prompt = load_prompt(cfg.workers.system_prompt_dir, "step3_analyse")
-        j_sys_prompt = load_prompt(cfg.judges.system_prompt_dir, "step3_check_analyse")
-        reflect_prompt = load_prompt(cfg.workers.system_prompt_dir, "reflect_analyse")
+        w_sys_prompt = load_prompt(cfg, "step3_analyse", "workers")
+        j_sys_prompt = load_prompt(cfg, "step3_check_analyse", "judges")
+        reflect_prompt = load_prompt(cfg, "reflect_analyse", "workers")
 
         final_modules = discover_modules(str(workspace))
         ctx.modules_needing_reclassify = []
@@ -200,15 +201,13 @@ class AnalyseStage(BaseStage):
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("analyse", j_item)
-                j_session = str(ctx.sess_dir / f"analyse-{mod_name}-judge{j_idx}-a{attempt+1}.jsonl")
                 j_ar = await run_agent_checked(
                     context=f"s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",
                     prompt=f"评审模块 `{mod_name}` 的分析报告。",
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
-                    cwd=str(workspace),
-                    session_file=j_session,
+                    cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -221,7 +220,8 @@ class AnalyseStage(BaseStage):
                     "passed": parsed["pass"],
                     "feedback": parsed["feedback"],
                     "token_usage": j_ar.token_usage,
-                })("judge_eval", stage=3, judge_id=f"judge-{j_idx}",
+                })
+                ctx.emit_event("judge_eval", stage=3, judge_id=f"judge-{j_idx}",
                                module=mod_name, passed=parsed["pass"], score=parsed["score"])
                 archive_file(
                     ctx.output_dir,
@@ -268,11 +268,12 @@ class AnalyseStage(BaseStage):
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter(s_cfg)
             report_exists = (mod_dir / "module_report.md").exists()
+            forced_pass = max_reached and report_exists and max_rounds_exceeded_treated_as_passed(cfg)
             ctx.record_evaluation_round(
                 module_name=mod_name,
                 stage="analyse",
                 stage_round=attempt + 1,
-                status="passed" if final_pass else "failed" if max_reached else "running",
+                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -284,8 +285,16 @@ class AnalyseStage(BaseStage):
                 },
                 judges=judge_records,
                 passed_by_vote=voted_pass,
-                module_completed=final_pass and report_exists,
-                completion_reason="passed" if final_pass and report_exists else "max_rounds_exceeded" if max_reached else "",
+                module_completed=(final_pass or forced_pass) and report_exists,
+                completion_reason=(
+                    "passed"
+                    if final_pass and report_exists
+                    else "max_rounds_exceeded_treated_as_passed"
+                    if forced_pass
+                    else "max_rounds_exceeded"
+                    if max_reached
+                    else ""
+                ),
                 needed_reflection=not final_pass,
                 artifact_paths=[str(mod_dir / "module_report.md")],
                 extra={
@@ -311,6 +320,8 @@ class AnalyseStage(BaseStage):
                     f"judge-{i}: {r['feedback'][:500]}"
                     for i, r in enumerate(judge_results) if not r["pass"])
                 feedback = "# 评审意见（未通过）\n\n" + fail_fb + "\n\n请根据意见修正分析。"
+            if forced_pass:
+                return
 
         if mod_name not in ctx.modules_needing_reclassify:
             raise StageError(f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")
@@ -332,9 +343,13 @@ class AnalyseStage(BaseStage):
         ctx.emit_event("stage", stage="2-redo", modules=to_reclassify)
 
         s_cfg_refine = cfg.stages.refine
-        w_sys_refine = load_prompt(cfg.workers.system_prompt_dir, "step2_refine")
-        j_sys_refine = load_prompt(cfg.judges.system_prompt_dir, "step2_check_refine")
-        reflect_refine = load_prompt(cfg.workers.system_prompt_dir, "reflect_refine")
+        w_sys_refine = load_prompt(cfg, "step2_refine", "workers")
+        j_sys_refine = load_prompt(cfg, "step2_check_refine", "judges")
+        reflect_refine = load_prompt(cfg, "reflect_refine", "workers")
+        # 2-redo 中注入安全维度约束，防止重分类超出过滤范围
+        from .s1_classify import _build_security_focus_section  # noqa: PLC0415
+        _sec_cats = getattr(cfg, "security_focus_categories", ["all"])
+        _sec_focus_hint = _build_security_focus_section(_sec_cats)
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
 
@@ -345,6 +360,8 @@ class AnalyseStage(BaseStage):
 
             refine_session = str(ctx.sess_dir / f"refine-redo-{mod_name}.jsonl")
             feedback = "# 重分类要求\n\nStage 3 分析发现该模块分类不合理，需要重新细分。"
+            if _sec_focus_hint:
+                feedback += _sec_focus_hint  # 注入安全维度约束
 
             for attempt in range(max_iter(s_cfg_refine)):
                 ctx.emit_event("stage", stage="2-redo", module=mod_name, attempt=attempt + 1)
@@ -360,16 +377,15 @@ class AnalyseStage(BaseStage):
                 ctx.tokens += ar.token_usage
 
                 judge_results = []
+                eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
                 for j_idx, j_item in enumerate(ctx.j_cfgs):
-                    j_session = str(ctx.sess_dir / f"analyse-redo-{mod_name}-judge{j_idx}-a{attempt+1}.jsonl")
                     j_ar = await run_agent_checked(
                         context=f"s2-redo-judge-{mod_name}-j{j_idx}-a{attempt+1}",
                         prompt=f"评审模块 `{mod_name}` 的重新细分。",
                         model=ctx.jm("refine", j_item),
                         system_prompt=j_sys_refine,
                         tools=cfg.judges.default_tools,
-                        cwd=str(workspace),
-                        session_file=j_session,
+                        cwd=eval_cwd,
                         **j_base,
                     )
                     ctx.tokens += j_ar.token_usage
@@ -394,6 +410,13 @@ class AnalyseStage(BaseStage):
                     feedback = f"# 评审意见\n\n{fail_fb}"
             else:
                 raise StageError(f"Stage 2-redo 模块 {mod_name} 重分类未通过")
+
+        # Stage 3-redo 前强制过滤约束：删除重分类引入的越界文件
+        if ctx.filtered_files:
+            removed = enforce_filter_constraint(workspace, set(ctx.filtered_files))
+            if removed:
+                ctx.emit_event("log", level="warn",
+                               msg=f"[S3-redo过滤约束] 删除 {removed} 个超出 filtered_files.txt 的越界条目")
 
         # Stage 3-redo: 只处理新子模块 + 原始模块（files.list 非空）
         new_mods = discover_modules(str(workspace))

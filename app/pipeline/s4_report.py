@@ -31,7 +31,8 @@ from .helpers import (
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module,
     generate_modules_list, strip_target_prefix,
-    StageError, PiFatalError,
+    StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
+    enforce_filter_constraint,
 )
 
 
@@ -45,8 +46,7 @@ class CompletenessCheckStage(BaseStage):
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        j_completeness_prompt = load_prompt(
-            cfg.judges.system_prompt_dir, "step4_check_completeness")
+        j_completeness_prompt = load_prompt(cfg, "step4_check_completeness", "judges")
         j_base = ctx.make_j_base()
 
         ctx.emit_event("stage", stage="4a")
@@ -54,7 +54,6 @@ class CompletenessCheckStage(BaseStage):
         missing_modules: list[str] = []
 
         for j_idx, j_item in enumerate(ctx.j_cfgs):
-            j_session = str(ctx.sess_dir / f"completeness-judge{j_idx}.jsonl")
             j_ar = await run_agent_checked(
                 context=f"s4a-judge-j{j_idx}",
                 prompt="运行 check_outputs.sh 检查所有模块是否都有 module_report.md。",
@@ -62,7 +61,6 @@ class CompletenessCheckStage(BaseStage):
                 system_prompt=j_completeness_prompt,
                 tools=cfg.judges.default_tools,
                 cwd=str(workspace),
-                session_file=j_session,
                 **j_base,
             )
             ctx.tokens += j_ar.token_usage
@@ -96,9 +94,9 @@ class CompletenessCheckStage(BaseStage):
 
         s_cfg_refine = cfg.stages.refine
         s_cfg_analyse = cfg.stages.analyse
-        w_sys_refine = load_prompt(cfg.workers.system_prompt_dir, "step2_refine")
-        w_sys_analyse = load_prompt(cfg.workers.system_prompt_dir, "step3_analyse")
-        j_sys_analyse = load_prompt(cfg.judges.system_prompt_dir, "step3_check_analyse")
+        w_sys_refine = load_prompt(cfg, "step2_refine", "workers")
+        w_sys_analyse = load_prompt(cfg, "step3_analyse", "workers")
+        j_sys_analyse = load_prompt(cfg, "step3_check_analyse", "judges")
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
 
@@ -160,7 +158,7 @@ class CompletenessCheckStage(BaseStage):
                         model=ctx.jm("analyse", j_item),
                         system_prompt=j_sys_analyse,
                         tools=cfg.judges.default_tools,
-                        cwd=str(workspace),
+                        cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
                         **j_base,
                     )
                     ctx.tokens += j_ar.token_usage
@@ -168,6 +166,7 @@ class CompletenessCheckStage(BaseStage):
                     judge_results.append(parsed)
                     ctx.emit_event("judge_eval", stage="3-redo-s4", judge_id=f"judge-{j_idx}",
                                    module=mod_name, passed=parsed["pass"], score=parsed["score"])
+
                 if check_voting(judge_results, s_cfg_analyse.pass_mode, ctx.j_count):
                     break
                 fail_fb = "\n".join(
@@ -176,6 +175,13 @@ class CompletenessCheckStage(BaseStage):
                 feedback = f"# 评审意见\n\n{fail_fb}"
             else:
                 raise StageError(f"Stage 4a 补做模块 {mod_name} 分析未通过")
+
+        # 补做完成后强制过滤约束
+        if ctx.filtered_files:
+            removed = enforce_filter_constraint(workspace, set(ctx.filtered_files))
+            if removed:
+                ctx.emit_event("log", level="warn",
+                               msg=f"[S4-redo过滤约束] 删除 {removed} 个超出 filtered_files.txt 的越界条目")
 
 
 class FinalReportStage(BaseStage):
@@ -190,9 +196,9 @@ class FinalReportStage(BaseStage):
         final_out_dir = ctx.final_out_dir
 
         s_cfg = cfg.stages.final_check
-        report_sys_prompt = load_prompt(cfg.workers.system_prompt_dir, "step4_final_report")
-        j_report_prompt = load_prompt(cfg.judges.system_prompt_dir, "step4_check_report")
-        reflect_report = load_prompt(cfg.workers.system_prompt_dir, "reflect_report")
+        report_sys_prompt = load_prompt(cfg, "step4_final_report", "workers")
+        j_report_prompt = load_prompt(cfg, "step4_check_report", "judges")
+        reflect_report = load_prompt(cfg, "reflect_report", "workers")
         report_session = str(ctx.sess_dir / "final_report.jsonl")
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
@@ -226,7 +232,6 @@ class FinalReportStage(BaseStage):
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("report", j_item)
-                j_session = str(ctx.sess_dir / f"report-judge{j_idx}-a{attempt+1}.jsonl")
                 j_ar = await run_agent_checked(
                     context=f"s4b-judge-j{j_idx}-a{attempt+1}",
                     prompt="评审 final_report.md 的质量和完整性。",
@@ -234,7 +239,6 @@ class FinalReportStage(BaseStage):
                     system_prompt=j_report_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
-                    session_file=j_session,
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -260,11 +264,12 @@ class FinalReportStage(BaseStage):
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter(s_cfg)
+            forced_pass = max_reached and has_report and max_rounds_exceeded_treated_as_passed(cfg)
             ctx.record_evaluation_round(
                 module_name="__task__",
                 stage="final_report",
                 stage_round=attempt + 1,
-                status="passed" if final_pass else "failed" if max_reached else "running",
+                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -276,8 +281,16 @@ class FinalReportStage(BaseStage):
                 },
                 judges=judge_records,
                 passed_by_vote=voted_pass,
-                module_completed=final_pass and has_report,
-                completion_reason="passed" if final_pass and has_report else "max_rounds_exceeded" if max_reached else "",
+                module_completed=(final_pass or forced_pass) and has_report,
+                completion_reason=(
+                    "passed"
+                    if final_pass and has_report
+                    else "max_rounds_exceeded_treated_as_passed"
+                    if forced_pass
+                    else "max_rounds_exceeded"
+                    if max_reached
+                    else ""
+                ),
                 needed_reflection=not final_pass,
                 artifact_paths=[str(workspace / "final_report.md")],
                 extra={"has_report": has_report},
@@ -298,6 +311,8 @@ class FinalReportStage(BaseStage):
                     for i, r in enumerate(judge_results) if not r["pass"])
                 feedback = (f"# 评审意见（未通过）\n\n{fail_fb}"
                             "\n\n请根据意见修正 final_report.md。")
+            if forced_pass:
+                break
         else:
             raise StageError(f"Stage 4b 最终报告未通过，已达最大轮数 {s_cfg.max_rounds}")
 
