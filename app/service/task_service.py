@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import time as _time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -25,8 +26,24 @@ from app.logging_utils import log_event
 from app.service.task_query_service import TaskQueryService
 from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
 from app.service.task_repository import TaskRepository
+from app.service.runtime_control_service import get_runtime_control_service
+from app.service.runner_registry_service import (
+    RUNNER_STATUS_ACTIVE,
+    get_runner_registry_service,
+    init_runner_registry_service,
+)
+from app.service.service_role import is_manager_role, is_runner_role
 from app.service.worker_dispatcher import (
+    GLOBAL_CLAIM_LOCK_KEY,
+    GLOBAL_CLAIM_LOCK_TIMEOUT_SECONDS,
+    MAX_RUNNING_TASKS_GLOBAL,
     WORKER_INSTANCE_ID,
+    WORKER_IDLE_BACKOFF_MAX_SECONDS,
+    WORKER_OVERLOAD_COOLDOWN_SECONDS,
+    WORKER_POLL_INTERVAL_SECONDS,
+    WORKER_POLL_JITTER_SECONDS,
+    WORKER_STALE_SWEEP_INTERVAL_SECONDS,
+    WORKER_TASK_CONCURRENCY,
     get_worker_runtime_health as _get_dispatcher_runtime_health,
     lease_deadline as _lease_deadline,
     WorkerDispatcher,
@@ -42,6 +59,10 @@ TASK_STAGE_FLUSH_BATCH_SIZE = max(5, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_
 TASK_STAGE_FLUSH_MIN_INTERVAL_SECONDS = max(
     1.0,
     float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_STAGE_FLUSH_MIN_INTERVAL", "10")),
+)
+RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS = max(
+    1.0,
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS", "3")),
 )
 
 # Running asyncio tasks keyed by task_id so we can cancel them
@@ -76,6 +97,21 @@ _SESSION_THINKING_LEVEL_MAP = {"off": "off", "minimal": "minimal", "low": "low",
 
 def get_worker_runtime_health() -> dict:
     return _get_dispatcher_runtime_health(len(_running_tasks))
+
+
+def get_worker_runtime_settings() -> dict:
+    return {
+        "worker_instance_id": WORKER_INSTANCE_ID,
+        "worker_task_concurrency": WORKER_TASK_CONCURRENCY,
+        "worker_poll_interval_seconds": WORKER_POLL_INTERVAL_SECONDS,
+        "worker_poll_jitter_seconds": WORKER_POLL_JITTER_SECONDS,
+        "worker_idle_backoff_max_seconds": WORKER_IDLE_BACKOFF_MAX_SECONDS,
+        "worker_overload_cooldown_seconds": WORKER_OVERLOAD_COOLDOWN_SECONDS,
+        "worker_stale_sweep_interval_seconds": WORKER_STALE_SWEEP_INTERVAL_SECONDS,
+        "worker_max_running_tasks_global": MAX_RUNNING_TASKS_GLOBAL,
+        "worker_global_claim_lock_key": GLOBAL_CLAIM_LOCK_KEY,
+        "worker_global_claim_lock_timeout_seconds": GLOBAL_CLAIM_LOCK_TIMEOUT_SECONDS,
+    }
 
 
 def _task_execution_lock_path(output_path: str | None, task_id: str) -> Path | None:
@@ -521,6 +557,10 @@ class TaskService:
         from app.db import get_db
 
         self._task_repository = TaskRepository()
+        self._runner_registry = init_runner_registry_service(
+            get_db=get_db,
+            get_running_tasks_count=lambda: len(_running_tasks),
+        )
         self._runner = TaskRunner(
             deps=TaskRunnerDependencies(
                 get_db=get_db,
@@ -548,10 +588,14 @@ class TaskService:
             get_db=get_db,
             clear_task_execution_lock=_clear_task_execution_lock,
             claim_task_lease=self._claim_task_lease,
-            spawn_task=self._run_task_locally,
+            spawn_task=self._on_task_claimed,
+            select_dispatch_target=self._select_dispatch_target,
             get_running_tasks_count=lambda: len(_running_tasks),
+            load_runtime_control=self._load_runtime_control,
             task_repository=self._task_repository,
         )
+        self._runner_assignment_task: asyncio.Task | None = None
+        self._runner_assignment_loop_running = False
         self._query = TaskQueryService(
             get_or_404=self._get_or_404,
             read_text_if_exists=_read_text_if_exists,
@@ -638,6 +682,55 @@ class TaskService:
 
     def get_task_evaluation(self, db: Session, task_id: str) -> dict:
         return self._query.get_task_evaluation(db, task_id)
+
+    def get_runtime_overview(self, db: Session) -> dict:
+        status_counts = self._task_repository.get_status_counts(db)
+        oldest_pending_created_at = self._task_repository.get_oldest_pending_created_at(db)
+        running_rows = self._task_repository.list_running_tasks(db, limit=20)
+        worker_health = get_worker_runtime_health()
+        runtime_control = get_runtime_control_service().get_runtime_control(db)
+        active_runners = get_runner_registry_service().list_active_runners(db)
+        return {
+            "queue": {
+                "status_counts": status_counts,
+                "pending_count": int(status_counts.get("pending", 0)),
+                "running_count": int(status_counts.get("running", 0)),
+                "terminal_count": sum(
+                    int(status_counts.get(status, 0))
+                    for status in ("passed", "failed", "error", "cancelled")
+                ),
+                "oldest_pending_created_at": isoformat_local(oldest_pending_created_at),
+            },
+            "worker_settings": get_worker_runtime_settings(),
+            "worker_health": worker_health,
+            "runtime_control": runtime_control,
+            "active_runners": [
+                {
+                    "instance_id": str(item["instance_id"]),
+                    "status": str(item["status"]),
+                    "capacity": int(item["capacity"]),
+                    "running_tasks": int(item["running_tasks"]),
+                    "age_seconds": float(item.get("age_seconds") or 0.0),
+                    "updated_at": isoformat_local(item.get("updated_at")),
+                }
+                for item in active_runners
+            ],
+            "running_tasks": [
+                {
+                    "task_id": row.task_id,
+                    "project_id": row.project_id,
+                    "task_name": row.task_name,
+                    "analysis_mode": _infer_analysis_mode(row),
+                    "dispatcher_instance_id": row.dispatcher_instance_id,
+                    "lease_epoch": int(row.lease_epoch or 0),
+                    "dispatch_started_at": isoformat_local(row.dispatch_started_at),
+                    "lease_expires_at": isoformat_local(row.lease_expires_at),
+                    "started_at": isoformat_local(row.started_at),
+                    "created_at": isoformat_local(row.created_at),
+                }
+                for row in running_rows
+            ],
+        }
 
     def create_task(self, db: Session, *, project_id: str, task_name: str,
                     input_path: str, output_path: Optional[str] = None,
@@ -730,19 +823,61 @@ class TaskService:
         return self._row_to_dict(row)
 
     @staticmethod
-    def _claim_task_lease(db: Session, row: AppSaTask) -> int | None:
+    def _claim_task_lease(db: Session, row: AppSaTask, dispatch_target: str) -> int | None:
         return TaskRepository.claim_task_lease(
             db,
             row,
-            worker_instance_id=WORKER_INSTANCE_ID,
+            worker_instance_id=dispatch_target,
             lease_deadline=_lease_deadline,
         )
 
+    @staticmethod
+    def _load_runtime_control(db: Session) -> dict:
+        return get_runtime_control_service().get_runtime_control(db)
+
     async def start_worker_loop(self) -> None:
-        await self._dispatcher.start()
+        if is_manager_role():
+            await self._dispatcher.start()
+        if is_runner_role():
+            await self._runner_registry.start()
+            await self._start_runner_assignment_loop()
 
     async def stop_worker_loop(self) -> None:
-        await self._dispatcher.stop()
+        if is_manager_role():
+            await self._dispatcher.stop()
+        if is_runner_role():
+            await self._stop_runner_assignment_loop()
+            await self._runner_registry.stop()
+
+    def _on_task_claimed(self, task_id: str, lease_epoch: int, dispatch_target: str) -> None:
+        if dispatch_target != WORKER_INSTANCE_ID:
+            return
+        self._run_task_locally(task_id, lease_epoch)
+
+    @staticmethod
+    def _select_dispatch_target(db: Session) -> str | None:
+        if is_runner_role():
+            return WORKER_INSTANCE_ID
+        if not is_manager_role():
+            return WORKER_INSTANCE_ID
+        active_runners = get_runner_registry_service().list_active_runners(db)
+        if not active_runners:
+            return None
+        runner_ids = [str(item["instance_id"]) for item in active_runners]
+        running_counts = TaskRepository.get_running_task_counts_by_instance(db, runner_ids)
+        best_runner: dict | None = None
+        best_score: tuple[int, float, str] | None = None
+        for item in active_runners:
+            instance_id = str(item["instance_id"])
+            capacity = max(1, int(item.get("capacity") or 1))
+            assigned_running = int(running_counts.get(instance_id, 0))
+            if assigned_running >= capacity:
+                continue
+            score = (assigned_running, float(item.get("age_seconds") or 0.0), instance_id)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_runner = item
+        return str(best_runner["instance_id"]) if best_runner else None
 
     def _run_task_locally(self, task_id: str, lease_epoch: int) -> None:
         if task_id in _running_tasks and not _running_tasks[task_id].done():
@@ -750,6 +885,61 @@ class TaskService:
         asyncio_task = asyncio.create_task(self._runner.execute_task(task_id, lease_epoch), name=f"sa_task_{task_id}")
         _running_tasks[task_id] = asyncio_task
         _running_task_epochs[task_id] = lease_epoch
+
+    async def _start_runner_assignment_loop(self) -> None:
+        if self._runner_assignment_task and not self._runner_assignment_task.done():
+            return
+        self._runner_assignment_loop_running = True
+        self._runner_assignment_task = asyncio.create_task(
+            self._runner_assignment_loop(),
+            name="sa_runner_assignment_loop",
+        )
+
+    async def _stop_runner_assignment_loop(self) -> None:
+        self._runner_assignment_loop_running = False
+        task = self._runner_assignment_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._runner_assignment_task = None
+
+    async def _runner_assignment_loop(self) -> None:
+        while self._runner_assignment_loop_running:
+            try:
+                self._poll_runner_assignments_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("runner assignment loop failed: %s", exc, exc_info=True)
+            await asyncio.sleep(RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS)
+
+    def _poll_runner_assignments_once(self) -> None:
+        available_slots = max(0, WORKER_TASK_CONCURRENCY - len(_running_tasks))
+        if available_slots <= 0:
+            return
+        db_gen = self._runner._deps.get_db()
+        db: Session = next(db_gen)
+        try:
+            rows = self._task_repository.list_tasks_assigned_to_instance(
+                db,
+                instance_id=WORKER_INSTANCE_ID,
+                limit=available_slots,
+            )
+            now = now_local()
+            for row in rows:
+                if row.task_id in _running_tasks:
+                    continue
+                if row.lease_expires_at and row.lease_expires_at < now:
+                    continue
+                self._run_task_locally(row.task_id, int(row.lease_epoch or 0))
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
 
     @staticmethod
     def _remove_running_task(task_id: str) -> None:

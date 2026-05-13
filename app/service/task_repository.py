@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Callable
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -12,6 +12,108 @@ from app.time_utils import now_local
 
 
 class TaskRepository:
+    @staticmethod
+    def count_running_tasks(db: Session) -> int:
+        return int(
+            db.query(func.count(AppSaTask.id)).filter(
+                AppSaTask.is_deleted.is_(False),
+                AppSaTask.status == "running",
+            ).scalar()
+            or 0
+        )
+
+    @staticmethod
+    def get_status_counts(db: Session) -> dict[str, int]:
+        rows = (
+            db.query(AppSaTask.status, func.count(AppSaTask.id))
+            .filter(AppSaTask.is_deleted.is_(False))
+            .group_by(AppSaTask.status)
+            .all()
+        )
+        return {str(status): int(count or 0) for status, count in rows}
+
+    @staticmethod
+    def get_oldest_pending_created_at(db: Session) -> datetime | None:
+        return (
+            db.query(func.min(AppSaTask.created_at))
+            .filter(
+                AppSaTask.is_deleted.is_(False),
+                AppSaTask.status == "pending",
+            )
+            .scalar()
+        )
+
+    @staticmethod
+    def list_running_tasks(db: Session, limit: int = 20) -> list[AppSaTask]:
+        return (
+            db.query(AppSaTask)
+            .filter(
+                AppSaTask.is_deleted.is_(False),
+                AppSaTask.status == "running",
+            )
+            .order_by(AppSaTask.dispatch_started_at.asc(), AppSaTask.created_at.asc())
+            .limit(max(1, limit))
+            .all()
+        )
+
+    @staticmethod
+    def list_tasks_assigned_to_instance(db: Session, *, instance_id: str, limit: int) -> list[AppSaTask]:
+        return (
+            db.query(AppSaTask)
+            .filter(
+                AppSaTask.is_deleted.is_(False),
+                AppSaTask.status == "running",
+                AppSaTask.dispatcher_instance_id == instance_id,
+            )
+            .order_by(AppSaTask.dispatch_started_at.asc(), AppSaTask.created_at.asc())
+            .limit(max(1, limit))
+            .all()
+        )
+
+    @staticmethod
+    def get_running_task_counts_by_instance(db: Session, instance_ids: list[str]) -> dict[str, int]:
+        normalized_ids = [str(instance_id).strip() for instance_id in instance_ids if str(instance_id).strip()]
+        if not normalized_ids:
+            return {}
+        rows = (
+            db.query(AppSaTask.dispatcher_instance_id, func.count(AppSaTask.id))
+            .filter(
+                AppSaTask.is_deleted.is_(False),
+                AppSaTask.status == "running",
+                AppSaTask.dispatcher_instance_id.in_(normalized_ids),
+            )
+            .group_by(AppSaTask.dispatcher_instance_id)
+            .all()
+        )
+        return {
+            str(instance_id): int(count or 0)
+            for instance_id, count in rows
+            if instance_id
+        }
+
+    @staticmethod
+    def try_acquire_global_claim_lock(db: Session, *, lock_key: str, timeout_seconds: int = 1) -> bool:
+        bind = db.get_bind()
+        dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+        if dialect_name != "mysql":
+            return True
+        result = db.execute(
+            text("SELECT GET_LOCK(:lock_key, :timeout_seconds)"),
+            {"lock_key": lock_key, "timeout_seconds": max(0, int(timeout_seconds))},
+        ).scalar()
+        return bool(result)
+
+    @staticmethod
+    def release_global_claim_lock(db: Session, *, lock_key: str) -> None:
+        bind = db.get_bind()
+        dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+        if dialect_name != "mysql":
+            return
+        try:
+            db.execute(text("SELECT RELEASE_LOCK(:lock_key)"), {"lock_key": lock_key})
+        except Exception:
+            db.rollback()
+
     @staticmethod
     def get_task(db: Session, task_id: str) -> AppSaTask | None:
         return db.query(AppSaTask).filter_by(task_id=task_id).first()

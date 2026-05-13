@@ -43,6 +43,10 @@ from .config import (
 from .logging_utils import configure_container_logging, log_event
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
+from .service.service_role import is_api_role as _is_api_service_role
+from .service.service_role import is_dispatcher_role as _is_dispatcher_service_role
+from .service.service_role import is_runner_role as _is_runner_service_role
+from .service.service_role import service_role as _normalized_service_role
 
 load_dotenv()
 configure_container_logging("01-system_analyse")
@@ -51,24 +55,25 @@ logger = logging.getLogger("sa.server")
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", f"{CONFIG_DIR}/config.json")
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 
+def _is_api_role() -> bool:
+    return _is_api_service_role()
+
+
+def _is_manager_role() -> bool:
+    return _is_dispatcher_service_role()
+
+
+def _is_runner_role() -> bool:
+    return _is_runner_service_role()
+
 
 def _service_role() -> str:
-    raw_role = os.environ.get("SECFLOW_SYSTEM_ANALYSE_ROLE") or ""
-    normalized = str(raw_role).strip().lower()
-    return normalized if normalized in {"api", "worker"} else "all"
-
-
-def _is_api_role() -> bool:
-    return _service_role() in {"api", "all"}
-
-
-def _is_worker_role() -> bool:
-    return _service_role() in {"worker", "all"}
+    return _normalized_service_role()
 
 
 def _require_api_role() -> None:
     if not _is_api_role():
-        raise HTTPException(status_code=503, detail="当前实例为 worker-only，不提供 API 服务")
+        raise HTTPException(status_code=503, detail="当前实例不提供 API 服务")
 
 
 def _db_pool_overrides(svc_yaml) -> tuple[int, int, int, int]:
@@ -77,14 +82,25 @@ def _db_pool_overrides(svc_yaml) -> tuple[int, int, int, int]:
     default_overflow = int(svc_yaml.database.max_overflow)
     default_timeout = int(svc_yaml.database.pool_timeout)
     default_recycle = int(svc_yaml.database.pool_recycle)
-    pool_env = "SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_WORKER" if role == "worker" else "SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_API"
-    overflow_env = "SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_WORKER" if role == "worker" else "SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_API"
-    timeout_env = "SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_WORKER" if role == "worker" else "SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_API"
-    recycle_env = "SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_WORKER" if role == "worker" else "SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_API"
-    pool_size = int(os.environ.get(pool_env, str(default_pool)))
-    max_overflow = int(os.environ.get(overflow_env, str(default_overflow)))
-    pool_timeout = int(os.environ.get(timeout_env, str(default_timeout)))
-    pool_recycle = int(os.environ.get(recycle_env, str(default_recycle)))
+
+    def _env_with_fallback(primary: str, fallback: str) -> str:
+        return os.environ.get(primary, os.environ.get(fallback, ""))
+
+    if role == "api":
+        pool_size = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_API", str(default_pool)))
+        max_overflow = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_API", str(default_overflow)))
+        pool_timeout = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_API", str(default_timeout)))
+        pool_recycle = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_API", str(default_recycle)))
+    elif role == "runner":
+        pool_size = int(_env_with_fallback("SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_RUNNER", "SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_WORKER") or str(default_pool))
+        max_overflow = int(_env_with_fallback("SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_RUNNER", "SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_WORKER") or str(default_overflow))
+        pool_timeout = int(_env_with_fallback("SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_RUNNER", "SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_WORKER") or str(default_timeout))
+        pool_recycle = int(_env_with_fallback("SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_RUNNER", "SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_WORKER") or str(default_recycle))
+    else:
+        pool_size = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_WORKER", str(default_pool)))
+        max_overflow = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_WORKER", str(default_overflow)))
+        pool_timeout = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_WORKER", str(default_timeout)))
+        pool_recycle = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_WORKER", str(default_recycle)))
     return max(1, pool_size), max(0, max_overflow), max(1, pool_timeout), max(60, pool_recycle)
 
 
@@ -134,7 +150,7 @@ async def lifespan(app: FastAPI):
         from .api import router as mgmt_router
         app.include_router(mgmt_router)
 
-    if _is_worker_role():
+    if _is_manager_role() or _is_runner_role():
         from .service.task_service import get_task_service
         await get_task_service().start_worker_loop()
 
@@ -142,7 +158,7 @@ async def lifespan(app: FastAPI):
 
     # --- shutdown ---
     try:
-        if _is_worker_role():
+        if _is_manager_role() or _is_runner_role():
             from .service.task_service import get_task_service
             await get_task_service().stop_worker_loop()
         if _is_api_role():
@@ -200,8 +216,10 @@ def _health_status() -> dict:
     worker_ok = worker_health.get("worker_loop_fresh", True) and not worker_claim_paused
     if role == "api":
         ready = db_ok
-    elif role == "worker":
+    elif role == "manager":
         ready = db_ok and worker_ok
+    elif role == "runner":
+        ready = db_ok
     else:
         ready = db_ok and worker_ok
     return {
