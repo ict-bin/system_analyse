@@ -1,4 +1,4 @@
-﻿"""Task management service for secflow-app-system-analyse.
+"""Task management service for secflow-app-system-analyse.
 
 Bridges the FastAPI management layer with the existing Orchestrator engine.
 Each task is persisted in MySQL and executed asynchronously.

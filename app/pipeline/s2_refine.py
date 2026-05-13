@@ -32,6 +32,7 @@ from .helpers import (
     archive_file, max_iter,
     SUB_WORKER_THRESHOLD, collect_file_summaries,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
+    module_has_nonempty_files,
 )
 
 
