@@ -90,7 +90,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "self_reflection": {
         "enabled": False,
         "model": "",
-        "output_dir": "/data/self-reflection",
+        "output_dir": "",  # 空 = 自动使用 /data/files/{project_id}/app/secflow-app-system-analyse/self-reflection
         "max_session_lines": 1000,
     },
 }

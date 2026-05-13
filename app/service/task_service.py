@@ -1104,6 +1104,8 @@ class TaskService:
                 from app.pipeline.self_reflection import get_self_reflection_service
                 _sr_run_dir = Path(row.output_path or "") / row.task_id / "run" if row.output_path else None
                 _sr_out_dir = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
+                # 自省报告存储目录：/data/files/{project_id}/app/secflow-app-system-analyse/self-reflection
+                _sr_dir = Path(row.output_path) / "self-reflection" if row.output_path else None
                 _sr_status = result.status.value if result else "error"
                 if _sr_run_dir and _sr_out_dir:
                     await get_self_reflection_service().trigger_async(
@@ -1112,6 +1114,7 @@ class TaskService:
                         output_dir=_sr_out_dir,
                         cfg=cfg,
                         task_status=_sr_status,
+                        sr_dir=_sr_dir,
                     )
             except Exception as _sr_exc:
                 logger.warning("self-reflection trigger failed: %s", _sr_exc)

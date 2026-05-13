@@ -392,8 +392,8 @@ class SelfReflectionConfig(BaseModel):
         description="自省分析使用的 LLM 模型，留空时使用 workers.agents[0].model"
     )
     output_dir: str = Field(
-        default="/data/self-reflection",
-        description="自省报告存储目录（容器内绝对路径）"
+        default="",
+        description="自省报告存储目录（空则自动推断为 /data/files/{project_id}/app/secflow-app-system-analyse/self-reflection）"
     )
     max_session_lines: int = Field(
         default=1000,
