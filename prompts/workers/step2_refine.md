@@ -84,16 +84,19 @@ SRC_MOD="<当前模块名>"   # 如 auth
 DST_MOD="<目标模块名>"   # 如 routing
 FILE="<相对路径>"
 
-# 用 flock 防并发写冲突
+# 问题3：同时锁源和目标，防止并发 Worker 竟争导致文件丢失
 (
-  flock -x 200
+  flock -x 200  # 锁目标
+  flock -x 201  # 锁源
   # 从源模块删除
-  grep -vxF "$FILE" modules/$SRC_MOD/files.list > /tmp/src_new.txt       && mv /tmp/src_new.txt modules/$SRC_MOD/files.list
+  grep -vxF "$FILE" modules/$SRC_MOD/files.list > /tmp/src_new_$$.txt \
+      && mv /tmp/src_new_$$.txt modules/$SRC_MOD/files.list
   # 追加到目标模块（去重）
   if ! grep -qxF "$FILE" modules/$DST_MOD/files.list 2>/dev/null; then
       echo "$FILE" >> modules/$DST_MOD/files.list
   fi
-) 200>modules/$DST_MOD/files.list.lock
+) 200>modules/$DST_MOD/files.list.lock \
+  201>modules/$SRC_MOD/files.list.lock
 echo "已迁移 $(basename $FILE) → $DST_MOD"
 ```
 
@@ -112,15 +115,26 @@ echo "拆分前: $BEFORE 个文件"
 # 例：crypto_certs 模块含 mbedtls 库，应拆分为：
 mkdir -p modules/mbedtls_crypto modules/mbedtls_ssl modules/mbedtls_docs
 
+# ── 路径自检（问题2：防止孤儿目录）──────────────────────────────────────────
+for sub in mbedtls_crypto mbedtls_ssl mbedtls_docs; do
+    if [ ! -d "modules/$sub" ]; then
+        echo "❌ 错误：modules/$sub 未创建成功，检查当前工作目录："
+        pwd && ls -la | head -20
+        exit 1
+    fi
+done
+echo "✅ 路径自检通过，所有子模块在 modules/ 下"
+# ─────────────────────────────────────────────────────────────────────────────
+
 # 按关键词分类到子模块
 grep -iE 'aes|sha|rsa|ecp|bignum|cipher|hash' modules/$MOD/files.list > modules/mbedtls_crypto/files.list || true
 grep -iE 'ssl|tls|x509|pkcs' modules/$MOD/files.list > modules/mbedtls_ssl/files.list || true
 grep -iE 'README|doc|CHANGE|LICENSE|AUTHORS' modules/$MOD/files.list > modules/mbedtls_docs/files.list || true
 
 # 未匹配的归入功能最接近的子模块（兜底，保证无遗漏）
-cat modules/mbedtls_*/files.list 2>/dev/null | sort > /tmp/moved.txt
-sort modules/$MOD/files.list > /tmp/orig.txt
-comm -23 /tmp/orig.txt /tmp/moved.txt >> modules/mbedtls_crypto/files.list || true
+cat modules/mbedtls_*/files.list 2>/dev/null | sort > /tmp/moved_$$.txt
+sort modules/$MOD/files.list > /tmp/orig_$$.txt
+comm -23 /tmp/orig_$$.txt /tmp/moved_$$.txt >> modules/mbedtls_crypto/files.list || true
 
 # 去重
 for f in modules/mbedtls_*/files.list; do sort -u "$f" -o "$f"; done
@@ -138,12 +152,27 @@ if [ -d "modules/$MOD/deleted" ]; then
 else
     rm -rf modules/$MOD
 fi
+rm -f /tmp/moved_$$.txt /tmp/orig_$$.txt
 ```
 
 > ⚠️ **第二轮重试时**：Python 已自动从快照恢复 `files.list` 并删除上轮子模块，你只需按新策略重新拆分即可。无需手动清理上轮残留文件。
 
 
-## 4. 不需要拆分时 不需要拆分时
+## ⚠️ 重试时必须先读诊断报告（问题1/4）
+
+**若 judge 返回 "Missing files > 0"，在修复之前必须先执行：**
+
+1. 阅读 retry prompt 中提供的 `.diagnose/` 文件路径
+2. `read <该路径>` 读取完整诊断报告
+3. 根据报告描述针对性修复：
+   - 文件在孤儿目录：按报告提供的 mv 命令修复
+   - 文件已在其他模块：无需操作，重新运行 check_module.sh 确认
+   - 文件真正丢失：从快照恢复后重新拆分
+
+**不要在未读诊断报告的情况下盲目重写拆分脚本。**
+
+
+## 4. 不需要拆分时
 
 直接输出说明理由，**不执行任何文件操作**。
 

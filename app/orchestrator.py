@@ -184,6 +184,26 @@ class Orchestrator:
         flag_path = final_out_dir / "flag"
         flag_path.write_text("0", encoding="utf-8")  # 失败默认值，成功时覆盖
 
+        # ── 生成 workspace 级 pi settings.json（问题4：提升 compaction 保留窗口）─────────
+        # 默认 keepRecentTokens=20k 太小，S2 多轮后关键错误信息被压缩。
+        # 提升到 40k 确保 Worker 始终能看到最近 2-3 轮的完整错误输出。
+        try:
+            pi_settings_dir = workspace / ".pi"
+            pi_settings_dir.mkdir(exist_ok=True)
+            import json as _json
+            pi_settings = {
+                "compaction": {
+                    "enabled": True,
+                    "reserveTokens": 16384,
+                    "keepRecentTokens": 40000,
+                }
+            }
+            (pi_settings_dir / "settings.json").write_text(
+                _json.dumps(pi_settings, indent=2), encoding="utf-8"
+            )
+        except Exception as _pi_cfg_err:
+            _log.warning("pi settings.json 写入失败（非致命）: %s", _pi_cfg_err)
+
         result = TaskResult(
             task_id=task_id,
             status=TaskStatus.RUNNING,

@@ -266,6 +266,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "") -> TaskCon
         result_dir=svc.result_dir,
         start_stage=svc.start_stage,
         resume_workspace=svc.resume_workspace,
+        skip_path_patterns=svc.skip_path_patterns,
         self_reflection=svc.self_reflection.model_copy(deep=True),
     )
 

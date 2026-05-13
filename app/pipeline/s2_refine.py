@@ -34,6 +34,7 @@ from .helpers import (
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
     archive_module_deletions, get_module_deleted_files, restore_module_for_retry,
+    fix_orphan_dirs_before_judge, build_s2_diagnose_report,
 )
 
 
@@ -187,6 +188,17 @@ class RefineStage(BaseStage):
             ctx.emit_event("stage_result", stage=2, module=mod_name,
                            split=was_split, new_modules=new_ones)
 
+            # ── Judge 前自动修复孤儿目录（问题2/3：路径写错导致MISSING）──────
+            orphan_fixed = fix_orphan_dirs_before_judge(
+                workspace, mod_name, self._refined
+            )
+            if orphan_fixed:
+                ctx.emit_event(
+                    "log",
+                    level="warn",
+                    msg=f"[S2孤儿修复] {mod_name}: 自动移入modules/ {orphan_fixed}",
+                )
+
             # ── Judge ──────────────────────────────────────────────────
             # 生成 deleted/ 摘要注入 Judge prompt
             del_files = get_module_deleted_files(mod_dir)
@@ -203,9 +215,21 @@ class RefineStage(BaseStage):
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("refine", j_item)
+                # 问题9：将 check_module.sh 完整命令（含实际 target_dir）直接注入 Judge prompt
+                # 避免 Judge 自己猜测路径导致脚本执行失败
+                check_cmd = (
+                    f"bash /app/scripts/check_module.sh "
+                    f"{cfg.target_dir} modules {mod_name}"
+                )
+                judge_prompt_text = (
+                    f"评审 Worker 对模块 `{mod_name}` 的细分判断。"
+                    f"{deleted_summary}\n\n"
+                    f"**必须执行的校验命令（直接复制执行，无需修改）：**\n"
+                    f"```bash\n{check_cmd}\n```"
+                )
                 j_ar = await run_agent_checked(
                     context=f"s2-judge-{mod_name}-j{j_idx}-a{attempt+1}",
-                    prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。{deleted_summary}",
+                    prompt=judge_prompt_text,
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
@@ -307,8 +331,29 @@ class RefineStage(BaseStage):
                     for i, r in enumerate(judge_results) if not r["pass"])
                 if "missing" in fail_fb.lower() or "丢失" in fail_fb or "遗漏" in fail_fb:
                     guidance = (
-                        "\n\n⚠️ **文件丢失！** 请修复文件覆盖问题，不要改变拆分策略。\n"
-                        "运行 check_classification.sh 查看遗漏文件，将它们归入合适的模块。"
+                        "\n\n⚠️ **文件丢失！** "
+                        "请先阅读下方诊断报告，**不要盲目重写脚本**，"
+                        "按报告指引针对性修复。"
+                    )
+                    # 问题1/4: 构建磁盘诊断文件，Worker 通过 read 工具获取完整原始诊断
+                    missing_files = [
+                        line.split("MISSING: ")[1].strip()
+                        for r in judge_results if not r["pass"]
+                        for line in r["feedback"].splitlines()
+                        if line.startswith("MISSING: ")
+                    ]
+                    diagnose_path = build_s2_diagnose_report(
+                        workspace, mod_name, missing_files
+                    )
+                    ctx.emit_event(
+                        "log",
+                        level="info",
+                        msg=f"[S2诊断] {mod_name}: 诊断报告已写入 {diagnose_path}",
+                    )
+                    guidance += (
+                        f"\n\n🔍 **请先执行诊断**（这一步必须做）：\n"
+                        f"```\nread {diagnose_path}\n```\n"
+                        f"报告会告诉你每个 MISSING 文件当前在哪里，应该怎么修复。"
                     )
                 else:
                     guidance = "\n\n请根据评审意见调整拆分策略。"

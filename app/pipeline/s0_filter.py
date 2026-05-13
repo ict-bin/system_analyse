@@ -56,6 +56,10 @@ class FilterStage(BaseStage):
         )
 
         task_tmp = ctx.task_tmp
+        extra_env = {**os.environ, "TMPDIR": str(task_tmp)}
+        # 问题7: 将项目自定义路径跳过模式传入过滤脚本
+        if cfg.skip_path_patterns:
+            extra_env["SECFLOW_SA_SKIP_PATH_PATTERNS"] = " ".join(cfg.skip_path_patterns)
         proc = await asyncio.create_subprocess_exec(
             "bash", filter_script, cfg.target_dir,
             str(workspace / "filtered_files.txt"),
@@ -63,7 +67,7 @@ class FilterStage(BaseStage):
             *cfg.analyse_targets,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "TMPDIR": str(task_tmp)},
+            env=extra_env,
         )
         stdout, stderr_bytes = await proc.communicate()
         _out = (stdout or b"").decode("utf-8", errors="replace").strip()

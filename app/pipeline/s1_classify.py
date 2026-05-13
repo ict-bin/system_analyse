@@ -316,9 +316,37 @@ class ClassifyStage(BaseStage):
                     f"judge-{i}: {r['feedback'][:500]}"
                     for i, r in enumerate(judge_results)
                 )
+                # 问题6：注入增量修复指导，防止 Worker 全量重写分类脚本
+                current_mods = discover_modules(str(workspace))
+                total_classified = 0
+                filtered_total = 0
+                try:
+                    fl = workspace / "filtered_files.txt"
+                    if fl.exists():
+                        filtered_total = sum(1 for l in fl.read_text("utf-8").splitlines() if l.strip())
+                    for m in current_mods:
+                        flist = get_modules_root(str(workspace)) / m / "files.list"
+                        if flist.exists():
+                            total_classified += sum(1 for l in flist.read_text("utf-8").splitlines() if l.strip())
+                except Exception:
+                    pass
+                coverage = f"{total_classified}/{filtered_total}" if filtered_total > 0 else str(total_classified)
+                incremental_guidance = (
+                    f"\n\n## ⚠️ 增量修复要求（必读）\n\n"
+                    f"当前状态：{len(current_mods)} 个模块，已分类 {coverage} 个文件。"
+                    f"现有分类基本正确，**请不要重写整个分类脚本**。\n\n"
+                    f"正确做法：只针对 judge 指出的遗漏文件做增量补充：\n"
+                    f"```bash\n"
+                    f"# 示例：只将遗漏文件追加到已有模块\n"
+                    f"echo 'path/to/missing_file.c' >> modules/最合适的模块名/files.list\n"
+                    f"# 然后重新校验覆盖率\n"
+                    f"bash /app/scripts/check_classification.sh {cfg.target_dir} .\n"
+                    f"```\n"
+                )
                 feedback = (
                     f"# 上轮评审不通过（第 {attempt+1} 轮）\n\n"
                     f"## Judge 上轮意见\n\n{fail_fb}\n\n"
+                    + incremental_guidance
                     + reflect_prompt
                 )
 

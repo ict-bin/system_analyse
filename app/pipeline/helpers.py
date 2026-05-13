@@ -214,6 +214,7 @@ def restore_module_for_retry(
     1. 恢复快照 → mod_dir/files.list
     2. rm -rf 上一轮 Worker 新建的子模块（不在 refined_set 中的新增模块）
     3. 清空 mod_dir/deleted/（如存在）
+    4. 清理 workspace 根下与此模块相关的孤儿目录（路径写错导致）
     """
     mods_root = get_modules_root(str(workspace))
     snapshot_path = workspace / ".s2_snapshots" / f"{mod_name}.snapshot"
@@ -224,18 +225,21 @@ def restore_module_for_retry(
         shutil.copy2(str(snapshot_path), str(mod_dir / "files.list"))
 
     # 2. 删除上一轮新建的子模块
+    # 条件：必须同时满足以下三者，避免误删并行 Worker 的合法模块
+    #   a) 以 mod_name + "_" 严格前缀开头（含下划线分隔符，避免 auth 误删 authenticate）
+    #   b) 无快照文件（证明是本轮新建，不是原有模块）
+    #   c) 不在 refined_set 中（证明未被其他并行 Worker 完成处理）
     current_mods = set(discover_modules(str(workspace)))
     for m in current_mods:
         if m == mod_name:
             continue
         if m in refined_set:
             continue
-        # 任何不属于已完成模块的模块——如果它是上一轮这个模块的拆分产物就删除
-        # 简单判断：迎合 mod_name 前缀，或者它的快照不存在（说明是本轮新建）
         sub_snap = workspace / ".s2_snapshots" / f"{m}.snapshot"
-        is_new_sub = (m.startswith(mod_name + "_")
-                      or m.startswith(mod_name)
-                      or not sub_snap.exists())
+        is_new_sub = (
+            m.startswith(mod_name + "_")  # 严格子模块前缀（含下划线）
+            and not sub_snap.exists()      # 无快照 = 本轮新建
+        )
         if is_new_sub:
             shutil.rmtree(str(mods_root / m), ignore_errors=True)
 
@@ -243,6 +247,242 @@ def restore_module_for_retry(
     deleted_dir = mod_dir / "deleted"
     if deleted_dir.exists():
         shutil.rmtree(str(deleted_dir), ignore_errors=True)
+
+    # 4. 清理 workspace 根下与此模块相关的孤儿目录
+    #    孤儿目录特征：在 workspace 根下（不在 modules/）、包含 files.list、
+    #    名称含 mod_name、且无对应快照（非正规模块）
+    _clean_orphan_dirs(workspace, mod_name, refined_set)
+
+
+def _clean_orphan_dirs(
+    workspace: "Path",
+    mod_name: str,
+    refined_set: set[str],
+) -> list[str]:
+    """清理 workspace 根下路径拼写错误产生的孤儿模块目录。
+
+    孤儿目录是 Worker bash 脚本将 modules/<name> 写成 modules<name>
+    （缺少 /）时在 workspace 根下产生的，check_module.sh 找不到它们，
+    导致校验永远报 MISSING。
+
+    返回被清理的目录名列表（供日志记录）。
+    """
+    cleaned: list[str] = []
+    for d in workspace.iterdir():
+        if not d.is_dir():
+            continue
+        if d.name.startswith("."):
+            continue
+        if d.name == "modules":
+            continue
+        if d.name in refined_set:
+            continue
+        # 孤儿目录判定：有 files.list、无快照、名称包含 mod_name
+        fl = d / "files.list"
+        snap = workspace / ".s2_snapshots" / f"{d.name}.snapshot"
+        if fl.exists() and not snap.exists() and mod_name.lower() in d.name.lower():
+            shutil.rmtree(str(d), ignore_errors=True)
+            cleaned.append(d.name)
+    return cleaned
+
+
+def fix_orphan_dirs_before_judge(
+    workspace: "Path",
+    mod_name: str,
+    refined_set: set[str],
+) -> list[str]:
+    """Judge 运行前扫描并自动修复 workspace 根下的孤儿模块目录。
+
+    若发现名称含 mod_name 的孤儿目录（有 files.list 但无快照），
+    尝试将其 move 进 modules/ 下正确位置，保留内容供 Judge 校验。
+
+    返回被修复的目录名列表（供日志/feedback 记录）。
+    """
+    mods_root = get_modules_root(str(workspace))
+    fixed: list[str] = []
+    for d in workspace.iterdir():
+        if not d.is_dir():
+            continue
+        if d.name.startswith("."):
+            continue
+        if d.name == "modules":
+            continue
+        if d.name in refined_set:
+            continue
+        fl = d / "files.list"
+        snap = workspace / ".s2_snapshots" / f"{d.name}.snapshot"
+        if not fl.exists() or snap.exists():
+            continue
+        if mod_name.lower() not in d.name.lower():
+            continue
+        # 尝试推断正确目标名（去掉可能多余的前缀 "modules"）
+        correct_name = d.name
+        if correct_name.lower().startswith("modules"):
+            correct_name = correct_name[len("modules"):].lstrip("_-")
+        if not correct_name:
+            correct_name = d.name
+        target = mods_root / correct_name
+        if not target.exists():
+            try:
+                shutil.move(str(d), str(target))
+                fixed.append(f"{d.name} → modules/{correct_name}")
+            except Exception:
+                # move 失败则直接删除孤儿目录，避免污染 check
+                shutil.rmtree(str(d), ignore_errors=True)
+                fixed.append(f"{d.name} (removed, move failed)")
+        else:
+            # 目标已存在，将孤儿文件追加进去后删除孤儿目录
+            try:
+                orphan_files = [ln.strip() for ln in fl.read_text("utf-8").splitlines() if ln.strip()]
+                target_fl = target / "files.list"
+                existing = set()
+                if target_fl.exists():
+                    existing = {ln.strip() for ln in target_fl.read_text("utf-8").splitlines() if ln.strip()}
+                with open(str(target_fl), "a", encoding="utf-8") as f:
+                    for fp in orphan_files:
+                        if fp not in existing:
+                            f.write(fp + "\n")
+                shutil.rmtree(str(d), ignore_errors=True)
+                fixed.append(f"{d.name} merged → modules/{correct_name}")
+            except Exception:
+                shutil.rmtree(str(d), ignore_errors=True)
+                fixed.append(f"{d.name} (removed, merge failed)")
+    return fixed
+
+
+def build_s2_diagnose_report(
+    workspace: "Path",
+    mod_name: str,
+    missing_files: list[str],
+) -> str:
+    """对 Judge 报告的每个 MISSING 文件，Python 侧自动定位其当前物理位置。
+
+    生成结构化诊断报告，写入 workspace/.diagnose/ 目录，
+    由调用方将文件路径注入 Worker 的 retry prompt。
+    返回诊断文件的绝对路径（字符串）。
+    """
+    import json as _json
+
+    diagnose_dir = workspace / ".diagnose"
+    diagnose_dir.mkdir(exist_ok=True)
+
+    mods_root = get_modules_root(str(workspace))
+    lines: list[str] = [
+        f"# S2 Refine 诊断报告：模块 `{mod_name}`",
+        "",
+        "## MISSING 文件定位",
+        "",
+    ]
+
+    # 预构建：所有 modules/*/files.list 的内容索引（文件→模块名列表）
+    file_to_mods: dict[str, list[str]] = {}
+    for flist in mods_root.glob("*/files.list"):
+        mod = flist.parent.name
+        for f in flist.read_text("utf-8", errors="replace").splitlines():
+            f = f.strip()
+            if f:
+                file_to_mods.setdefault(f, []).append(mod)
+
+    # 读取 workspace/deleted.list
+    deleted_set: set[str] = set()
+    deleted_path = workspace / "deleted.list"
+    if deleted_path.exists():
+        deleted_set = {ln.strip() for ln in deleted_path.read_text("utf-8", errors="replace").splitlines() if ln.strip()}
+
+    orphan_index: dict[str, list[str]] = {}
+    for d in workspace.iterdir():
+        if not d.is_dir() or d.name.startswith(".") or d.name == "modules":
+            continue
+        fl = d / "files.list"
+        if fl.exists():
+            for f in fl.read_text("utf-8", errors="replace").splitlines():
+                f = f.strip()
+                if f:
+                    orphan_index.setdefault(f, []).append(d.name)
+
+    all_truly_missing: list[str] = []
+    all_in_mods: list[tuple[str, list[str]]] = []
+    all_in_orphans: list[tuple[str, list[str]]] = []
+    all_in_deleted: list[str] = []
+
+    for rel in (missing_files or [])[:30]:
+        if rel in deleted_set:
+            all_in_deleted.append(rel)
+        elif rel in file_to_mods:
+            all_in_mods.append((rel, file_to_mods[rel]))
+        elif rel in orphan_index:
+            all_in_orphans.append((rel, orphan_index[rel]))
+        else:
+            all_truly_missing.append(rel)
+
+    if all_in_mods:
+        lines.append("### ✅ 文件已在其他模块中（可能竞态导致暂时不可见，重新运行 check_module.sh 应通过）")
+        for f, mods in all_in_mods:
+            lines.append(f"- `{f}` → 位于 `modules/{mods[0]}/files.list`")
+        lines.append("")
+
+    if all_in_orphans:
+        lines.append("### ⚠️ 文件在 workspace 根下孤儿目录中（路径写错！需要修复）")
+        for f, dirs in all_in_orphans:
+            lines.append(f"- `{f}` → 位于孤儿目录 `{dirs[0]}/files.list`")
+        lines.append("")
+        lines.append("**修复方法（孤儿目录）**：")
+        orphan_dirs = {d for _, dirs in all_in_orphans for d in dirs}
+        for od in sorted(orphan_dirs):
+            correct = od.lstrip("modules").lstrip("_-") or od
+            lines.append(f"```bash")
+            lines.append(f"mkdir -p modules/{correct}")
+            lines.append(f"cat {od}/files.list >> modules/{correct}/files.list")
+            lines.append(f"sort -u modules/{correct}/files.list -o modules/{correct}/files.list")
+            lines.append(f"rm -rf {od}")
+            lines.append(f"```")
+        lines.append("")
+
+    if all_in_deleted:
+        lines.append("### ℹ️ 文件在 workspace/deleted.list 中（已标记排除，check_module.sh 应自动放行）")
+        for f in all_in_deleted:
+            lines.append(f"- `{f}`")
+        lines.append("")
+
+    if all_truly_missing:
+        lines.append("### ❌ 文件真正丢失（未在任何模块/孤儿目录/deleted.list 中）")
+        for f in all_truly_missing:
+            phys = workspace / "target" / f
+            exists = "物理文件存在✓" if phys.exists() else "物理文件也不存在❌"
+            lines.append(f"- `{f}` ({exists})")
+        lines.append("")
+        lines.append("**修复方法（真正丢失）**：从快照恢复后重新拆分")
+        lines.append(f"```bash")
+        lines.append(f"cp .s2_snapshots/{mod_name}.snapshot modules/{mod_name}/files.list")
+        lines.append(f"# 然后重新执行拆分脚本")
+        lines.append(f"```")
+
+    lines += [
+        "",
+        "## workspace 根目录状态（孤儿目录检查）",
+        "",
+    ]
+    orphan_dirs_found = [
+        d.name for d in workspace.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+        and d.name != "modules"
+        and (d / "files.list").exists()
+        and not (workspace / ".s2_snapshots" / f"{d.name}.snapshot").exists()
+    ]
+    if orphan_dirs_found:
+        lines.append(f"⚠️ 发现 {len(orphan_dirs_found)} 个孤儿目录（有 files.list 但不在 modules/ 下）：")
+        for od in orphan_dirs_found:
+            cnt = len([l for l in (workspace / od / "files.list").read_text("utf-8", errors="replace").splitlines() if l.strip()])
+            lines.append(f"- `{od}/` ({cnt} 个文件)")
+    else:
+        lines.append("✅ workspace 根目录无孤儿目录")
+
+    # 写入文件并返回路径
+    import time as _time
+    ts = int(_time.time())
+    out_path = diagnose_dir / f"{mod_name}_{ts}.md"
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return str(out_path)
 
 
 def enforce_filter_constraint(workspace: "Path", filtered_files: set[str]) -> int:

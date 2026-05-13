@@ -55,6 +55,36 @@ echo "类型过滤后: $BEFORE 个文件"
 # 备份类型过滤结果，架构过滤失效时回退用
 cp "$OUTPUT_FILE" /tmp/_typefilter_backup.txt 2>/dev/null || true
 
+# ── 路径黑名单过滤（问题7：过滤低安全价値的构建/测试/文档路径）──
+SKIP_PATTERNS_DEFAULT="*/CI/* */ci/* */test/* */tests/* *_test.* *_mock.* *_fake.* */testcase* */packaging/* *CMakeLists* */docs/* */doc/*"
+# 支持通过环境变量添加额外跳过模式（驼棯分隔）
+SKIP_EXTRA="${SECFLOW_SA_SKIP_PATH_PATTERNS:-}"
+if [ -n "$SKIP_EXTRA" ]; then
+    SKIP_PATTERNS="$SKIP_PATTERNS_DEFAULT $SKIP_EXTRA"
+else
+    SKIP_PATTERNS="$SKIP_PATTERNS_DEFAULT"
+fi
+
+FILTERED_OUT=0
+if [ -n "$SKIP_PATTERNS" ]; then
+    cp "$OUTPUT_FILE" /tmp/_before_skip.txt
+    > "$OUTPUT_FILE"
+    while IFS= read -r rel; do
+        skip=0
+        for pat in $SKIP_PATTERNS; do
+            case "/$rel" in
+                $pat) skip=1; break ;;
+            esac
+        done
+        [ $skip -eq 0 ] && echo "$rel" >> "$OUTPUT_FILE"
+    done < /tmp/_before_skip.txt
+    rm -f /tmp/_before_skip.txt
+    AFTER_SKIP=$(wc -l < "$OUTPUT_FILE")
+    FILTERED_OUT=$((BEFORE - AFTER_SKIP))
+    [ $FILTERED_OUT -gt 0 ] && echo "路径黑名单过滤: 过滤掉 $FILTERED_OUT 个文件 (CI/test/docs 等)"
+    BEFORE=$AFTER_SKIP
+fi
+
 # ── 架构过滤（仅对 ELF 有效）──
 if [ "$ARCH_FILTER" = "all" ] || [ -z "$ARCH_FILTER" ]; then
     echo "架构: 不过滤"

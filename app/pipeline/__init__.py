@@ -13,6 +13,7 @@ from .helpers import (
     SUB_BATCH_SIZE, SUB_WORKER_THRESHOLD,
     pre_read_file, read_one_elf, pre_read_module, collect_file_summaries,
     write_failure_report, generate_modules_list, strip_target_prefix,
+    fix_orphan_dirs_before_judge, build_s2_diagnose_report,
 )
 from .s0_filter import FilterStage, ExploreStage, PrescanStage
 from .s0_path_group import PathGroupStage
@@ -36,6 +37,7 @@ __all__ = [
     "SUB_BATCH_SIZE", "SUB_WORKER_THRESHOLD",
     "pre_read_file", "read_one_elf", "pre_read_module", "collect_file_summaries",
     "write_failure_report", "generate_modules_list", "strip_target_prefix",
+    "fix_orphan_dirs_before_judge", "build_s2_diagnose_report",
     # 阶段
     "FilterStage", "ExploreStage", "PrescanStage",
     "PathGroupStage",
