@@ -51,6 +51,7 @@ _CONTEXT_WINDOW_BY_MODEL = {
     "glm-5.1": 128_000,
     "zai-org/glm-5": 128_000,
 }
+_DEFAULT_STDOUT_IDLE_TIMEOUT_SECONDS = 300.0
 
 
 # ─── 结果类 ───────────────────────────────────────────────────────────────────
@@ -108,6 +109,16 @@ def _backoff(base_delay: float, attempt: int) -> float:
 
 def _fmt_max(n: int) -> str:
     return "∞" if n < 0 else str(n)
+
+
+def _normalize_timeout_seconds(timeout_seconds: float | int | None) -> float | None:
+    if timeout_seconds is None:
+        return None
+    try:
+        value = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _should_retry(
@@ -203,6 +214,16 @@ def _format_context_overflow_failure(
         f"超过上下文窗口 75% 阈值 {single_input_limit}/{context_window}，"
         f"本次请求不再继续重试。原始错误: {original_error or 'unknown'}"
     )
+
+def _stdout_idle_timeout() -> float:
+    raw = os.environ.get("PI_STDOUT_IDLE_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_STDOUT_IDLE_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_STDOUT_IDLE_TIMEOUT_SECONDS
+    return max(30.0, value)
 
 
 def _find_pi_command() -> list[str]:
@@ -480,6 +501,9 @@ async def run_agent(
     cancel_event: asyncio.Event | None = None,
     max_retries: int = 3,  # API 错误最大重试（-1=无限）
     retry_delay: float = 10.0,  # API 重试首次等待
+    run_timeout_seconds: float | int = 3600,
+    timeout_retry_enabled: bool = True,
+    timeout_max_retries: int = 3,
     pi_max_retries: int = -1,  # pi 进程最大重试（-1=无限）
     pi_retry_delay: float = 10.0,  # pi 进程重试首次等待
 ) -> AgentResult:
@@ -512,25 +536,55 @@ async def run_agent(
         )
         args.extend(["--append-system-prompt", sys_tmp_file])
 
+    timeout_seconds = _normalize_timeout_seconds(run_timeout_seconds)
+    timeout_failures = 0
     try:
-        return await _run_with_context_overflow_recovery(
-            pi_cmd=pi_cmd,
-            args=args,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model=model,
-            tools=tools,
-            thinking_level=thinking_level,
-            session_file=session_file,
-            cwd=os.path.abspath(cwd),
-            env=env,
-            cancel_event=cancel_event,
-            on_stream=on_stream,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            pi_max_retries=pi_max_retries,
-            pi_retry_delay=pi_retry_delay,
-        )
+        while True:
+            try:
+                coro = _run_with_context_overflow_recovery(
+                    pi_cmd=pi_cmd,
+                    args=args,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model=model,
+                    tools=tools,
+                    thinking_level=thinking_level,
+                    session_file=session_file,
+                    cwd=os.path.abspath(cwd),
+                    env=env,
+                    cancel_event=cancel_event,
+                    on_stream=on_stream,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
+                    pi_max_retries=pi_max_retries,
+                    pi_retry_delay=pi_retry_delay,
+                )
+                return await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
+            except asyncio.TimeoutError:
+                timeout_failures += 1
+                result = AgentResult()
+                result.error = (
+                    f"agent run timed out after {timeout_seconds:.0f}s"
+                    if timeout_seconds else
+                    "agent run timed out"
+                )
+                result.exit_code = -1
+                can_retry = timeout_retry_enabled and (
+                    timeout_max_retries < 0 or timeout_failures <= timeout_max_retries
+                )
+                if not can_retry or (cancel_event and cancel_event.is_set()):
+                    return result
+                delay = _backoff(retry_delay, timeout_failures)
+                _log_warn(
+                    f"agent 单次输入超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
+                    f"{delay:.0f}s 后重试: {result.error}"
+                )
+                if on_stream:
+                    on_stream(
+                        f"\n⏱️ 智能体执行超时，{delay:.0f}s 后重试 "
+                        f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
+                    )
+                await asyncio.sleep(delay)
     finally:
         if sys_tmp_file and os.path.exists(sys_tmp_file):
             try:
@@ -709,8 +763,23 @@ async def _run_with_api_retry(
             await proc.stdin.drain()
 
             buffer = b""
+            idle_timeout = _stdout_idle_timeout()
             while True:
-                chunk = await proc.stdout.read(4096)
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=idle_timeout)
+                except asyncio.TimeoutError:
+                    result.error = f"pi stdout idle timeout after {idle_timeout:.0f}s"
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                    result.exit_code = proc.returncode or -1
+                    break
                 if not chunk:
                     break
                 buffer += chunk
@@ -767,6 +836,16 @@ async def _run_with_api_retry(
                 await proc.wait()
                 result.exit_code = -1
 
+        except asyncio.CancelledError:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             # 管道断裂、进程被杀等
             _log_warn(f"pi 进程读取异常: {e}")

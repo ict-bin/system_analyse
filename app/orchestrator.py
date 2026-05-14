@@ -22,7 +22,7 @@ from typing import Callable
 _log = logging.getLogger("sa.orchestrator")
 
 from .config import get_service_yaml
-from .service.llm_provider_sync import sync_providers_to_pi
+from .service.llm_provider_sync import sync_providers_to_pi, validate_pi_models_file
 from .models import (
     TaskConfig, TaskResult, TaskStatus, TokenUsage, SwarmEvent,
 )
@@ -137,17 +137,31 @@ class Orchestrator:
         self._cancel_event = asyncio.Event()
 
         # ── 同步配置中心的 LLM Provider → pi models.json ─────────────────────
-        try:
-            svc = get_service_yaml()
-            await sync_providers_to_pi(
-                base_url=svc.configcenter.base_url,
-                token=svc.auth_service.service_machine_token,
-                timeout=svc.configcenter.timeout,
-            )
-        except Exception as _sync_err:
-            import logging as _log
-            _log.getLogger("sa.orchestrator").warning(
-                "LLM Provider 同步失败，使用已有 models.json: %s", _sync_err
+        svc = get_service_yaml()
+        sync_ok = await sync_providers_to_pi(
+            base_url=svc.configcenter.base_url,
+            token=svc.auth_service.service_machine_token,
+            timeout=svc.configcenter.timeout,
+        )
+        if not sync_ok:
+            raise RuntimeError("LLM Provider 从配置中心同步失败，拒绝继续使用旧 models.json")
+        validation = validate_pi_models_file()
+        import logging as _log
+        _logger = _log.getLogger("sa.orchestrator")
+        _logger.info(
+            "LLM Provider runtime models ready: path=%s providers=%s models=%s",
+            validation["path"],
+            validation["provider_count"],
+            validation["model_count"],
+        )
+        for model_summary in validation["models"]:
+            _logger.info(
+                "runtime model source=configcenter provider=%s model=%s contextWindow=%s contextLength=%s maxTokens=%s",
+                model_summary["provider_key"],
+                model_summary["model_id"],
+                model_summary["contextWindow"],
+                model_summary["contextLength"],
+                model_summary["maxTokens"],
             )
 
         # ── 目录初始化（统一逻辑，不再区分 resume/fresh 模式）────────────────

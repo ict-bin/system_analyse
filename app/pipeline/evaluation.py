@@ -113,6 +113,7 @@ class EvaluationRecorder:
                 normalized_judges.append({
                     "judge_id": item.get("judge_id", ""),
                     "model": item.get("model", ""),
+                    "session_file": item.get("session_file", ""),
                     "score": int(item.get("score") or 0),
                     "passed": bool(item.get("passed")),
                     "feedback_excerpt": str(item.get("feedback") or "")[:1000],

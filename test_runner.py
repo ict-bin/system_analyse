@@ -119,6 +119,34 @@ class RunAgentTests(unittest.TestCase):
         self.assertIn("75%", result.error or "")
         self.assertIn("不再继续重试", result.error or "")
 
+    def test_run_agent_retries_after_timeout(self):
+        attempts = {"count": 0}
+
+        async def fake_run_with_pi_retry(**kwargs):
+            attempts["count"] += 1
+            await asyncio.sleep(0.02)
+            result = runner.AgentResult()
+            result.output = "ok"
+            return result
+
+        with patch.object(runner, "_find_pi_command", return_value=["/usr/bin/pi"]):
+            with patch.object(runner, "_run_with_pi_retry", side_effect=fake_run_with_pi_retry):
+                result = asyncio.run(
+                    runner.run_agent(
+                        "hello",
+                        model="test-model",
+                        tools=["read"],
+                        cwd=".",
+                        run_timeout_seconds=0.01,
+                        timeout_retry_enabled=True,
+                        timeout_max_retries=1,
+                        retry_delay=0,
+                    )
+                )
+
+        self.assertEqual(attempts["count"], 2)
+        self.assertIn("timed out", result.error or "")
+
 
 if __name__ == "__main__":
     unittest.main()

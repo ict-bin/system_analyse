@@ -51,7 +51,10 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "parallel_sub_workers": 4,
     "agent_max_retries": 5,
     "agent_retry_delay": 60,
-    "pi_max_retries": 3,
+    "agent_run_timeout_seconds": 3600,
+    "agent_timeout_retry_enabled": True,
+    "agent_timeout_max_retries": 3,
+    "pi_max_retries": -1,
     "pi_retry_delay": 5,
     "stages": {
         "classify":    {"min_rounds": 1, "max_rounds": 8,  "pass_mode": "all"},

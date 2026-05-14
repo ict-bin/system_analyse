@@ -57,6 +57,10 @@ _MIGRATIONS = [
         "  UNIQUE KEY uix_sa_models_cfg_key (config_key)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
     ),
+    "CREATE INDEX ix_sa_tasks_project_deleted_created_id ON secflow_app_sa_tasks (project_id, is_deleted, created_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_created_id ON secflow_app_sa_tasks (project_id, created_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_status_created_id ON secflow_app_sa_tasks (project_id, is_deleted, status, created_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_mode_created_id ON secflow_app_sa_tasks (project_id, is_deleted, analysis_mode, created_at, id)",
 ]
 
 

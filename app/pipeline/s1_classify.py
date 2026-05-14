@@ -170,7 +170,11 @@ class ClassifyStage(BaseStage):
 
         classify_session = str(ctx.sess_dir / "classify.jsonl")
         classify_model = cfg.workers.model_for("classify")
-        judge_model = cfg.judges.agents[0].model if cfg.judges.agents else classify_model
+        judge_model = (
+            ctx.jm("classify", ctx.j_cfgs[0])
+            if ctx.j_cfgs else
+            classify_model
+        )
 
         ctx.emit_event("stage", stage=1)
         ctx.emit_event("model", stage="classify",
@@ -202,6 +206,9 @@ class ClassifyStage(BaseStage):
             cancel_event=ctx.cancel_event,
             max_retries=cfg.agent_max_retries,
             retry_delay=cfg.agent_retry_delay,
+            run_timeout_seconds=cfg.agent_run_timeout_seconds,
+            timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+            timeout_max_retries=cfg.agent_timeout_max_retries,
             pi_max_retries=cfg.pi_max_retries,
             pi_retry_delay=cfg.pi_retry_delay,
         )
@@ -328,6 +335,9 @@ class ClassifyStage(BaseStage):
                     cancel_event=ctx.cancel_event,
                     max_retries=cfg.agent_max_retries,
                     retry_delay=cfg.agent_retry_delay,
+                    run_timeout_seconds=cfg.agent_run_timeout_seconds,
+                    timeout_retry_enabled=cfg.agent_timeout_retry_enabled,
+                    timeout_max_retries=cfg.agent_timeout_max_retries,
                     pi_max_retries=cfg.pi_max_retries,
                     pi_retry_delay=cfg.pi_retry_delay,
                 )
