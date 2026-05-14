@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.db.models import AppSaTask
-from app.service.event_log import clear_events, events_path
+from app.service.event_log import clear_events, events_path, strip_final_marker
 from app.time_utils import now_local
 
 
@@ -182,6 +182,9 @@ class TaskRepository:
         flag_modified(row, "task_config_json")
         db.commit()
         db.refresh(row)
+        # 续跑保留 events.jsonl（历史日志续写），但删除文件末尾的 __FINAL__ 标记。
+        # 这样新运行的事件就展现为未完成状态，避免 final=True 误报。
+        strip_final_marker(events_path(row.output_path, row.task_id))
         return row
 
     @staticmethod
