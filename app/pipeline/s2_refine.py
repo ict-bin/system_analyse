@@ -373,6 +373,19 @@ class RefineStage(BaseStage):
                         for i, r in enumerate(judge_results))
                     feedback += "\n\n## Judge 上轮意见\n\n" + jfb
             else:
+                # Process recover/ (Judge marked wrong-deleted files)
+                recovered = process_module_recover(mod_dir)
+                if recovered:
+                    has_missing = any(
+                        "missing" in r["feedback"].lower() or "遗漏" in r["feedback"]
+                        or "丢失" in r["feedback"]
+                        for r in judge_results if not r["pass"]
+                    )
+                    if not has_missing:
+                        skip_restore = True
+                    ctx.emit_event("log", level="info",
+                                   msg=(f"[S2] {mod_name}: recovered {len(recovered)} files "
+                                        f"(skip_restore={skip_restore})"))
                 fail_fb = "\n".join(
                     f"judge-{i}: {r['feedback'][:500]}"
                     for i, r in enumerate(judge_results) if not r["pass"])
@@ -405,6 +418,13 @@ class RefineStage(BaseStage):
                 else:
                     guidance = "\n\n请根据评审意见调整拆分策略。"
                 feedback = "# 评审意见（未通过）\n\n" + fail_fb + guidance
+                if recovered:
+                    rec_list = chr(10).join(f"  - {f}" for f in recovered[:30])
+                    feedback += (
+                        chr(10) + chr(10)
+                        + "## ⚠️ 已从 deleted/ 恢复的文件（禁止再次删除）"
+                        + chr(10) + chr(10) + rec_list
+                    )
 
             if forced_pass:
                 await archive_module_deletions(

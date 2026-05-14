@@ -148,11 +148,33 @@ head -10 /tmp/missing.txt
 如果任务额外指定了安全维度过滤：
 
 - 你的分类目标不是“给所有文件找一个大致功能桶”，而是**只保留与该安全维度直接相关的模块**
-- 允许丢弃与目标维度无关的文件，但**不允许**为了追求覆盖率，把职责不清的文件塞进一个宽泛模块
+- 与安全维度**完全无关**的文件（测试代码、CI 脚本、构建文件、文档、样例数据等）**禁止**塞入安全模块，必须写入 `deleted/files.list`（workspace 根目录，每行一个相对路径）：
+
+```bash
+mkdir -p deleted
+# 将确认无关的文件追加到 deleted/files.list
+echo "path/to/test_file.c" >> deleted/files.list
+# 或批量匹配
+grep -E '(^|/)tests?/|_test\.c$|/ci/|CMakeLists\.txt|Makefile|\.md$|/doc/' \n    filtered_files.txt >> deleted/files.list
+sort -u deleted/files.list -o deleted/files.list
+```
+
+- **禁止真正丢弃任何文件**：`filtered_files.txt` 中每个文件必须出现在 `modules/*/files.list` **或** `deleted/files.list` 其中之一
+- 安全维度模块的边界要**精准**，不要把外围支撑代码归入安全模块
 - 当维度是“网络协议解析”时，优先保留：
   `协议报文解析`、`编解码`、`状态机`、`握手`、`会话管理`、`协议字段校验`
 - 当维度是“网络协议解析”时，优先识别那些**直接承担协议语义处理**的代码，而不是只看目录名或通用网络关键词
-- 若暂时无法判断，应使用更审慎的模块边界，避免把过多外围职责合并成一个过宽的泛化模块
+- 若暂时无法判断某文件是否安全相关，先放入 `deleted/files.list`，由 Judge 审核后决定是否恢复
+
+**校验（同时检查模块和 deleted/）**：
+
+```bash
+TOTAL=$(wc -l < filtered_files.txt)
+CLASSIFIED=$(cat modules/*/files.list 2>/dev/null | sort -u | wc -l)
+DELETED=$(wc -l < deleted/files.list 2>/dev/null || echo 0)
+echo "总文件: $TOTAL  已分类: $CLASSIFIED  提议删除: $DELETED  合计: $((CLASSIFIED + DELETED))"
+[ "$TOTAL" -eq "$((CLASSIFIED + DELETED))" ] && echo "✅ 覆盖率 100%" || echo "❌ 仍有遗漏"
+```
 
 # 输出格式
 

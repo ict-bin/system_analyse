@@ -37,12 +37,22 @@ cat modules/<当前模块>/deleted/files.list 2>/dev/null | head -30
 ```
 
 对每个提议排除的文件，判断：
-- ✅ **允许排除**：文件确实与指定安全维度完全无关（如纯测试代码、绺 UI 渲染、国际化文字串）
+- ✅ **允许排除**：文件确实与指定安全维度完全无关（如纯测试代码、UI 渲染、国际化字符串）
 - ❌ **不允许排除**：文件实际上是协议实现层、框架调用层等安全维度范围内的代码
 
-在评审意见中明确说明 deleted/ 中每类文件的处置建议。
+**若有不应排除的文件**：将其写入 `modules/<模块名>/recover/files.list`，Python 会在下轮 Worker 之前把它们移回 files.list：
 
-**若 deleted/ 中有被错误排除的文件 → 直接 0 分、不通过**（与文件遗漏同等严重）
+```bash
+mkdir -p modules/$MOD/recover
+# 对每个不应排除的文件：
+echo "path/to/wrongly_deleted_file.c" >> modules/$MOD/recover/files.list
+```
+
+写入 recover/ 后，本次 **0 分、不通过**，并在评审意见中说明哪些文件被写入 recover/ 及原因。
+
+若 deleted/ 中所有文件确实无关 → 通过该项检查。
+
+**若 deleted/ 中有被错误排除的文件 → 已写入 recover/，0 分、不通过**（与文件遗漏同等严重）
 
 ## 3. 评审模块合理性
 

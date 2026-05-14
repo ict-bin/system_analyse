@@ -52,6 +52,22 @@ echo "剩余 files.list: $(wc -l < modules/$MOD/files.list) 个"
 - deleted/ 中的文件不计入子模块文件数，但计入快照校验：`快照数 = 子模块数 + deleted数`
 - 若未配置安全维度过滤（all 模式）：**所有文件必须归入模块**，不得使用 deleted/
 
+# ⚠️ recover/ 文件处理（优先级最高）
+
+如果 `modules/<模块名>/recover/files.list` 存在（上轮 Judge 将误删文件标记为待恢复），这些文件已由 Python 移回 `files.list`，**必须在本轮最先处理**：
+
+```bash
+# 查看待处理文件
+cat modules/$MOD/recover/files.list 2>/dev/null
+
+# 1. 将 recover/ 中的文件归入合适的子模块（不得再次放入 deleted/）
+# 2. 处理完成后删除 recover/：
+rm -f modules/$MOD/recover/files.list
+rmdir modules/$MOD/recover 2>/dev/null || true
+```
+
+**注意**：`recover/files.list` 中的文件已被 Judge 确认应保留，**绝对禁止再次写入 `deleted/`**。
+
 # 步骤
 
 ## 1. 读取文件摘要

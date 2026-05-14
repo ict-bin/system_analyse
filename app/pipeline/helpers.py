@@ -203,6 +203,45 @@ async def archive_module_deletions(
     return len(files)
 
 
+
+
+def process_module_recover(mod_dir):
+    """Move recover/files.list entries back to files.list (after Judge wrong-delete review).
+
+    Returns list of restored file paths. Empty if no recover/ exists.
+    """
+    nl = chr(10)
+    recover_flist = mod_dir / 'recover' / 'files.list'
+    if not recover_flist.exists():
+        return []
+    recover_files = [
+        ln.strip()
+        for ln in recover_flist.read_text('utf-8', errors='replace').splitlines()
+        if ln.strip()
+    ]
+    if not recover_files:
+        shutil.rmtree(str(mod_dir / 'recover'), ignore_errors=True)
+        return []
+    recover_set = set(recover_files)
+    deleted_flist = mod_dir / 'deleted' / 'files.list'
+    if deleted_flist.exists():
+        remaining = [
+            ln.strip()
+            for ln in deleted_flist.read_text('utf-8', errors='replace').splitlines()
+            if ln.strip() and ln.strip() not in recover_set
+        ]
+        if remaining:
+            deleted_flist.write_text(nl.join(remaining) + nl, encoding='utf-8')
+        else:
+            deleted_flist.unlink(missing_ok=True)
+            deleted_dir = mod_dir / 'deleted'
+            if deleted_dir.exists() and not any(deleted_dir.iterdir()):
+                deleted_dir.rmdir()
+    files_list = mod_dir / 'files.list'
+    with open(str(files_list), 'a', encoding='utf-8') as f:
+        f.write(nl.join(recover_files) + nl)
+    shutil.rmtree(str(mod_dir / 'recover'), ignore_errors=True)
+    return recover_files
 def restore_module_for_retry(
     mod_name: str,
     mod_dir: "Path",

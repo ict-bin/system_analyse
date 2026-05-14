@@ -82,6 +82,53 @@ def _build_security_focus_section(sec_cats: list[str]) -> str:
     )
 
 
+# ── S1 deleted/recover/ lifecycle helpers ────────────────────────────────────
+
+def _archive_s1_deleted(workspace):
+    """Archive workspace/deleted/files.list -> workspace/deleted.list."""
+    import shutil as _sh
+    src_p = workspace / 'deleted' / 'files.list'
+    if not src_p.exists():
+        return 0
+    lines = [ln.strip() for ln in src_p.read_text('utf-8', errors='replace').splitlines() if ln.strip()]
+    if lines:
+        with open(str(workspace / 'deleted.list'), 'a', encoding='utf-8') as _f:
+            _f.write(chr(10).join(lines) + chr(10))
+    _sh.rmtree(str(workspace / 'deleted'), ignore_errors=True)
+    return len(lines)
+
+
+def _pop_s1_recover(workspace):
+    """Read & clear workspace/recover/files.list; return list for Worker feedback."""
+    import shutil as _sh
+    src_p = workspace / 'recover' / 'files.list'
+    if not src_p.exists():
+        return []
+    lines = [ln.strip() for ln in src_p.read_text('utf-8', errors='replace').splitlines() if ln.strip()]
+    _sh.rmtree(str(workspace / 'recover'), ignore_errors=True)
+    return lines
+
+
+def _clear_s1_deleted(workspace):
+    """Clear workspace/deleted/ before retry."""
+    import shutil as _sh
+    _sh.rmtree(str(workspace / 'deleted'), ignore_errors=True)
+
+
+def _build_recover_prompt(recover_files):
+    """Build feedback section for files recovered from deleted/."""
+    nl = chr(10)
+    items = nl.join(f"  - {f}" for f in recover_files[:50])
+    extra = f"（共 {len(recover_files)} 个）" if len(recover_files) > 50 else ""
+    return (
+        nl + nl
+        + "# ⚠️ 必须重新分类的文件（上轮误放入 deleted/）" + nl + nl
+        + "以下文件经 Judge 审核确认不应删除，已从 deleted/ 恢复，"
+        + "**必须归入合适的安全维度模块，禁止再次写入 deleted/files.list**：" + nl
+        + items + extra
+    )
+
+
 class ClassifyStage(BaseStage):
     """Stage 1: 粗分类"""
 
@@ -139,6 +186,15 @@ class ClassifyStage(BaseStage):
         for attempt in range(max_iter):
             round_started = utc_now_iso()
             round_start_ts = time.time()
+
+            # Pre-retry: clear old deleted/, pop recover/ for feedback
+            recover_files = []
+            if attempt > 0:
+                _clear_s1_deleted(workspace)
+                recover_files = _pop_s1_recover(workspace)
+                if recover_files:
+                    ctx.emit_event("log", level="info",
+                                   msg=f"[S1] pop recover/ {len(recover_files)} files for re-classification")
             # 构建 prompt
             prompt_parts = [ctx.task]
             # ⚠️ 注入工作目录绝对路径，防止 agent cd 到错误目录
@@ -189,6 +245,8 @@ class ClassifyStage(BaseStage):
                     "请根据模块名直接将对应路径组写入模块的 files.list，无需重新分析路径。"
                 )
 
+            if recover_files:
+                prompt_parts.append(_build_recover_prompt(recover_files))
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
@@ -297,9 +355,14 @@ class ClassifyStage(BaseStage):
             )
 
             if voted_pass and attempt + 1 >= s_cfg.min_rounds:
+                archived = _archive_s1_deleted(workspace)
+                if archived:
+                    ctx.emit_event("log", level="info",
+                                   msg=f"[S1] archived {archived} proposed-deleted files")
                 ctx.classified_modules = modules
                 return
             if forced_pass:
+                _archive_s1_deleted(workspace)
                 ctx.classified_modules = modules
                 return
 

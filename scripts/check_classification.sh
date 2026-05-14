@@ -27,16 +27,36 @@ if [ -f "$WORKSPACE_DIR/deleted.list" ]; then
     echo "已排除确认删除文件: $DELETED_COUNT 个，剩余工作集: $TOTAL 个"
 fi
 
-# ── 收集 files.list（兼容 */files.list 和 modules/*/files.list）──
-# 统一去掉可能残留的绝对路径前缀
-cat "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list 2>/dev/null \
-    | sed '/^$/d' | sed "s|^${TARGET_DIR}/||" | sort -u > /tmp/classified_files.txt
+# ★ 减去提议删除文件（workspace/deleted/files.list，S1 Worker 暂存，待 Judge 审核）
+if [ -f "$WORKSPACE_DIR/deleted/files.list" ]; then
+    sort "$WORKSPACE_DIR/deleted/files.list" > /tmp/proposed_deleted.txt
+    PROPOSED_COUNT=$(wc -l < /tmp/proposed_deleted.txt)
+    comm -23 /tmp/all_files.txt /tmp/proposed_deleted.txt > /tmp/all_files_adj.txt
+    mv /tmp/all_files_adj.txt /tmp/all_files.txt
+    TOTAL=$(wc -l < /tmp/all_files.txt)
+    echo "提议删除 (deleted/files.list): $PROPOSED_COUNT 个，调整后工作集: $TOTAL 个"
+    rm -f /tmp/proposed_deleted.txt
+fi
+
+# ── 收集 files.list（兼容 */files.list 和 modules/*/files.list，排除 deleted/ 和 recover/）──
+{
+  for flist in "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list; do
+    [ -f "$flist" ] || continue
+    _d=$(basename "$(dirname "$flist")")
+    [ "$_d" = "deleted" ] && continue
+    [ "$_d" = "recover" ] && continue
+    cat "$flist"
+  done
+} | sed '/^$/d' | sed "s|^${TARGET_DIR}/||" | sort -u > /tmp/classified_files.txt
 CLASSIFIED_COUNT=$(wc -l < /tmp/classified_files.txt)
 
-# ── 模块列表 ──
+# ── 模块列表（排除 deleted/ recover/）──
 MODULES=""
 for flist in "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list; do
     [ -f "$flist" ] || continue
+    _d=$(basename "$(dirname "$flist")")
+    [ "$_d" = "deleted" ] && continue
+    [ "$_d" = "recover" ] && continue
     MOD=$(basename "$(dirname "$flist")")
     MODULES="$MODULES $MOD"
 done
@@ -45,9 +65,16 @@ done
 comm -23 /tmp/all_files.txt /tmp/classified_files.txt > /tmp/missing_files.txt
 MISSING_COUNT=$(wc -l < /tmp/missing_files.txt)
 
-# ── 重复分类 ──
-cat "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list 2>/dev/null \
-    | sed '/^$/d' | sed "s|^${TARGET_DIR}/||" | sort | uniq -d > /tmp/dup_files.txt
+# ── 重复分类（排除 deleted/ recover/）──
+{
+  for flist in "$WORKSPACE_DIR"/*/files.list "$WORKSPACE_DIR"/modules/*/files.list; do
+    [ -f "$flist" ] || continue
+    _d=$(basename "$(dirname "$flist")")
+    [ "$_d" = "deleted" ] && continue
+    [ "$_d" = "recover" ] && continue
+    cat "$flist"
+  done
+} | sed '/^$/d' | sed "s|^${TARGET_DIR}/||" | sort | uniq -d > /tmp/dup_files.txt
 DUP_COUNT=$(wc -l < /tmp/dup_files.txt)
 
 echo "=== Classification Check ==="
