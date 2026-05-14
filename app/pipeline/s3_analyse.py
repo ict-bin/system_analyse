@@ -27,7 +27,7 @@ from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
-    discover_modules, get_modules_root, load_prompt,
+    discover_modules, get_modules_root, load_prompt, build_granularity_hint,
     archive_file, max_iter, pre_read_module, pre_read_module_with_details,
     module_has_nonempty_files,
     load_details_for_module,
@@ -60,6 +60,12 @@ class AnalyseStage(BaseStage):
         w_sys_prompt = load_prompt(cfg, "step3_analyse", "workers")
         j_sys_prompt = load_prompt(cfg, "step3_check_analyse", "judges")
         reflect_prompt = load_prompt(cfg, "reflect_analyse", "workers")
+
+        # ── 粒度约束注入（S3 Worker 和 Judge）───────────────────────────────────────────
+        _gran_hint = build_granularity_hint(getattr(cfg, "module_granularity", "fine") or "fine")
+        if _gran_hint:
+            w_sys_prompt += _gran_hint
+            j_sys_prompt += _gran_hint
 
         final_modules = discover_modules(str(workspace))
         ctx.modules_needing_reclassify = []
@@ -453,6 +459,11 @@ class AnalyseStage(BaseStage):
         from .s1_classify import _build_security_focus_section  # noqa: PLC0415
         _sec_cats = getattr(cfg, "security_focus_categories", ["all"])
         _sec_focus_hint = _build_security_focus_section(_sec_cats)
+        # 2-redo 中同样注入粒度约束，与 S2 保持一致
+        _gran_hint = build_granularity_hint(getattr(cfg, "module_granularity", "fine") or "fine")
+        if _gran_hint:
+            w_sys_refine += _gran_hint
+            j_sys_refine += _gran_hint
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
 

@@ -38,6 +38,71 @@ class PiFatalError(StageError):
     pass
 
 
+# ── 粒度约束工具 ────────────────────────────────────────────────────────────────
+
+def build_granularity_hint(granularity: str) -> str:
+    """生成粒度约束段落，统一追加到 S2/S3 Worker 和 Judge 的 system prompt 末尾。
+
+    判断树设计：
+
+    粗粒度（coarse）— "一个协议 / 一个服务 / 一个守护进程 = 一个模块"
+      拆分触发条件（同时满足全部）：
+        1. 模块内存在完全独立的顶层协议或服务（不同 RFC / 不同守护进程）
+        2. 两者之间无直接调用或数据依赖
+        3. 文件数 > 15
+      绝对禁止拆分的场景（任一满足则禁拆）：
+        - 同协议的 client / server / config / parser / utils / v4-v6变体
+        - 同协议族的子协议（OSPFv2 + OSPFv3、ICMPv4 + ICMPv6、AH + ESP）
+        - 文件数 <= 30 的任意模块
+        - 库文件 + 使用该库的协议实现代码
+      口诀："同一个 RFC / 同一个 daemon" → 同一个模块
+
+    细粒度（fine）— "一个组件做一件事 = 一个模块"
+      拆分触发条件（满足任一）：
+        1. 文件数 > 20 且建议子模块种类 >= 3
+        2. 文件功能属于不同子系统（client/server/parser/config 等任意组合）
+      不拆分条件（满足任一）：
+        1. 文件数 <= 10
+        2. 所有文件属于同一协议/功能
+      口诀："一个组件做一件事" → 一个模块
+    """
+    if granularity == "coarse":
+        return (
+            "\n\n---\n"
+            "# ⚠️ 粒度约束（粗粒度模式，最高优先级，覆盖上方所有拆分规则）\n\n"
+            "当前任务配置为 **粗粒度（coarse）** 模式，模块边界 = 完整协议 / 完整服务 / 独立守护进程。\n\n"
+            "## 拆分触发条件（三条必须同时满足）\n"
+            "1. 模块内存在**完全独立的顶层协议或服务**（属于不同 RFC 标准或不同守护进程）\n"
+            "2. 两者之间**无直接调用或数据依赖**\n"
+            "3. 文件数 **> 15**\n\n"
+            "## 绝对禁止拆分（满足任一则禁拆）\n"
+            "- 同协议的 client / server / config / parser / utils — 必须合并\n"
+            "- 同协议族的子版本变体（OSPFv2 + OSPFv3 → `ospf`；ICMPv4 + ICMPv6 → `icmp`）\n"
+            "- 文件数 **≤ 30** 的任意模块（无论功能有多少子分类）\n"
+            "- 库文件与使用该库的协议实现（如 libssl + TLS 握手代码）\n"
+            "- **上方 prompt 中的 `文件数 > 20 强制拆分` 规则在粗粒度模式下完全无效，必须忽略**\n\n"
+            "## 正确示范 ✅\n"
+            "- `ssh`（ssh_server + ssh_client + ssh_config 共 12 文件）→ **不拆**\n"
+            "- `iccp`（iccp_client + iccp_server + etrunk 共 4 文件）→ **不拆**\n"
+            "- `tls`（libssl + libcrypto + libtls 共 8 文件）→ **不拆**\n"
+            "- `routing`（bgp + ospf + isis 共 42 文件）→ **拆**（三个独立协议：`bgp` / `ospf` / `isis`）\n\n"
+            "## 错误示范 ❌\n"
+            "- `ssh_server` + `ssh_client`（同协议拆碎）\n"
+            "- `icmp_parse` + `icmp_send`（同协议子功能拆碎）\n"
+            "- `ospfv2` + `ospfv3`（同协议版本变体拆碎）\n"
+        )
+    if granularity == "fine":
+        return (
+            "\n\n---\n"
+            "# 粒度约束（细粒度模式）\n\n"
+            "当前任务配置为 **细粒度（fine）** 模式，遵循 prompt 中的默认拆分条件：\n"
+            "- 文件数 > 20 且建议子模块种类 >= 3 → 拆分\n"
+            "- 文件功能属于不同子系统（client/server/parser/config 等）→ 拆分\n"
+            "- 文件数 <= 10 → 不拆\n"
+        )
+    return ""
+
+
 def check_agent_result(ar: AgentResult, context: str = "") -> None:
     if ar.fatal:
         msg = f"pi 致命错误（不可重试）: {ar.error or ar.output or 'unknown'}"

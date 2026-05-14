@@ -425,8 +425,15 @@ class ServiceConfig(BaseModel):
     module_granularity: str = Field(
         default="fine",
         description=(
-            "模块划分粒度: fine=子组件级（当前默认），"
-            "coarse=协议/服务/功能级（同一协议/功能的所有代码归为一个模块）"
+            "模块划分粒度:\n"
+            "  fine   = 子组件级（默认）: 一个组件做一件事，\n"
+            "           拆分条件: 文件数>20 且 子模块种类>=3，或功能属于不同子系统\n"
+            "           示例: ssh → ssh_server + ssh_client + ssh_config\n"
+            "  coarse = 协议/服务级: 一个 RFC/守护进程 = 一个模块，\n"
+            "           拆分条件: 内存完全独立的顶层协议且文件数>15，\n"
+            "           禁止拆分: client/server/config/utils 共居, 文件数<=30, \n"
+            "           S2 的 'files>20 强制拆分' 规则在此模式下被禁用\n"
+            "           示例: ssh_server + ssh_client + ssh_config → ssh"
         ),
     )
     filter_engine: str = Field(

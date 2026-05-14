@@ -7,7 +7,7 @@ from .base import BaseStage, Pipeline
 from .helpers import (
     StageError, PiFatalError,
     run_agent_checked, check_agent_result,
-    get_modules_root, discover_modules,
+    get_modules_root, discover_modules, build_granularity_hint,
     parse_eval_md, check_voting,
     load_prompt,
     max_iter, extract_result, archive_file,
@@ -41,7 +41,7 @@ __all__ = [
     # 工具函数与常量
     "StageError", "PiFatalError",
     "run_agent_checked", "check_agent_result",
-    "get_modules_root", "discover_modules",
+    "get_modules_root", "discover_modules", "build_granularity_hint",
     "parse_eval_md", "check_voting", "load_prompt",
     "max_iter", "extract_result", "archive_file",
     "SUB_BATCH_SIZE", "SUB_WORKER_THRESHOLD",

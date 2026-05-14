@@ -288,12 +288,25 @@ class ClassifyStage(BaseStage):
             if attempt == 0 and granularity == "coarse":
                 prompt_parts.append(
                     "\n\n# ⚠️ 模块划分粒度：粗粒度（协议/服务/功能级）\n\n"
-                    "模块划分必须以**完整协议 / 完整服务 / 完整安全功能**为边界：\n"
-                    "- 某个网络协议的所有实现代码（解析器、编码器、状态机、会话管理等）"
-                    "统一归入**同一个模块**。\n"
-                    "- 例如：`HTTP协议` 是一个模块，**不要**拆分为"
-                    " `HTTP请求解析`、`HTTP响应构造`、`HTTP分块传输`。\n"
-                    "- 固件中有多少个协议 / 功能就创建多少个模块，**不限制总模块数量**。"
+                    "**每个完整协议/服务/独立守护进程 → 一个模块**\n\n"
+                    "判断口诀：问自己「这两组文件是否实现同一个 RFC 标准\n"
+                    "或同一个守护进程？」"
+                    " - 是 → 必须合并入同一模块\n"
+                    " - 否（完全不同的协议/服务）→ 分为不同模块\n\n"
+                    "**必须合并的场景：**\n"
+                    "- 同协议的 client/server/config/parser/utils"
+                    " → 必须合并，**不得**拆成多个模块\n"
+                    "- 同协议族子协议变体（OSPFv2+OSPFv3→`ospf`；"
+                    "ICMPv4+ICMPv6→`icmp`）\n\n"
+                    "**正确示范 ✅**\n"
+                    "- `ssh`（ssh_server+ssh_client+ssh_config）\n"
+                    "- `ospf`（OSPFv2+OSPFv3+OSPF工具）\n"
+                    "- `tls`（libssl+libcrypto+TLS握手实现）\n\n"
+                    "**错误示范 ❌**\n"
+                    "- `ssh_server`+`ssh_client`（同协议拆碎）\n"
+                    "- `ospfv2`+`ospfv3`（同协议版本拆碎）\n"
+                    "- 固件中有多少个协议"
+                    "/功能就创建多少个模块，**不限制总模块数量**。"
                 )
 
             # ── 路径先验分组指引（path_groups.md 由 PathGroupStage 生成）──
@@ -346,9 +359,17 @@ class ClassifyStage(BaseStage):
                 # S1 Judge 只检查：所有 filtered_files.txt 中的文件是否已全部分类。
                 if granularity == "coarse":
                     judge_prompt.append(
-                        "\n\n# 模块粒度要求\n\n"
-                        "当前要求是粗粒度（协议/服务/功能级）。"
-                        "不要把同一协议拆成多个碎片模块。"
+                        "\n\n# 模块粒度要求（粗粒度审核）\n\n"
+                        "当前要求是粗粒度（协议/服务/功能级）。\n"
+                        "验收重点：\n"
+                        "1. 是否存在同一协议的碎片模块"
+                        "（如 ssh_server 和 ssh_client 分开存在）"
+                        "——若有则不通过\n"
+                        "2. 是否存在同协议族子协议碎片"
+                        "（如 ospfv2 和 ospfv3 分开存在）"
+                        "——若有则不通过\n"
+                        "3. 所有 filtered_files.txt 中的文件"
+                        "是否已全部分类（覆盖率 100%）"
                     )
                 j_ar = await run_agent_with_stage_guard(
                     ctx=ctx,
