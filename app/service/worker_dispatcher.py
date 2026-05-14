@@ -128,6 +128,7 @@ class WorkerDispatcher:
         *,
         get_db: Callable[[], object],
         clear_task_execution_lock: Callable[[str | None, str], None],
+        cleanup_resume_files: Callable[[str | None, str], None],
         claim_task_lease: Callable[[Session, AppSaTask, str], int | None],
         spawn_task: Callable[[str, int, str], None],
         select_dispatch_target: Callable[[Session], str | None],
@@ -137,6 +138,7 @@ class WorkerDispatcher:
     ) -> None:
         self._get_db = get_db
         self._clear_task_execution_lock = clear_task_execution_lock
+        self._cleanup_resume_files = cleanup_resume_files
         self._claim_task_lease = claim_task_lease
         self._spawn_task = spawn_task
         self._select_dispatch_target = select_dispatch_target
@@ -279,6 +281,7 @@ class WorkerDispatcher:
             now=now,
             lease_timeout_seconds=TASK_LEASE_TIMEOUT_SECONDS,
             clear_task_execution_lock=self._clear_task_execution_lock,
+            cleanup_resume_files=self._cleanup_resume_files,
         )
         _runtime_state.last_stale_recovery_ts = now_ts
 

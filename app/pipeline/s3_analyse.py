@@ -179,8 +179,15 @@ class AnalyseStage(BaseStage):
         # ── 双重保护 checkpoint 跳过（checkpoint + 报告文件双重确认）──────────
         # checkpoint 存在 + 报告文件存在 → 安全跳过
         if cp and cp.is_done(f"s3_modules/{mod_name}") and report_path.exists():
+            try:
+                import json as _json
+                _cp_data = _json.loads(cp._resolve(f"s3_modules/{mod_name}").read_text(encoding="utf-8"))
+                _score = _cp_data.get("extra", {}).get("score")
+                _score_str = f" (score={_score})" if _score is not None else ""
+            except Exception:
+                _score_str = ""
             ctx.emit_event("log", level="info",
-                           msg=f"[S3] {mod_name} checkpoint 已完成，跳过")
+                           msg=f"[S3] {mod_name} checkpoint 已完成，跳过{_score_str}")
             return
         # checkpoint 存在但报告丢失 → 清除脏 checkpoint 重做
         if cp and cp.is_done(f"s3_modules/{mod_name}") and not report_path.exists():
@@ -428,7 +435,8 @@ class AnalyseStage(BaseStage):
                 if attempt + 1 >= s_cfg.min_rounds:
                     # ── 写模块级 checkpoint ─────────────────────────────
                     if cp:
-                        cp.mark_done(f"s3_modules/{mod_name}")
+                        _avg = int(sum(r["score"] for r in judge_results) / max(len(judge_results), 1)) if judge_results else 0
+                        cp.mark_done(f"s3_modules/{mod_name}", score=_avg, attempts=attempt + 1)
                     return
                 else:
                     ctx.emit_event("reflect", stage=3, module=mod_name, round=attempt + 1)
