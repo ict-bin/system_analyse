@@ -148,6 +148,79 @@ def _clear_task_execution_lock(output_path: str | None, task_id: str) -> None:
         pass
 
 
+def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) -> None:
+    """断点续做前清理上次中断留下的中间文件。
+
+    - modules/<mod>/deleted/ 存在 → 从快照恢复 files.list（含所有原始文件），删除 deleted/
+    - modules/<mod>/recover/ 存在 → 同上，删除 recover/
+    - workspace/deleted/（S1 级）→ 直接删除
+    - workspace/recover/（S1 级）→ 直接删除
+
+    快照优先：.s2_snapshots/<mod>.snapshot 包含 Worker 运行前的原始 files.list，
+    从快照恢复即可将 deleted 和 recover 的文件一并还原，无需逐条合并。
+    无快照时降级为手动追加（保证文件不丢失）。
+    """
+    if not output_path:
+        return
+    import shutil as _shutil
+    workspace = Path(output_path) / task_id / "run" / "workspace"
+    if not workspace.exists():
+        return
+    modules_dir = workspace / "modules"
+    snapshots_dir = workspace / ".s2_snapshots"
+
+    # ── S2 级：逐模块清理 deleted/ 和 recover/ ────────────────────────────
+    if modules_dir.exists():
+        for mod_dir in sorted(modules_dir.iterdir()):
+            if not mod_dir.is_dir():
+                continue
+            deleted_dir = mod_dir / "deleted"
+            recover_dir = mod_dir / "recover"
+            if not deleted_dir.exists() and not recover_dir.exists():
+                continue
+            # 快照存在 → 直接恢复原始 files.list（自动覆盖 deleted/recover 内容）
+            snapshot = snapshots_dir / f"{mod_dir.name}.snapshot"
+            if snapshot.exists():
+                try:
+                    _shutil.copy2(str(snapshot), str(mod_dir / "files.list"))
+                except Exception:
+                    pass
+            else:
+                # 无快照 → 手动将 deleted/ 和 recover/ 中的文件追加回 files.list
+                files_list_path = mod_dir / "files.list"
+                existing: set[str] = set()
+                if files_list_path.exists():
+                    existing = {
+                        ln.strip()
+                        for ln in files_list_path.read_text("utf-8", errors="replace").splitlines()
+                        if ln.strip()
+                    }
+                to_add: list[str] = []
+                for src in [deleted_dir / "files.list", recover_dir / "files.list"]:
+                    if src.exists():
+                        for ln in src.read_text("utf-8", errors="replace").splitlines():
+                            f = ln.strip()
+                            if f and f not in existing:
+                                existing.add(f)
+                                to_add.append(f)
+                if to_add:
+                    with open(str(files_list_path), "a", encoding="utf-8") as _f:
+                        _f.write("\n".join(to_add) + "\n")
+            # 删除中间目录
+            _shutil.rmtree(str(deleted_dir), ignore_errors=True)
+            _shutil.rmtree(str(recover_dir), ignore_errors=True)
+            logger.info(
+                "[resume-cleanup] %s: 清理中间文件 deleted/ recover/，已从快照恢复 files.list",
+                mod_dir.name,
+            )
+
+    # ── S1 级：workspace 根目录下的 deleted/ 和 recover/ ─────────────────
+    for d in [workspace / "deleted", workspace / "recover"]:
+        if d.exists():
+            _shutil.rmtree(str(d), ignore_errors=True)
+            logger.info("[resume-cleanup] S1 workspace/%s 已清理", d.name)
+
+
 def _security_filter_log_payload(config: dict | None, *, resolved: bool = False) -> dict:
     cfg = config or {}
     return {
@@ -611,6 +684,7 @@ class TaskService:
         self._dispatcher = WorkerDispatcher(
             get_db=get_db,
             clear_task_execution_lock=_clear_task_execution_lock,
+            cleanup_resume_files=_cleanup_resume_intermediate_files,
             claim_task_lease=self._claim_task_lease,
             spawn_task=self._on_task_claimed,
             select_dispatch_target=self._select_dispatch_target,
@@ -902,6 +976,7 @@ class TaskService:
                 )
         row = self._task_repository.resume_task_in_place(db, row)
         _clear_task_execution_lock(row.output_path, task_id)
+        _cleanup_resume_intermediate_files(row.output_path, task_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)

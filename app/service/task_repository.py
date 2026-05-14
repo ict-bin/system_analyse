@@ -210,6 +210,7 @@ class TaskRepository:
         now: datetime,
         lease_timeout_seconds: int,
         clear_task_execution_lock: Callable[[str | None, str], None],
+        cleanup_resume_files: Callable[[str | None, str], None],
     ) -> int:
         stale_rows = db.query(AppSaTask).filter(
             AppSaTask.is_deleted.is_(False),
@@ -231,6 +232,7 @@ class TaskRepository:
             stale.lease_expires_at = None
             stale.finished_at = None
             clear_task_execution_lock(stale.output_path, stale.task_id)
+            cleanup_resume_files(stale.output_path, stale.task_id)
         if stale_rows:
             db.commit()
         return len(stale_rows)

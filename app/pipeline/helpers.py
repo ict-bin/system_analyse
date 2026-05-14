@@ -197,8 +197,43 @@ def get_modules_root(workspace: str | Path) -> Path:
 
 
 def discover_modules(workspace: str | Path) -> list[str]:
-    """返回 workspace 下所有 files.list 非空的目录名（叶节点模块）。"""
+    """返回 workspace/modules/ 下所有 files.list 非空的叶节点模块名。
+
+    同时自动展平 S2 Worker 可能创建的嵌套子模块目录：
+      modules/<parent>/<sub>/files.list  →  modules/<sub>/files.list
+    只处理二级嵌套（parent 本身无 files.list，但其内部子目录有 files.list）。
+    """
     root = get_modules_root(str(workspace))
+    # ── 展平嵌套子模块（二级）─────────────────────────────────────────
+    for parent in sorted(root.iterdir()):
+        if not parent.is_dir() or parent.name.startswith("."):
+            continue
+        if module_has_nonempty_files(parent):
+            continue  # parent 本身有 files.list，不是容器目录
+        nested = [
+            sub for sub in parent.iterdir()
+            if sub.is_dir() and not sub.name.startswith(".")
+            and module_has_nonempty_files(sub)
+        ]
+        for sub in nested:
+            target = root / sub.name
+            if not target.exists():
+                try:
+                    shutil.move(str(sub), str(target))
+                except Exception:
+                    pass
+            else:
+                # 目标已存在：将 sub 的 files.list 去重追加到 target，再删除 sub
+                try:
+                    existing = set(read_module_files(target))
+                    for f in read_module_files(sub):
+                        if f not in existing:
+                            with open(str(target / "files.list"), "a", encoding="utf-8") as _fh:
+                                _fh.write(f + "\n")
+                    shutil.rmtree(str(sub), ignore_errors=True)
+                except Exception:
+                    pass
+    # ── 收集第一层叶节点模块 ──────────────────────────────────────────
     result = []
     for d in sorted(root.iterdir()):
         if d.is_dir() and not d.name.startswith(".") and module_has_nonempty_files(d):
