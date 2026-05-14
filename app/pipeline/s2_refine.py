@@ -216,7 +216,28 @@ class RefineStage(BaseStage):
         j_sys_prompt = load_prompt(cfg, "step2_check_refine", "judges")
         reflect_prompt = load_prompt(cfg, "reflect_refine", "workers")
 
-        feedback = ""
+        # ── 粒度约束注入：coarse 模式抑制过度拆分 ────────────────────────────
+        _granularity = getattr(cfg, "module_granularity", "fine") or "fine"
+        _granularity_hint = ""
+        if _granularity == "coarse":
+            _granularity_hint = (
+                "\n\n# ⚠️ 粒度约束（粗粒度模式）\n\n"
+                "当前任务配置为 **粗粒度（coarse）** 模式，模块应对应协议/服务/功能级别。\n\n"
+                "**在此模式下，拆分条件更严格**：\n"
+                "- 文件数 <= 30 时，原则上不拆分\n"
+                "- 仅当模块内存在**完全不同的顶层协议/服务**（如 OSPF 与 BGP，而非 client/server 子组件）且文件数 > 30 时才拆分\n"
+                "- 同一协议的 client/server/core/utils 子组件**不得拆分**，保留在同一模块\n"
+                "- 'files.list 文件数 > 20' 的强制拆分条件在此模式下**无效**，忽略该条件\n"
+            )
+        elif _granularity == "fine":
+            _granularity_hint = (
+                "\n\n# 粒度约束（细粒度模式）\n\n"
+                "当前任务配置为 **细粒度（fine）** 模式，按子组件级别拆分，遵循 prompt 中的默认拆分条件。\n"
+            )
+        if _granularity_hint:
+            w_sys_prompt = w_sys_prompt + _granularity_hint
+            j_sys_prompt = j_sys_prompt + _granularity_hint
+
         for attempt in range(max_iter(s_cfg)):
             round_started = utc_now_iso()
             round_start_ts = time.time()
