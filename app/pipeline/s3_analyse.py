@@ -29,6 +29,7 @@ from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module, pre_read_module_with_details,
+    module_has_nonempty_files,
     load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
