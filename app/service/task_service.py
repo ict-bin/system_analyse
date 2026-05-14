@@ -221,6 +221,103 @@ def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) ->
             logger.info("[resume-cleanup] S1 workspace/%s 已清理", d.name)
 
 
+def _module_dirs(workspace: Path) -> list[Path]:
+    modules_dir = workspace / "modules"
+    if not modules_dir.exists() or not modules_dir.is_dir():
+        return []
+    return sorted(path for path in modules_dir.iterdir() if path.is_dir() and not path.name.startswith("."))
+
+
+def _nonempty_files_list(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        return any(line.strip() for line in path.read_text("utf-8", errors="replace").splitlines())
+    except Exception:
+        return False
+
+
+def _inspect_resume_health(row: AppSaTask) -> dict:
+    from app.pipeline.checkpoint import CheckpointManager
+
+    result = {
+        "task_id": row.task_id,
+        "can_resume": False,
+        "reason": "",
+        "workspace": None,
+        "checkpoint_dir": None,
+        "warnings": [],
+        "missing_artifacts": [],
+        "last_completed_stage": None,
+    }
+    if not row.output_path:
+        result["reason"] = "no_output_path"
+        return result
+
+    workspace = Path(row.output_path) / row.task_id / "run" / "workspace"
+    checkpoint_dir = workspace / ".checkpoint"
+    result["workspace"] = str(workspace)
+    result["checkpoint_dir"] = str(checkpoint_dir)
+
+    if not workspace.exists():
+        result["reason"] = "workspace_missing"
+        result["missing_artifacts"].append(str(workspace))
+        return result
+    if not checkpoint_dir.exists():
+        result["reason"] = "no_checkpoint_dir"
+        result["missing_artifacts"].append(str(checkpoint_dir))
+        return result
+
+    cp = CheckpointManager(workspace)
+    summary = cp.load_summary()
+    result["last_completed_stage"] = summary.get("last_completed_stage")
+    if not cp.has_any_checkpoint():
+        result["reason"] = "empty_checkpoint_dir"
+        return result
+
+    filtered_files = workspace / "filtered_files.txt"
+    if not filtered_files.exists():
+        result["missing_artifacts"].append(str(filtered_files))
+
+    module_dirs = _module_dirs(workspace)
+    modules_root = workspace / "modules"
+    if summary["stages"].get("s1_classify", {}).get("done"):
+        if not module_dirs:
+            result["missing_artifacts"].append(str(modules_root))
+
+    if summary["stages"].get("s2_refine", {}).get("done"):
+        if not module_dirs:
+            result["missing_artifacts"].append(str(modules_root))
+        for module_dir in module_dirs:
+            files_list = module_dir / "files.list"
+            if not _nonempty_files_list(files_list):
+                result["missing_artifacts"].append(str(files_list))
+
+    if summary["stages"].get("s3_analyse", {}).get("done"):
+        report_missing = []
+        for module_dir in module_dirs:
+            files_list = module_dir / "files.list"
+            if not _nonempty_files_list(files_list):
+                continue
+            report_path = module_dir / "module_report.md"
+            if not report_path.exists():
+                report_missing.append(str(report_path))
+        result["missing_artifacts"].extend(report_missing)
+
+    if summary["stages"].get("s4_report", {}).get("done"):
+        final_report = Path(row.output_path) / row.task_id / "output" / "final_report.md"
+        if not final_report.exists():
+            result["missing_artifacts"].append(str(final_report))
+
+    if result["missing_artifacts"]:
+        result["reason"] = "missing_artifacts"
+        return result
+
+    result["can_resume"] = True
+    result["reason"] = "ok"
+    return result
+
+
 def _security_filter_log_payload(config: dict | None, *, resolved: bool = False) -> dict:
     cfg = config or {}
     return {
@@ -961,25 +1058,24 @@ class TaskService:
     def resume_task(self, db: Session, task_id: str) -> dict:
         """断点续跑：保留已有 workspace 和 .checkpoint/ 目录，系统自动从中断处继续。"""
         from fastapi import HTTPException
-        from pathlib import Path as _Path
         row = self._get_or_404(db, task_id)
         if row.status in ("pending", "running"):
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
-        # 检查 .checkpoint/ 目录是否存在（无断点就无法续跑）
-        if row.output_path:
-            checkpoint_dir = _Path(row.output_path) / task_id / "run" / "workspace" / ".checkpoint"
-            if not checkpoint_dir.exists():
-                raise HTTPException(
-                    400,
-                    f"没有找到断点信息（{checkpoint_dir}），"
-                    f"请使用重启（restart）代替续跑。"
-                )
+        health = _inspect_resume_health(row)
+        if not health["can_resume"]:
+            missing = health.get("missing_artifacts") or []
+            hint = f" 缺失产物: {', '.join(missing[:6])}" if missing else ""
+            raise HTTPException(400, f"断点不可续跑: {health['reason']}。请使用重启（restart）代替续跑。{hint}")
         row = self._task_repository.resume_task_in_place(db, row)
         _clear_task_execution_lock(row.output_path, task_id)
         _cleanup_resume_intermediate_files(row.output_path, task_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
+
+    def get_resume_check(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        return _inspect_resume_health(row)
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)

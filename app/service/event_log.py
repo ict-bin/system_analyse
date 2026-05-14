@@ -37,14 +37,14 @@ def events_path(output_path: Optional[str], task_id: str) -> Optional[Path]:
 
 # ─── 写操作 ──────────────────────────────────────────────────────────────────
 
-def append_events(path: Optional[Path], new_events: list[dict]) -> None:
+def append_events(path: Optional[Path], new_events: list[dict]) -> bool:
     """增量追加 new_events 到 events.jsonl（每次只写本批新增行）。
 
     幂等安全：若文件中已有内容，只追加 new_events 对应的行。
     在运行期间由 on_event 触发，替代原来的全量 DB flush。
     """
     if path is None or not new_events:
-        return
+        return True
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = "".join(
@@ -53,17 +53,19 @@ def append_events(path: Optional[Path], new_events: list[dict]) -> None:
         )
         with open(path, "a", encoding="utf-8") as f:
             f.write(lines)
+        return True
     except Exception as exc:
         logger.warning("append_events failed path=%s: %s", path, exc)
+        return False
 
 
-def write_final(path: Optional[Path], all_events: list[dict]) -> None:
+def write_final(path: Optional[Path], all_events: list[dict]) -> bool:
     """原子写：全量 events + 末行 __final__ 标记（tmp → rename）。
 
     在任务完成/失败时调用，保证 events.jsonl 是完整快照。
     """
     if path is None:
-        return
+        return False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = Path(str(path) + ".tmp")
@@ -74,8 +76,10 @@ def write_final(path: Optional[Path], all_events: list[dict]) -> None:
         lines += json.dumps(_FINAL_MARKER, separators=(",", ":")) + "\n"
         tmp.write_text(lines, encoding="utf-8")
         tmp.replace(path)
+        return True
     except Exception as exc:
         logger.warning("write_final failed path=%s: %s", path, exc)
+        return False
 
 
 def clear_events(path: Optional[Path]) -> None:

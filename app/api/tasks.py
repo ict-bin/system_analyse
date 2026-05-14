@@ -317,6 +317,12 @@ async def resume_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().resume_task(db, task_id)
 
 
+@router.get("/tasks/{task_id}/resume-check")
+async def get_task_resume_check(task_id: str, db: Session = Depends(get_db)):
+    """返回任务当前是否适合断点续跑，以及缺失的关键产物。"""
+    return get_task_service().get_resume_check(db, task_id)
+
+
 @router.delete("/tasks/{task_id}", status_code=204)
 async def delete_task(
     task_id: str,

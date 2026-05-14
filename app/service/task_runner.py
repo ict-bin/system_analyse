@@ -71,7 +71,9 @@ class TaskRunner:
             ):
                 # 增量写文件（存在 events_file），否则降级写 DB
                 if events_file is not None:
-                    append_events(events_file, event_buffer[last_stage_flush_count:])
+                    persisted = append_events(events_file, event_buffer[last_stage_flush_count:])
+                    if not persisted:
+                        self._deps.flush_stages(task_id, event_buffer)
                 else:
                     self._deps.flush_stages(task_id, event_buffer)
                 last_stage_flush_ts = now_ts
@@ -84,7 +86,9 @@ class TaskRunner:
             events_file = events_path(task_snapshot.output_path, task_id)
             # 如果在 _prepare 期间 on_event 已经被触发过（极少发生），补刷一次
             if event_buffer:
-                append_events(events_file, event_buffer)
+                persisted = append_events(events_file, event_buffer)
+                if not persisted:
+                    self._deps.flush_stages(task_id, event_buffer)
                 last_stage_flush_count = len(event_buffer)
             orch = Orchestrator(config=cfg, on_event=on_event)
             task_supervisor = asyncio.create_task(
@@ -101,7 +105,9 @@ class TaskRunner:
                     pass
             # 最终增量刷新剩余 events
             if events_file is not None:
-                append_events(events_file, event_buffer[last_stage_flush_count:])
+                persisted = append_events(events_file, event_buffer[last_stage_flush_count:])
+                if not persisted:
+                    self._deps.flush_stages(task_id, event_buffer)
             else:
                 self._deps.flush_stages(task_id, event_buffer)
             self._persist_task_result(task_id, lease_epoch, task_snapshot, result, event_buffer, events_file)
@@ -225,7 +231,8 @@ class TaskRunner:
         events_file: Path | None = None,
     ) -> None:
         # 先写文件（包含 __final__ 标记）
-        write_final(events_file, event_buffer)
+        if not write_final(events_file, event_buffer):
+            self._deps.flush_stages(task_id, event_buffer)
         db_gen = self._deps.get_db()
         db = next(db_gen)
         try:
@@ -263,7 +270,8 @@ class TaskRunner:
         events_file: Path | None = None,
     ) -> None:
         # 先写文件（包含 __final__ 标记）
-        write_final(events_file, event_buffer)
+        if not write_final(events_file, event_buffer):
+            self._deps.flush_stages(task_id, event_buffer)
         try:
             db_gen = self._deps.get_db()
             db = next(db_gen)

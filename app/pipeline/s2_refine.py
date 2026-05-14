@@ -45,6 +45,29 @@ class RefineStage(BaseStage):
 
     stage_num = 2
     stage_name = "细分"
+
+    @staticmethod
+    def _module_refine_artifacts_valid(workspace: Path, mod_name: str) -> bool:
+        mod_dir = get_modules_root(str(workspace)) / mod_name
+        files_list = mod_dir / "files.list"
+        if not files_list.exists() or not files_list.is_file():
+            return False
+        try:
+            if not any(line.strip() for line in files_list.read_text("utf-8", errors="replace").splitlines()):
+                return False
+        except Exception:
+            return False
+        if (mod_dir / "deleted").exists() or (mod_dir / "recover").exists():
+            return False
+        return True
+
+    @classmethod
+    def _stage_refine_artifacts_valid(cls, workspace: Path) -> bool:
+        modules = discover_modules(str(workspace))
+        if not modules:
+            return False
+        return all(cls._module_refine_artifacts_valid(workspace, mod_name) for mod_name in modules)
+
     def _reset(self) -> None:
         """每次 execute 前重置并发状态。"""
         self._refined: set[str] = set()
@@ -64,17 +87,29 @@ class RefineStage(BaseStage):
 
         # ── checkpoint: 整体已完成 ────────────────────────────────────────────
         if cp and cp.is_done("s2_refine"):
-            ctx.refined_modules = discover_modules(str(workspace))
-            ctx.emit_event("log", level="info",
-                           msg=f"[S2] 整体 checkpoint 已完成，跳过({len(ctx.refined_modules)}个模块)")
-            return
+            if self._stage_refine_artifacts_valid(workspace):
+                ctx.refined_modules = discover_modules(str(workspace))
+                ctx.emit_event("log", level="info",
+                               msg=f"[S2] 整体 checkpoint 已完成，跳过({len(ctx.refined_modules)}个模块)")
+                return
+            cp.clear("s2_refine")
+            cp.clear("s2_global_check")
+            ctx.emit_event("log", level="warn",
+                           msg="[S2] 检测到整体 checkpoint 与模块产物不一致，已清理脏 checkpoint 并重建")
 
         # ── 从 checkpoint 恢复已完成模块，增量续跑 ─────────────────────────────
         done_modules: set[str] = cp.list_done_modules("s2") if cp else set()
         if done_modules:
-            self._refined = set(done_modules)
+            valid_done_modules = {mod_name for mod_name in done_modules if self._module_refine_artifacts_valid(workspace, mod_name)}
+            stale_done_modules = sorted(done_modules - valid_done_modules)
+            for mod_name in stale_done_modules:
+                cp.clear(f"s2_modules/{mod_name}")
+            self._refined = set(valid_done_modules)
             ctx.emit_event("log", level="info",
-                           msg=f"[S2] 从 checkpoint 恢复 {len(done_modules)} 个已完成模块")
+                           msg=f"[S2] 从 checkpoint 恢复 {len(valid_done_modules)} 个已完成模块")
+            if stale_done_modules:
+                ctx.emit_event("log", level="warn",
+                               msg=f"[S2] 发现 {len(stale_done_modules)} 个脏模块 checkpoint，已清理并重新细分")
 
         all_modules = discover_modules(str(workspace))
         skipped = 0
@@ -152,10 +187,15 @@ class RefineStage(BaseStage):
 
         # ── 模块级 checkpoint 跳过（并发断点续跑） ────────────────────────────
         if cp and cp.is_done(f"s2_modules/{mod_name}"):
-            self._refined.add(mod_name)
-            ctx.emit_event("log", level="info",
-                           msg=f"[S2] {mod_name} 模块 checkpoint 已完成，跳过")
-            return
+            if not self._module_refine_artifacts_valid(workspace, mod_name):
+                cp.clear(f"s2_modules/{mod_name}")
+                ctx.emit_event("log", level="warn",
+                               msg=f"[S2] {mod_name} checkpoint 存在但产物不完整，已清理并重新执行")
+            else:
+                self._refined.add(mod_name)
+                ctx.emit_event("log", level="info",
+                               msg=f"[S2] {mod_name} 模块 checkpoint 已完成，跳过")
+                return
 
         mod_dir = get_modules_root(str(workspace)) / mod_name
         if not (mod_dir / "files.list").exists():
