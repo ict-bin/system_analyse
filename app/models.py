@@ -406,6 +406,10 @@ class ServiceConfig(BaseModel):
         default="treat_as_passed",
         description="达到最大轮次且评审仍未通过时的处理策略：treat_as_passed/treat_as_failed",
     )
+    continue_on_module_failure: bool = Field(
+        default=True,
+        description="是否允许单个模块失败后继续推进其他模块和后续阶段，默认允许",
+    )
     analyse_targets: list[str] = Field(
         default=["all"],
         description="分析目标文件类型，可组合: binary/script/source/config/firmware/crypto/database/web/network_model/document/archive/all"
@@ -516,6 +520,10 @@ class TaskConfig(BaseModel):
     cwd: str = Field(default="/data/target")
 
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")
+    continue_on_module_failure: bool = Field(
+        default=True,
+        description="是否允许单个模块失败后继续推进其他模块和后续阶段",
+    )
     agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
     agent_run_timeout_seconds: int = Field(default=3600, description="单次智能体输入最大运行时长（秒），-1=不限制")

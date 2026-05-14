@@ -131,118 +131,130 @@ class CompletenessCheckStage(BaseStage):
             mod_dir = mods_root / mod_name
             if not mod_dir.exists() or not (mod_dir / "files.list").exists():
                 continue
-
-            # Stage 2 补做
-            refine_session = ctx.session_path("refine-s4", f"{mod_name}.jsonl")
-            ar = await run_agent_with_stage_guard(
-                ctx=ctx,
-                stage="2-redo-s4",
-                context=f"s4-s2-redo-{mod_name}",
-                heartbeat_payload_factory=lambda beat, module=mod_name, session=refine_session: {
-                    "module": module,
-                    "heartbeat": beat,
-                    "session_file": session,
-                },
-                model=ctx.wm("refine"),
-                prompt=f"检查模块 `{mod_name}` 是否需要细分。",
-                system_prompt=w_sys_refine,
-                session_file=refine_session,
-                **w_base,
-            )
-            ctx.tokens += ar.token_usage
-
-            # Stage 3 补做（预读内容，优先复用 details/ JSON）
-            loop = __import__("asyncio").get_event_loop()
-            # ctx.details_dir 由 orchestrator 初始化，永不为 None
-            _details_dir_opt = ctx.details_dir if ctx.details_dir.exists() else None
-            pre_content = await loop.run_in_executor(
-                None, pre_read_module_with_details,
-                cfg.target_dir, mod_dir, _details_dir_opt
-            )
-            w_sys_s4 = w_sys_analyse.replace("{{PRE_READ_CONTENT}}", pre_content) \
-                                     .replace("{{MODULE_NAME}}", mod_name)
-
-            analyse_session = ctx.session_path("analyse-s4", f"{mod_name}.jsonl")
-            feedback = ""
-            for attempt in range(max_iter(s_cfg_analyse)):
-                prompt_parts = [
-                    f"将模块 `{mod_name}` 的分析报告写入 `modules/{mod_name}/module_report.md`。",
-                    "文件内容已在 system prompt 中提供。",
-                ]
-                if feedback:
-                    prompt_parts.append(f"\n\n{feedback}")
+            try:
+                # Stage 2 补做
+                refine_session = ctx.session_path("refine-s4", f"{mod_name}.jsonl")
                 ar = await run_agent_with_stage_guard(
                     ctx=ctx,
-                    stage="3-redo-s4",
-                    context=f"s4-s3-redo-{mod_name}-a{attempt+1}",
-                    heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=analyse_session: {
+                    stage="2-redo-s4",
+                    context=f"s4-s2-redo-{mod_name}",
+                    heartbeat_payload_factory=lambda beat, module=mod_name, session=refine_session: {
                         "module": module,
-                        "attempt": attempt_no,
                         "heartbeat": beat,
                         "session_file": session,
                     },
-                    model=ctx.wm("analyse"),
-                    prompt="\n".join(prompt_parts),
-                    system_prompt=w_sys_s4,
-                    tools=["write"],
-                    session_file=analyse_session,
-                    cwd=str(workspace),
-                    cancel_event=ctx.cancel_event,
-                    max_retries=1,
-                    retry_delay=0,
-                    pi_max_retries=cfg.pi_max_retries,
-                    pi_retry_delay=cfg.pi_retry_delay,
+                    model=ctx.wm("refine"),
+                    prompt=f"检查模块 `{mod_name}` 是否需要细分。",
+                    system_prompt=w_sys_refine,
+                    session_file=refine_session,
+                    **w_base,
                 )
                 ctx.tokens += ar.token_usage
 
-                # enforce 在 Judge 前运行，Judge 看到清洁数据
-                if ctx.filtered_files:
-                    _rm = enforce_filter_constraint(workspace, set(ctx.filtered_files))
-                    if _rm:
-                        ctx.emit_event("log", level="warn",
-                                       msg=f"[S4-redo过滤] 补先移除 {_rm} 个越界条目")
+                # Stage 3 补做（预读内容，优先复用 details/ JSON）
+                loop = __import__("asyncio").get_event_loop()
+                _details_dir_opt = ctx.details_dir if ctx.details_dir.exists() else None
+                pre_content = await loop.run_in_executor(
+                    None, pre_read_module_with_details,
+                    cfg.target_dir, mod_dir, _details_dir_opt
+                )
+                w_sys_s4 = w_sys_analyse.replace("{{PRE_READ_CONTENT}}", pre_content) \
+                                         .replace("{{MODULE_NAME}}", mod_name)
 
-                judge_results = []
-                for j_idx, j_item in enumerate(ctx.j_cfgs):
-                    judge_session = ctx.session_path(
-                        "judges",
-                        "analyse-s4",
-                        mod_name,
-                        f"analyse-s4-a{attempt + 1}-j{j_idx}.jsonl",
-                    )
-                    j_ar = await run_agent_with_stage_guard(
+                analyse_session = ctx.session_path("analyse-s4", f"{mod_name}.jsonl")
+                feedback = ""
+                for attempt in range(max_iter(s_cfg_analyse)):
+                    prompt_parts = [
+                        f"将模块 `{mod_name}` 的分析报告写入 `modules/{mod_name}/module_report.md`。",
+                        "文件内容已在 system prompt 中提供。",
+                    ]
+                    if feedback:
+                        prompt_parts.append(f"\n\n{feedback}")
+                    ar = await run_agent_with_stage_guard(
                         ctx=ctx,
                         stage="3-redo-s4",
-                        context=f"s4-s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",
-                        heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
+                        context=f"s4-s3-redo-{mod_name}-a{attempt+1}",
+                        heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=analyse_session: {
                             "module": module,
                             "attempt": attempt_no,
                             "heartbeat": beat,
-                            "judge_id": f"judge-{judge_id}",
                             "session_file": session,
                         },
-                        prompt=f"评审模块 `{mod_name}` 的分析报告。",
-                        model=ctx.jm("analyse", j_item),
-                        system_prompt=j_sys_analyse,
-                        tools=cfg.judges.default_tools,
-                        cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
-                        session_file=judge_session,
-                        **j_base,
+                        model=ctx.wm("analyse"),
+                        prompt="\n".join(prompt_parts),
+                        system_prompt=w_sys_s4,
+                        tools=["write"],
+                        session_file=analyse_session,
+                        cwd=str(workspace),
+                        cancel_event=ctx.cancel_event,
+                        max_retries=1,
+                        retry_delay=0,
+                        pi_max_retries=cfg.pi_max_retries,
+                        pi_retry_delay=cfg.pi_retry_delay,
                     )
-                    ctx.tokens += j_ar.token_usage
-                    parsed = parse_eval_md(j_ar.output or "")
-                    judge_results.append(parsed)
-                    ctx.emit_event("judge_eval", stage="3-redo-s4", judge_id=f"judge-{j_idx}",
-                                   module=mod_name, passed=parsed["pass"], score=parsed["score"])
+                    ctx.tokens += ar.token_usage
 
-                if check_voting(judge_results, s_cfg_analyse.pass_mode, ctx.j_count):
-                    break
-                fail_fb = "\n".join(
-                    f"judge-{i}: {r['feedback'][:500]}"
-                    for i, r in enumerate(judge_results) if not r["pass"])
-                feedback = f"# 评审意见\n\n{fail_fb}"
-            else:
-                raise StageError(f"Stage 4a 补做模块 {mod_name} 分析未通过")
+                    if ctx.filtered_files:
+                        _rm = enforce_filter_constraint(workspace, set(ctx.filtered_files))
+                        if _rm:
+                            ctx.emit_event("log", level="warn",
+                                           msg=f"[S4-redo过滤] 补先移除 {_rm} 个越界条目")
+
+                    judge_results = []
+                    for j_idx, j_item in enumerate(ctx.j_cfgs):
+                        judge_session = ctx.session_path(
+                            "judges",
+                            "analyse-s4",
+                            mod_name,
+                            f"analyse-s4-a{attempt + 1}-j{j_idx}.jsonl",
+                        )
+                        j_ar = await run_agent_with_stage_guard(
+                            ctx=ctx,
+                            stage="3-redo-s4",
+                            context=f"s4-s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",
+                            heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
+                                "module": module,
+                                "attempt": attempt_no,
+                                "heartbeat": beat,
+                                "judge_id": f"judge-{judge_id}",
+                                "session_file": session,
+                            },
+                            prompt=f"评审模块 `{mod_name}` 的分析报告。",
+                            model=ctx.jm("analyse", j_item),
+                            system_prompt=j_sys_analyse,
+                            tools=cfg.judges.default_tools,
+                            cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                            session_file=judge_session,
+                            **j_base,
+                        )
+                        ctx.tokens += j_ar.token_usage
+                        parsed = parse_eval_md(j_ar.output or "")
+                        judge_results.append(parsed)
+                        ctx.emit_event("judge_eval", stage="3-redo-s4", judge_id=f"judge-{j_idx}",
+                                       module=mod_name, passed=parsed["pass"], score=parsed["score"])
+
+                    if check_voting(judge_results, s_cfg_analyse.pass_mode, ctx.j_count):
+                        break
+                    fail_fb = "\n".join(
+                        f"judge-{i}: {r['feedback'][:500]}"
+                        for i, r in enumerate(judge_results) if not r["pass"])
+                    feedback = f"# 评审意见\n\n{fail_fb}"
+                else:
+                    raise StageError(f"Stage 4a 补做模块 {mod_name} 分析未通过")
+            except PiFatalError:
+                raise
+            except StageError as exc:
+                if ctx.continue_on_module_failure:
+                    ctx.record_soft_module_failure(
+                        stage="3-redo-s4",
+                        module_name=mod_name,
+                        error=str(exc),
+                        session_file=ctx.session_path("analyse-s4", f"{mod_name}.jsonl"),
+                        artifact_paths=[str(mod_dir / "module_report.md")],
+                        extra={"soft_failed": True, "from_stage": "s4_completeness_redo"},
+                    )
+                    continue
+                raise
 
 
 class FinalReportStage(BaseStage):

@@ -1420,15 +1420,25 @@ class Orchestrator:
         modules_root: str,
     ) -> None:
         """任务失败/错误时生成 final_report.md，记录失败原因和已完成进度。"""
+        normalized_status = str(result.status.value or "").strip().lower()
+        if normalized_status == "cancelled":
+            reason_title = "取消原因"
+            fallback_error = "任务被取消"
+        elif normalized_status == "failed":
+            reason_title = "失败原因"
+            fallback_error = "任务执行失败"
+        else:
+            reason_title = "错误原因"
+            fallback_error = "unknown error"
         lines = [
             "# 固件系统威胁分析总报告",
             "",
             f"> ⚠️ **任务状态：{result.status.value.upper()}**",
             "",
-            "## 失败原因",
+            f"## {reason_title}",
             "",
             f"```",
-            f"{result.error or 'unknown error'}",
+            f"{result.error or fallback_error}",
             f"```",
             "",
             f"- 任务ID: {result.task_id}",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -38,6 +39,9 @@ def _normalize_evaluation_round_status(payload: dict) -> dict:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_DISCOVERED_MODULE_COUNT_RE = re.compile(r"已发现\s*(\d+)\s*个模块")
 
 
 def _resolve_enable_final_check(row: AppSaTask) -> bool | None:
@@ -132,9 +136,61 @@ class TaskQueryService:
         self._parse_session_jsonl_file = parse_session_jsonl_file
         self._write_json_atomic = write_json_atomic
 
+    @staticmethod
+    def _parse_discovered_module_count(final_report_markdown: str | None) -> int | None:
+        if not final_report_markdown:
+            return None
+        match = _DISCOVERED_MODULE_COUNT_RE.search(final_report_markdown)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _load_evaluation_summary_module_count(run_root: Path | None, warnings: list[str]) -> int | None:
+        if not run_root or not run_root.is_dir():
+            return None
+        summary_path = run_root / "evaluation_summary.json"
+        if not summary_path.exists():
+            return None
+        try:
+            loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            warnings.append(f"evaluation_summary.json 读取失败: {exc}")
+            return None
+        if not isinstance(loaded, dict):
+            warnings.append("evaluation_summary.json 格式不是对象")
+            return None
+        try:
+            module_count = int(loaded.get("module_count") or 0)
+        except (TypeError, ValueError):
+            return None
+        return module_count if module_count > 0 else None
+
+    @staticmethod
+    def _count_workspace_modules(run_root: Path | None, warnings: list[str]) -> int | None:
+        if not run_root or not run_root.is_dir():
+            return None
+        modules_root = run_root / "workspace" / "modules"
+        if not modules_root.exists() or not modules_root.is_dir():
+            return None
+        try:
+            count = sum(
+                1
+                for path in modules_root.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            )
+        except Exception as exc:
+            warnings.append(f"workspace/modules 统计失败: {exc}")
+            return None
+        return count if count > 0 else None
+
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         output_root = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
+        run_root = self._task_run_root(row)
         final_report_path = output_root / "final_report.md" if output_root else None
         modules_list_path = output_root / "modules.list" if output_root else None
         modules_root = output_root / "modules" if output_root else None
@@ -214,8 +270,20 @@ class TaskQueryService:
                 })
 
         summary = self._parse_summary(final_report_markdown)
+        if summary["module_count"] == 0:
+            report_module_count = self._parse_discovered_module_count(final_report_markdown)
+            if report_module_count:
+                summary["module_count"] = report_module_count
         if summary["module_count"] == 0 and modules:
             summary["module_count"] = len(modules)
+        if summary["module_count"] == 0:
+            evaluation_module_count = self._load_evaluation_summary_module_count(run_root, warnings)
+            if evaluation_module_count:
+                summary["module_count"] = evaluation_module_count
+        if summary["module_count"] == 0:
+            workspace_module_count = self._count_workspace_modules(run_root, warnings)
+            if workspace_module_count:
+                summary["module_count"] = workspace_module_count
         if summary["high_risk_module_count"] == 0 and high_risk_modules_counted:
             summary["high_risk_module_count"] = high_risk_modules_counted
         if summary["total_file_count"] == 0 and total_files_counted:

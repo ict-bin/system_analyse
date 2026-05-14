@@ -120,8 +120,23 @@ class RefineStage(BaseStage):
             try:
                 if mod_name not in self._refined:
                     await self._refine_one(mod_name)
-            except (StageError, PiFatalError) as e:
+            except PiFatalError as e:
                 self._errors.append(e)
+            except StageError as e:
+                if ctx := self._ctx:
+                    if ctx.continue_on_module_failure:
+                        ctx.record_soft_module_failure(
+                            stage="refine",
+                            module_name=mod_name,
+                            error=str(e),
+                            artifact_paths=[str(ctx.module_dir(mod_name) / "files.list")],
+                            extra={"soft_failed": True},
+                            record_round="已达最大轮数" not in str(e),
+                        )
+                    else:
+                        self._errors.append(e)
+                else:
+                    self._errors.append(e)
             finally:
                 self._queue.task_done()
 
