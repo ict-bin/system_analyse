@@ -65,6 +65,23 @@ class PipelineContext:
     # ══════════════════════════════════════════════════════════
     # Stage 1 输出
     # ══════════════════════════════════════════════════════════
+
+    # ── 预处理新增字段 ────────────────────────────────────────────────
+    file_catalog: dict = field(default_factory=dict)
+    # TypeClassifyStage 产出的 file_catalog.json 解析结果
+
+    details_dir: Path | None = None
+    # workspace/details/ 目录，SubReaderStage 完成后注入，None=尚未生成
+
+    classify_context_path: Path | None = None
+    # workspace/classify_context.md，SubReaderStage 生成，ClassifyStage 注入 prompt
+
+    invalid_detail_files: list[str] = field(default_factory=list)
+    # ValidateDetailsStage 发现的无效 details JSON 列表
+
+    unknown_files: list[str] = field(default_factory=list)
+    # TypeClassifyStage 识别出的 UNKNOWN 类型文件列表
+
     classified_modules: list[str] = field(default_factory=list)
     """粗分类后的模块名列表（workspace/modules/<name>/files.list）"""
 

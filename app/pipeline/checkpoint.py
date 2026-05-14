@@ -50,9 +50,13 @@ _S3_MODULES_DIR = "s3_modules"
 # 所有阶段的有序标记名称（用于 load_summary 返回）
 STAGE_KEYS = [
     "s0_filter",
+    "s0_type_classify",
+    "s0_unknown_checker",
     "s0_explore",
     "s0_prescan",
     "s0_pathgroup",
+    "s0_sub_reader",
+    "s0_validate_details",
     "s1_classify",
     "s1_security_filter",
     "s2_refine",

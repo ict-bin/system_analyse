@@ -455,6 +455,35 @@ class ServiceConfig(BaseModel):
             "例：['*/generated/*', '*/vendor/*']"
         ),
     )
+    # ── 预处理阶段配置 ─────────────────────────────────────────────────────────
+    sub_reader_mode: str = Field(
+        default="python_only",
+        description=(
+            "SubReaderStage 工作模式："
+            "python_only=纯Python提取(快速，ELF用nm/readelf，源码用ctags/grep)；"
+            "llm_assist=Python提取+LLM生成语义摘要(质量更高但token消耗大)"
+        ),
+    )
+    sub_reader_batch_size: int = Field(
+        default=20,
+        description="sub_reader 并行分批大小，每批处理的文件数",
+    )
+    enable_unknown_checker: bool = Field(
+        default=True,
+        description="是否启用 unknown_checker agent 分析无法通过magic/扩展名识别类型的文件",
+    )
+    filter_useless_modules: bool = Field(
+        default=True,
+        description=(
+            "是否在 S1.5 过滤阶段启用无用模块语义过滤"
+            "（test/build/CI/packaging/docs/i18n等），"
+            "security_focus_categories=all 时此选项仍生效"
+        ),
+    )
+    sub_reader_llm_threshold: int = Field(
+        default=0,
+        description="不清晰文件数超过此阈值才触发 LLM 补充分析（0=只要有不清晰就补充）",
+    )
     self_reflection: SelfReflectionConfig = Field(
         default_factory=SelfReflectionConfig,
         description="自省分析配置"
@@ -501,6 +530,35 @@ class TaskConfig(BaseModel):
     skip_path_patterns: list[str] = Field(
         default=[],
         description="S0过滤阶段额外跳过的路径模式列表",
+    )
+    # ── 预处理阶段配置 ─────────────────────────────────────────────────────────
+    sub_reader_mode: str = Field(
+        default="python_only",
+        description=(
+            "SubReaderStage 工作模式："
+            "python_only=纯Python提取(快速)；"
+            "llm_assist=Python+LLM生成语义摘要(质量更高但token消耗大)"
+        ),
+    )
+    sub_reader_batch_size: int = Field(
+        default=20,
+        description="sub_reader 并行分批大小",
+    )
+    enable_unknown_checker: bool = Field(
+        default=True,
+        description="是否启用 unknown_checker agent 分析无法识别类型的文件",
+    )
+    filter_useless_modules: bool = Field(
+        default=True,
+        description=(
+            "是否在 S1.5 启用无用模块语义过滤"
+            "（test/build/CI/packaging/docs/i18n），"
+            "security_focus_categories=all 时此选项仍生效"
+        ),
+    )
+    sub_reader_llm_threshold: int = Field(
+        default=0,
+        description="不清晰文件数超过此阈值才触发 LLM 补充（0=只要有不清晰就补充）",
     )
     self_reflection: SelfReflectionConfig = Field(
         default_factory=SelfReflectionConfig,

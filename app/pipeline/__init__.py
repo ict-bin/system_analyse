@@ -21,6 +21,10 @@ from .helpers import (
 )
 from .s0_filter import FilterStage, ExploreStage, PrescanStage
 from .s0_path_group import PathGroupStage
+from .s0_type_classify import TypeClassifyStage
+from .s0_unknown_checker import UnknownCheckerStage
+from .s0_sub_reader import SubReaderStage
+from .s0_validate_details import ValidateDetailsStage
 from .s1_classify import ClassifyStage
 from .s1_security_filter import SecurityFocusFilterStage
 from .s2_refine import RefineStage
@@ -49,6 +53,7 @@ __all__ = [
     # 阶段
     "FilterStage", "ExploreStage", "PrescanStage",
     "PathGroupStage",
+    "TypeClassifyStage", "UnknownCheckerStage", "SubReaderStage", "ValidateDetailsStage",
     "ClassifyStage",
     "SecurityFocusFilterStage",
     "RefineStage",

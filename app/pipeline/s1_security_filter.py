@@ -67,10 +67,14 @@ class SecurityFocusFilterStage(BaseStage):
         cfg = ctx.cfg
         sec_cats: list[str] = getattr(cfg, "security_focus_categories", ["all"])
 
-        # ── 快速跳过（all 模式） ─────────────────────────────────────────────
-        if not sec_cats or "all" in sec_cats:
+        # ── 确定运行模式 ──────────────────────────────────────────────────────
+        do_security_filter = bool(sec_cats) and "all" not in sec_cats
+        do_useless_filter = getattr(cfg, "filter_useless_modules", True)
+
+        # 两种过滤都不需要时跳过
+        if not do_security_filter and not do_useless_filter:
             ctx.emit_event("log", level="info",
-                           msg="[安全维度过滤] security_focus_categories=all，跳过")
+                           msg="[S1.5] 安全过滤=all 且 无用模块过滤=False，跳过")
             return
 
         # ── checkpoint 跳过 ───────────────────────────────────────────────────
@@ -83,6 +87,12 @@ class SecurityFocusFilterStage(BaseStage):
 
         workspace = ctx.workspace
         modules_root = get_modules_root(str(workspace))
+
+        # ── 记录本次运行模式 ──────────────────────────────────────────────────
+        ctx.emit_event("log", level="info",
+                       msg=(f"[S1.5] 过滤模式: "
+                            f"安全维度={'开启('+','.join(sec_cats)+')' if do_security_filter else '跳过(all)'}，"
+                            f"无用模块过滤={'开启' if do_useless_filter else '关闭'}"))
 
         # ── Stage 配置（向后兼容旧配置无此字段时使用默认值） ────────────────
         s_cfg = getattr(cfg.stages, "security_filter", None)

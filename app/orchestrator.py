@@ -29,6 +29,7 @@ from .models import (
 from .pipeline import (
     PipelineContext, Pipeline,
     FilterStage, ExploreStage, PrescanStage, PathGroupStage,
+    TypeClassifyStage, UnknownCheckerStage, SubReaderStage, ValidateDetailsStage,
     ClassifyStage,
     SecurityFocusFilterStage,
     RefineStage,
@@ -236,11 +237,15 @@ class Orchestrator:
         # ── 组装并运行 Pipeline ───────────────────────────────────────────────
         pipeline = Pipeline([
             FilterStage(),
-            ExploreStage(),
-            PrescanStage(),
-            PathGroupStage(),
+            TypeClassifyStage(),         # S0.1: 文件类型识别 → file_catalog.json
+            UnknownCheckerStage(),       # S0.2: UNKNOWN 类型识别
+            ExploreStage(),              # S0.3: 目录探索 → keywords.txt
+            PrescanStage(),              # S0.4: 预扫描 → keyword_summary.txt
+            PathGroupStage(),            # S0.5: 路径先验分组
+            SubReaderStage(),            # S0.6: 全量文件预读 → details/*.json
+            ValidateDetailsStage(),      # S0.7: 校验 details/ 完整性
             ClassifyStage(),
-            SecurityFocusFilterStage(),   # S1.5: 安全维度过滤（属 于 stage_num=1，stable-sort 保证在 Classify 之后）
+            SecurityFocusFilterStage(),  # S1.5: 安全维度过滤 + 无用模块过滤
             RefineStage(),
             AnalyseStage(),
             CompletenessCheckStage(),

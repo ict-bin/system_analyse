@@ -66,6 +66,38 @@ head -10 $SOURCE    # 查看样本
 
 # 分类策略（按优先级）
 
+## 策略 -1（最优先）：如果已有 details/ 预处理信息
+
+**当 `classify_context.md` 或 `details/` 目录存在时，优先使用这些结构化信息。**
+
+`classify_context.md` 按文件类型和建议模块汇总了所有文件，是最快的分类起点：
+
+```bash
+# 第1步：查看分类上下文摘要
+read classify_context.md
+
+# 第2步：对每个建议模块，直接从 classify_context.md 中提取文件列表
+# classify_context.md 已按"建议模块"分组，直接批量创建 files.list
+
+# 示例：将 classify_context.md 中 "建议模块: crypto_tls" 的文件归入对应模块
+# 找到对应行后：
+mkdir -p modules/crypto_tls
+# 将文件路径写入 files.list（从 classify_context.md 复制路径列表）
+```
+
+**需要更多文件信息时**：查阅 `details/<path>.json`
+```bash
+read details/lib/libssl.so.json
+# 输出: {"path":"lib/libssl.so", "type":"ELF", "summary":"OpenSSL TLS库...", "symbols":["SSL_connect",...]}
+```
+
+**使用 details/ 的规则**：
+- ELF 文件：不需要读原始文件，details/ 中已有符号表和依赖库
+- 源码文件：details/ 中已有函数名列表，通常够用
+- 只有当 `summary` 字段显示 `[需补充]` 时，才用 `read target/<path>` 读原文件
+
+---
+
 ## 策略 0：如果已有预扫描数据
 
 如果你收到了预扫描摘要，`prescan/` 目录下已有按关键词分组的文件列表（已是相对路径）。直接使用：

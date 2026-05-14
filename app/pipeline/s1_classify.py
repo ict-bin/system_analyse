@@ -163,8 +163,10 @@ class ClassifyStage(BaseStage):
             ),
         )
 
-        # ── 构建 prescan 摘要注入 ──
+        # ── 构建分类上下文注入（details/ 优先，fallback prescan 摘要）──
         prescan_summary = ctx.prescan_summary
+        classify_context_path = ctx.classify_context_path or (workspace / "classify_context.md")
+        has_classify_context = classify_context_path.exists()
 
         # ── 基础 Worker 参数 ──
         w_tools = cfg.workers.default_tools
@@ -203,10 +205,23 @@ class ClassifyStage(BaseStage):
                 f"你的工作目录已固定为：`{workspace}`\n\n"
                 f"- `filtered_files.txt` 完整路径：`{workspace}/filtered_files.txt`\n"
                 f"- 预扫描数据目录：`{workspace}/prescan/`\n"
+                f"- 文件详情目录：`{workspace}/details/`（每个文件的类型/摘要/符号表 JSON）\n"
+                f"- 分类上下文：`{workspace}/classify_context.md`（按类型分组的文件汇总）\n"
                 f"- 模块输出路径：`{workspace}/modules/<模块名>/files.list`\n\n"
                 f"**严禁执行任何 `cd` 命令**。所有脚本必须使用绝对路径或相对当前工作目录的路径。"
             )
-            if attempt == 0 and prescan_summary:
+            # ── details/ 优先注入（比 prescan 更丰富的结构化信息）──────────────
+            if attempt == 0 and has_classify_context:
+                prompt_parts.append(
+                    f"\n\n# 文件预处理信息（优先使用）\n\n"
+                    f"`classify_context.md` 已包含按类型/建议模块分组的文件汇总，"
+                    "请用 `read classify_context.md` 查看。\n\n"
+                    "每个文件的详细信息（类型/摘要/符号表/函数名）在 `details/<path>.json`，"
+                    "可用 `read details/<path>.json` 按需查阅。\n\n"
+                    "**分类策略**：优先根据 details/ 中的功能摘要和符号信息归类，"
+                    "无需再读原始文件（除非 details 中显示 [需补充]）。"
+                )
+            elif attempt == 0 and prescan_summary:
                 prompt_parts.append(
                     "\n\n# 预扫描摘要（已自动生成，请基于此分类）\n\n"
                     + prescan_summary
