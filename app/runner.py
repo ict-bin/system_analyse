@@ -30,7 +30,8 @@ from .models import TokenUsage
 
 logger = logging.getLogger("sa.runner")
 
-_MAX_BACKOFF = 300  # 退避上限 5 分钟
+_MAX_BACKOFF = 30  # 退避上限 30s
+_BACKOFF_SCHEDULE = (3.0, 5.0, 10.0, 15.0, 30.0)  # 固定退避序列
 _DEFAULT_CONTEXT_WINDOW = 128_000
 _SINGLE_INPUT_CONTEXT_RATIO = 0.75
 _PROMPT_TOKEN_OVERHEAD = 128
@@ -102,8 +103,12 @@ def _log_info(msg: str) -> None:
 
 
 def _backoff(base_delay: float, attempt: int) -> float:
-    """指数退避，带上限。attempt 从 1 开始。"""
-    return min(base_delay * (2 ** min(attempt - 1, 6)), _MAX_BACKOFF)
+    """固定退避序列：3s → 5s → 10s → 15s → 30s，之后保持 30s。
+
+    base_delay 参数保留以兼容调用方签名，但不影响实际退避值。
+    """
+    idx = max(0, min(attempt - 1, len(_BACKOFF_SCHEDULE) - 1))
+    return _BACKOFF_SCHEDULE[idx]
 
 
 def _fmt_max(n: int) -> str:

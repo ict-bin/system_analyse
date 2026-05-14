@@ -443,11 +443,10 @@ class ServiceConfig(BaseModel):
     parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1")
     parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1")
     agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
-    agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
+    agent_retry_delay: float = Field(default=3.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     agent_timeout_seconds: float = Field(default=1800.0, description="单个智能体会话最大等待秒数，超时后终止当前阶段")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
-
     stages: StagesConfig = Field(default_factory=StagesConfig)
     enable_final_check: bool = Field(default=False, description="是否启用 Stage 4a 完整性检查")
 
@@ -514,7 +513,7 @@ class TaskConfig(BaseModel):
 
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")
     agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
-    agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
+    agent_retry_delay: float = Field(default=3.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     agent_timeout_seconds: float = Field(default=1800.0, description="单个智能体会话最大等待秒数，超时后终止当前阶段")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")

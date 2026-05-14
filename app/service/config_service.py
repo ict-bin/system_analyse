@@ -59,7 +59,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "parallel_modules": 1,
     "parallel_sub_workers": 1,
     "agent_max_retries": 5,
-    "agent_retry_delay": 60,
+    "agent_retry_delay": 3,
     "pi_max_retries": -1,
     "agent_timeout_seconds": 1800.0,
     "pi_retry_delay": 5,
