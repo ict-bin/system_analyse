@@ -45,7 +45,11 @@ def check_agent_result(ar: AgentResult, context: str = "") -> None:
             msg = f"[{context}] {msg}"
         raise PiFatalError(msg)
     if ar.error and not ar.output:
-        msg = f"pi 进程崩溃 (exit=1): {ar.error}"
+        err_lower = (ar.error or "").lower()
+        if "context length" in err_lower and "input tokens" in err_lower:
+            msg = f"智能体输入超长: {ar.error}"
+        else:
+            msg = f"pi 进程崩溃 (exit=1): {ar.error}"
         if context:
             msg = f"[{context}] {msg}"
         raise StageError(msg)
