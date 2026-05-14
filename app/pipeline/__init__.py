@@ -12,7 +12,10 @@ from .helpers import (
     load_prompt,
     max_iter, extract_result, archive_file,
     SUB_BATCH_SIZE, SUB_WORKER_THRESHOLD,
-    pre_read_file, read_one_elf, pre_read_module, collect_file_summaries,
+    pre_read_file, read_one_elf, pre_read_module, pre_read_module_with_details,
+    collect_file_summaries,
+    load_detail_json, is_detail_sufficient, format_detail_as_summary_line,
+    load_details_for_module,
     write_failure_report, generate_modules_list, strip_target_prefix,
     fix_orphan_dirs_before_judge, build_s2_diagnose_report,
 )
@@ -37,7 +40,10 @@ __all__ = [
     "parse_eval_md", "check_voting", "load_prompt",
     "max_iter", "extract_result", "archive_file",
     "SUB_BATCH_SIZE", "SUB_WORKER_THRESHOLD",
-    "pre_read_file", "read_one_elf", "pre_read_module", "collect_file_summaries",
+    "pre_read_file", "read_one_elf", "pre_read_module", "pre_read_module_with_details",
+    "collect_file_summaries",
+    "load_detail_json", "is_detail_sufficient", "format_detail_as_summary_line",
+    "load_details_for_module",
     "write_failure_report", "generate_modules_list", "strip_target_prefix",
     "fix_orphan_dirs_before_judge", "build_s2_diagnose_report",
     # 阶段

@@ -765,11 +765,21 @@ async def collect_file_summaries(
     parallel: int = 1,
     sub_model: str = "",
     target_dir: str = "/data/target",
+    files_override: "list[str] | None" = None,
 ) -> str:
+    """
+    主从模式：子 Worker 并行分批读取文件，返回合并的文件摘要字符串。
+
+    files_override: 若指定，只处理这些文件（用于 details/ 存在时只补充不清晰的文件），
+                    而非 mod_dir/files.list 中的全部文件。
+    """
     """主从模式：子 Worker 并行分批读取文件，返回合并的文件摘要字符串。"""
     w_base = ctx.make_w_base()
-    flist_path = mod_dir / "files.list"
-    files = [l.strip() for l in flist_path.read_text("utf-8").splitlines() if l.strip()]
+    if files_override is not None:
+        files = [f for f in files_override if f.strip()]
+    else:
+        flist_path = mod_dir / "files.list"
+        files = [l.strip() for l in flist_path.read_text("utf-8").splitlines() if l.strip()]
 
     batches: list[list[str]] = []
     for i in range(0, len(files), SUB_BATCH_SIZE):
@@ -848,6 +858,353 @@ async def collect_file_summaries(
 
 
 # ─── 输出后处理工具 ──────────────────────────────────────────────────────────
+
+
+# ─── Details JSON — 加载与格式化工具 ─────────────────────────────────────────
+
+import json as _json
+
+# details JSON 中视为"摘要不足"的占位值（lower()后比较）
+_INSUFFICIENT_SUMMARIES = frozenset({
+    "", "n/a", "unknown", "binary", "elf binary", "elf binary, see symbols",
+    "see symbols", "无法解析", "内容为空或无法解析", "(空文件或无法读取)",
+})
+
+# 文本类型集合（需要读取实际文件内容做安全分析）
+_TEXT_TYPES_UPPER = frozenset({
+    "C_SOURCE", "CPP_SOURCE", "HEADER", "SCRIPT_SHELL", "SCRIPT_PYTHON",
+    "SCRIPT_LUA", "SCRIPT_PERL", "SCRIPT_TCL", "SCRIPT_AWK",
+    "CONFIG_JSON", "CONFIG_YAML", "CONFIG_XML", "CONFIG_INI", "CONFIG_TOML",
+    "CONFIG_ENV", "CONFIG_CONF", "CONFIG_NGINX", "CONFIG_PROPERTIES",
+    "NETWORK_MODEL", "DATABASE_SQL",
+    "TEXT",   # pre_read_file 的历史类型值
+})
+
+
+def _detail_path(details_dir: "Path", rel_path: str) -> "Path":
+    """返回 details/<rel_path>.json 的路径。"""
+    safe = rel_path.lstrip("/")
+    return details_dir / (safe + ".json")
+
+
+def load_detail_json(details_dir: "Path", rel_path: str) -> "dict | None":
+    """加载单个文件的 details JSON，不存在或解析失败返回 None。"""
+    p = _detail_path(details_dir, rel_path)
+    if not p.exists():
+        return None
+    try:
+        return _json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def is_detail_sufficient(detail: "dict | None") -> bool:
+    """
+    判断 details JSON 中的摘要是否充分（不充分时 S2 需补充 LLM 分析）。
+
+    充分条件（满足以下任一）：
+    - ELF 且 symbols 列表非空
+    - 源码 且 functions 列表非空
+    - summary 非空且不在占位值列表中，且 confidence != "low"
+    """
+    if detail is None:
+        return False
+    ftype = str(detail.get("type") or "").upper()
+    if ftype == "UNKNOWN":
+        return False
+    summary = str(detail.get("summary") or "").strip().lower()
+    symbols = detail.get("symbols") or []
+    functions = detail.get("functions") or []
+    confidence = str(detail.get("confidence") or "").lower()
+    if ftype == "ELF":
+        return bool(symbols) or (summary and summary not in _INSUFFICIENT_SUMMARIES)
+    if ftype in ("C_SOURCE", "CPP_SOURCE", "HEADER"):
+        return bool(functions) or (summary and summary not in _INSUFFICIENT_SUMMARIES)
+    if confidence == "low":
+        return bool(symbols) or bool(functions)
+    return bool(summary) and summary not in _INSUFFICIENT_SUMMARIES
+
+
+def format_detail_as_summary_line(detail: dict, rel_path: str) -> str:
+    """
+    将 details JSON 格式化为 S2 sub_reader 兼容的5列管道分隔行。
+    输出格式：路径 | 类型 | 功能摘要 | 核心技术标识(3-5个) | 建议子模块
+    """
+    path = detail.get("path") or rel_path
+    ftype = str(detail.get("type") or "unknown")
+    summary = str(detail.get("summary") or "(摘要缺失)").strip()
+    keywords = detail.get("keywords") or []
+    if not keywords:
+        syms = (detail.get("symbols") or [])[:5]
+        fns = (detail.get("functions") or [])[:5]
+        keywords = syms or fns
+    kw_str = "、".join(str(k) for k in keywords[:5]) if keywords else "-"
+    suggested = str(
+        detail.get("suggested_module") or detail.get("suggested_submodule") or "unknown"
+    )
+    return f"{path} | {ftype} | {summary} | {kw_str} | {suggested}"
+
+
+def load_details_for_module(
+    details_dir: "Path",
+    files: "list[str]",
+    target_dir: str = "",
+) -> "tuple[str, list[str]]":
+    """
+    从 details/ 目录批量加载模块文件摘要。
+
+    返回:
+      summary_str   — 格式化5列管道分隔行字符串（与 collect_file_summaries 输出兼容）
+      unclear_files — details JSON 不存在或摘要不足的文件列表（需 LLM 补充）
+
+    不充分的文件摘要行标注 [需补充]，让 Worker 知晓可读原文件。
+    """
+    lines: list[str] = []
+    unclear_files: list[str] = []
+    for rel in files:
+        detail = load_detail_json(details_dir, rel)
+        if is_detail_sufficient(detail):
+            lines.append(format_detail_as_summary_line(detail, rel))
+        else:
+            unclear_files.append(rel)
+            ftype = str((detail or {}).get("type") or "unknown")
+            placeholder = "[需补充] 摘要不足，Worker 可用 read target/<path> 读取原文件"
+            lines.append(f"{rel} | {ftype} | {placeholder} | - | unknown")
+    if not lines:
+        return "", unclear_files
+    header = (
+        f"文件清单（共 {len(lines)} 个文件，其中 {len(unclear_files)} 个需补充）\n"
+        f"格式: 路径 | 类型 | 功能摘要 | 核心技术标识 | 建议子模块"
+    )
+    return header + "\n" + "\n".join(lines), unclear_files
+
+
+def _render_fallback_file(
+    parts: "list[str]",
+    rp: str,
+    ftype: str,
+    data: dict,
+    truncated_files: "list[str]",
+    text_total_limit: int,
+    text_file_limit: int,
+    text_chars_used: int,
+) -> int:
+    """将原始读取结果（fallback）渲染到 parts，返回本次消耗的文本字符数。"""
+    if ftype == "ELF":
+        exports = data.get("exports", [])
+        imports_l = data.get("imports", [])
+        needed = data.get("needed", [])
+        sh = data.get("strings_head", [])
+        parts.append("类型: ELF（fallback 原始读取）")
+        if needed:
+            parts.append(f"依赖库: {', '.join(needed)}")
+        if exports:
+            parts.append(f"导出函数 ({len(exports)}个):")
+            parts.append("```")
+            parts.extend(exports)
+            parts.append("```")
+        if imports_l:
+            parts.append(f"外部调用 ({len(imports_l)}个):")
+            parts.append("```")
+            parts.extend(imports_l)
+            parts.append("```")
+        if sh:
+            parts.append(f"strings头部 ({len(sh)}行):")
+            parts.append("```")
+            parts.extend(sh)
+            parts.append("```")
+        return 0
+    elif ftype == "text":
+        full = data.get("content", "")
+        if text_chars_used >= text_total_limit:
+            truncated_files.append(rp)
+            parts.append("类型: 文本文件")
+            parts.append("〔内容已略去（总预算已满），可用 read 工具获取完整内容〕")
+            return 0
+        remaining = text_total_limit - text_chars_used
+        take = min(len(full), text_file_limit, remaining)
+        snippet = full[:take]
+        total_lines = full.count("\n") + 1
+        shown_lines = snippet.count("\n") + 1
+        is_cut = take < len(full)
+        cut_note = (
+            f"  (前{shown_lines}行/{total_lines}行，已截断，余下内容可用 read 工具获取)"
+            if is_cut else f"  ({total_lines}行)"
+        )
+        parts.append(f"类型: 文本文件{cut_note}:")
+        parts.append("```")
+        parts.extend(snippet.splitlines())
+        parts.append("```")
+        return take
+    elif ftype == "missing":
+        parts.append("(文件不存在 target_dir)")
+        return 0
+    else:
+        parts.append(f"类型: {ftype}")
+        return 0
+
+
+def pre_read_module_with_details(
+    target_dir: str,
+    mod_dir: "Path",
+    details_dir: "Path | None" = None,
+) -> str:
+    """
+    预读模块所有文件，优先复用 details/ JSON 避免重复 I/O 和符号提取。
+
+    每个文件的处理策略（按优先级）：
+    1. details_dir 为 None 或不存在            → fallback：完整读取（等同旧 pre_read_module）
+    2. details/<path>.json 不存在              → fallback：原始读取（nm/readelf/文本）
+    3. type == ELF                             → 直接用 details 符号（不重跑 nm/readelf）
+    4. type 为文本类（C_SOURCE/SCRIPT/CONFIG） → details 摘要前缀 + 读取实际文件内容
+    5. 其他类型（UNKNOWN/BINARY/CERT等）       → 只输出 details 摘要，不读文件
+
+    返回同 pre_read_module：带 '__HAS_TEXT__\\n' 前缀（如有文本文件）
+    """
+    # 策略1：details_dir 为 None 或不存在 → 完全 fallback
+    if details_dir is None or not details_dir.exists():
+        return pre_read_module(target_dir, mod_dir)
+
+    try:
+        flist = (mod_dir / "files.list").read_text("utf-8").strip().splitlines()
+    except OSError:
+        return "(files.list 不可读)"
+    files = [l.strip() for l in flist if l.strip()]
+    if not files:
+        return "(模块文件列表为空)"
+
+    TEXT_TOTAL_CHAR_LIMIT = 150_000
+    TEXT_FILE_CHAR_LIMIT = 8_000
+    text_chars_used = 0
+    has_text_files = False
+    truncated_files: list[str] = []
+    parts: list[str] = []
+
+    def _raw_read_one(relpath: str):
+        fp = str(Path(target_dir) / relpath)
+        try:
+            with open(fp, "rb") as f:
+                magic = f.read(4)
+        except OSError:
+            return relpath, "missing", {}
+        if magic == b"\x7fELF":
+            return relpath, "ELF", read_one_elf(fp)
+        try:
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                content_full = f.read()
+            return relpath, "text", {"content": content_full}
+        except Exception:
+            return relpath, "binary", {}
+
+    # 预先确定哪些文件需要原始读取（并行处理）
+    detail_cache: dict[str, "dict | None"] = {}
+    needs_raw: list[str] = []
+    for rp in files:
+        detail = load_detail_json(details_dir, rp)
+        detail_cache[rp] = detail
+        ftype_d = str((detail or {}).get("type") or "").upper()
+        # 策略2：details 不存在 → 原始读取
+        # 策略4：文本类 → 需要读实际内容
+        if detail is None or ftype_d in _TEXT_TYPES_UPPER or ftype_d == "":
+            needs_raw.append(rp)
+
+    raw_results: dict[str, tuple] = {}
+    if needs_raw:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            futs = [(rp, pool.submit(_raw_read_one, rp)) for rp in needs_raw]
+        for rp, fut in futs:
+            try:
+                raw_results[rp] = fut.result(timeout=20)
+            except Exception:
+                raw_results[rp] = (rp, "unknown", {})
+
+    for rp in files:
+        parts.append(f"### {rp}")
+        detail = detail_cache[rp]
+        ftype_d = str((detail or {}).get("type") or "").upper()
+
+        # 策略2：details 不存在 → 原始读取渲染
+        if detail is None:
+            _, ftype_r, data = raw_results.get(rp, (rp, "unknown", {}))
+            consumed = _render_fallback_file(
+                parts, rp, ftype_r, data,
+                truncated_files, TEXT_TOTAL_CHAR_LIMIT, TEXT_FILE_CHAR_LIMIT,
+                text_chars_used,
+            )
+            if ftype_r == "text":
+                has_text_files = True
+                text_chars_used += consumed
+            continue
+
+        # 策略3：ELF → 直接用 details 符号（核心优化，零额外 I/O）
+        if ftype_d == "ELF":
+            exports = detail.get("symbols") or []
+            imports_l = detail.get("imports") or []
+            needed = detail.get("needed") or []
+            sh = detail.get("strings_head") or detail.get("strings") or []
+            parts.append("类型: ELF（符号来自预处理 details）")
+            if needed:
+                parts.append(f"依赖库: {', '.join(str(x) for x in needed)}")
+            if exports:
+                parts.append(f"导出函数 ({len(exports)}个, 对外攻击面):")
+                parts.append("```")
+                parts.extend(str(s) for s in exports[:300])
+                parts.append("```")
+            if imports_l:
+                parts.append(f"外部调用 ({len(imports_l)}个, 含潜在危险函数):")
+                parts.append("```")
+                parts.extend(str(s) for s in imports_l[:150])
+                parts.append("```")
+            if sh:
+                parts.append(f"strings头部 ({len(sh)}行):")
+                parts.append("```")
+                parts.extend(str(s) for s in sh[:50])
+                parts.append("```")
+            if not exports and not imports_l:
+                summary = str(detail.get("summary") or "").strip()
+                if summary:
+                    parts.append(f"摘要（details）: {summary}")
+            continue
+
+        # 策略4：文本类 → details 摘要前缀 + 读取实际文件内容
+        if ftype_d in _TEXT_TYPES_UPPER or ftype_d == "":
+            has_text_files = True
+            summary = str(detail.get("summary") or "").strip()
+            functions = detail.get("functions") or []
+            if summary:
+                parts.append(f"摘要（details）: {summary}")
+            if functions:
+                parts.append(
+                    f"函数列表（details）: {', '.join(str(f) for f in functions[:20])}"
+                )
+            _, ftype_r, data = raw_results.get(rp, (rp, "text", {}))
+            consumed = _render_fallback_file(
+                parts, rp, "text", data,
+                truncated_files, TEXT_TOTAL_CHAR_LIMIT, TEXT_FILE_CHAR_LIMIT,
+                text_chars_used,
+            )
+            text_chars_used += consumed
+            continue
+
+        # 策略5：其他类型（BINARY/CERT/ARCHIVE/UNKNOWN等）→ 只输出 details 摘要
+        summary = str(detail.get("summary") or "").strip()
+        parts.append(f"类型: {detail.get('type', 'unknown')}")
+        if summary:
+            parts.append(f"摘要（details）: {summary}")
+
+    if truncated_files:
+        parts.append("")
+        parts.append(
+            f"⚠️ 以下 {len(truncated_files)} 个文件因总内容超限未展示，"
+            f"可用 read 工具直接读取："
+        )
+        for tf in truncated_files:
+            parts.append(f"  - target/{tf}")
+
+    result_str = "\n".join(parts)
+    prefix = "__HAS_TEXT__\n" if has_text_files else ""
+    return prefix + result_str
+
 
 def write_failure_report(
     report_path: Path,

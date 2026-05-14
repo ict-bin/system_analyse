@@ -28,7 +28,7 @@ from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
-    archive_file, max_iter, pre_read_module,
+    archive_file, max_iter, pre_read_module, pre_read_module_with_details,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
 )
@@ -197,9 +197,13 @@ class AnalyseStage(BaseStage):
             return
 
         # 预读所有文件（Python侧，无需 LLM tool call）
+        # 优先复用 details/ JSON 避免重复 nm/readelf 系统调用
+        details_dir = ctx.workspace / "details"
+        details_dir_opt = details_dir if details_dir.exists() else None
         loop = asyncio.get_event_loop()
         pre_read_content = await loop.run_in_executor(
-            None, pre_read_module, cfg.target_dir, mod_dir
+            None, pre_read_module_with_details,
+            cfg.target_dir, mod_dir, details_dir_opt
         )
         has_text = pre_read_content.startswith('__HAS_TEXT__\n')
         if has_text:

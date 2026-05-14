@@ -16,7 +16,9 @@
 根据上方已提供的文件数据，完成安全分析并输出报告。
 
 ⚠️ **约束（严格遵守）**：
-1. **ELF 模块**：上方数据已完整，禁止再调用 `bash` 运行 nm/readelf/strings
+1. **ELF 模块**：上方数据已完整（来自预处理阶段 details/ 或 nm/readelf 直接提取），
+   **绝对禁止**再调用 `bash` 运行 nm/readelf/strings/file 命令。
+   这些命令的输出已全部预置在 system prompt 中，重复运行浪费 token，违者评分降10分。
 2. **文本模块**：上方已展示前 150KB 内容；若需要查看被截断文件的剩余内容，可用 `read target/<相对路径>` 工具获取
 3. **只需一步**：将分析报告写入 `modules/{{MODULE_NAME}}/module_report.md`
 4. 使用相对路径，不要使用 `/data/output/...` 绝对路径

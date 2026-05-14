@@ -31,6 +31,7 @@ from .helpers import (
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter,
     SUB_WORKER_THRESHOLD, collect_file_summaries,
+    load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
     archive_module_deletions, get_module_deleted_files, restore_module_for_retry,
@@ -162,9 +163,44 @@ class RefineStage(BaseStage):
             shutil.copy2(str(mod_dir / "files.list"), str(snapshot_path))
 
         # 文件数超过阈值时，先用子 Worker 收集文件摘要
+        # ── 文件摘要获取：三层降级逻辑 ────────────────────────────────────
+        # 层1: details/ 存在 → 直接读 JSON（零 LLM，任意文件数均适用）
+        # 层2: 有不清晰文件  → 只对这些文件调用 LLM sub_reader（最小 token）
+        # 层3: details/ 不存在 → 原有逻辑（fc > SUB_WORKER_THRESHOLD 时调用）
+        files_list = [l.strip() for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip()]
         sub_prompt = load_prompt(cfg, "step2_sub_read", "workers")
         file_summary = ""
-        if sub_prompt and fc > SUB_WORKER_THRESHOLD:
+        details_dir = ctx.workspace / "details"
+
+        if details_dir.exists():
+            # 层1+2：优先从 details/ 读取
+            summary_from_details, unclear_files = load_details_for_module(
+                details_dir, files_list, cfg.target_dir
+            )
+            no_llm_note = " (跳过LLM)" if not unclear_files else ""
+            ctx.emit_event("log", level="info",
+                           msg=(f"[S2] {mod_name}: {fc}个文件，"
+                                f"{len(unclear_files)}个需LLM补充{no_llm_note}"))
+            if unclear_files and sub_prompt:
+                # 层2：只对不清晰文件调用 LLM
+                supplement = await collect_file_summaries(
+                    ctx=ctx,
+                    mod_name=mod_name,
+                    mod_dir=mod_dir,
+                    sub_prompt_template=sub_prompt,
+                    parallel=cfg.parallel_sub_workers,
+                    sub_model=cfg.workers.model_for("sub_read"),
+                    target_dir=cfg.target_dir,
+                    files_override=unclear_files,
+                )
+                file_summary = (
+                    (summary_from_details + "\n" + supplement)
+                    if summary_from_details else supplement
+                )
+            else:
+                file_summary = summary_from_details
+        elif sub_prompt and fc > SUB_WORKER_THRESHOLD:
+            # 层3 fallback：details/ 不存在，走原有逻辑
             file_summary = await collect_file_summaries(
                 ctx=ctx,
                 mod_name=mod_name,
