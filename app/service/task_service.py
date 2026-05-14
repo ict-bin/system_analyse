@@ -153,6 +153,7 @@ def _security_filter_log_payload(config: dict | None, *, resolved: bool = False)
         "binary_arch": cfg.get("binary_arch"),
         "security_focus_categories": cfg.get("security_focus_categories"),
         "module_granularity": cfg.get("module_granularity"),
+        "filter_engine": cfg.get("filter_engine"),
         "resolved": resolved,
     }
 

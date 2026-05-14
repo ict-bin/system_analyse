@@ -20,6 +20,7 @@ from pathlib import Path
 from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
+from .filter_engine import normalize_filter_engine
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, StageError,
@@ -85,6 +86,20 @@ class ClassifyStage(BaseStage):
         workspace = ctx.workspace
         task_id = ctx.task_id
         s_cfg = cfg.stages.classify
+
+        if normalize_filter_engine(getattr(cfg, "filter_engine", "script")) == "agent":
+            modules = discover_modules(str(workspace))
+            if modules:
+                ctx.classified_modules = modules
+                ctx.emit_event(
+                    "stage_result",
+                    stage=1,
+                    status="skipped",
+                    reason="agent_filter_engine_already_produced_modules",
+                    modules=modules,
+                    effective_engine=getattr(ctx, "effective_filter_engine", "agent"),
+                )
+                return
 
         classify_prompt = load_prompt(cfg, "step1_classify", "workers")
         check_prompt = load_prompt(cfg, "step1_check_classify", "judges")

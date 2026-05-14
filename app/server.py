@@ -33,6 +33,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -41,6 +42,7 @@ from .config import (
     build_task_config, get_service_yaml, load_service_config,
 )
 from .logging_utils import configure_container_logging, log_event
+from .metrics import observe_request as observe_metrics_request, render_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
 from .service.service_role import is_api_role as _is_api_service_role
@@ -187,6 +189,14 @@ _tasks: dict[str, TaskEntry] = {}
 app = FastAPI(title="system_analyse", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+@app.middleware("http")
+async def collect_request_metrics(request, call_next):
+    started = _time.perf_counter()
+    response = await call_next(request)
+    observe_metrics_request(request.method, request.url.path, response.status_code, _time.perf_counter() - started)
+    return response
+
 _svc_config = None
 
 
@@ -249,6 +259,12 @@ async def health():
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
     }
+
+
+@app.get("/metrics")
+@app.get("/api/app/system-analyse/metrics", include_in_schema=False)
+async def metrics():
+    return PlainTextResponse(render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/livez")

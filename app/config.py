@@ -255,6 +255,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "") -> TaskCon
         binary_arch=svc.binary_arch,
         security_focus_categories=svc.security_focus_categories,
         module_granularity=svc.module_granularity,
+        filter_engine=svc.filter_engine,
         parallel_modules=svc.parallel_modules,
         parallel_sub_workers=svc.parallel_sub_workers,
         enable_final_check=bool(getattr(svc, "enable_final_check", False)),

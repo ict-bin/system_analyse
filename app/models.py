@@ -318,6 +318,10 @@ class ServiceConfig(BaseModel):
             "coarse=协议/服务/功能级（同一协议/功能的所有代码归为一个模块）"
         ),
     )
+    filter_engine: str = Field(
+        default="script",
+        description="文件过滤引擎: script=脚本过滤+S1粗分类, agent=智能体过滤+模块划分",
+    )
     parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1")
     parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1")
     agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
@@ -364,6 +368,10 @@ class TaskConfig(BaseModel):
     module_granularity: str = Field(
         default="fine",
         description="模块划分粒度: fine=子组件级，coarse=协议/服务/功能级",
+    )
+    filter_engine: str = Field(
+        default="script",
+        description="文件过滤引擎: script=脚本过滤+S1粗分类, agent=智能体过滤+模块划分",
     )
     parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1")
     parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1")

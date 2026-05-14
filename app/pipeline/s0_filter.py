@@ -16,6 +16,11 @@ from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
+from .filter_engine import (
+    load_script_filter_outputs,
+    normalize_filter_engine,
+    run_agent_filter_engine,
+)
 from .helpers import run_agent_with_stage_guard, load_prompt
 
 
@@ -28,6 +33,8 @@ class FilterStage(BaseStage):
     async def execute(self, ctx: PipelineContext) -> None:
         cfg = ctx.cfg
         workspace = ctx.workspace
+        ctx.selected_filter_engine = normalize_filter_engine(getattr(cfg, "filter_engine", "script"))
+        ctx.effective_filter_engine = "script"
 
         filter_script = "/app/scripts/filter_files.sh"
         if not os.path.isfile(filter_script):
@@ -42,6 +49,7 @@ class FilterStage(BaseStage):
             arch=arch_str,
             security_focus_categories=list(cfg.security_focus_categories),
             module_granularity=cfg.module_granularity,
+            selected_filter_engine=ctx.selected_filter_engine,
         )
         ctx.emit_event(
             "log",
@@ -51,9 +59,40 @@ class FilterStage(BaseStage):
                 f"analyse_targets={cfg.analyse_targets}, "
                 f"binary_arch={cfg.binary_arch}, "
                 f"security_focus_categories={cfg.security_focus_categories}, "
-                f"module_granularity={cfg.module_granularity}"
+                f"module_granularity={cfg.module_granularity}, "
+                f"filter_engine={ctx.selected_filter_engine}"
             ),
         )
+
+        if ctx.selected_filter_engine == "agent":
+            try:
+                stats = await run_agent_filter_engine(ctx)
+                ctx.emit_event(
+                    "stage_result",
+                    stage="filter-engine",
+                    status="passed",
+                    selected_engine=ctx.selected_filter_engine,
+                    effective_engine=ctx.effective_filter_engine,
+                    file_count=stats.file_count,
+                    module_count=stats.module_count,
+                    batch_count=stats.batch_count,
+                )
+                return
+            except Exception as exc:
+                ctx.filter_fallback_reason = str(exc)
+                ctx.effective_filter_engine = "script"
+                ctx.emit_event(
+                    "stage",
+                    stage="filter-fallback",
+                    selected_engine=ctx.selected_filter_engine,
+                    effective_engine="script",
+                    reason=str(exc),
+                )
+                ctx.emit_event(
+                    "log",
+                    level="warn",
+                    msg=f"智能体过滤引擎失败，已自动回退脚本引擎: {exc}",
+                )
 
         task_tmp = ctx.task_tmp
         proc = await asyncio.create_subprocess_exec(
@@ -72,20 +111,16 @@ class FilterStage(BaseStage):
         if _cli:
             ctx.emit_event("cli_output", stage="filter", text=_cli[:3000])
 
-        filtered_path = workspace / "filtered_files.txt"
-        if filtered_path.exists():
-            lines = [l.strip() for l in filtered_path.read_text("utf-8", errors="replace").splitlines() if l.strip()]
-            ctx.filtered_files = lines
-            ctx.filter_count = len(lines)
-            # 备份过滤结果，防止后续 agent 步骤覆盖
-            (workspace / ".filtered_backup.txt").write_text(
-                filtered_path.read_text("utf-8"), encoding="utf-8")
+        load_script_filter_outputs(workspace, ctx)
 
         ctx.emit_event("stage_result", stage="filter",
                        types=cfg.analyse_targets, file_count=ctx.filter_count,
                        arch=arch_str,
                        security_focus_categories=list(cfg.security_focus_categories),
-                       module_granularity=cfg.module_granularity)
+                       module_granularity=cfg.module_granularity,
+                       selected_engine=ctx.selected_filter_engine,
+                       effective_engine=ctx.effective_filter_engine,
+                       fallback_reason=ctx.filter_fallback_reason)
 
 
 class ExploreStage(BaseStage):

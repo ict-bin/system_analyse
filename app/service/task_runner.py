@@ -131,6 +131,8 @@ class TaskRunner:
                 svc.security_focus_categories = tcfg["security_focus_categories"]
             if tcfg.get("module_granularity"):
                 svc.module_granularity = tcfg["module_granularity"]
+            if tcfg.get("filter_engine"):
+                svc.filter_engine = tcfg["filter_engine"]
             if "enable_final_check" in tcfg:
                 svc.enable_final_check = bool(tcfg["enable_final_check"])
             svc.start_stage = tcfg["start_stage"] if tcfg.get("start_stage") else 0

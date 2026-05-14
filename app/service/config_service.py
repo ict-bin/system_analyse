@@ -54,6 +54,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "binary_arch": ["all"],
     "security_focus_categories": ["all"],
     "module_granularity": "fine",
+    "filter_engine": "script",
     "worker_task_concurrency": 4,
     "parallel_modules": 1,
     "parallel_sub_workers": 1,

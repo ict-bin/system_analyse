@@ -14,6 +14,7 @@ from .helpers import (
     pre_read_file, read_one_elf, pre_read_module, collect_file_summaries,
     write_failure_report, generate_modules_list, strip_target_prefix,
 )
+from .filter_engine import normalize_filter_engine
 from .s0_filter import FilterStage, ExploreStage, PrescanStage
 from .s0_path_group import PathGroupStage
 from .s1_classify import ClassifyStage
@@ -35,6 +36,7 @@ __all__ = [
     "SUB_BATCH_SIZE", "SUB_WORKER_THRESHOLD",
     "pre_read_file", "read_one_elf", "pre_read_module", "collect_file_summaries",
     "write_failure_report", "generate_modules_list", "strip_target_prefix",
+    "normalize_filter_engine",
     # 阶段
     "FilterStage", "ExploreStage", "PrescanStage",
     "PathGroupStage",

@@ -8,6 +8,10 @@ from typing import Callable
 
 
 _STAGE_ORDER = {
+    "filter-engine": 1,
+    "filter-tree-batch": 2,
+    "filter-merge": 3,
+    "filter-fallback": 4,
     "classify": 10,
     "2-sub": 20,
     "refine": 30,
@@ -21,6 +25,10 @@ _STAGE_ORDER = {
 }
 
 _STAGE_LABEL = {
+    "filter-engine": "智能体过滤",
+    "filter-tree-batch": "文件树批次过滤",
+    "filter-merge": "全局模块归并",
+    "filter-fallback": "过滤引擎回退",
     "classify": "全局分类",
     "2-sub": "细分类预读",
     "refine": "细分类",
@@ -116,6 +124,27 @@ def _infer_path_descriptor(relative_path: str) -> dict:
             "stage_label": _STAGE_LABEL["classify"],
             "stage_order": _STAGE_ORDER["classify"],
             "family_key": "classify",
+        })
+        return desc
+    if parts[0] == "filter-engine" and len(parts) >= 2:
+        if stem == "merge":
+            desc.update({
+                "stage_key": "filter-merge",
+                "stage_label": _STAGE_LABEL["filter-merge"],
+                "stage_order": _STAGE_ORDER["filter-merge"],
+                "family_key": "filter-merge",
+            })
+            return desc
+        match = re.fullmatch(r"batch-(\d+)", stem)
+        batch_index = _safe_int(match.group(1)) if match else None
+        desc.update({
+            "stage_key": "filter-tree-batch",
+            "stage_label": _STAGE_LABEL["filter-tree-batch"],
+            "stage_order": _STAGE_ORDER["filter-tree-batch"],
+            "batch_index": batch_index,
+            "parallel_group": "filter-tree-batch",
+            "family_key": "filter-tree-batch",
+            "flow_kind": "parallel",
         })
         return desc
     if normalized == "final_report.jsonl":
@@ -458,6 +487,12 @@ def build_session_catalog(
         for node in root_nodes:
             if node["stage_key"] in {"refine", "2-sub"}:
                 add_edge(classify_node["relative_path"], node["relative_path"], "dispatch", "进入细分类")
+
+    filter_merge_node = node_map.get("filter-engine/merge.jsonl")
+    if filter_merge_node:
+        for node in root_nodes:
+            if node["stage_key"] == "filter-tree-batch":
+                add_edge(node["relative_path"], filter_merge_node["relative_path"], "progress", "汇总到全局归并")
 
     final_report_node = node_map.get("final_report.jsonl")
     if final_report_node:

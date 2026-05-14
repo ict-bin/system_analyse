@@ -57,6 +57,15 @@ class PipelineContext:
     filter_count: int = 0
     """过滤后文件总数"""
 
+    selected_filter_engine: str = "script"
+    """配置选择的过滤引擎"""
+
+    effective_filter_engine: str = "script"
+    """实际执行成功的过滤引擎"""
+
+    filter_fallback_reason: str = ""
+    """agent 引擎回退到脚本引擎的原因"""
+
     # ══════════════════════════════════════════════════════════
     # Stage 1 输出
     # ══════════════════════════════════════════════════════════

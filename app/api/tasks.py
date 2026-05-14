@@ -27,6 +27,7 @@ class TaskCreateRequest(BaseModel):
     binary_arch: Optional[list[str]] = None      # Override service-level binary_arch
     security_focus_categories: Optional[list[str]] = None  # Override S1 category filter
     module_granularity: Optional[str] = None               # Override module split granularity
+    filter_engine: Optional[str] = None                    # Override filter engine
     enable_final_check: Optional[bool] = None              # Override service-level final_check enable flag
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
@@ -200,7 +201,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     task_config: dict | None = None
     _override_fields = (
         body.analyse_targets, body.binary_arch,
-        body.security_focus_categories, body.module_granularity, body.enable_final_check,
+        body.security_focus_categories, body.module_granularity, body.filter_engine, body.enable_final_check,
     )
     if any(f is not None for f in _override_fields):
         task_config = {}
@@ -212,6 +213,8 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
             task_config["security_focus_categories"] = body.security_focus_categories
         if body.module_granularity is not None:
             task_config["module_granularity"] = body.module_granularity
+        if body.filter_engine is not None:
+            task_config["filter_engine"] = body.filter_engine
         if body.enable_final_check is not None:
             task_config["enable_final_check"] = bool(body.enable_final_check)
     return svc.create_task(

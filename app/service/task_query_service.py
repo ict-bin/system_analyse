@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -33,6 +34,74 @@ def _normalize_evaluation_round_status(payload: dict) -> dict:
     normalized["raw_status"] = raw_status
     normalized["status"] = effective_status
     return normalized
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_enable_final_check(row: AppSaTask) -> bool | None:
+    raw_task_config = getattr(row, "task_config_json", None)
+    task_config = raw_task_config if isinstance(raw_task_config, dict) else {}
+    snapshot = task_config.get("resolved_config_snapshot") if isinstance(task_config.get("resolved_config_snapshot"), dict) else None
+    if snapshot and "enable_final_check" in snapshot:
+        return bool(snapshot.get("enable_final_check"))
+    if "enable_final_check" in task_config:
+        return bool(task_config.get("enable_final_check"))
+    return None
+
+
+def _compute_missing_files(workspace_root: Path) -> tuple[list[str], list[str]]:
+    warnings: list[str] = []
+    filtered_files_path = workspace_root / "filtered_files.txt"
+    modules_root = workspace_root / "modules"
+
+    if not filtered_files_path.is_file():
+        warnings.append("filtered_files.txt 缺失，无法计算遗漏文件")
+        return [], warnings
+
+    try:
+        all_target = {
+            line.strip()
+            for line in filtered_files_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+    except Exception as exc:
+        warnings.append(f"filtered_files.txt 读取失败: {exc}")
+        return [], warnings
+
+    if not modules_root.exists() or not modules_root.is_dir():
+        warnings.append("modules 目录缺失，无法计算遗漏文件")
+        return [], warnings
+
+    classified_files: set[str] = set()
+    module_dirs = sorted(path for path in modules_root.iterdir() if path.is_dir() and not path.name.startswith("."))
+    if not module_dirs:
+        warnings.append("modules 目录为空，无法计算遗漏文件")
+        return [], warnings
+
+    files_list_found = False
+    for module_dir in module_dirs:
+        files_list_path = module_dir / "files.list"
+        if not files_list_path.is_file():
+            warnings.append(f"模块 {module_dir.name} 缺失 files.list")
+            continue
+        files_list_found = True
+        try:
+            lines = [line.strip() for line in files_list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if not lines:
+                warnings.append(f"模块 {module_dir.name} 的 files.list 为空")
+                continue
+            for normalized in lines:
+                classified_files.add(normalized)
+        except Exception as exc:
+            warnings.append(f"{files_list_path.relative_to(workspace_root)} 读取失败: {exc}")
+
+    if not files_list_found:
+        warnings.append("未发现任何模块 files.list，无法计算遗漏文件")
+        return [], warnings
+
+    return sorted(all_target - classified_files), warnings
 
 
 class TaskQueryService:
@@ -256,6 +325,25 @@ class TaskQueryService:
                     warnings.append("evaluation_summary.json 格式不是对象")
             except Exception as exc:
                 warnings.append(f"evaluation_summary.json 读取失败: {exc}")
+
+        final_check_enabled = _resolve_enable_final_check(row)
+        if final_check_enabled is False:
+            if summary is None:
+                summary = {}
+            workspace_root = run_root / "workspace"
+            if not workspace_root.exists() or not workspace_root.is_dir():
+                warnings.append("workspace 目录缺失，无法计算遗漏文件")
+                missing_files: list[str] = []
+            else:
+                missing_files, missing_warnings = _compute_missing_files(workspace_root)
+                warnings.extend(missing_warnings)
+            summary.update({
+                "final_check_disabled": True,
+                "missing_file_count": len(missing_files),
+                "missing_files": missing_files,
+                "missing_files_preview": missing_files[:20],
+                "missing_files_computed_at": _utc_now_iso(),
+            })
 
         rounds: list[dict] = []
         for round_dir in sorted(run_root.glob("round_*")):
