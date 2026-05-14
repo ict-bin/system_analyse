@@ -58,6 +58,7 @@ def _resolve_enable_final_check(row: AppSaTask) -> bool | None:
 def _compute_missing_files(workspace_root: Path) -> tuple[list[str], list[str]]:
     warnings: list[str] = []
     filtered_files_path = workspace_root / "filtered_files.txt"
+    deleted_files_path = workspace_root / "deleted.list"
     modules_root = workspace_root / "modules"
 
     if not filtered_files_path.is_file():
@@ -105,7 +106,18 @@ def _compute_missing_files(workspace_root: Path) -> tuple[list[str], list[str]]:
         warnings.append("未发现任何模块 files.list，无法计算遗漏文件")
         return [], warnings
 
-    return sorted(all_target - classified_files), warnings
+    confirmed_deleted: set[str] = set()
+    if deleted_files_path.exists():
+        try:
+            confirmed_deleted = {
+                line.strip()
+                for line in deleted_files_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.strip()
+            }
+        except Exception as exc:
+            warnings.append(f"deleted.list 读取失败: {exc}")
+
+    return sorted((all_target - classified_files) - confirmed_deleted), warnings
 
 
 class TaskQueryService:

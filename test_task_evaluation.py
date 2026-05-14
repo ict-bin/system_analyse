@@ -122,6 +122,33 @@ def test_get_task_evaluation_does_not_add_missing_files_when_final_check_enabled
         assert "missing_file_count" not in (result["summary"] or {})
 
 
+def test_get_task_evaluation_excludes_confirmed_deleted_from_missing_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "sat_eval" / "run"
+        workspace = run_root / "workspace"
+        modules_root = workspace / "modules"
+        modules_root.mkdir(parents=True)
+        (run_root / "evaluation_summary.json").write_text(json.dumps({"round_count": 1}), encoding="utf-8")
+        (workspace / "filtered_files.txt").write_text("a.bin\nb.bin\nc.bin\n", encoding="utf-8")
+        (workspace / "deleted.list").write_text("c.bin\n", encoding="utf-8")
+        (modules_root / "mod1").mkdir()
+        (modules_root / "mod1" / "files.list").write_text("a.bin\nb.bin\n", encoding="utf-8")
+
+        row = SimpleNamespace(
+            task_id="sat_eval",
+            status="passed",
+            output_path=tmp,
+            task_config_json={"enable_final_check": False},
+        )
+
+        result = _service_with_row(row).get_task_evaluation(None, "sat_eval")
+
+        assert result["summary"]["final_check_disabled"] is True
+        assert result["summary"]["missing_file_count"] == 0
+        assert result["summary"]["missing_files"] == []
+        assert result["summary"]["missing_files_preview"] == []
+
+
 def test_get_task_evaluation_missing_files_warns_when_filtered_files_missing():
     with tempfile.TemporaryDirectory() as tmp:
         run_root = Path(tmp) / "sat_eval" / "run"
