@@ -687,11 +687,26 @@ def pre_read_file(fullpath: str) -> tuple[str, list[str]]:
 
 
 def read_one_elf(fullpath: str) -> dict:
-    """ELF 三层提取：nm 导出/导入符号 + readelf 依赖库 + strings 头部。"""
+    """ELF 三层提取：nm 导出/导入符号 + readelf 依赖库 + strings 头部。
+
+    根据 ELF 类型自适应选择 nm 参数：
+    - ET_DYN=3 (.so 共享库): nm -D 读动态符号表（.dynsym）
+    - ET_REL=1 (.ko 内核模块/可重定位): nm 读所有符号（.ko 无 .dynsym）
+    - ET_EXEC=2 (可执行文件): nm -D 优先，为空则用 nm
+    """
     res: dict = {"exports": [], "imports": [], "needed": [], "strings_head": []}
     try:
-        r = subprocess.run(["nm", "-D", fullpath],
-                           capture_output=True, text=True, timeout=15)
+        # 读 ELF 类型以决定 nm 参数
+        import struct as _struct
+        with open(fullpath, "rb") as _f:
+            _hdr = _f.read(18)
+        _ei_data = _hdr[5] if len(_hdr) > 5 else 1  # 1=LE, 2=BE
+        _etype_fmt = ">H" if _ei_data == 2 else "<H"
+        _etype = _struct.unpack_from(_etype_fmt, _hdr, 0x10)[0] if len(_hdr) >= 18 else 0
+        # ET_REL=1(.ko), ET_EXEC=2, ET_DYN=3(.so)
+        _nm_args = ["nm", "-D", fullpath] if _etype == 3 else ["nm", fullpath]
+
+        r = subprocess.run(_nm_args, capture_output=True, text=True, timeout=15)
         for line in r.stdout.splitlines():
             p = line.split()
             if len(p) >= 3:
@@ -713,7 +728,10 @@ def read_one_elf(fullpath: str) -> dict:
                     res["needed"].append(m.group(1))
         r = subprocess.run(["strings", "-n", "6", fullpath],
                            capture_output=True, text=True, timeout=15)
-        res["strings_head"] = r.stdout.splitlines()[:50]
+        # 过滤：只保留标识符/路径类字符串（排除二进制垃圾）
+        _ident_re = re.compile(r'^[A-Za-z_/][A-Za-z0-9_./:@\-]{4,}$')
+        _filtered = [s for s in r.stdout.splitlines() if _ident_re.match(s)]
+        res["strings_head"] = _filtered[:50]
     except Exception:
         pass
     return res

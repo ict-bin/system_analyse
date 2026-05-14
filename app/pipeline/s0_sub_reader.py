@@ -96,8 +96,16 @@ def _extract_python_info(full_path: str, rel_path: str, ftype: str) -> dict:
             if len(sym) > 4:
                 keywords.append(sym)
         result["keywords"] = list(dict.fromkeys(keywords))[:5]
+        # 检测 ELF 类型以生成更准确的摘要
+        _ext_ko = Path(rel_path).suffix.lower() in (".ko",) or ftype in ("KO", "KERNEL_MODULE")
         if exports:
-            result["summary"] = f"ELF 共享库，导出 {len(exports)} 个函数，依赖 {', '.join(needed[:3]) or '无'}"
+            if _ext_ko:
+                result["summary"] = (
+                    f"内核模块，导出 {len(exports)} 个符号"
+                    + (f"，示例：{', '.join(exports[:3])}" if exports[:3] else "")
+                )
+            else:
+                result["summary"] = f"ELF 共享库，导出 {len(exports)} 个函数，依赖 {', '.join(needed[:3]) or '无'}"
             result["confidence"] = "medium"
         else:
             result["summary"] = "ELF 二进制，符号表为空（可能已 strip）"

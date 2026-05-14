@@ -166,7 +166,10 @@ def classify_file(target_dir: str, rel_path: str) -> dict:
     if header[:4] == ELF_MAGIC:
         result["type"] = "ELF"
         try:
-            em = struct.unpack_from("<H", header, 0x12)[0]
+            # EI_DATA (offset 0x05): 1=little-endian, 2=big-endian
+            ei_data = header[5] if len(header) > 5 else 1
+            fmt = ">H" if ei_data == 2 else "<H"
+            em = struct.unpack_from(fmt, header, 0x12)[0]
             arch = ELF_MACHINE_MAP.get(em, f"unknown_e_machine_{em}")
         except Exception:
             arch = "unknown"
