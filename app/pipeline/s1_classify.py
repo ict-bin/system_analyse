@@ -69,11 +69,9 @@ def _build_security_focus_section(sec_cats: list[str]) -> str:
 
     return (
         "\n\n# ⚠️ 安全分析范围约束（必须严格执行）\n\n"
-        "**将文件分为两类**：\n"
-        "1. **安全相关文件** → 归入对应的安全维度模块（见下方）\n"
-        "2. **其余所有文件** → 统一归入 **`other`** 兜底模块\n\n"
-        "⚠️ **禁止丢弃任何文件**：所有文件必须分类，100% 覆盖率是铁律。\n"
-        "`other` 模块是必须存在的兜底模块，不算范围漂移。\n\n"
+        "**只将与以下安全维度直接相关的文件归入模块**，"
+        "无关文件（测试代码、国际化字符串、构建脚本、样例数据、文档等）"
+        "**绝对不得**创建任何模块——直接丢弃。\n\n"
         "**指定安全维度：**\n" + "\n".join(cat_lines)
         + includes_section
         + boundary_section
@@ -91,18 +89,9 @@ class ClassifyStage(BaseStage):
     stage_name = "分类"
 
     async def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
         task_id = ctx.task_id
-
-        # ── checkpoint 跳过 ──────────────────────────────────────────────────
-        if cp and cp.is_done("s1_classify"):
-            ctx.classified_modules = discover_modules(str(workspace))
-            ctx.emit_event("log", level="info",
-                           msg=f"[S1-Classify] checkpoint已完成，跳过（{len(ctx.classified_modules)}个模块）")
-            return
-
         s_cfg = cfg.stages.classify
 
         classify_prompt = load_prompt(cfg, "step1_classify", "workers")
@@ -309,14 +298,9 @@ class ClassifyStage(BaseStage):
 
             if voted_pass and attempt + 1 >= s_cfg.min_rounds:
                 ctx.classified_modules = modules
-                if cp:
-                    cp.mark_done("s1_classify", module_count=len(modules))
                 return
             if forced_pass:
                 ctx.classified_modules = modules
-                if cp:
-                    cp.mark_done("s1_classify", module_count=len(modules),
-                                 forced=True)
                 return
 
             if voted_pass:
