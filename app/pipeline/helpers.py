@@ -197,8 +197,48 @@ def get_modules_root(workspace: str | Path) -> Path:
 
 
 def discover_modules(workspace: str | Path) -> list[str]:
-    """返回 workspace 下所有 files.list 非空的目录名（叶节点模块）。"""
+    """返回 workspace/modules/ 下所有 files.list 非空的叶节点模块名。
+
+    同时修复 S2 Worker 可能创建的嵌套子模块目录：
+      modules/<parent>/<sub>/files.list  →  modules/<sub>/files.list
+    （平铺后原嵌套子目录移到顶层，parent 如变空则保留空目录不影响流程）
+    """
     root = get_modules_root(str(workspace))
+    # ── 先展平所有嵌套子模块（二级嵌套）──────────────────────────────────
+    for parent in sorted(root.iterdir()):
+        if not parent.is_dir() or parent.name.startswith("."):
+            continue
+        if module_has_nonempty_files(parent):
+            continue  # parent 本身有 files.list，不是容器
+        # parent 无 files.list → 检查是否有嵌套 sub-module
+        nested = []
+        for sub in sorted(parent.iterdir()):
+            if sub.is_dir() and not sub.name.startswith(".") and module_has_nonempty_files(sub):
+                nested.append(sub)
+        if not nested:
+            continue
+        # 将 nested sub-module 移到 root 层
+        for sub in nested:
+            target = root / sub.name
+            if not target.exists():
+                try:
+                    import shutil as _shutil
+                    _shutil.move(str(sub), str(target))
+                except Exception:
+                    pass  # move 失败则仍在原处（后续会被跳过）
+            else:
+                # target 已存在（同名模块），追加 files.list 后删除 sub
+                try:
+                    existing_files = set(read_module_files(target))
+                    new_files = [f for f in read_module_files(sub) if f not in existing_files]
+                    if new_files:
+                        with open(target / "files.list", "a", encoding="utf-8") as _f:
+                            _f.write("\n".join(new_files) + "\n")
+                    import shutil as _shutil
+                    _shutil.rmtree(str(sub), ignore_errors=True)
+                except Exception:
+                    pass
+    # ── 收集第一层叶节点 ────────────────────────────────────────────────
     result = []
     for d in sorted(root.iterdir()):
         if d.is_dir() and not d.name.startswith(".") and module_has_nonempty_files(d):

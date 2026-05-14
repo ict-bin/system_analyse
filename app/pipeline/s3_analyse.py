@@ -428,7 +428,8 @@ class AnalyseStage(BaseStage):
                 if attempt + 1 >= s_cfg.min_rounds:
                     # ── 写模块级 checkpoint ─────────────────────────────
                     if cp:
-                        cp.mark_done(f"s3_modules/{mod_name}")
+                        avg_score = int(sum(r["score"] for r in judge_results) / max(len(judge_results), 1))
+                        cp.mark_done(f"s3_modules/{mod_name}", score=avg_score, attempts=attempt + 1)
                     return
                 else:
                     ctx.emit_event("reflect", stage=3, module=mod_name, round=attempt + 1)
