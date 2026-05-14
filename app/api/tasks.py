@@ -320,3 +320,49 @@ async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
 async def generate_prompt(body: GeneratePromptRequest):
     """Auto-generate a prompt from an input path."""
     return {"prompt": generate_prompt_from_path(body.input_path)}
+
+
+@router.get("/tasks/{task_id}/checkpoint")
+async def get_task_checkpoint(task_id: str, db: Session = Depends(get_db)):
+    """返回任务的断点续跑状态摘要。
+
+    用于前端展示各阶段/模块的完成情况。
+    """
+    import os as _os
+    from pathlib import Path as _Path
+    from app.db.models import AppSaTask
+    from app.pipeline.checkpoint import CheckpointManager
+
+    row = db.query(AppSaTask).filter(
+        AppSaTask.task_id == task_id,
+        AppSaTask.is_deleted.is_(False),
+    ).first()
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(404, f"任务不存在: {task_id}")
+
+    if not row.output_path:
+        return {"task_id": task_id, "available": False, "reason": "no_output_path"}
+
+    workspace = _Path(row.output_path) / task_id / "run" / "workspace"
+    checkpoint_dir = workspace / ".checkpoint"
+
+    if not checkpoint_dir.exists():
+        return {
+            "task_id": task_id,
+            "available": False,
+            "reason": "no_checkpoint_dir",
+            "workspace": str(workspace),
+        }
+
+    cp = CheckpointManager(workspace)
+    summary = cp.load_summary()
+
+    return {
+        "task_id": task_id,
+        "available": True,
+        "workspace": str(workspace),
+        "checkpoint_dir": str(checkpoint_dir),
+        **summary,
+    }
+

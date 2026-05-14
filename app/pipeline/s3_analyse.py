@@ -41,8 +41,19 @@ class AnalyseStage(BaseStage):
     stage_name = "分析"
 
     async def execute(self, ctx: PipelineContext) -> None:
+        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
+
+        # ── checkpoint: 整体已完成 ────────────────────────────────────────────
+        if cp and cp.is_done("s3_analyse"):
+            ctx.analysed_modules = [
+                d.name for d in ctx.modules_root().iterdir()
+                if d.is_dir() and (d / "module_report.md").exists() and module_has_nonempty_files(d)
+            ]
+            ctx.emit_event("log", level="info",
+                           msg=f"[S3] 整体 checkpoint 已完成，跳过({len(ctx.analysed_modules)}个模块)")
+            return
 
         w_sys_prompt = load_prompt(cfg, "step3_analyse", "workers")
         j_sys_prompt = load_prompt(cfg, "step3_check_analyse", "judges")
@@ -81,8 +92,11 @@ class AnalyseStage(BaseStage):
                     raise e
             raise s3_errors[0]
 
-        # ── Stage 2 → Stage 3 重分类回溯 ────────────────────────────────────
+        # ── Stage 2 → Stage 3 重分类回溯 ──────────────────────────────────────
         if ctx.modules_needing_reclassify:
+            # redo 前清除相关模块的 S3 checkpoint（分类已改变，旧报告无效）
+            if cp:
+                cp.clear_stage_modules("s3", ctx.modules_needing_reclassify)
             await self._redo_s2_s3(
                 ctx, final_modules,
                 w_sys_prompt, j_sys_prompt, reflect_prompt,
@@ -92,6 +106,10 @@ class AnalyseStage(BaseStage):
             d.name for d in ctx.modules_root().iterdir()
             if d.is_dir() and (d / "module_report.md").exists() and module_has_nonempty_files(d)
         ]
+
+        # ── 写整体 checkpoint ────────────────────────────────────────────────
+        if cp:
+            cp.mark_done("s3_analyse", module_count=len(ctx.analysed_modules))
 
     # ── 单模块分析（W+J 多轮）────────────────────────────────────────────────
     async def _analyse_module(
@@ -108,6 +126,7 @@ class AnalyseStage(BaseStage):
         s_cfg = cfg.stages.analyse
         j_base = ctx.make_j_base()
 
+        cp = ctx.checkpoint
         mod_dir = get_modules_root(str(workspace)) / mod_name
         sess_name = f"analyse{session_suffix}-{mod_name}.jsonl"
         analyse_session = str(ctx.sess_dir / sess_name)
@@ -134,7 +153,23 @@ class AnalyseStage(BaseStage):
             )
             return
 
-        # 如果 module_report.md 已存在且 files.list 非空（如 Pod 重启后续跑），直接跳过重新分析
+        # ── 双重保护 checkpoint 跳过（checkpoint + 报告文件双重确认）──────────
+        # checkpoint 存在 + 报告文件存在 → 安全跳过
+        if cp and cp.is_done(f"s3_modules/{mod_name}") and report_path.exists():
+            ctx.emit_event("log", level="info",
+                           msg=f"[S3] {mod_name} checkpoint 已完成，跳过")
+            return
+        # checkpoint 存在但报告丢失 → 清除脏 checkpoint 重做
+        if cp and cp.is_done(f"s3_modules/{mod_name}") and not report_path.exists():
+            cp.clear(f"s3_modules/{mod_name}")
+        # 报告存在但无 checkpoint → 旧版本遗留或写到一半 → 删除脏报告重做
+        if report_path.exists() and not (cp and cp.is_done(f"s3_modules/{mod_name}")):
+            try:
+                report_path.unlink()
+            except OSError:
+                pass
+
+        # 如果 module_report.md 已存在且 files.list 非空（旧逻辑保留作兜底）
         if report_path.exists():
             ctx.emit_event("log", level="info",
                            msg=f"[跳过 S3] {mod_name} module_report.md 已存在，跳过本轮分析")
@@ -327,6 +362,9 @@ class AnalyseStage(BaseStage):
             )
             if voted_pass:
                 if attempt + 1 >= s_cfg.min_rounds:
+                    # ── 写模块级 checkpoint ─────────────────────────────
+                    if cp:
+                        cp.mark_done(f"s3_modules/{mod_name}")
                     return
                 else:
                     ctx.emit_event("reflect", stage=3, module=mod_name, round=attempt + 1)
@@ -344,6 +382,8 @@ class AnalyseStage(BaseStage):
                     for i, r in enumerate(judge_results) if not r["pass"])
                 feedback = "# 评审意见（未通过）\n\n" + fail_fb + "\n\n请根据意见修正分析。"
             if forced_pass:
+                if cp:
+                    cp.mark_done(f"s3_modules/{mod_name}", forced=True)
                 return
 
         if mod_name not in ctx.modules_needing_reclassify:

@@ -43,8 +43,15 @@ class CompletenessCheckStage(BaseStage):
     stage_name = "完整性检查"
 
     async def execute(self, ctx: PipelineContext) -> None:
+        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
+
+        # ── checkpoint 跳过 ──────────────────────────────────────────────────
+        if cp and cp.is_done("s4_completeness"):
+            ctx.emit_event("log", level="info",
+                           msg="[S4a-Completeness] checkpoint已完成，跳过")
+            return
 
         j_completeness_prompt = load_prompt(cfg, "step4_check_completeness", "judges")
         j_base = ctx.make_j_base()
@@ -84,6 +91,10 @@ class CompletenessCheckStage(BaseStage):
 
         if not s4a_pass and missing_modules:
             await self._redo_missing(ctx, missing_modules)
+
+        # ── 写 checkpoint ────────────────────────────────────────────────────────
+        if cp := ctx.checkpoint:
+            cp.mark_done("s4_completeness")
 
     # ── 补做缺失模块的 Stage 2+3 ──────────────────────────────────────────
     async def _redo_missing(self, ctx: PipelineContext, missing_modules: list[str]) -> None:
@@ -195,9 +206,21 @@ class FinalReportStage(BaseStage):
     stage_name = "生成报告"
 
     async def execute(self, ctx: PipelineContext) -> None:
+        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
         final_out_dir = ctx.final_out_dir
+
+        # ── checkpoint 跳过（checkpoint + final_report.md 双重确认） ────────────
+        if cp and cp.is_done("s4_report"):
+            report_dst = final_out_dir / "final_report.md"
+            if report_dst.exists():
+                ctx.final_report_path = str(report_dst)
+                ctx.emit_event("log", level="info",
+                               msg="[S4b-Report] checkpoint已完成，跳过")
+                # 直接进入后处理（并不跳过。级处理将在后面执行）
+                # 不 return，需要继续进行论文归档等后处理
+                return
 
         s_cfg = cfg.stages.final_check
         report_sys_prompt = load_prompt(cfg, "step4_final_report", "workers")
@@ -320,6 +343,10 @@ class FinalReportStage(BaseStage):
                 break
         else:
             raise StageError(f"Stage 4b 最终报告未通过，已达最大轮数 {s_cfg.max_rounds}")
+
+        # ── 写 checkpoint（在归档前确认报告已生成） ─────────────────────────────
+        if cp and (workspace / "final_report.md").exists():
+            cp.mark_done("s4_report")
 
         # ── 组装输出目录 ──────────────────────────────────────────────────────
         final_mods = discover_modules(str(workspace))

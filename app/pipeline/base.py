@@ -26,20 +26,16 @@ class BaseStage(ABC):
 
 
 class Pipeline:
-    """将多个 BaseStage 串联成流水线，支持从指定阶段恢复。"""
+    """将多个 BaseStage 串联成流水线。
+
+    各 Stage 通过自身的 checkpoint 逆辑决定是否执行，无需外部传入 start_stage。
+    """
 
     def __init__(self, stages: list[BaseStage]):
         self._stages = sorted(stages, key=lambda s: s.stage_num)
 
-    async def run(self, ctx: PipelineContext, start_stage: int = 0) -> PipelineContext:
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
         for stage in self._stages:
-            if stage.stage_num < start_stage:
-                ctx.emit_event(
-                    "log",
-                    level="info",
-                    msg=f"[跳过] Stage {stage.stage_num} ({stage.stage_name})，resume start_stage={start_stage}",
-                )
-                continue
             await stage.execute(ctx)
             # Stage 0 过滤后无文件 → 终止流水线，避免后续阶段空跑
             if stage.stage_num == 0 and ctx.filter_count == 0:

@@ -1,6 +1,7 @@
 """
 pipeline/__init__.py
 """
+from .checkpoint import CheckpointManager
 from .context import PipelineContext
 from .base import BaseStage, Pipeline
 from .helpers import (
@@ -25,6 +26,7 @@ from .s4_report import CompletenessCheckStage, FinalReportStage
 from .evaluation import EvaluationRecorder
 
 __all__ = [
+    "CheckpointManager",
     # 上下文与基类
     "PipelineContext", "BaseStage", "Pipeline",
     "EvaluationRecorder",

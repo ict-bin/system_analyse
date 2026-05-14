@@ -157,7 +157,23 @@ class PathGroupStage(BaseStage):
     stage_name = "路径先验分组"
 
     async def execute(self, ctx: PipelineContext) -> None:
+        cp = ctx.checkpoint
+
+        # ── checkpoint 跳过（PathGroup 是纯Python，运行很快，但续跑时 prescan_summary 需要重建） ──
+        if cp and cp.is_done("s0_pathgroup"):
+            # 从磁盘重建 prescan_summary
+            p = ctx.workspace / "prescan" / "path_groups.md"
+            if p.exists():
+                pg_content = p.read_text("utf-8", errors="replace")
+                separator = "\n\n---\n\n" if ctx.prescan_summary else ""
+                # 只注入重要的摘要部分（避免重复运行分组逻辑）
+                ctx.prescan_summary = ctx.prescan_summary + separator + pg_content[:2000]
+            ctx.emit_event("log", level="info", msg="[S0-PathGroup] checkpoint已完成，跳过")
+            return
+
         if not ctx.filtered_files:
+            if cp:
+                cp.mark_done("s0_pathgroup", skipped="no_filtered_files")
             return
 
         ctx.emit_event("stage", stage="path_group", file_count=len(ctx.filtered_files))
@@ -192,3 +208,9 @@ class PathGroupStage(BaseStage):
             special_groups=len(special_groups),
             total_files=len(ctx.filtered_files),
         )
+
+        # ── 写 checkpoint ────────────────────────────────────────────────────────
+        if cp:
+            cp.mark_done("s0_pathgroup",
+                         normal_groups=len(normal_groups),
+                         special_groups=len(special_groups))

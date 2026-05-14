@@ -36,6 +36,7 @@ from .pipeline import (
     CompletenessCheckStage, FinalReportStage,
     StageError, PiFatalError,
 )
+from .pipeline.checkpoint import CheckpointManager
 from .pipeline.helpers import (
     discover_modules, get_modules_root,
     write_failure_report, generate_modules_list, strip_target_prefix,
@@ -148,38 +149,27 @@ class Orchestrator:
                 "LLM Provider 同步失败，使用已有 models.json: %s", _sync_err
             )
 
-        # ── 目录初始化 ────────────────────────────────────────────────────────
-        if cfg.resume_workspace and cfg.start_stage > 1:
-            # Resume 模式：复用已有 workspace（跳过 S0-S2）
-            workspace = Path(os.path.abspath(cfg.resume_workspace))
-            run_dir = workspace.parent
-            out_dir = run_dir.parent
-            task_id = out_dir.name
-            final_out_dir = out_dir / "output"
-            final_out_dir.mkdir(exist_ok=True)
-            sess_dir = run_dir / "sessions"
-            sess_dir.mkdir(exist_ok=True)
-            task_tmp = workspace / "tmp"
-            task_tmp.mkdir(exist_ok=True)
-        else:
-            out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
-            out_dir.mkdir(parents=True, exist_ok=True)
-            run_dir = out_dir / "run"
-            run_dir.mkdir(exist_ok=True)
-            final_out_dir = out_dir / "output"
-            final_out_dir.mkdir(exist_ok=True)
-            sess_dir = run_dir / "sessions"
-            sess_dir.mkdir(exist_ok=True)
-            workspace = run_dir / "workspace"
-            workspace.mkdir(exist_ok=True)
-            task_tmp = workspace / "tmp"
-            task_tmp.mkdir(exist_ok=True)
-            target_link = workspace / "target"
-            if not target_link.exists():
-                try:
-                    target_link.symlink_to(os.path.abspath(cfg.target_dir))
-                except OSError:
-                    pass
+        # ── 目录初始化（统一逻辑，不再区分 resume/fresh 模式）────────────────
+        # 断点续跑通过 workspace/.checkpoint/ 目录中的标记文件驱动，
+        # 不再依赖 cfg.start_stage / cfg.resume_workspace。
+        out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = out_dir / "run"
+        run_dir.mkdir(exist_ok=True)
+        final_out_dir = out_dir / "output"
+        final_out_dir.mkdir(exist_ok=True)
+        sess_dir = run_dir / "sessions"
+        sess_dir.mkdir(exist_ok=True)
+        workspace = run_dir / "workspace"
+        workspace.mkdir(exist_ok=True)
+        task_tmp = workspace / "tmp"
+        task_tmp.mkdir(exist_ok=True)
+        target_link = workspace / "target"
+        if not target_link.exists():
+            try:
+                target_link.symlink_to(os.path.abspath(cfg.target_dir))
+            except OSError:
+                pass
 
         flag_path = final_out_dir / "flag"
         flag_path.write_text("0", encoding="utf-8")  # 失败默认值，成功时覆盖
@@ -240,6 +230,7 @@ class Orchestrator:
             tokens=tokens,
             evaluator=evaluator,
             cancel_event=self._cancel_event,
+            checkpoint=CheckpointManager(workspace),
         )
 
         # ── 组装并运行 Pipeline ───────────────────────────────────────────────
@@ -257,7 +248,7 @@ class Orchestrator:
         ])
 
         try:
-            await pipeline.run(ctx, start_stage=cfg.start_stage)
+            await pipeline.run(ctx)
             result.status = TaskStatus.PASSED
             result.total_tokens = ctx.tokens
             # 过滤结果为 0 文件：流水线已正常终止，写说明报告

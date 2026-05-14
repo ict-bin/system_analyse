@@ -131,8 +131,7 @@ class TaskRunner:
                 svc.security_focus_categories = tcfg["security_focus_categories"]
             if tcfg.get("module_granularity"):
                 svc.module_granularity = tcfg["module_granularity"]
-            svc.start_stage = tcfg["start_stage"] if tcfg.get("start_stage") else 0
-            svc.resume_workspace = tcfg.get("resume_workspace") or ""
+            # 断点续跑由文件系统 .checkpoint/ 驱动，不再读取 start_stage/resume_workspace
             if row.output_path:
                 svc.output_dir = row.output_path
                 svc.archive_dir = row.output_path

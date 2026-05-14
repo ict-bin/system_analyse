@@ -154,14 +154,20 @@ class TaskRepository:
         return row
 
     @staticmethod
-    def resume_task_in_place(db: Session, row: AppSaTask, *, resume_workspace: str) -> AppSaTask:
-        task_config_json = {
+    def resume_task_in_place(db: Session, row: AppSaTask) -> AppSaTask:
+        """断点续跑：保留 workspace 和 .checkpoint/，不设置 start_stage/resume_workspace。
+
+        与旧版的区别：
+        - 不清除 started_at（续跑保留原始开始时间）
+        - 不清除 stages_json（续跑保留历史事件流）
+        - 不向 task_config_json 写入 start_stage/resume_workspace
+        - 断点由文件系统 .checkpoint/ 目录驱动，无需 DB 字段控制
+        """
+        clean_config = {
             k: v for k, v in (row.task_config_json or {}).items()
-            if k != "resolved_config_snapshot"
-        }
-        task_config_json["start_stage"] = 3
-        task_config_json["resume_workspace"] = resume_workspace
-        row.task_config_json = task_config_json
+            if k not in ("start_stage", "resume_workspace", "resolved_config_snapshot")
+        } or None
+        row.task_config_json = clean_config
         row.status = "pending"
         row.finished_at = None
         row.result_json = None
@@ -169,6 +175,7 @@ class TaskRepository:
         row.dispatcher_instance_id = None
         row.dispatch_started_at = None
         row.lease_expires_at = None
+        # 保留 started_at 和 stages_json（续跑不重置历史）
         flag_modified(row, "task_config_json")
         db.commit()
         db.refresh(row)

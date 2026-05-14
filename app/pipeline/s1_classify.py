@@ -91,9 +91,18 @@ class ClassifyStage(BaseStage):
     stage_name = "分类"
 
     async def execute(self, ctx: PipelineContext) -> None:
+        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
         task_id = ctx.task_id
+
+        # ── checkpoint 跳过 ──────────────────────────────────────────────────
+        if cp and cp.is_done("s1_classify"):
+            ctx.classified_modules = discover_modules(str(workspace))
+            ctx.emit_event("log", level="info",
+                           msg=f"[S1-Classify] checkpoint已完成，跳过（{len(ctx.classified_modules)}个模块）")
+            return
+
         s_cfg = cfg.stages.classify
 
         classify_prompt = load_prompt(cfg, "step1_classify", "workers")
@@ -300,9 +309,14 @@ class ClassifyStage(BaseStage):
 
             if voted_pass and attempt + 1 >= s_cfg.min_rounds:
                 ctx.classified_modules = modules
+                if cp:
+                    cp.mark_done("s1_classify", module_count=len(modules))
                 return
             if forced_pass:
                 ctx.classified_modules = modules
+                if cp:
+                    cp.mark_done("s1_classify", module_count=len(modules),
+                                 forced=True)
                 return
 
             if voted_pass:

@@ -821,7 +821,7 @@ class TaskService:
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
         row = self._task_repository.restart_task_in_place(db, row)
-        # Clean up previous run directory so fresh execution starts from scratch
+        # 清除上次运行目录（含 .checkpoint/），当次从零开始
         if row.output_path:
             import shutil as _shutil
             task_root = os.path.join(row.output_path, task_id)
@@ -836,18 +836,25 @@ class TaskService:
         return self._row_to_dict(row)
 
     def resume_task(self, db: Session, task_id: str) -> dict:
-        """从断点续跑：保留同一任务ID，跳过 Stage 1/2 直接从 Stage 3 开始。"""
+        """断点续跑：保留已有 workspace 和 .checkpoint/ 目录，系统自动从中断处继续。"""
+        from fastapi import HTTPException
+        from pathlib import Path as _Path
         row = self._get_or_404(db, task_id)
         if row.status in ("pending", "running"):
-            from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
-        svc = _load_svc_config_from_db(db, row.project_id)
-        effective_output = row.output_path or svc.output_dir
-        resume_workspace = os.path.join(effective_output, task_id, "run", "workspace")
-        row = self._task_repository.resume_task_in_place(db, row, resume_workspace=resume_workspace)
+        # 检查 .checkpoint/ 目录是否存在（无断点就无法续跑）
+        if row.output_path:
+            checkpoint_dir = _Path(row.output_path) / task_id / "run" / "workspace" / ".checkpoint"
+            if not checkpoint_dir.exists():
+                raise HTTPException(
+                    400,
+                    f"没有找到断点信息（{checkpoint_dir}），"
+                    f"请使用重启（restart）代替续跑。"
+                )
+        row = self._task_repository.resume_task_in_place(db, row)
         _clear_task_execution_lock(row.output_path, task_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
-                  task_id=task_id, project_id=row.project_id, resume_workspace=resume_workspace)
+                  task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
@@ -1067,11 +1074,8 @@ class TaskService:
                 svc.security_focus_categories = tcfg["security_focus_categories"]
             if tcfg.get("module_granularity"):
                 svc.module_granularity = tcfg["module_granularity"]
-            # start_stage / resume_workspace come ONLY from task_config_json
-            # (set by resume_task).  Never inherit from project config so that
-            # fresh runs and restarts always start from Stage 0.
-            svc.start_stage = tcfg["start_stage"] if tcfg.get("start_stage") else 0
-            svc.resume_workspace = tcfg.get("resume_workspace") or ""
+            # 断点续跑由文件系统 .checkpoint/ 目录驱动，
+            # 不再从 task_config_json 读取 start_stage/resume_workspace。
             # Use row.output_path as the working root so the Orchestrator writes to
             # the user-specified location ({output_path}/{task_id}/workspace/) rather
             # than the global /data/output directory from config.json.

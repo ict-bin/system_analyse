@@ -55,13 +55,36 @@ class RefineStage(BaseStage):
 
     # ── 主入口 ─────────────────────────────────────────────────────────────
     async def execute(self, ctx: PipelineContext) -> None:
+        cp = ctx.checkpoint
         self._reset()
         self._ctx = ctx
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        for mod in discover_modules(str(workspace)):
-            await self._queue.put(mod)
+        # ── checkpoint: 整体已完成 ────────────────────────────────────────────
+        if cp and cp.is_done("s2_refine"):
+            ctx.refined_modules = discover_modules(str(workspace))
+            ctx.emit_event("log", level="info",
+                           msg=f"[S2] 整体 checkpoint 已完成，跳过({len(ctx.refined_modules)}个模块)")
+            return
+
+        # ── 从 checkpoint 恢复已完成模块，增量续跑 ─────────────────────────────
+        done_modules: set[str] = cp.list_done_modules("s2") if cp else set()
+        if done_modules:
+            self._refined = set(done_modules)
+            ctx.emit_event("log", level="info",
+                           msg=f"[S2] 从 checkpoint 恢复 {len(done_modules)} 个已完成模块")
+
+        all_modules = discover_modules(str(workspace))
+        skipped = 0
+        for mod in all_modules:
+            if mod not in self._refined:
+                await self._queue.put(mod)
+            else:
+                skipped += 1
+        if skipped:
+            ctx.emit_event("log", level="info",
+                           msg=f"[S2] 跳过 {skipped} 个已完成模块，待处理 {self._queue.qsize()} 个")
 
         parallel = max(1, cfg.parallel_modules)
         workers = [asyncio.create_task(self._worker()) for _ in range(parallel)]
@@ -76,8 +99,18 @@ class RefineStage(BaseStage):
                     raise e
             raise self._errors[0]
 
-        await self._global_completeness_check()
+        # ── 全局完整性检查（有独立 checkpoint，避免重复运行）─────────────────
+        if not (cp and cp.is_done("s2_global_check")):
+            await self._global_completeness_check()
+            if cp:
+                cp.mark_done("s2_global_check")
+        else:
+            ctx.emit_event("log", level="info",
+                           msg="[S2] 全局完整性检查 checkpoint 已完成，跳过")
+
         ctx.refined_modules = discover_modules(str(workspace))
+        if cp:
+            cp.mark_done("s2_refine", module_count=len(ctx.refined_modules))
 
     # ── Queue worker ───────────────────────────────────────────────────────
     async def _worker(self) -> None:
@@ -94,11 +127,19 @@ class RefineStage(BaseStage):
     # ── 单模块细分 ─────────────────────────────────────────────────────────
     async def _refine_one(self, mod_name: str) -> None:
         ctx = self._ctx
+        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
         s_cfg = cfg.stages.refine
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
+
+        # ── 模块级 checkpoint 跳过（并发断点续跑） ────────────────────────────
+        if cp and cp.is_done(f"s2_modules/{mod_name}"):
+            self._refined.add(mod_name)
+            ctx.emit_event("log", level="info",
+                           msg=f"[S2] {mod_name} 模块 checkpoint 已完成，跳过")
+            return
 
         mod_dir = get_modules_root(str(workspace)) / mod_name
         if not (mod_dir / "files.list").exists():
@@ -314,6 +355,12 @@ class RefineStage(BaseStage):
                                 self._in_progress.add(nm)
                                 await self._queue.put(nm)
                     self._refined.add(mod_name)
+                    # ── 写模块级 checkpoint（judge通过后原子写入）────────────
+                    _cp = self._ctx.checkpoint if self._ctx else None
+                    if _cp:
+                        _cp.mark_done(f"s2_modules/{mod_name}",
+                                      split=was_split,
+                                      new_modules=new_ones)
                     return
                 else:
                     ctx.emit_event("reflect", stage=2, module=mod_name, round=attempt + 1)
@@ -372,6 +419,13 @@ class RefineStage(BaseStage):
                             self._in_progress.add(nm)
                             await self._queue.put(nm)
                 self._refined.add(mod_name)
+                # ── forced_pass 也写 checkpoint ────────────────────────────
+                _cp2 = self._ctx.checkpoint if self._ctx else None
+                if _cp2:
+                    _cp2.mark_done(f"s2_modules/{mod_name}",
+                                   split=was_split,
+                                   new_modules=new_ones,
+                                   forced=True)
                 return
 
         raise StageError(f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
