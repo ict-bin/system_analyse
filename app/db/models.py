@@ -44,6 +44,10 @@ class AppSaTask(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     result_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # DEPRECATED: events moved to {output_path}/{task_id}/run/events.jsonl
+    # Kept for backward-compat read of old tasks that have no events.jsonl.
+    # New tasks no longer write to this field. Do NOT remove until all rows
+    # have been migrated by scripts/migrate_stages_to_file.py.
     stages_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
