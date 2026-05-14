@@ -165,7 +165,8 @@ class ClassifyStage(BaseStage):
 
         # ── 构建分类上下文注入（details/ 优先，fallback prescan 摘要）──
         prescan_summary = ctx.prescan_summary
-        classify_context_path = ctx.classify_context_path or (workspace / "classify_context.md")
+        # ctx.classify_context_path 已由 orchestrator 初始化为 workspace/classify_context.md，永不为 None
+        classify_context_path = ctx.classify_context_path
         has_classify_context = classify_context_path.exists()
 
         # ── 基础 Worker 参数 ──

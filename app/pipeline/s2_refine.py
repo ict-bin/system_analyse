@@ -170,7 +170,8 @@ class RefineStage(BaseStage):
         files_list = [l.strip() for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip()]
         sub_prompt = load_prompt(cfg, "step2_sub_read", "workers")
         file_summary = ""
-        details_dir = ctx.workspace / "details"
+        # ctx.details_dir 已由 orchestrator 初始化为 workspace/details/，直接使用
+        details_dir = ctx.details_dir
 
         if details_dir.exists():
             # 层1+2：优先从 details/ 读取

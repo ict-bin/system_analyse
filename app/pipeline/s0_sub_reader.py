@@ -191,10 +191,15 @@ def _get_file_type_from_catalog(catalog: dict, rel_path: str) -> str:
 
 
 def _write_detail_json(detail_path: Path, data: dict) -> None:
-    """原子写入 detail JSON 文件。"""
+    """原子写入 detail JSON 文件（tmp→rename 保证原子性）。
+
+    tmp 文件名 = detail_path.name + ".tmp"，避免 with_suffix() 对多点文件名的歧义。
+    例: libssl.so.1.1.json → libssl.so.1.1.json.tmp
+    """
     import json as _json
     data["generated_at"] = _utc_now()
-    tmp = detail_path.with_suffix(".tmp")
+    # 追加 .tmp 而非替换后缀，对含多个点的文件名（libssl.so.1.1）更安全
+    tmp = detail_path.parent / (detail_path.name + ".tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.rename(detail_path)
@@ -217,12 +222,19 @@ class SubReaderStage(BaseStage):
         workspace = ctx.workspace
 
         # ── checkpoint 跳过（整体）───────────────────────────────────────
+        # ctx.details_dir 和 ctx.classify_context_path 已由 orchestrator 初始化，无需重赋
         if cp and cp.is_done("s0_sub_reader"):
-            ctx.details_dir = workspace / "details"
-            ctx.classify_context_path = workspace / "classify_context.md"
             ctx.emit_event("log", level="info",
-                           msg=f"[S0-SubReader] checkpoint 已完成，跳过")
+                           msg=f"[S0-SubReader] checkpoint 已完成，跳过"
+                               f"（details 目录: {ctx.details_dir}）")
             return
+
+        # ── details/ 目录始终提前创建（保证目录可见，即使后续 early return）────
+        # ctx.details_dir 已由 orchestrator 初始化为正确路径，直接使用
+        details_dir = ctx.details_dir   # = workspace / "details"
+        details_dir.mkdir(exist_ok=True)
+        ctx.emit_event("log", level="info",
+                       msg=f"[S0-SubReader] details 目录: {details_dir}")
 
         # ── 读取文件列表 ──────────────────────────────────────────────────
         ff = workspace / "filtered_files.txt"
@@ -239,9 +251,6 @@ class SubReaderStage(BaseStage):
                 cp.mark_done("s0_sub_reader", skipped="empty_file_list")
             return
 
-        details_dir = workspace / "details"
-        details_dir.mkdir(exist_ok=True)
-        ctx.details_dir = details_dir
         ctx.emit_event("stage", stage="sub_reader", file_count=len(files))
 
         # ── 确定模式和并行度 ──────────────────────────────────────────────
@@ -438,7 +447,7 @@ class SubReaderStage(BaseStage):
                     lines.append(f"- ...（共 {len(mod_files)} 个，余下见 details/）")
                 lines.append("")
 
-        ctx.classify_context_path = ctx.workspace / "classify_context.md"
+        # ctx.classify_context_path 已由 orchestrator 初始化，直接写入
         ctx.classify_context_path.write_text("\n".join(lines), encoding="utf-8")
         ctx.emit_event("log", level="info",
                        msg=f"[S0-SubReader] classify_context.md 已生成 ({len(lines)} 行)")

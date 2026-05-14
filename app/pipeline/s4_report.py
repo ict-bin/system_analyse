@@ -131,8 +131,8 @@ class CompletenessCheckStage(BaseStage):
 
             # Stage 3 补做（预读内容，优先复用 details/ JSON）
             loop = __import__("asyncio").get_event_loop()
-            _details_dir = ctx.workspace / "details"
-            _details_dir_opt = _details_dir if _details_dir.exists() else None
+            # ctx.details_dir 由 orchestrator 初始化，永不为 None
+            _details_dir_opt = ctx.details_dir if ctx.details_dir.exists() else None
             pre_content = await loop.run_in_executor(
                 None, pre_read_module_with_details,
                 cfg.target_dir, mod_dir, _details_dir_opt

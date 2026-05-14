@@ -37,8 +37,10 @@ class Pipeline:
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         for stage in self._stages:
             await stage.execute(ctx)
-            # Stage 0 过滤后无文件 → 终止流水线，避免后续阶段空跑
-            if stage.stage_num == 0 and ctx.filter_count == 0:
+            # 文件过滤阶段后无文件，终止后续阶段空跑
+            # 仅针对 FilterStage（stage_name=="文件过滤"）检测，避免其他 stage_num==0
+            # 的新预处理阶段（TypeClassify/SubReader/ValidateDetails等）错误触发该中断
+            if stage.stage_name == "文件过滤" and ctx.filter_count == 0:
                 ctx.emit_event(
                     "log",
                     level="warning",

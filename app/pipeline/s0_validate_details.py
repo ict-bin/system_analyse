@@ -45,7 +45,8 @@ class ValidateDetailsStage(BaseStage):
             return
 
         # ── details/ 不存在则跳过 ─────────────────────────────────────────
-        details_dir = ctx.details_dir or workspace / "details"
+        # ctx.details_dir 已由 orchestrator 初始化为 workspace/details/，永不为 None
+        details_dir = ctx.details_dir
         if not details_dir.exists():
             ctx.emit_event("log", level="info",
                            msg="[S0-ValidateDetails] details/ 不存在，跳过")

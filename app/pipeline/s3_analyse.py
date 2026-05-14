@@ -199,8 +199,8 @@ class AnalyseStage(BaseStage):
 
         # 预读所有文件（Python侧，无需 LLM tool call）
         # 优先复用 details/ JSON 避免重复 nm/readelf 系统调用
-        details_dir = ctx.workspace / "details"
-        details_dir_opt = details_dir if details_dir.exists() else None
+        # ctx.details_dir 由 orchestrator 初始化，永不为 None
+        details_dir_opt = ctx.details_dir if ctx.details_dir.exists() else None
         loop = asyncio.get_event_loop()
         pre_read_content = await loop.run_in_executor(
             None, pre_read_module_with_details,
@@ -432,7 +432,7 @@ class AnalyseStage(BaseStage):
                 feedback += _sec_focus_hint  # 注入安全维度约束
 
             # ── 为 redo 的 refine Worker 预加载 details/ 摘要（节省 token）─────────────
-            _details_dir = workspace / "details"
+            _details_dir = ctx.details_dir  # 由 orchestrator 初始化，永不为 None
             if _details_dir.exists() and mod_dir.exists():
                 _flist = [l.strip() for l in (mod_dir / "files.list").read_text("utf-8",errors="replace").splitlines() if l.strip()] if (mod_dir / "files.list").exists() else []
                 if _flist:

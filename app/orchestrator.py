@@ -232,6 +232,9 @@ class Orchestrator:
             evaluator=evaluator,
             cancel_event=self._cancel_event,
             checkpoint=CheckpointManager(workspace),
+            # ── 预处理阶段目录（在 orchestrator 层统一初始化，保证永不为 None）───────
+            details_dir=workspace / "details",
+            classify_context_path=workspace / "classify_context.md",
         )
 
         # ── 组装并运行 Pipeline ───────────────────────────────────────────────
