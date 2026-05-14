@@ -89,6 +89,42 @@ def clear_events(path: Optional[Path]) -> None:
         logger.warning("clear_events failed path=%s: %s", path, exc)
 
 
+def strip_final_marker(path: Optional[Path]) -> None:
+    """删除 events.jsonl 末尾的 __final__ 行（resume 时调用）。
+
+    resume 续跑保留历史事件，但上一次运行结束时写入的 {"__final__": true}
+    必须删除，否则 read_events 会返回 final=True，误报任务已完成。
+    只删除尾部的 __final__ 行（中间的由 _parse_jsonl 读取时自动忽略）。
+    """
+    if path is None or not path.exists():
+        return
+    try:
+        content = path.read_bytes()
+        if not content:
+            return
+        # 读取所有行，删除最后连续的 __final__ 行
+        lines = content.splitlines(keepends=True)
+        while lines:
+            stripped = lines[-1].strip()
+            if not stripped:
+                lines.pop()
+                continue
+            try:
+                obj = json.loads(stripped)
+                if isinstance(obj, dict) and obj.get("__final__"):
+                    lines.pop()
+                    continue
+            except Exception:
+                pass
+            break
+        if len(lines) != len(content.splitlines(keepends=True)):
+            tmp = Path(str(path) + ".tmp")
+            tmp.write_bytes(b"".join(lines))
+            tmp.replace(path)
+    except Exception as exc:
+        logger.warning("strip_final_marker failed path=%s: %s", path, exc)
+
+
 # ─── 读操作 ──────────────────────────────────────────────────────────────────
 
 def read_events(
@@ -116,7 +152,11 @@ def read_events(
 
 
 def _parse_jsonl(path: Path) -> dict:
-    """解析 events.jsonl，提取 events 列表和 final 标记。"""
+    """解析 events.jsonl，提取 events 列表和 final 标记。
+
+    __final__ 只有在文件最后一行才被视为「任务已完成」标记。
+    resume 场景下旧 __final__ 夹在中间，不影响 final 判断。
+    """
     events: list[dict] = []
     final = False
     try:
@@ -130,9 +170,12 @@ def _parse_jsonl(path: Path) -> dict:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(obj, dict) and obj.get("__final__"):
+                    # 临时设 final=True；若后面还有 event 行则重置为 False
                     final = True
                 elif isinstance(obj, dict):
                     events.append(obj)
+                    # 新 event 出现在 __final__ 之后 → 任务已续跑，重置 final
+                    final = False
     except Exception as exc:
         logger.warning("_parse_jsonl failed path=%s: %s", path, exc)
     return {"events": events, "final": final}
