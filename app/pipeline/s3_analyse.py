@@ -9,7 +9,7 @@ pipeline/s3_analyse.py — Stage 3: 模块分析 (STRIDE)
 
 核心流程:
   对每个模块并行运行（asyncio.Semaphore）:
-    Python预读模块所有文件（pre_read_module）
+    从 details/ 加载文件摘要行（load_details_for_module，按需 read）
     → Worker(step3_analyse.md, 占位符替换) → Judge(step3_check_analyse.md)
   重分类检测: judge 输出含 [需要重新分类] → 回 Stage 2 重做
   Stage 2/3 重做循环: 修正模块分类后重新分析
@@ -28,7 +28,7 @@ from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, build_granularity_hint,
-    archive_file, max_iter, pre_read_module, pre_read_module_with_details,
+    archive_file, max_iter,
     module_has_nonempty_files,
     load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
@@ -206,21 +206,26 @@ class AnalyseStage(BaseStage):
             )
             return
 
-        # 预读所有文件（Python侧，无需 LLM tool call）
-        # 优先复用 details/ JSON 避免重复 nm/readelf 系统调用
-        # ctx.details_dir 由 orchestrator 初始化，永不为 None
-        details_dir_opt = ctx.details_dir if ctx.details_dir.exists() else None
-        loop = asyncio.get_event_loop()
-        pre_read_content = await loop.run_in_executor(
-            None, pre_read_module_with_details,
-            cfg.target_dir, mod_dir, details_dir_opt
+        # 使用 details/ 摘要行（按需 read）替代全量符号预展开
+        # 每文件一行：路径 | 类型 | 功能摘要 | 关键符号(前5个) | 建议子模块
+        # Worker 通过 read details/<path>.json 按需获取完整符号表
+        flist: list[str] = []
+        flist_path = mod_dir / "files.list"
+        if flist_path.exists():
+            flist = [
+                l.strip()
+                for l in flist_path.read_text("utf-8", errors="replace").splitlines()
+                if l.strip()
+            ]
+        pre_read_content, _unclear_files = load_details_for_module(
+            ctx.details_dir, flist, cfg.target_dir
         )
-        has_text = pre_read_content.startswith('__HAS_TEXT__\n')
-        if has_text:
-            pre_read_content = pre_read_content[len('__HAS_TEXT__\n'):]
+        if _unclear_files:
+            ctx.emit_event("log", level="info",
+                           msg=f"[S3] {mod_name}: {len(_unclear_files)}/{len(flist)} 个文件 details 不足，"
+                               f"Worker 可用 read target/<path> 补充")
 
-        # 如果 mod_dir 中存在 analysis.md / SPLITTING_EVAL.md 等阶段产出文件，
-        # 将其内容追加到 system prompt，并开启 read 工具让 worker 可继续查阅
+        # 如果 mod_dir 中存在 analysis.md / SPLITTING_EVAL.md 等阶段产出文件，追加到摘要
         for extra_md in ["analysis.md", "SPLITTING_EVAL.md"]:
             extra_path = mod_dir / extra_md
             if extra_path.exists():
@@ -230,13 +235,13 @@ class AnalyseStage(BaseStage):
                         pre_read_content += (
                             f"\n\n## 模块目录已有分析文件：{extra_md}\n\n{extra_content}"
                         )
-                        has_text = True  # 开启 read 工具，以便 worker 进一步查阅
                 except OSError:
                     pass
 
         w_sys = w_sys_prompt.replace("{{PRE_READ_CONTENT}}", pre_read_content) \
                             .replace("{{MODULE_NAME}}", mod_name)
-        w_tools_s3 = ["read", "write"] if has_text else ["write"]
+        # read 工具始终开放：Worker 需要通过 read details/<path>.json 获取完整符号表
+        w_tools_s3 = ["read", "write"]
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
@@ -403,7 +408,7 @@ class AnalyseStage(BaseStage):
                 artifact_paths=[str(mod_dir / "module_report.md")],
                 extra={
                     "report_exists": report_exists,
-                    "has_text_pre_read": has_text,
+                    "has_text_pre_read": False,
                 },
             )
             if voted_pass:
