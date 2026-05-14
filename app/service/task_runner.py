@@ -154,6 +154,8 @@ class TaskRunner:
                 svc.filter_engine = tcfg["filter_engine"]
             if "enable_final_check" in tcfg:
                 svc.enable_final_check = bool(tcfg["enable_final_check"])
+            if "continue_on_module_failure" in tcfg:
+                svc.continue_on_module_failure = bool(tcfg["continue_on_module_failure"])
             # 断点续跑由文件系统 .checkpoint/ 驱动，不再读取 start_stage/resume_workspace
             if row.output_path:
                 svc.output_dir = row.output_path

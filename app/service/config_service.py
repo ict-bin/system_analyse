@@ -49,6 +49,7 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds_exceeded_action": "treat_as_passed",
+    "continue_on_module_failure": True,
     "enable_final_check": False,
     "analyse_targets": ["binary", "source"],
     "binary_arch": ["arm", "aarch64"],

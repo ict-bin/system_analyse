@@ -29,6 +29,7 @@ class TaskCreateRequest(BaseModel):
     module_granularity: Optional[str] = None               # Override module split granularity
     filter_engine: Optional[str] = None                    # Override filter engine
     enable_final_check: Optional[bool] = None              # Override service-level final_check enable flag
+    continue_on_module_failure: Optional[bool] = None      # Override service-level module-failure policy
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None
@@ -201,7 +202,8 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     task_config: dict | None = None
     _override_fields = (
         body.analyse_targets, body.binary_arch,
-        body.security_focus_categories, body.module_granularity, body.filter_engine, body.enable_final_check,
+        body.security_focus_categories, body.module_granularity, body.filter_engine,
+        body.enable_final_check, body.continue_on_module_failure,
     )
     if any(f is not None for f in _override_fields):
         task_config = {}
@@ -217,6 +219,8 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
             task_config["filter_engine"] = body.filter_engine
         if body.enable_final_check is not None:
             task_config["enable_final_check"] = bool(body.enable_final_check)
+        if body.continue_on_module_failure is not None:
+            task_config["continue_on_module_failure"] = bool(body.continue_on_module_failure)
     return svc.create_task(
         db,
         project_id=body.project_id,
@@ -450,4 +454,3 @@ async def get_task_checkpoint(task_id: str, db: Session = Depends(get_db)):
         "checkpoint_dir": str(checkpoint_dir),
         **summary,
     }
-

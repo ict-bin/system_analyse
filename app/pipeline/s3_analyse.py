@@ -79,8 +79,21 @@ class AnalyseStage(BaseStage):
                         ctx, mod_name,
                         w_sys_prompt, j_sys_prompt, reflect_prompt,
                     )
-                except (StageError, PiFatalError) as e:
+                except PiFatalError as e:
                     s3_errors.append(e)
+                except StageError as e:
+                    if ctx.continue_on_module_failure:
+                        ctx.record_soft_module_failure(
+                            stage="analyse",
+                            module_name=mod_name,
+                            error=str(e),
+                            session_file=ctx.session_path("analyse", f"{mod_name}.jsonl"),
+                            artifact_paths=[str(ctx.module_dir(mod_name) / "module_report.md")],
+                            extra={"soft_failed": True},
+                            record_round="已达最大轮数" not in str(e),
+                        )
+                    else:
+                        s3_errors.append(e)
 
         results = await asyncio.gather(
             *[_analyse_one(m) for m in final_modules],

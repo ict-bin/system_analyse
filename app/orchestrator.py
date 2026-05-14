@@ -103,6 +103,7 @@ class Orchestrator:
             f"binary_arch                = {cfg.binary_arch}",
             f"security_focus_categories  = {cfg.security_focus_categories}",
             f"module_granularity         = {cfg.module_granularity}",
+            f"continue_on_module_failure = {cfg.continue_on_module_failure}",
             f"parallel_modules           = {cfg.parallel_modules}",
             f"parallel_sub_workers       = {cfg.parallel_sub_workers}",
             f"stages.classify            = {_stage_str(cfg.stages.classify)}",

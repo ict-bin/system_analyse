@@ -247,6 +247,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "") -> TaskCon
         max_rounds_exceeded_action=normalize_max_rounds_exceeded_action(
             getattr(svc, "max_rounds_exceeded_action", None)
         ),
+        continue_on_module_failure=bool(getattr(svc, "continue_on_module_failure", True)),
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
         agent_timeout_seconds=svc.agent_timeout_seconds,

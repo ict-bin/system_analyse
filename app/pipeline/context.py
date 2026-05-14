@@ -109,6 +109,9 @@ class PipelineContext:
     modules_needing_reclassify: list[str] = field(default_factory=list)
     """Stage 3 要求重新细分的模块"""
 
+    soft_failed_modules: list[dict] = field(default_factory=list)
+    """记录被允许跳过的模块级失败，供汇总与日志使用"""
+
     # ══════════════════════════════════════════════════════════
     # Stage 4 输出
     # ══════════════════════════════════════════════════════════
@@ -161,6 +164,60 @@ class PipelineContext:
                 msg=f"evaluation round write failed: {exc}",
             )
             return None
+
+    @property
+    def continue_on_module_failure(self) -> bool:
+        return bool(getattr(self.cfg, "continue_on_module_failure", True))
+
+    def record_soft_module_failure(
+        self,
+        *,
+        stage: str,
+        module_name: str,
+        error: str,
+        session_file: str = "",
+        artifact_paths: list[str] | None = None,
+        extra: dict | None = None,
+        record_round: bool = True,
+    ) -> None:
+        payload = {
+            "stage": stage,
+            "module_name": module_name,
+            "error": error,
+            "session_file": session_file,
+            "artifact_paths": artifact_paths or [],
+        }
+        if extra:
+            payload["extra"] = extra
+        self.soft_failed_modules.append(payload)
+        self.emit_event(
+            "log",
+            level="warn",
+            msg=f"[{stage}] 模块 {module_name} 失败，但任务按配置继续推进: {error}",
+        )
+        if record_round:
+            now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+            self.record_evaluation_round(
+                module_name=module_name,
+                stage=stage,
+                stage_round=0,
+                status="failed",
+                started_at=now,
+                ended_at=now,
+                duration_ms=0.0,
+                worker={
+                    "model": self.wm("analyse" if stage in {"analyse", "3-redo-s4"} else "refine"),
+                    "session_file": session_file,
+                    "token_usage": None,
+                    "error": error,
+                },
+                judges=[],
+                passed_by_vote=False,
+                module_completed=False,
+                completion_reason="error",
+                artifact_paths=artifact_paths or [],
+                extra=extra,
+            )
 
     # ── Worker / Judge 参数构建 ────────────────────────────────
 

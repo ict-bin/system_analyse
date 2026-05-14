@@ -676,7 +676,15 @@ class TaskService:
             from app.service.config_service import get_config_service
             proj_cfg = get_config_service().get_config(db, row.project_id)
             tcfg = row.task_config_json or {}
-            _fields = ("analyse_targets", "binary_arch", "security_focus_categories", "module_granularity")
+            _fields = (
+                "analyse_targets",
+                "binary_arch",
+                "security_focus_categories",
+                "module_granularity",
+                "filter_engine",
+                "enable_final_check",
+                "continue_on_module_failure",
+            )
             effective: dict = {}
             source: dict = {}   # 每个字段的来源："task"或"project"
             for _f in _fields:
@@ -814,7 +822,14 @@ class TaskService:
         # 快照项目配置中的关键字段，确保任务配置自包含，不依赖重跑时项目配置的当前状态
         # 未显式传入的字段（security_focus_categories / module_granularity / binary_arch）
         # 从项目配置读取并写入 task_config_json，防止重跑时项目配置变更导致运行参数隐性改变
-        _snap_fields = ("security_focus_categories", "module_granularity", "binary_arch")
+        _snap_fields = (
+            "security_focus_categories",
+            "module_granularity",
+            "binary_arch",
+            "filter_engine",
+            "enable_final_check",
+            "continue_on_module_failure",
+        )
         _missing_snap = [k for k in _snap_fields if k not in effective_task_config]
         if _missing_snap:
             try:
@@ -1108,6 +1123,12 @@ class TaskService:
                 svc.security_focus_categories = tcfg["security_focus_categories"]
             if tcfg.get("module_granularity"):
                 svc.module_granularity = tcfg["module_granularity"]
+            if tcfg.get("filter_engine"):
+                svc.filter_engine = tcfg["filter_engine"]
+            if "enable_final_check" in tcfg:
+                svc.enable_final_check = bool(tcfg["enable_final_check"])
+            if "continue_on_module_failure" in tcfg:
+                svc.continue_on_module_failure = bool(tcfg["continue_on_module_failure"])
             # 断点续跑由文件系统 .checkpoint/ 目录驱动，
             # 不再从 task_config_json 读取 start_stage/resume_workspace。
             # Use row.output_path as the working root so the Orchestrator writes to
