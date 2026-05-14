@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time as _time
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 
@@ -14,6 +15,7 @@ from app.db.models import AppSaTask
 from app.logging_utils import log_event
 from app.models import SwarmEvent
 from app.orchestrator import Orchestrator
+from app.service.event_log import append_events, write_final, events_path
 from app.service.task_repository import TaskRepository
 from app.service.worker_dispatcher import WORKER_INSTANCE_ID, lease_deadline
 
@@ -25,7 +27,7 @@ class TaskRunnerDependencies:
     get_db: Callable[[], object]
     acquire_execution_lock: Callable[[str | None, str, int], object | None]
     clear_task_execution_lock: Callable[[str | None, str], None]
-    flush_stages: Callable[[str, list[dict]], None]
+    flush_stages: Callable[[str, list[dict]], None]  # kept for legacy _execute_task path
     load_svc_config_from_db: Callable[[Session, str], object]
     infer_analysis_mode: Callable[[AppSaTask], str]
     security_filter_log_payload_resolved: Callable[[dict | None], dict]
@@ -55,6 +57,8 @@ class TaskRunner:
         output_path_for_lock: str | None = None
         last_stage_flush_ts = 0.0
         last_stage_flush_count = 0
+        # events_file 在 _prepare_task_execution 返回后才可知，先用 None
+        events_file: Path | None = None
 
         def on_event(event: SwarmEvent) -> None:
             nonlocal last_stage_flush_ts, last_stage_flush_count
@@ -65,13 +69,23 @@ class TaskRunner:
                 buffered_count >= self._settings.task_stage_flush_batch_size
                 or (last_stage_flush_ts > 0.0 and (now_ts - last_stage_flush_ts) >= self._settings.task_stage_flush_min_interval_seconds)
             ):
-                self._deps.flush_stages(task_id, event_buffer)
+                # 增量写文件（存在 events_file），否则降级写 DB
+                if events_file is not None:
+                    append_events(events_file, event_buffer[last_stage_flush_count:])
+                else:
+                    self._deps.flush_stages(task_id, event_buffer)
                 last_stage_flush_ts = now_ts
                 last_stage_flush_count = len(event_buffer)
 
         try:
             task_snapshot, cfg = self._prepare_task_execution(task_id, lease_epoch, on_event)
             output_path_for_lock = task_snapshot.output_path
+            # 现在可以确定 events_file 路径
+            events_file = events_path(task_snapshot.output_path, task_id)
+            # 如果在 _prepare 期间 on_event 已经被触发过（极少发生），补刷一次
+            if event_buffer:
+                append_events(events_file, event_buffer)
+                last_stage_flush_count = len(event_buffer)
             orch = Orchestrator(config=cfg, on_event=on_event)
             task_supervisor = asyncio.create_task(
                 self._supervise_running_task(task_id, lease_epoch, orch),
@@ -85,8 +99,12 @@ class TaskRunner:
                     await task_supervisor
                 except asyncio.CancelledError:
                     pass
-            self._deps.flush_stages(task_id, event_buffer)
-            self._persist_task_result(task_id, lease_epoch, task_snapshot, result, event_buffer)
+            # 最终增量刷新剩余 events
+            if events_file is not None:
+                append_events(events_file, event_buffer[last_stage_flush_count:])
+            else:
+                self._deps.flush_stages(task_id, event_buffer)
+            self._persist_task_result(task_id, lease_epoch, task_snapshot, result, event_buffer, events_file)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -98,7 +116,7 @@ class TaskRunner:
                 task_id=task_id,
                 error=str(exc),
             )
-            self._persist_task_error(task_id, lease_epoch, event_buffer, exc)
+            self._persist_task_error(task_id, lease_epoch, event_buffer, exc, events_file)
         finally:
             self._deps.remove_running_task(task_id)
             self._deps.clear_task_execution_lock(output_path_for_lock, task_id)
@@ -202,7 +220,10 @@ class TaskRunner:
         task_snapshot: object,
         result: object,
         event_buffer: list[dict],
+        events_file: Path | None = None,
     ) -> None:
+        # 先写文件（包含 __final__ 标记）
+        write_final(events_file, event_buffer)
         db_gen = self._deps.get_db()
         db = next(db_gen)
         try:
@@ -225,7 +246,6 @@ class TaskRunner:
                 result_status=result.status.value if result else "error",
                 result_json=result_json,
                 result_error=result_error,
-                stages_json={"events": [dict(e) for e in event_buffer], "final": True},
             )
             if not updated:
                 return
@@ -235,7 +255,13 @@ class TaskRunner:
             except StopIteration:
                 pass
 
-    def _persist_task_error(self, task_id: str, lease_epoch: int, event_buffer: list[dict], exc: Exception) -> None:
+    def _persist_task_error(
+        self, task_id: str, lease_epoch: int,
+        event_buffer: list[dict], exc: Exception,
+        events_file: Path | None = None,
+    ) -> None:
+        # 先写文件（包含 __final__ 标记）
+        write_final(events_file, event_buffer)
         try:
             db_gen = self._deps.get_db()
             db = next(db_gen)
@@ -245,7 +271,6 @@ class TaskRunner:
                     task_id=task_id,
                     lease_epoch=lease_epoch,
                     error=str(exc),
-                    stages_json={"events": [dict(e) for e in event_buffer], "final": True},
                 )
             finally:
                 try:

@@ -380,8 +380,9 @@ async def get_task_reflection(task_id: str, db: Session = Depends(get_db)):
 
 @router.get("/tasks/{task_id}/logs")
 async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
-    """Return stages_json for the task (stage events used as structured log stream)."""
+    """Return events stream for the task (from events.jsonl file, with DB fallback)."""
     from app.db.models import AppSaTask
+    from app.service.event_log import read_events, events_path
     row = db.query(AppSaTask).filter(
         AppSaTask.task_id == task_id,
         AppSaTask.is_deleted.is_(False),
@@ -389,10 +390,14 @@ async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
     if not row:
         from fastapi import HTTPException
         raise HTTPException(404, f"任务不存在: {task_id}")
+    data = read_events(
+        events_path(row.output_path, task_id),
+        row.stages_json,
+    )
     return {
         "task_id": task_id,
         "status": row.status,
-        "stages_json": row.stages_json or {"events": []},
+        "stages_json": data,
     }
 
 

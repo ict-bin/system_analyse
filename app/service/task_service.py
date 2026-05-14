@@ -28,6 +28,7 @@ from app.service.config_service import get_worker_task_concurrency as _get_worke
 from app.service.task_query_service import TaskQueryService
 from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
 from app.service.task_repository import TaskRepository
+from app.service.event_log import append_events, write_final, read_events, events_path as _events_path
 from app.service.runtime_control_service import get_runtime_control_service
 from app.service.runner_registry_service import (
     RUNNER_STATUS_ACTIVE,
@@ -534,6 +535,10 @@ def generate_prompt_from_path(input_path: str, analysis_mode: str | None = None)
 
 
 def _flush_stages(task_id: str, events: list[dict]) -> None:
+    """Legacy flush path (used by _execute_task废弃路径 and as fallback).
+    新代码路径通过 event_log.append_events 直接写文件，不再经过此函数。
+    此函数保留以兼容尚未迁移的老代码路径。
+    """
     try:
         from sqlalchemy.orm.attributes import flag_modified
         from app.db import get_db as _get_db
@@ -1227,7 +1232,10 @@ class TaskService:
             "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
             "error": row.error,
             "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
-            "stages_json": row.stages_json if include_heavy else None,
+            "stages_json": read_events(
+                _events_path(row.output_path, row.task_id),
+                row.stages_json,
+            ) if include_heavy else None,
             "task_config_json": row.task_config_json if include_heavy else None,
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),

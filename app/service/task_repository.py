@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.db.models import AppSaTask
+from app.service.event_log import clear_events, events_path
 from app.time_utils import now_local
 
 
@@ -142,7 +143,7 @@ class TaskRepository:
         row.status = "pending"
         row.started_at = None
         row.finished_at = None
-        row.stages_json = None
+        row.stages_json = None  # 清除旧 DB 字段
         row.result_json = None
         row.error = None
         row.dispatcher_instance_id = None
@@ -151,6 +152,8 @@ class TaskRepository:
         flag_modified(row, "task_config_json")
         db.commit()
         db.refresh(row)
+        # 同步清除 events.jsonl（重跑从头）
+        clear_events(events_path(row.output_path, row.task_id))
         return row
 
     @staticmethod
@@ -322,6 +325,7 @@ class TaskRepository:
         return bool(updated)
 
     @staticmethod
+    @staticmethod
     def finalize_task_result(
         db: Session,
         *,
@@ -331,15 +335,15 @@ class TaskRepository:
         result_status: str,
         result_json: dict | None,
         result_error: str | None,
-        stages_json: dict,
     ) -> bool:
+        """Finalize task status/result. stages_json is no longer written to DB
+        (events are persisted to {output_path}/{task_id}/run/events.jsonl by event_log)."""
         values = {
             "status": result_status,
             "finished_at": now_local(),
             "dispatcher_instance_id": None,
             "dispatch_started_at": None,
             "lease_expires_at": None,
-            "stages_json": stages_json,
         }
         if result_json is not None:
             values["result_json"] = result_json
@@ -359,14 +363,16 @@ class TaskRepository:
         return True
 
     @staticmethod
+    @staticmethod
     def finalize_task_error(
         db: Session,
         *,
         task_id: str,
         lease_epoch: int,
         error: str,
-        stages_json: dict,
     ) -> bool:
+        """Finalize task as error. stages_json no longer written to DB
+        (events persisted to events.jsonl by event_log)."""
         db.rollback()
         row = db.query(AppSaTask).filter_by(task_id=task_id).first()
         if not row or row.status != "running":
@@ -377,7 +383,6 @@ class TaskRepository:
         row.dispatcher_instance_id = None
         row.dispatch_started_at = None
         row.lease_expires_at = None
-        row.stages_json = stages_json
         if int(row.lease_epoch or 0) != lease_epoch:
             return False
         db.commit()
