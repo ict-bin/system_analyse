@@ -45,7 +45,28 @@
 
 ## Phase B: 逐模块分析
 
-分析时先读取 `files.list` 获取文件列表，再用 `read target/<相对路径>` 格式读取源文件内容。
+### ⚠️ 文件信息获取规则（details/ 优先，严格遵守）
+
+**优先从 `details/` 目录获取文件信息，禁止无理由直接读源文件。**
+
+1. **先查 `details/<rel_path>.json`**（如目录存在）：
+   - 包含类型/摘要/符号表/函数名等结构化信息，通常已足够分析
+   - ELF 文件：`symbols`/`imports`/`needed` 字段已完整，**绝对禁止**再用 `nm`/`readelf`/`strings`
+   - 文本文件：`summary`/`functions` 字段通常已够用
+
+2. **满足以下任一条件才允许 `read target/<path>`**：
+   - details JSON 不存在（`details/` 目录未生成）
+   - details 中的 `summary` 字段被标注为 `[需补充]` 或为空
+   - 文本文件的分析需要具体代码行/行号（details 只含摘要时）
+   - 被截断的文本文件需要获取后半部分内容
+
+3. **绝对禁止**：
+   - 对 ELF 文件运行 `nm` / `readelf` / `strings` / `file` 命令
+   - 对摘要充分的文件批量 `read`
+   - "逐个读取文件后再分析"——应逐个查 details JSON 后再分析
+
+分析时先读取 `files.list` 获取文件列表，再**优先查 `details/<相对路径>.json`**，
+信息不足时才用 `read target/<相对路径>` 读取源文件内容。
 
 对每个模块独立完成分析，将结果写入该模块目录的 `module_report.md`：
 
@@ -75,7 +96,7 @@
 # 质量要求
 1. **引用具体位置**：每个发现必须标注文件名
 2. **不臆造**：只报告确实存在的问题
-3. **不遗漏**：使用 `read` 逐个读取文件后再分析（二进制文件根据文件名推断即可）
+3. **不遗漏**：优先查 `details/<path>.json` 逐个获取信息；details 不存在时才 `read target/<path>`（ELF 二进制根据 details 中的 symbols 或文件名推断，无需 read）
 4. **可操作**：修复建议必须具体
 
 ---
@@ -84,7 +105,8 @@
 
 ## 读取目标文件
 使用 `target/<相对路径>` 格式（通过 workspace 下的 `target/` 符号链接）：
-- ✅ `read target/lib/libbgp.so`
+- ✅ `read details/lib/libbgp.so.json`（优先查 details JSON）
+- ✅ `read target/lib/libbgp.so`（仅当 details 不存在或摘要不足时）
 - ❌ `read /data/target/lib/libbgp.so`（绝对路径，运行时可能不可达）
 
 ## files.list 中的路径格式

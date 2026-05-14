@@ -29,6 +29,7 @@ from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module, pre_read_module_with_details,
+    load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
 )
@@ -429,6 +430,22 @@ class AnalyseStage(BaseStage):
             feedback = "# 重分类要求\n\nStage 3 分析发现该模块分类不合理，需要重新细分。"
             if _sec_focus_hint:
                 feedback += _sec_focus_hint  # 注入安全维度约束
+
+            # ── 为 redo 的 refine Worker 预加载 details/ 摘要（节省 token）─────────────
+            _details_dir = workspace / "details"
+            if _details_dir.exists() and mod_dir.exists():
+                _flist = [l.strip() for l in (mod_dir / "files.list").read_text("utf-8",errors="replace").splitlines() if l.strip()] if (mod_dir / "files.list").exists() else []
+                if _flist:
+                    _det_summary, _unclear = load_details_for_module(_details_dir, _flist, cfg.target_dir)
+                    if _det_summary:
+                        feedback += (
+                            "\n\n## 模块文件摘要（来自 details/ 预处理）\n\n"
+                            + _det_summary[:3000]
+                            + ("\n（…摘要已截断）" if len(_det_summary) > 3000 else "")
+                        )
+                        ctx.emit_event("log", level="info",
+                                       msg=(f"[S3-2redo] {mod_name}: 注入 details 摘要"
+                                            f"（{len(_flist)}个文件，{len(_unclear)}个需补充）"))
 
             for attempt in range(max_iter(s_cfg_refine)):
                 ctx.emit_event("stage", stage="2-redo", module=mod_name, attempt=attempt + 1)

@@ -131,7 +131,10 @@ while IFS= read -r rel; do
 done < "$SOURCE"
 ```
 
-## 策略 2：文件名无语义时（按内容关键词）
+## 策略 2：文件名无语义时（按 details/ 信息推断）
+
+**优先查 `details/<path>.json` 的 `keywords`/`suggested_module` 字段，
+禁止对 ELF 文件运行 `strings`/`nm`/`readelf` 命令（details 已有提取结果）。**
 
 ```bash
 #!/bin/bash
@@ -139,9 +142,14 @@ SOURCE="filtered_files.txt"
 [ ! -f "$SOURCE" ] && find target -type f | sed 's|^target/||' > /tmp/s.txt && SOURCE=/tmp/s.txt
 
 while IFS= read -r rel; do
-    # target/ 是 workspace 中指向目标目录的符号链接
-    f="target/$rel"
-    kw=$(strings "$f" 2>/dev/null | head -100 | grep -oiE "bgp|ospf|dhcp|ipsec|ssh|mpls|kernel|driver" | head -1 | tr '[:upper:]' '[:lower:]')
+    # 优先查 details/<path>.json 中的 suggested_module 字段
+    detail_json="details/${rel}.json"
+    kw=""
+    if [ -f "$detail_json" ]; then
+        kw=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('suggested_module','') or d.get('keywords',[''])[0] or '')" "$detail_json" 2>/dev/null | tr -d '"'"' ')
+    fi
+    # Fallback：从文件路径名提取关键词
+    [ -z "$kw" ] && kw=$(echo "$rel" | grep -oiE "bgp|ospf|dhcp|ipsec|ssh|mpls|kernel|driver|auth|ssl|tls|http|dns|snmp" | head -1 | tr "[:upper:]" "[:lower:]")
     [ -z "$kw" ] && kw="unknown"
     mkdir -p "modules/$kw"
     echo "$rel" >> "modules/$kw/files.list"

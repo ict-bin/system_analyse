@@ -8,8 +8,10 @@
    - 再次 `read files.list`，逐行对照报告，查漏补缺
 
 2. **分析准确性**：每个文件的功能描述是否与实际内容一致？
-   - 对于文本文件，是否用 `read` 读取了内容后再描述？
-   - 二进制文件是否根据文件名和路径做了合理推断？
+   - 先查 `details/<path>.json` 的 `summary`/`functions`/`symbols` 字段，确认描述与 details 信息匹配
+   - 若描述与 details 摘要明显矛盾，查 details JSON 更正，**不要直接 read 源文件**（除非 details 不存在或摘要为空/[需补充]）
+   - ELF 文件：基于 details 中的 symbols/imports 字段核查，禁止用 nm/readelf
+   - 文本文件：details 中的 summary/functions 通常已够，只有需要具体行号时才 read
 
 3. **分类自检**：是否在报告中做了分类合理性判断？
    - 如发现有文件不属于本模块，是否标注了 `[分类问题]`？

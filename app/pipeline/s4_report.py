@@ -29,7 +29,7 @@ from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
-    archive_file, max_iter, pre_read_module,
+    archive_file, max_iter, pre_read_module, pre_read_module_with_details,
     generate_modules_list, strip_target_prefix,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
@@ -129,10 +129,13 @@ class CompletenessCheckStage(BaseStage):
             )
             ctx.tokens += ar.token_usage
 
-            # Stage 3 补做（预读内容）
+            # Stage 3 补做（预读内容，优先复用 details/ JSON）
             loop = __import__("asyncio").get_event_loop()
+            _details_dir = ctx.workspace / "details"
+            _details_dir_opt = _details_dir if _details_dir.exists() else None
             pre_content = await loop.run_in_executor(
-                None, pre_read_module, cfg.target_dir, mod_dir
+                None, pre_read_module_with_details,
+                cfg.target_dir, mod_dir, _details_dir_opt
             )
             w_sys_s4 = w_sys_analyse.replace("{{PRE_READ_CONTENT}}", pre_content) \
                                      .replace("{{MODULE_NAME}}", mod_name)

@@ -7,13 +7,32 @@
 # 文件访问说明
 
 - 模块文件在 `modules/<模块名>/` 下：`module_report.md`、`files.list`
-- 如需抽查实际源文件，路径格式为 `target/<files.list中的相对路径>`，例如 `target/src/foo.c`
+- **优先**通过 `details/<rel_path>.json` 验证 Worker 的分析准确性（比读源文件更快，有 symbols/functions/summary）
+- 如需抽查实际文件内容，路径格式为 `target/<files.list中的相对路径>`，例如 `target/src/foo.c`
 - **严禁使用 `prescan/` 目录判断文件完整性**：prescan 是预扫描的关键词匹配中间产物，
   其内文件数量与模块 `files.list` 必然不同；**模块所包含的文件以 `modules/<模块名>/files.list` 为唯一标准**
+
+# ⚠️ 抽查文件信息规则（details/ 优先）
+
+**抽查时按以下优先级获取文件信息：**
+
+1. **先查 `details/<rel_path>.json`**（ELF 文件用此验证符号表和依赖库，文本文件用此验证功能描述）
+   ```bash
+   read details/lib/libfoo.so.json   # 验证 Worker 描述的 symbols 是否与 details 一致
+   read details/src/auth.c.json      # 验证功能摘要和函数名是否准确
+   ```
+2. **仅在以下情况读 `target/<path>`**：
+   - details/ 目录不存在
+   - details 中 `summary` 为空或 `[需补充]`
+   - 需验证 Worker 报告中引用的具体代码行/行号
+
+3. **ELF 文件**：用 details 中的 `symbols`/`imports` 字段核查，**禁止用 nm/readelf/strings**
+
 # 步骤
 
 1. 使用 `read` 读取 `modules/<模块名>/module_report.md`
-2. 使用 `read` 读取 `modules/<模块名>/files.list`，按需抽查少数关键文件（路径格式：`target/<files.list中的路径>`）
+2. 使用 `read` 读取 `modules/<模块名>/files.list`，按需抽查少数关键文件：
+   **先查 `details/<path>.json`，details 不足时才 `read target/<path>`**
 3. 检查以下维度：
 
 ## 评分维度
