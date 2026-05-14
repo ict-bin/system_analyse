@@ -10,8 +10,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.db.models import AppSaModelsConfig
+from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
 from app.service.service_role import is_runner_role
-from app.service.worker_dispatcher import WORKER_INSTANCE_ID, WORKER_TASK_CONCURRENCY
+from app.service.worker_dispatcher import WORKER_INSTANCE_ID
 from app.time_utils import now_local
 
 logger = logging.getLogger("sa.runner_registry")
@@ -74,10 +75,11 @@ class RunnerRegistryService:
         db: Session = next(db_gen)
         try:
             key = runner_registry_key(WORKER_INSTANCE_ID)
+            capacity = max(1, int(_get_worker_task_concurrency_from_db(db)))
             payload = {
                 "instance_id": WORKER_INSTANCE_ID,
                 "status": RUNNER_STATUS_ACTIVE,
-                "capacity": WORKER_TASK_CONCURRENCY,
+                "capacity": capacity,
                 "running_tasks": self._get_running_tasks_count(),
                 "role": "runner",
                 "heartbeat_ts": now_local().isoformat(),

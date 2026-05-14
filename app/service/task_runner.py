@@ -132,6 +132,11 @@ class TaskRunner:
             if tcfg.get("module_granularity"):
                 svc.module_granularity = tcfg["module_granularity"]
             # 断点续跑由文件系统 .checkpoint/ 驱动，不再读取 start_stage/resume_workspace
+            if tcfg.get("filter_engine"):
+                svc.filter_engine = tcfg["filter_engine"]
+            if "enable_final_check" in tcfg:
+                svc.enable_final_check = bool(tcfg["enable_final_check"])
+            # 断点续跑由文件系统 .checkpoint/ 驱动，不再读取 start_stage/resume_workspace
             if row.output_path:
                 svc.output_dir = row.output_path
                 svc.archive_dir = row.output_path

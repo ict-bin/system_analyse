@@ -1,13 +1,107 @@
 from __future__ import annotations
 
 import json
-import time as _time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from sqlalchemy.orm import Session
 
 from app.db.models import AppSaTask
+from app.service.session_index import build_session_catalog
+
+
+def _normalize_evaluation_round_status(payload: dict) -> dict:
+    normalized = dict(payload)
+    raw_status = str(normalized.get("status") or "").strip()
+    ended_at = normalized.get("ended_at")
+    completion_reason = str(normalized.get("completion_reason") or "").strip()
+    module_completed = bool(normalized.get("module_completed"))
+    metrics = normalized.get("metrics") if isinstance(normalized.get("metrics"), dict) else {}
+    passed_by_vote = bool(metrics.get("passed_by_vote"))
+
+    effective_status = raw_status
+    if raw_status == "running" and ended_at:
+        if completion_reason == "reclassify_required":
+            effective_status = "reclassify_required"
+        elif module_completed or completion_reason in {"passed", "max_rounds_exceeded_treated_as_passed"}:
+            effective_status = "passed"
+        elif passed_by_vote:
+            effective_status = "needs_reflection"
+        else:
+            effective_status = "needs_retry"
+
+    normalized["raw_status"] = raw_status
+    normalized["status"] = effective_status
+    return normalized
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_enable_final_check(row: AppSaTask) -> bool | None:
+    raw_task_config = getattr(row, "task_config_json", None)
+    task_config = raw_task_config if isinstance(raw_task_config, dict) else {}
+    snapshot = task_config.get("resolved_config_snapshot") if isinstance(task_config.get("resolved_config_snapshot"), dict) else None
+    if snapshot and "enable_final_check" in snapshot:
+        return bool(snapshot.get("enable_final_check"))
+    if "enable_final_check" in task_config:
+        return bool(task_config.get("enable_final_check"))
+    return None
+
+
+def _compute_missing_files(workspace_root: Path) -> tuple[list[str], list[str]]:
+    warnings: list[str] = []
+    filtered_files_path = workspace_root / "filtered_files.txt"
+    modules_root = workspace_root / "modules"
+
+    if not filtered_files_path.is_file():
+        warnings.append("filtered_files.txt 缺失，无法计算遗漏文件")
+        return [], warnings
+
+    try:
+        all_target = {
+            line.strip()
+            for line in filtered_files_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+    except Exception as exc:
+        warnings.append(f"filtered_files.txt 读取失败: {exc}")
+        return [], warnings
+
+    if not modules_root.exists() or not modules_root.is_dir():
+        warnings.append("modules 目录缺失，无法计算遗漏文件")
+        return [], warnings
+
+    classified_files: set[str] = set()
+    module_dirs = sorted(path for path in modules_root.iterdir() if path.is_dir() and not path.name.startswith("."))
+    if not module_dirs:
+        warnings.append("modules 目录为空，无法计算遗漏文件")
+        return [], warnings
+
+    files_list_found = False
+    for module_dir in module_dirs:
+        files_list_path = module_dir / "files.list"
+        if not files_list_path.is_file():
+            warnings.append(f"模块 {module_dir.name} 缺失 files.list")
+            continue
+        files_list_found = True
+        try:
+            lines = [line.strip() for line in files_list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if not lines:
+                warnings.append(f"模块 {module_dir.name} 的 files.list 为空")
+                continue
+            for normalized in lines:
+                classified_files.add(normalized)
+        except Exception as exc:
+            warnings.append(f"{files_list_path.relative_to(workspace_root)} 读取失败: {exc}")
+
+    if not files_list_found:
+        warnings.append("未发现任何模块 files.list，无法计算遗漏文件")
+        return [], warnings
+
+    return sorted(all_target - classified_files), warnings
 
 
 class TaskQueryService:
@@ -24,6 +118,7 @@ class TaskQueryService:
         task_run_root: Callable[[AppSaTask], Path | None],
         resolve_session_path: Callable[[Path, str], Path],
         parse_session_jsonl_file: Callable[[Path], tuple[dict, list[dict], list[str], int]],
+        write_json_atomic: Callable[[Path, dict], None],
     ) -> None:
         self._get_or_404 = get_or_404
         self._read_text_if_exists = read_text_if_exists
@@ -35,6 +130,7 @@ class TaskQueryService:
         self._task_run_root = task_run_root
         self._resolve_session_path = resolve_session_path
         self._parse_session_jsonl_file = parse_session_jsonl_file
+        self._write_json_atomic = write_json_atomic
 
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -138,40 +234,48 @@ class TaskQueryService:
             "warnings": warnings,
         }
 
+    def _build_session_catalog(self, row: AppSaTask) -> dict:
+        sessions_root = self._task_sessions_root(row)
+        run_root = self._task_run_root(row)
+        if not sessions_root or not sessions_root.is_dir() or not run_root or not run_root.is_dir():
+            return {
+                "task_id": row.task_id,
+                "status": row.status,
+                "sessions_root": str(sessions_root) if sessions_root else None,
+                "index_path": str((sessions_root / "index.json")) if sessions_root else None,
+                "generated_at": None,
+                "items": [],
+                "index": None,
+                "warnings": [],
+            }
+        return build_session_catalog(
+            task_id=row.task_id,
+            row_status=row.status,
+            sessions_root=sessions_root,
+            run_root=run_root,
+            parse_session_jsonl_file=self._parse_session_jsonl_file,
+            write_json_atomic=self._write_json_atomic,
+        )
+
     def list_task_sessions(self, db: Session, task_id: str) -> list[dict]:
         row = self._get_or_404(db, task_id)
-        sessions_root = self._task_sessions_root(row)
-        if not sessions_root or not sessions_root.is_dir():
-            return []
-        now_ts = _time.time()
-        items: list[dict] = []
-        for session_file in sorted(sessions_root.rglob("*.jsonl")):
-            try:
-                relative_path = str(session_file.relative_to(sessions_root)).replace("\\", "/")
-                relative_parts = relative_path.split("/")
-                stage_group = relative_parts[0] if len(relative_parts) > 1 else "root"
-                session_name = session_file.stem
-                _, events, warnings, line_count = self._parse_session_jsonl_file(session_file)
-                stat = session_file.stat()
-                is_active = row.status in ("pending", "running") and (now_ts - stat.st_mtime) <= 120
-                display_name = session_name if stage_group == "root" else f"{stage_group} / {session_name}"
-                items.append({
-                    "session_id": session_name,
-                    "session_name": session_name,
-                    "relative_path": relative_path,
-                    "stage_group": stage_group,
-                    "role_name": session_name,
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "event_count": len(events),
-                    "line_count": line_count,
-                    "is_active": is_active,
-                    "display_name": display_name,
-                    "warnings": warnings,
-                })
-            except Exception:
-                continue
-        return sorted(items, key=lambda item: (item["stage_group"], -item["mtime"], item["relative_path"]))
+        return self._build_session_catalog(row).get("items") or []
+
+    def get_task_session_index(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        catalog = self._build_session_catalog(row)
+        return {
+            "task_id": catalog.get("task_id"),
+            "status": catalog.get("status"),
+            "sessions_root": catalog.get("sessions_root"),
+            "index_path": catalog.get("index_path"),
+            "generated_at": catalog.get("generated_at"),
+            "summary": (catalog.get("index") or {}).get("summary") or {},
+            "nodes": (catalog.get("index") or {}).get("nodes") or [],
+            "edges": (catalog.get("index") or {}).get("edges") or [],
+            "groups": (catalog.get("index") or {}).get("groups") or [],
+            "warnings": list(dict.fromkeys((catalog.get("warnings") or []) + (((catalog.get("index") or {}).get("warnings")) or []))),
+        }
 
     def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -222,6 +326,25 @@ class TaskQueryService:
             except Exception as exc:
                 warnings.append(f"evaluation_summary.json 读取失败: {exc}")
 
+        final_check_enabled = _resolve_enable_final_check(row)
+        if final_check_enabled is False:
+            if summary is None:
+                summary = {}
+            workspace_root = run_root / "workspace"
+            if not workspace_root.exists() or not workspace_root.is_dir():
+                warnings.append("workspace 目录缺失，无法计算遗漏文件")
+                missing_files: list[str] = []
+            else:
+                missing_files, missing_warnings = _compute_missing_files(workspace_root)
+                warnings.extend(missing_warnings)
+            summary.update({
+                "final_check_disabled": True,
+                "missing_file_count": len(missing_files),
+                "missing_files": missing_files,
+                "missing_files_preview": missing_files[:20],
+                "missing_files_computed_at": _utc_now_iso(),
+            })
+
         rounds: list[dict] = []
         for round_dir in sorted(run_root.glob("round_*")):
             if not round_dir.is_dir():
@@ -237,6 +360,7 @@ class TaskQueryService:
                 if not isinstance(payload, dict):
                     warnings.append(f"{path.relative_to(run_root)} 格式不是对象")
                     continue
+                payload = _normalize_evaluation_round_status(payload)
                 payload.setdefault("source_path", str(path))
                 rounds.append(payload)
 

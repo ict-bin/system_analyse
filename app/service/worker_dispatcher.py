@@ -13,6 +13,7 @@ from typing import Callable
 from sqlalchemy.orm import Session
 
 from app.db.models import AppSaTask
+from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
 from app.service.task_repository import TaskRepository
 from app.time_utils import now_local
 
@@ -20,7 +21,7 @@ logger = logging.getLogger("sa.worker_dispatcher")
 
 WORKER_POLL_INTERVAL_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_POLL_INTERVAL", "3"))
 WORKER_POLL_JITTER_SECONDS = max(0.0, float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_POLL_JITTER", "2")))
-WORKER_TASK_CONCURRENCY = max(1, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_TASK_CONCURRENCY", "1")))
+WORKER_TASK_CONCURRENCY = max(1, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_TASK_CONCURRENCY", "4")))
 TASK_LEASE_TIMEOUT_SECONDS = max(30, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_LEASE_TIMEOUT_SECONDS", "300")))
 WORKER_OVERLOAD_COOLDOWN_SECONDS = max(5.0, float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_OVERLOAD_COOLDOWN", "30")))
 WORKER_IDLE_BACKOFF_MAX_SECONDS = max(
@@ -76,6 +77,7 @@ class WorkerRuntimeState:
     control_pause_claim_until_ts: float = 0.0
     control_reason: str | None = None
     control_updated_at: str | None = None
+    current_worker_task_concurrency: int = WORKER_TASK_CONCURRENCY
 
     def snapshot(self, running_tasks_count: int) -> dict:
         now_ts = _time.time()
@@ -106,7 +108,7 @@ class WorkerRuntimeState:
             "worker_control_updated_at": self.control_updated_at,
             "worker_poll_interval_seconds": WORKER_POLL_INTERVAL_SECONDS,
             "worker_poll_jitter_seconds": WORKER_POLL_JITTER_SECONDS,
-            "worker_task_concurrency": WORKER_TASK_CONCURRENCY,
+            "worker_task_concurrency": self.current_worker_task_concurrency,
             "worker_idle_backoff_max_seconds": WORKER_IDLE_BACKOFF_MAX_SECONDS,
             "worker_stale_sweep_interval_seconds": WORKER_STALE_SWEEP_INTERVAL_SECONDS,
             "worker_max_running_tasks_global": MAX_RUNNING_TASKS_GLOBAL,
@@ -144,6 +146,15 @@ class WorkerDispatcher:
         self._running = False
         self._task: asyncio.Task | None = None
         self._idle_sleep_seconds = WORKER_POLL_INTERVAL_SECONDS
+
+    @staticmethod
+    def _resolve_worker_task_concurrency(db: Session | None = None) -> int:
+        if db is None:
+            return WORKER_TASK_CONCURRENCY
+        try:
+            return max(1, int(_get_worker_task_concurrency_from_db(db)))
+        except Exception:
+            return WORKER_TASK_CONCURRENCY
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -197,13 +208,15 @@ class WorkerDispatcher:
         paused = _runtime_state.pause_claim_until_ts > now_ts
         if paused:
             return 0
-        available_slots = max(0, WORKER_TASK_CONCURRENCY - self._get_running_tasks_count())
-        if available_slots <= 0:
-            return 0
 
         db_gen = self._get_db()
         db: Session = next(db_gen)
         try:
+            current_concurrency = self._resolve_worker_task_concurrency(db)
+            _runtime_state.current_worker_task_concurrency = current_concurrency
+            available_slots = max(0, current_concurrency - self._get_running_tasks_count())
+            if available_slots <= 0:
+                return 0
             now = now_local()
             self._recover_stale_tasks_if_due(db, now, now_ts)
             self._apply_runtime_control(self._load_runtime_control(db), now_ts)
@@ -213,7 +226,7 @@ class WorkerDispatcher:
                 _runtime_state.last_global_capacity_remaining = None
                 _runtime_state.global_limit_reached = False
                 _runtime_state.global_claim_lock_skipped = False
-                return self._claim_pending_tasks(db, available_slots)
+                return self._claim_pending_tasks(db, available_slots, current_concurrency)
             if not self._task_repository.try_acquire_global_claim_lock(
                 db,
                 lock_key=GLOBAL_CLAIM_LOCK_KEY,
@@ -223,7 +236,7 @@ class WorkerDispatcher:
                 return 0
             _runtime_state.global_claim_lock_skipped = False
             try:
-                return self._claim_pending_tasks_with_global_limit(db, available_slots)
+                return self._claim_pending_tasks_with_global_limit(db, available_slots, current_concurrency)
             finally:
                 self._task_repository.release_global_claim_lock(db, lock_key=GLOBAL_CLAIM_LOCK_KEY)
         finally:
@@ -269,12 +282,12 @@ class WorkerDispatcher:
         )
         _runtime_state.last_stale_recovery_ts = now_ts
 
-    def _claim_pending_tasks(self, db: Session, available_slots: int) -> int:
+    def _claim_pending_tasks(self, db: Session, available_slots: int, current_concurrency: int) -> int:
         pending_rows = self._task_repository.list_pending_tasks(db, available_slots)
         claimed_count = 0
         _runtime_state.last_claim_attempt_ts = _time.time()
         for row in pending_rows:
-            if self._get_running_tasks_count() >= WORKER_TASK_CONCURRENCY:
+            if self._get_running_tasks_count() >= current_concurrency:
                 break
             dispatch_target = self._select_dispatch_target(db)
             if not dispatch_target:
@@ -288,7 +301,7 @@ class WorkerDispatcher:
             self._spawn_task(row.task_id, lease_epoch, dispatch_target)
         return claimed_count
 
-    def _claim_pending_tasks_with_global_limit(self, db: Session, available_slots: int) -> int:
+    def _claim_pending_tasks_with_global_limit(self, db: Session, available_slots: int, current_concurrency: int) -> int:
         global_running = self._task_repository.count_running_tasks(db)
         _runtime_state.last_global_running_tasks = global_running
         remaining_global_capacity = MAX_RUNNING_TASKS_GLOBAL - global_running
@@ -296,4 +309,4 @@ class WorkerDispatcher:
         _runtime_state.global_limit_reached = remaining_global_capacity <= 0
         if remaining_global_capacity <= 0:
             return 0
-        return self._claim_pending_tasks(db, min(available_slots, remaining_global_capacity))
+        return self._claim_pending_tasks(db, min(available_slots, remaining_global_capacity), current_concurrency)

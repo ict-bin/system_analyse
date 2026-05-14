@@ -147,6 +147,5 @@ class RunAgentTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 2)
         self.assertIn("timed out", result.error or "")
 
-
 if __name__ == "__main__":
     unittest.main()

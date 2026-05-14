@@ -225,7 +225,6 @@ def _stdout_idle_timeout() -> float:
         return _DEFAULT_STDOUT_IDLE_TIMEOUT_SECONDS
     return max(30.0, value)
 
-
 def _find_pi_command() -> list[str]:
     pi_bin = os.environ.get("PI_BIN")
     if pi_bin and os.path.isfile(pi_bin):

@@ -756,6 +756,30 @@ def test_refine_stage_stub():
     print("  ✅ RefineStage 骨架不崩溃")
 
 
+def test_refine_stage_reclassify_cleanup_path():
+    """补分类收尾路径不应因 helper 缺失而抛 NameError。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        setup_prompts(tmp)
+        ctx = make_ctx(tmp)
+        make_modules(ctx.workspace, ["bgp"])
+        (ctx.workspace / "filtered_files.txt").write_text("lib/libtest.so\norphan.bin\n", encoding="utf-8")
+
+        async def _fake_agent(*args, **kwargs):
+            # 模拟补分类将遗漏文件归入已有模块。
+            files = (ctx.workspace / "modules" / "bgp" / "files.list")
+            current = files.read_text(encoding="utf-8")
+            if "orphan.bin" not in current:
+                files.write_text(current + "orphan.bin\n", encoding="utf-8")
+            return make_ar("<result>已归类 1 个文件到各模块</result>")
+
+        with patch("app.pipeline.s2_refine.run_agent_checked", side_effect=_fake_agent):
+            _arun(RefineStage().execute(ctx))
+
+        assert "bgp" in ctx.refined_modules
+        assert "orphan.bin" in (ctx.workspace / "modules" / "bgp" / "files.list").read_text(encoding="utf-8")
+    print("  ✅ RefineStage 补分类收尾路径不崩溃")
+
+
 def test_analyse_stage_stub():
     """AnalyseStage 骨架：不崩溃，更新 ctx.analysed_modules。"""
     with tempfile.TemporaryDirectory() as tmp:
@@ -993,6 +1017,7 @@ TESTS = [
     test_classify_vote_mode_any,
     # stage 2/3/4 骨架
     test_refine_stage_stub,
+    test_refine_stage_reclassify_cleanup_path,
     test_analyse_stage_stub,
     test_report_stages_stub,
     # pipeline 集成

@@ -94,20 +94,24 @@ def _flush_pending():
         )
     elif stage == 2 or stage == "2-redo" or stage == "2-redo-s4":
         mod = d.get("module", "")
+        dur = _st.module_elapsed()
+        suffix = f" [{dur}]" if dur else ""
         if d.get("skipped"):
             fc = d.get("file_count", 0)
-            print(f"  ▸ {mod} ({fc} files, 跳过)")
+            print(f"  ✓ 模块 {mod} 细分完成 ({fc} files, 跳过){suffix}")
         elif d.get("split"):
             new = d.get("new_modules", [])
             names = ", ".join(new[:5])
             if len(new) > 5:
                 names += f" (+{len(new) - 5})"
-            print(f"      ↳ 拆分 → {names}")
+            print(f"  ✓ 模块 {mod} 细分完成 → 拆分为 {names}{suffix}")
         else:
-            print(f"      ↳ 保持模块不变")
+            print(f"  ✓ 模块 {mod} 细分完成 → 保持模块不变{suffix}")
     elif stage == "2-sub":
         lines = d.get("summary_lines", 0)
-        print(f"      📖 摘要完成 ({lines} 行)")
+        mod = d.get("module", "")
+        mod_prefix = f"[{mod}] " if mod else ""
+        print(f"      📖 {mod_prefix}摘要完成 ({lines} 行)")
     elif stage == 3 or stage == "3-redo" or stage == "3-redo-s4":
         mod = d.get("module", "")
         has_report = d.get("has_report")
@@ -159,7 +163,9 @@ def render_event(event: SwarmEvent, quiet: bool = False):
                 _flush_pending()
                 _st.current_module = mod
                 _st.module_start = time.time()
-                if stage != "2-sub":
+                if stage == 2 or stage == "2-redo" or stage == "2-redo-s4":
+                    print(f"  ▶ 模块 {mod} 开始{_sname(stage)}", end="", flush=True)
+                elif stage != "2-sub":
                     print(f"  ▸ {mod}", end="", flush=True)
         if stage != "2-sub" and att != _st.current_attempt:
             _st.current_attempt = att
@@ -179,8 +185,9 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         _st.pending_result = d
         if d.get("stage") == "2-sub":
             fc = d.get("file_count", 0)
+            mod = d.get("module", "")
             print(
-                f"      📖 [{mod if mod else d.get('module', '')}] 摘要完成 ({fc} 个文件)"
+                f"      📖 [{mod}] 摘要完成 ({fc} 个文件)" if mod else f"      📖 摘要完成 ({fc} 个文件)"
             )
             _flush_pending()
 

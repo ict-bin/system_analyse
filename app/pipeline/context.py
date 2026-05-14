@@ -62,6 +62,15 @@ class PipelineContext:
     filter_count: int = 0
     """过滤后文件总数"""
 
+    selected_filter_engine: str = "script"
+    """配置选择的过滤引擎"""
+
+    effective_filter_engine: str = "script"
+    """实际执行成功的过滤引擎"""
+
+    filter_fallback_reason: str = ""
+    """agent 引擎回退到脚本引擎的原因"""
+
     # ══════════════════════════════════════════════════════════
     # Stage 1 输出
     # ══════════════════════════════════════════════════════════
@@ -127,6 +136,12 @@ class PipelineContext:
 
     def module_dir(self, mod_name: str) -> Path:
         return self.modules_root() / mod_name
+
+    def session_path(self, *parts: str) -> str:
+        """返回 session 文件路径，并确保父目录存在。"""
+        path = self.sess_dir.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
 
     def emit_event(self, event_type: str, **data):
         """便捷 emit，自动带 task_id"""

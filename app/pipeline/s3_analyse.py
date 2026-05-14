@@ -26,7 +26,7 @@ from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
-    run_agent_checked, parse_eval_md, check_voting,
+    run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module, pre_read_module_with_details,
     module_has_nonempty_files,
@@ -130,8 +130,10 @@ class AnalyseStage(BaseStage):
 
         cp = ctx.checkpoint
         mod_dir = get_modules_root(str(workspace)) / mod_name
-        sess_name = f"analyse{session_suffix}-{mod_name}.jsonl"
-        analyse_session = str(ctx.sess_dir / sess_name)
+        analyse_session = ctx.session_path(
+            "analyse" if not session_suffix else f"analyse{session_suffix}",
+            f"{mod_name}.jsonl",
+        )
         report_path = mod_dir / "module_report.md"
         has_files = module_has_nonempty_files(mod_dir)
 
@@ -186,7 +188,7 @@ class AnalyseStage(BaseStage):
                 duration_ms=0.0,
                 worker={
                     "model": ctx.wm("analyse"),
-                    "session_file": str(ctx.sess_dir / sess_name),
+                    "session_file": analyse_session,
                     "token_usage": None,
                     "error": None,
                 },
@@ -243,8 +245,16 @@ class AnalyseStage(BaseStage):
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
-            ar = await run_agent_checked(
+            ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="analyse",
                 context=f"s3-analyse-{mod_name}-a{attempt+1}",
+                heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=analyse_session: {
+                    "module": module,
+                    "attempt": attempt_no,
+                    "heartbeat": beat,
+                    "session_file": session,
+                },
                 prompt="\n".join(prompt_parts),
                 model=ctx.wm("analyse"),
                 system_prompt=w_sys,
@@ -264,14 +274,29 @@ class AnalyseStage(BaseStage):
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("analyse", j_item)
-                j_ar = await run_agent_checked(
+                judge_session = ctx.session_path(
+                    "judges",
+                    "analyse" if not session_suffix else f"analyse{session_suffix}",
+                    mod_name,
+                    f"analyse-a{attempt + 1}-j{j_idx}.jsonl",
+                )
+                j_ar = await run_agent_with_stage_guard(
+                    ctx=ctx,
+                    stage="analyse",
                     context=f"s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",
+                    heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
+                        "module": module,
+                        "attempt": attempt_no,
+                        "heartbeat": beat,
+                        "judge_id": f"judge-{judge_id}",
+                        "session_file": session,
+                    },
                     prompt=f"评审模块 `{mod_name}` 的分析报告。",
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
-                    session_file=str(ctx.sess_dir / f"analyse-judge-{mod_name}-j{j_idx}-a{attempt+1}.jsonl"),
+                    session_file=judge_session,
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -283,6 +308,7 @@ class AnalyseStage(BaseStage):
                     "score": parsed["score"],
                     "passed": parsed["pass"],
                     "feedback": parsed["feedback"],
+                    "session_file": judge_session,
                     "token_usage": j_ar.token_usage,
                 })
                 ctx.emit_event("judge_eval", stage=3, judge_id=f"judge-{j_idx}",
@@ -337,7 +363,15 @@ class AnalyseStage(BaseStage):
                 module_name=mod_name,
                 stage="analyse",
                 stage_round=attempt + 1,
-                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
+                status=(
+                    "passed"
+                    if (final_pass or forced_pass)
+                    else "failed"
+                    if max_reached
+                    else "needs_reflection"
+                    if voted_pass
+                    else "needs_retry"
+                ),
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -427,7 +461,7 @@ class AnalyseStage(BaseStage):
             if not mod_dir.exists():
                 continue
 
-            refine_session = str(ctx.sess_dir / f"refine-redo-{mod_name}.jsonl")
+            refine_session = ctx.session_path("refine-redo", f"{mod_name}.jsonl")
             feedback = "# 重分类要求\n\nStage 3 分析发现该模块分类不合理，需要重新细分。"
             if _sec_focus_hint:
                 feedback += _sec_focus_hint  # 注入安全维度约束
@@ -451,8 +485,16 @@ class AnalyseStage(BaseStage):
             for attempt in range(max_iter(s_cfg_refine)):
                 ctx.emit_event("stage", stage="2-redo", module=mod_name, attempt=attempt + 1)
 
-                ar = await run_agent_checked(
+                ar = await run_agent_with_stage_guard(
+                    ctx=ctx,
+                    stage="2-redo",
                     context=f"s2-redo-{mod_name}-a{attempt+1}",
+                    heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=refine_session: {
+                        "module": module,
+                        "attempt": attempt_no,
+                        "heartbeat": beat,
+                        "session_file": session,
+                    },
                     model=ctx.wm("refine"),
                     prompt=f"重新检查模块 `{mod_name}` 并细分。\n\n{feedback}",
                     system_prompt=w_sys_refine,
@@ -471,16 +513,29 @@ class AnalyseStage(BaseStage):
                 judge_results = []
                 eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
                 for j_idx, j_item in enumerate(ctx.j_cfgs):
-                    j_ar = await run_agent_checked(
+                    judge_session = ctx.session_path(
+                        "judges",
+                        "refine-redo",
+                        mod_name,
+                        f"refine-redo-a{attempt + 1}-j{j_idx}.jsonl",
+                    )
+                    j_ar = await run_agent_with_stage_guard(
+                        ctx=ctx,
+                        stage="2-redo",
                         context=f"s2-redo-judge-{mod_name}-j{j_idx}-a{attempt+1}",
+                        heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
+                            "module": module,
+                            "attempt": attempt_no,
+                            "heartbeat": beat,
+                            "judge_id": f"judge-{judge_id}",
+                            "session_file": session,
+                        },
                         prompt=f"评审模块 `{mod_name}` 的重新细分。",
                         model=ctx.jm("refine", j_item),
                         system_prompt=j_sys_refine,
                         tools=cfg.judges.default_tools,
                         cwd=eval_cwd,
-                        session_file=str(
-                            ctx.sess_dir / f"s2redo-judge-{mod_name}-j{j_idx}-a{attempt+1}.jsonl"
-                        ),
+                        session_file=judge_session,
                         **j_base,
                     )
                     ctx.tokens += j_ar.token_usage

@@ -16,7 +16,12 @@ from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
-from .helpers import run_agent_checked, load_prompt
+from .filter_engine import (
+    load_script_filter_outputs,
+    normalize_filter_engine,
+    run_agent_filter_engine,
+)
+from .helpers import run_agent_with_stage_guard, load_prompt
 
 
 def _restore_filtered_files(ctx: PipelineContext) -> None:
@@ -50,6 +55,8 @@ class FilterStage(BaseStage):
         cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
+        ctx.selected_filter_engine = normalize_filter_engine(getattr(cfg, "filter_engine", "script"))
+        ctx.effective_filter_engine = "script"
 
         # ── checkpoint 跳过 ───────────────────────────────────────────────
         if cp and cp.is_done("s0_filter"):
@@ -73,6 +80,7 @@ class FilterStage(BaseStage):
             arch=arch_str,
             security_focus_categories=list(cfg.security_focus_categories),
             module_granularity=cfg.module_granularity,
+            selected_filter_engine=ctx.selected_filter_engine,
         )
         ctx.emit_event(
             "log",
@@ -82,9 +90,40 @@ class FilterStage(BaseStage):
                 f"analyse_targets={cfg.analyse_targets}, "
                 f"binary_arch={cfg.binary_arch}, "
                 f"security_focus_categories={cfg.security_focus_categories}, "
-                f"module_granularity={cfg.module_granularity}"
+                f"module_granularity={cfg.module_granularity}, "
+                f"filter_engine={ctx.selected_filter_engine}"
             ),
         )
+
+        if ctx.selected_filter_engine == "agent":
+            try:
+                stats = await run_agent_filter_engine(ctx)
+                ctx.emit_event(
+                    "stage_result",
+                    stage="filter-engine",
+                    status="passed",
+                    selected_engine=ctx.selected_filter_engine,
+                    effective_engine=ctx.effective_filter_engine,
+                    file_count=stats.file_count,
+                    module_count=stats.module_count,
+                    batch_count=stats.batch_count,
+                )
+                return
+            except Exception as exc:
+                ctx.filter_fallback_reason = str(exc)
+                ctx.effective_filter_engine = "script"
+                ctx.emit_event(
+                    "stage",
+                    stage="filter-fallback",
+                    selected_engine=ctx.selected_filter_engine,
+                    effective_engine="script",
+                    reason=str(exc),
+                )
+                ctx.emit_event(
+                    "log",
+                    level="warn",
+                    msg=f"智能体过滤引擎失败，已自动回退脚本引擎: {exc}",
+                )
 
         task_tmp = ctx.task_tmp
         extra_env = {**os.environ, "TMPDIR": str(task_tmp)}
@@ -106,19 +145,16 @@ class FilterStage(BaseStage):
         if _cli:
             ctx.emit_event("cli_output", stage="filter", text=_cli[:3000])
 
-        filtered_path = workspace / "filtered_files.txt"
-        if filtered_path.exists():
-            lines = [l.strip() for l in filtered_path.read_text("utf-8", errors="replace").splitlines() if l.strip()]
-            ctx.filtered_files = lines
-            ctx.filter_count = len(lines)
-            (workspace / ".filtered_backup.txt").write_text(
-                filtered_path.read_text("utf-8"), encoding="utf-8")
+        load_script_filter_outputs(workspace, ctx)
 
         ctx.emit_event("stage_result", stage="filter",
                        types=cfg.analyse_targets, file_count=ctx.filter_count,
                        arch=arch_str,
                        security_focus_categories=list(cfg.security_focus_categories),
-                       module_granularity=cfg.module_granularity)
+                       module_granularity=cfg.module_granularity,
+                       selected_engine=ctx.selected_filter_engine,
+                       effective_engine=ctx.effective_filter_engine,
+                       fallback_reason=ctx.filter_fallback_reason)
 
         # ── 写 checkpoint ────────────────────────────────────────────────────
         if cp:
@@ -174,8 +210,14 @@ class ExploreStage(BaseStage):
         )
 
         explore_session = str(ctx.sess_dir / "explore.jsonl")
-        ar = await run_agent_checked(
+        ar = await run_agent_with_stage_guard(
+            ctx=ctx,
+            stage="explore",
             context="explore",
+            heartbeat_payload_factory=lambda beat: {
+                "heartbeat": beat,
+                "session_file": explore_session,
+            },
             prompt=explore_user_prompt,
             model=explore_model,
             system_prompt=explore_prompt,

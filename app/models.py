@@ -429,17 +429,23 @@ class ServiceConfig(BaseModel):
             "coarse=协议/服务/功能级（同一协议/功能的所有代码归为一个模块）"
         ),
     )
-    parallel_modules: int = Field(default=20, description="Stage 2/3 并行处理的模块数，默认 20")
-    parallel_sub_workers: int = Field(default=4, description="单模块内子 Worker 并行数，默认 4")
+    filter_engine: str = Field(
+        default="script",
+        description="文件过滤引擎: script=脚本过滤+S1粗分类, agent=智能体过滤+模块划分",
+    )
+    parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1")
+    parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1")
     agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=30.0, description="API 重试首次等待秒数")
     agent_run_timeout_seconds: int = Field(default=3600, description="单次智能体输入最大运行时长（秒），-1=不限制")
     agent_timeout_retry_enabled: bool = Field(default=True, description="超时后是否自动重新输入并继续")
     agent_timeout_max_retries: int = Field(default=3, description="超时后最大自动重试次数，-1=无限")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
+    agent_timeout_seconds: float = Field(default=1800.0, description="单个智能体会话最大等待秒数，超时后终止当前阶段")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
 
     stages: StagesConfig = Field(default_factory=StagesConfig)
+    enable_final_check: bool = Field(default=False, description="是否启用 Stage 4a 完整性检查")
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -509,6 +515,7 @@ class TaskConfig(BaseModel):
     agent_timeout_retry_enabled: bool = Field(default=True, description="超时后是否自动重新输入并继续")
     agent_timeout_max_retries: int = Field(default=3, description="超时后最大自动重试次数，-1=无限")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
+    agent_timeout_seconds: float = Field(default=1800.0, description="单个智能体会话最大等待秒数，超时后终止当前阶段")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")
     binary_arch: list[str] = Field(default=["all"], description="binary 架构过滤")
@@ -520,9 +527,14 @@ class TaskConfig(BaseModel):
         default="fine",
         description="模块划分粒度: fine=子组件级，coarse=协议/服务/功能级",
     )
-    parallel_modules: int = Field(default=20, description="Stage 2/3 并行处理的模块数，默认 20")
-    parallel_sub_workers: int = Field(default=4, description="单模块内子 Worker 并行数，默认 4")
+    filter_engine: str = Field(
+        default="script",
+        description="文件过滤引擎: script=脚本过滤+S1粗分类, agent=智能体过滤+模块划分",
+    )
+    parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1")
+    parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1")
     stages: StagesConfig = Field(default_factory=StagesConfig)
+    enable_final_check: bool = Field(default=False, description="是否启用 Stage 4a 完整性检查")
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
     prompt_overrides: PromptOverrideConfig = Field(default_factory=PromptOverrideConfig)

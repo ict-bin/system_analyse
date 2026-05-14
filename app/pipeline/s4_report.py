@@ -27,7 +27,7 @@ from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
-    run_agent_checked, parse_eval_md, check_voting,
+    run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module, pre_read_module_with_details,
     generate_modules_list, strip_target_prefix,
@@ -52,6 +52,9 @@ class CompletenessCheckStage(BaseStage):
             ctx.emit_event("log", level="info",
                            msg="[S4a-Completeness] checkpoint已完成，跳过")
             return
+        if not getattr(cfg, "enable_final_check", False):
+            ctx.emit_event("stage", stage="4a", skipped=True, reason="disabled")
+            return
 
         j_completeness_prompt = load_prompt(cfg, "step4_check_completeness", "judges")
         j_base = ctx.make_j_base()
@@ -61,14 +64,26 @@ class CompletenessCheckStage(BaseStage):
         missing_modules: list[str] = []
 
         for j_idx, j_item in enumerate(ctx.j_cfgs):
-            j_ar = await run_agent_checked(
+            judge_session = ctx.session_path(
+                "judges",
+                "report-completeness",
+                f"s4a-j{j_idx}.jsonl",
+            )
+            j_ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="4a",
                 context=f"s4a-judge-j{j_idx}",
+                heartbeat_payload_factory=lambda beat, judge_id=j_idx, session=judge_session: {
+                    "heartbeat": beat,
+                    "judge_id": f"judge-{judge_id}",
+                    "session_file": session,
+                },
                 prompt="运行 check_outputs.sh 检查所有模块是否都有 module_report.md。",
                 model=ctx.jm("completeness", j_item),
                 system_prompt=j_completeness_prompt,
                 tools=cfg.judges.default_tools,
                 cwd=str(workspace),
-                session_file=str(ctx.sess_dir / f"completeness-j{j_idx}.jsonl"),
+                session_file=judge_session,
                 **j_base,
             )
             ctx.tokens += j_ar.token_usage
@@ -118,9 +133,16 @@ class CompletenessCheckStage(BaseStage):
                 continue
 
             # Stage 2 补做
-            refine_session = str(ctx.sess_dir / f"refine-s4-{mod_name}.jsonl")
-            ar = await run_agent_checked(
+            refine_session = ctx.session_path("refine-s4", f"{mod_name}.jsonl")
+            ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="2-redo-s4",
                 context=f"s4-s2-redo-{mod_name}",
+                heartbeat_payload_factory=lambda beat, module=mod_name, session=refine_session: {
+                    "module": module,
+                    "heartbeat": beat,
+                    "session_file": session,
+                },
                 model=ctx.wm("refine"),
                 prompt=f"检查模块 `{mod_name}` 是否需要细分。",
                 system_prompt=w_sys_refine,
@@ -140,7 +162,7 @@ class CompletenessCheckStage(BaseStage):
             w_sys_s4 = w_sys_analyse.replace("{{PRE_READ_CONTENT}}", pre_content) \
                                      .replace("{{MODULE_NAME}}", mod_name)
 
-            analyse_session = str(ctx.sess_dir / f"analyse-s4-{mod_name}.jsonl")
+            analyse_session = ctx.session_path("analyse-s4", f"{mod_name}.jsonl")
             feedback = ""
             for attempt in range(max_iter(s_cfg_analyse)):
                 prompt_parts = [
@@ -149,8 +171,16 @@ class CompletenessCheckStage(BaseStage):
                 ]
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
-                ar = await run_agent_checked(
+                ar = await run_agent_with_stage_guard(
+                    ctx=ctx,
+                    stage="3-redo-s4",
                     context=f"s4-s3-redo-{mod_name}-a{attempt+1}",
+                    heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=analyse_session: {
+                        "module": module,
+                        "attempt": attempt_no,
+                        "heartbeat": beat,
+                        "session_file": session,
+                    },
                     model=ctx.wm("analyse"),
                     prompt="\n".join(prompt_parts),
                     system_prompt=w_sys_s4,
@@ -174,16 +204,29 @@ class CompletenessCheckStage(BaseStage):
 
                 judge_results = []
                 for j_idx, j_item in enumerate(ctx.j_cfgs):
-                    j_ar = await run_agent_checked(
+                    judge_session = ctx.session_path(
+                        "judges",
+                        "analyse-s4",
+                        mod_name,
+                        f"analyse-s4-a{attempt + 1}-j{j_idx}.jsonl",
+                    )
+                    j_ar = await run_agent_with_stage_guard(
+                        ctx=ctx,
+                        stage="3-redo-s4",
                         context=f"s4-s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",
+                        heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
+                            "module": module,
+                            "attempt": attempt_no,
+                            "heartbeat": beat,
+                            "judge_id": f"judge-{judge_id}",
+                            "session_file": session,
+                        },
                         prompt=f"评审模块 `{mod_name}` 的分析报告。",
                         model=ctx.jm("analyse", j_item),
                         system_prompt=j_sys_analyse,
                         tools=cfg.judges.default_tools,
                         cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
-                        session_file=str(
-                            ctx.sess_dir / f"s4redo-judge-{mod_name}-j{j_idx}-a{attempt+1}.jsonl"
-                        ),
+                        session_file=judge_session,
                         **j_base,
                     )
                     ctx.tokens += j_ar.token_usage
@@ -229,7 +272,7 @@ class FinalReportStage(BaseStage):
         report_sys_prompt = load_prompt(cfg, "step4_final_report", "workers")
         j_report_prompt = load_prompt(cfg, "step4_check_report", "judges")
         reflect_report = load_prompt(cfg, "reflect_report", "workers")
-        report_session = str(ctx.sess_dir / "final_report.jsonl")
+        report_session = ctx.session_path("final_report.jsonl")
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
 
@@ -245,8 +288,15 @@ class FinalReportStage(BaseStage):
             if feedback:
                 prompt_parts.append(f"\n\n{feedback}")
 
-            ar = await run_agent_checked(
+            ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="4b",
                 context=f"s4b-report-a{attempt+1}",
+                heartbeat_payload_factory=lambda beat, attempt_no=attempt + 1, session=report_session: {
+                    "attempt": attempt_no,
+                    "heartbeat": beat,
+                    "session_file": session,
+                },
                 model=ctx.wm("report"),
                 prompt="\n".join(prompt_parts),
                 system_prompt=report_sys_prompt,
@@ -262,14 +312,27 @@ class FinalReportStage(BaseStage):
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("report", j_item)
-                j_ar = await run_agent_checked(
+                judge_session = ctx.session_path(
+                    "judges",
+                    "final_report",
+                    f"final-report-a{attempt + 1}-j{j_idx}.jsonl",
+                )
+                j_ar = await run_agent_with_stage_guard(
+                    ctx=ctx,
+                    stage="4b",
                     context=f"s4b-judge-j{j_idx}-a{attempt+1}",
+                    heartbeat_payload_factory=lambda beat, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
+                        "attempt": attempt_no,
+                        "heartbeat": beat,
+                        "judge_id": f"judge-{judge_id}",
+                        "session_file": session,
+                    },
                     prompt="评审 final_report.md 的质量和完整性。",
                     model=j_model,
                     system_prompt=j_report_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
-                    session_file=str(ctx.sess_dir / f"report-judge-j{j_idx}-a{attempt+1}.jsonl"),
+                    session_file=judge_session,
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -281,6 +344,7 @@ class FinalReportStage(BaseStage):
                     "score": parsed["score"],
                     "passed": parsed["pass"],
                     "feedback": parsed["feedback"],
+                    "session_file": judge_session,
                     "token_usage": j_ar.token_usage,
                 })
                 ctx.emit_event("judge_eval", stage="4b", judge_id=f"judge-{j_idx}",

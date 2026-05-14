@@ -19,6 +19,7 @@ from .helpers import (
     write_failure_report, generate_modules_list, strip_target_prefix,
     fix_orphan_dirs_before_judge, build_s2_diagnose_report,
 )
+from .filter_engine import normalize_filter_engine
 from .s0_filter import FilterStage, ExploreStage, PrescanStage
 from .s0_path_group import PathGroupStage
 from .s0_type_classify import TypeClassifyStage
@@ -50,6 +51,7 @@ __all__ = [
     "load_details_for_module",
     "write_failure_report", "generate_modules_list", "strip_target_prefix",
     "fix_orphan_dirs_before_judge", "build_s2_diagnose_report",
+    "normalize_filter_engine",
     # 阶段
     "FilterStage", "ExploreStage", "PrescanStage",
     "PathGroupStage",

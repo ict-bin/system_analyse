@@ -27,7 +27,7 @@ from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
-    run_agent_checked, parse_eval_md, check_voting,
+    run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter,
     SUB_WORKER_THRESHOLD, collect_file_summaries,
@@ -36,6 +36,7 @@ from .helpers import (
     enforce_filter_constraint,
     archive_module_deletions, get_module_deleted_files, restore_module_for_retry,
     fix_orphan_dirs_before_judge, build_s2_diagnose_report,
+    module_has_nonempty_files,
 )
 
 
@@ -44,7 +45,6 @@ class RefineStage(BaseStage):
 
     stage_num = 2
     stage_name = "细分"
-
     def _reset(self) -> None:
         """每次 execute 前重置并发状态。"""
         self._refined: set[str] = set()
@@ -153,7 +153,7 @@ class RefineStage(BaseStage):
             shutil.rmtree(str(mod_dir), ignore_errors=True)
             return
 
-        refine_session = str(ctx.sess_dir / f"refine-{mod_name}.jsonl")
+        refine_session = ctx.session_path("refine", f"{mod_name}.jsonl")
 
         # 快照（拆分前保存，重试时不覆盖）
         snapshots_dir = workspace / ".s2_snapshots"
@@ -236,8 +236,16 @@ class RefineStage(BaseStage):
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
-            ar = await run_agent_checked(
+            ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="refine",
                 context=f"s2-refine-{mod_name}-a{attempt+1}",
+                heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=refine_session: {
+                    "module": module,
+                    "attempt": attempt_no,
+                    "heartbeat": beat,
+                    "session_file": session,
+                },
                 prompt="\n".join(prompt_parts),
                 model=ctx.wm("refine"),
                 system_prompt=w_sys_prompt,
@@ -293,28 +301,34 @@ class RefineStage(BaseStage):
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("refine", j_item)
-                # 问题9：将 check_module.sh 完整命令（含实际 target_dir）直接注入 Judge prompt
-                # 避免 Judge 自己猜测路径导致脚本执行失败
-                check_cmd = (
-                    f"bash /app/scripts/check_module.sh "
-                    f"{cfg.target_dir} modules {mod_name}"
+                judge_session = ctx.session_path(
+                    "judges",
+                    "refine",
+                    mod_name,
+                    f"refine-a{attempt + 1}-j{j_idx}.jsonl",
                 )
-                judge_prompt_text = (
-                    f"评审 Worker 对模块 `{mod_name}` 的细分判断。"
-                    f"{deleted_summary}\n\n"
-                    f"**必须执行的校验命令（直接复制执行，无需修改）：**\n"
-                    f"```bash\n{check_cmd}\n```"
-                )
-                j_ar = await run_agent_checked(
+                j_ar = await run_agent_with_stage_guard(
+                    ctx=ctx,
+                    stage="refine",
                     context=f"s2-judge-{mod_name}-j{j_idx}-a{attempt+1}",
-                    prompt=judge_prompt_text,
+                    heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
+                        "module": module,
+                        "attempt": attempt_no,
+                        "heartbeat": beat,
+                        "judge_id": f"judge-{judge_id}",
+                        "session_file": session,
+                    },
+                    prompt=(
+                        f"评审 Worker 对模块 `{mod_name}` 的细分判断。"
+                        f"{deleted_summary}\n\n"
+                        f"**必须执行的校验命令（直接复制执行，无需修改）：**\n"
+                        f"```bash\nbash /app/scripts/check_module.sh {cfg.target_dir} modules {mod_name}\n```"
+                    ),
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
                     cwd=str(workspace),
-                    session_file=str(
-                        ctx.sess_dir / f"refine-judge-{mod_name}-j{j_idx}-a{attempt+1}.jsonl"
-                    ),
+                    session_file=judge_session,
                     **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
@@ -326,6 +340,7 @@ class RefineStage(BaseStage):
                     "score": parsed["score"],
                     "passed": parsed["pass"],
                     "feedback": parsed["feedback"],
+                    "session_file": judge_session,
                     "token_usage": j_ar.token_usage,
                 })
                 ctx.emit_event("judge_eval", stage=2, judge_id=f"judge-{j_idx}",
@@ -345,7 +360,15 @@ class RefineStage(BaseStage):
                 module_name=mod_name,
                 stage="refine",
                 stage_round=attempt + 1,
-                status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
+                status=(
+                    "passed"
+                    if (final_pass or forced_pass)
+                    else "failed"
+                    if max_reached
+                    else "needs_reflection"
+                    if voted_pass
+                    else "needs_retry"
+                ),
                 started_at=round_started,
                 ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
@@ -539,6 +562,8 @@ class RefineStage(BaseStage):
 
         reclass_prompt_tmpl = load_prompt(cfg, "step2_reclassify", "workers")
         max_rc = min(3, max_iter(cfg.stages.refine))
+        reclassify_sessions_dir = ctx.sess_dir / "reclassify"
+        reclassify_sessions_dir.mkdir(parents=True, exist_ok=True)
 
         reclass_prompt = (
             f"## 待归类文件（{len(missing_files)} 个）\n\n"
@@ -547,7 +572,24 @@ class RefineStage(BaseStage):
         )
 
         for rc_attempt in range(max_rc):
-            rc_ar = await run_agent_checked(
+            session_file = str(reclassify_sessions_dir / f"reclassify-a{rc_attempt + 1}.jsonl")
+            ctx.emit_event(
+                "stage",
+                stage="2-reclassify",
+                attempt=rc_attempt + 1,
+                missing_count=len(missing_files),
+                session_file=session_file,
+            )
+            ctx.emit_event("model", stage="2-reclassify", model=ctx.wm("classify"))
+            rc_ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="2-reclassify",
+                heartbeat_payload_factory=lambda beat, attempt=rc_attempt + 1, count=len(missing_files): {
+                    "attempt": attempt,
+                    "heartbeat": beat,
+                    "missing_count": count,
+                    "session_file": session_file,
+                },
                 context=f"s2-reclassify-a{rc_attempt+1}",
                 prompt=reclass_prompt,
                 model=ctx.wm("classify"),
@@ -555,7 +597,7 @@ class RefineStage(BaseStage):
                 system_prompt=reclass_prompt_tmpl,
                 cwd=str(workspace),
                 thinking_level=w_base.get("thinking_level", "off"),
-                session_file=str(ctx.sess_dir / f"reclassify-a{rc_attempt+1}.jsonl"),
+                session_file=session_file,
                 cancel_event=w_base.get("cancel_event"),
                 max_retries=w_base.get("max_retries", 3),
                 retry_delay=w_base.get("retry_delay", 10),
@@ -571,6 +613,14 @@ class RefineStage(BaseStage):
                     if l:
                         all_classified2.add(l)
             still_missing = sorted(all_target - all_classified2 - ctx.load_confirmed_deleted())
+            ctx.emit_event(
+                "stage_result",
+                stage="2-reclassify",
+                attempt=rc_attempt + 1,
+                status="completed",
+                missing_count=len(still_missing),
+                session_file=session_file,
+            )
             ctx.emit_event("log", level="info",
                            msg=f"补分类第{rc_attempt+1}轮: 剩余 {len(still_missing)} 个未归类")
             if not still_missing:

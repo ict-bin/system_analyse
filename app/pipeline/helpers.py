@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,15 @@ if TYPE_CHECKING:
 
 # ── 公共：运行 pi agent（带重试） ─────────────────────────────────────────────
 from ..runner import run_agent, AgentResult  # noqa: E402
+
+_DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS = max(
+    5.0,
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_AGENT_HEARTBEAT_INTERVAL_SECONDS", "30")),
+)
+_DEFAULT_AGENT_TIMEOUT_SECONDS = max(
+    60.0,
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_AGENT_TIMEOUT_SECONDS", "1800")),
+)
 
 
 class StageError(Exception):
@@ -49,6 +59,63 @@ async def run_agent_checked(context: str = "", **kwargs) -> AgentResult:
     ar = await run_agent(**kwargs)
     check_agent_result(ar, context)
     return ar
+
+
+async def run_agent_with_stage_guard(
+    *,
+    ctx: "PipelineContext",
+    stage: str,
+    context: str,
+    heartbeat_payload_factory=None,
+    heartbeat_interval: float | None = None,
+    timeout_seconds: float | None = None,
+    **kwargs,
+) -> AgentResult:
+    """Run an agent with heartbeat events and a hard timeout."""
+    heartbeat_every = heartbeat_interval or _DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS
+    stage_timeout = timeout_seconds or float(getattr(ctx.cfg, "agent_timeout_seconds", _DEFAULT_AGENT_TIMEOUT_SECONDS) or _DEFAULT_AGENT_TIMEOUT_SECONDS)
+
+    def _payload(heartbeat_index: int) -> dict:
+        if callable(heartbeat_payload_factory):
+            payload = heartbeat_payload_factory(heartbeat_index)
+            if isinstance(payload, dict):
+                return dict(payload)
+        return {}
+
+    agent_task = asyncio.create_task(run_agent_checked(context=context, **kwargs))
+    heartbeat_index = 0
+    started_monotonic = time.monotonic()
+    try:
+        while True:
+            elapsed = time.monotonic() - started_monotonic
+            if stage_timeout and elapsed >= stage_timeout:
+                payload = _payload(heartbeat_index)
+                payload["elapsed_seconds"] = round(elapsed, 3)
+                payload["timeout_seconds"] = stage_timeout
+                ctx.emit_event(
+                    "log",
+                    level="error",
+                    msg=(
+                        f"Stage {stage} 智能体会话超时：已等待 {int(elapsed)} 秒，"
+                        f"超过阈值 {int(stage_timeout)} 秒"
+                    ),
+                )
+                ctx.emit_event("stage_result", stage=stage, status="timeout", **payload)
+                raise StageError(
+                    f"Stage {stage} 智能体会话超时：等待返回超过 {int(stage_timeout)} 秒"
+                )
+            try:
+                return await asyncio.wait_for(asyncio.shield(agent_task), timeout=heartbeat_every)
+            except asyncio.TimeoutError:
+                heartbeat_index += 1
+                payload = _payload(heartbeat_index)
+                payload["elapsed_seconds"] = round(time.monotonic() - started_monotonic, 3)
+                payload["timeout_seconds"] = stage_timeout
+                ctx.emit_event("stage", stage=stage, **payload)
+    finally:
+        if not agent_task.done():
+            agent_task.cancel()
+            await asyncio.gather(agent_task, return_exceptions=True)
 
 
 # ── 模块目录发现 ──────────────────────────────────────────────────────────────
@@ -819,16 +886,30 @@ async def collect_file_summaries(
                 else:
                     parts.append("内容: (空文件或无法读取)")
             prompt = '\n'.join(parts)
+            session_file = ctx.session_path(
+                "sub_read",
+                mod_name,
+                f"batch{idx + 1}.jsonl",
+            )
 
-            ar = await run_agent_checked(
+            ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="2-sub",
                 context=f"s2-sub-{mod_name}-batch{idx+1}",
+                heartbeat_payload_factory=lambda beat, module=mod_name, batch_no=idx + 1, total=len(batches), session=session_file: {
+                    "module": module,
+                    "batch": batch_no,
+                    "total": total,
+                    "heartbeat": beat,
+                    "session_file": session,
+                },
                 prompt=prompt,
                 model=sub_model or w_base.get("model", ""),
                 tools=[],
                 system_prompt=sub_prompt_template,
                 cwd=w_base["cwd"],
                 thinking_level=w_base.get("thinking_level", "off"),
-                session_file=str(ctx.sess_dir / f"sub-{mod_name}-batch{idx+1}.jsonl"),
+                session_file=session_file,
                 cancel_event=w_base.get("cancel_event"),
                 max_retries=w_base.get("max_retries", 3),
                 retry_delay=w_base.get("retry_delay", 10),
