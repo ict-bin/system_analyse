@@ -12,6 +12,20 @@ from app.service.event_log import clear_events, events_path, strip_final_marker
 from app.time_utils import now_local
 
 
+_ERROR_MAX_LEN = 65535
+
+
+def _clip_error_message(error: str | None) -> str | None:
+    if error is None:
+        return None
+    text = str(error)
+    if len(text) <= _ERROR_MAX_LEN:
+        return text
+    suffix = f"\n\n...[truncated {len(text) - _ERROR_MAX_LEN} chars]"
+    keep = max(0, _ERROR_MAX_LEN - len(suffix))
+    return text[:keep] + suffix
+
+
 class TaskRepository:
     @staticmethod
     def count_running_tasks(db: Session) -> int:
@@ -353,7 +367,7 @@ class TaskRepository:
         if result_json is not None:
             values["result_json"] = result_json
         if result_error:
-            values["error"] = result_error
+            values["error"] = _clip_error_message(result_error)
         updated = db.query(AppSaTask).filter(
             AppSaTask.task_id == task_id,
             AppSaTask.is_deleted.is_(False),
@@ -383,7 +397,7 @@ class TaskRepository:
         if not row or row.status != "running":
             return False
         row.status = "error"
-        row.error = error
+        row.error = _clip_error_message(error)
         row.finished_at = now_local()
         row.dispatcher_instance_id = None
         row.dispatch_started_at = None

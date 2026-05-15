@@ -301,7 +301,20 @@ def load_prompt(source, name: str, role: str | None = None) -> str:
                 return prompt.strip()
         except Exception:
             pass
-    prompt_dir = str(source or "")
+
+    # source 可能是完整 cfg 对象，而不是 prompt_dir 字符串。
+    # 此时必须回退到 workers/judges.system_prompt_dir，不能对 str(cfg) 拼路径，
+    # 否则会把整段任务配置当成文件名，触发 [Errno 36] File name too long。
+    prompt_dir = ""
+    if role and hasattr(source, role):
+        try:
+            role_obj = getattr(source, role)
+            prompt_dir = str(getattr(role_obj, "system_prompt_dir", "") or "")
+        except Exception:
+            prompt_dir = ""
+    if not prompt_dir:
+        prompt_dir = str(source or "")
+
     for ext in [".md", ".txt", ""]:
         p = Path(prompt_dir) / f"{name}{ext}"
         if p.exists():

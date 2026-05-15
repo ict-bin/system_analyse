@@ -486,17 +486,19 @@ class AnalyseStage(BaseStage):
         ctx.emit_event("stage", stage="2-redo", modules=to_reclassify)
 
         s_cfg_refine = cfg.stages.refine
-        w_sys_refine = load_prompt(cfg, "step2_refine", "workers")
-        j_sys_refine = load_prompt(cfg, "step2_check_refine", "judges")
-        reflect_refine = load_prompt(cfg, "reflect_refine", "workers")
+        granularity = getattr(cfg, "module_granularity", "fine") or "fine"
+        w_sys_refine = load_granularity_prompt(cfg, "step2_refine", granularity, "workers")
+        j_sys_refine = load_granularity_prompt(cfg, "step2_check_refine", granularity, "judges")
+        reflect_refine = load_granularity_prompt(cfg, "reflect_refine", granularity, "workers")
         # 2-redo 中注入安全维度约束，防止重分类超出过滤范围
         from .s1_classify import _build_security_focus_section  # noqa: PLC0415
         _sec_cats = getattr(cfg, "security_focus_categories", ["all"])
         _sec_focus_hint = _build_security_focus_section(_sec_cats)
         # 2-redo 中同样注入粒度约束，与 S2 保持一致
-        _gran_hint = build_granularity_hint(getattr(cfg, "module_granularity", "fine") or "fine")
-        if _gran_hint:
+        _gran_hint = build_granularity_hint(granularity)
+        if _gran_hint and _gran_hint not in w_sys_refine:
             w_sys_refine += _gran_hint
+        if _gran_hint and _gran_hint not in j_sys_refine:
             j_sys_refine += _gran_hint
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
