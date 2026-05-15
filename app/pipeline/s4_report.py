@@ -282,6 +282,7 @@ class FinalReportStage(BaseStage):
                 return
 
         s_cfg = cfg.stages.final_check
+        granularity = getattr(cfg, "module_granularity", "fine") or "fine"
         report_sys_prompt = load_prompt(cfg, "step4_final_report", "workers")
         j_report_prompt = load_prompt(cfg, "step4_check_report", "judges")
         reflect_report = load_prompt(cfg, "reflect_report", "workers")
