@@ -419,6 +419,11 @@ def _task_result_path(row: AppSaTask) -> Path | None:
     return run_root / "result.json" if run_root else None
 
 
+def _task_workspace_root(row: AppSaTask) -> Path | None:
+    run_root = _task_run_root(row)
+    return run_root / "workspace" if run_root else None
+
+
 def _write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -446,14 +451,96 @@ def _write_task_result_json(row: AppSaTask, payload: dict) -> str | None:
     return str(path)
 
 
+def _read_json_file(path: Path | None) -> dict | None:
+    if not path or not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else None
+    except Exception as exc:
+        logger.warning("failed to load json file %s: %s", path, exc)
+        return None
+
+
+def _count_input_files(input_path: str | None) -> int | None:
+    if not input_path:
+        return None
+    try:
+        path = Path(input_path)
+        if not path.exists():
+            return None
+        if path.is_file():
+            return 1
+        return sum(1 for item in path.rglob("*") if item.is_file())
+    except Exception as exc:
+        logger.warning("failed to count input files for %s: %s", input_path, exc)
+        return None
+
+
+def _count_filtered_files(workspace: Path | None) -> int | None:
+    if not workspace:
+        return None
+    filtered_path = workspace / "filtered_files.txt"
+    if filtered_path.is_file():
+        try:
+            return sum(1 for line in filtered_path.read_text(encoding="utf-8").splitlines() if line.strip())
+        except Exception as exc:
+            logger.warning("failed to count filtered files from %s: %s", filtered_path, exc)
+    catalog = _read_json_file(workspace / "file_catalog.json")
+    if isinstance(catalog, dict):
+        for key in ("filtered_count", "total"):
+            value = catalog.get(key)
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def _build_preprocess_summary(row: AppSaTask, payload: dict | None = None) -> dict | None:
+    workspace = _task_workspace_root(row)
+    summary = payload.get("preprocess_summary") if isinstance(payload, dict) and isinstance(payload.get("preprocess_summary"), dict) else {}
+    filter_summary = _read_json_file(workspace / "filter_summary.json" if workspace else None) or {}
+
+    total_input = summary.get("total_input_file_count")
+    if not isinstance(total_input, int):
+        total_input = filter_summary.get("total_input_file_count")
+    if not isinstance(total_input, int):
+        total_input = _count_input_files(getattr(row, "input_path", None))
+
+    accepted_input = summary.get("accepted_input_file_count")
+    if not isinstance(accepted_input, int):
+        accepted_input = filter_summary.get("accepted_input_file_count")
+    if not isinstance(accepted_input, int):
+        accepted_input = _count_filtered_files(workspace)
+
+    selected_engine = summary.get("selected_filter_engine") or filter_summary.get("selected_filter_engine")
+    effective_engine = summary.get("effective_filter_engine") or filter_summary.get("effective_filter_engine")
+    fallback_reason = summary.get("fallback_reason") or filter_summary.get("fallback_reason")
+
+    if not any(
+        value is not None and value != ""
+        for value in (total_input, accepted_input, selected_engine, effective_engine, fallback_reason)
+    ):
+        return None
+
+    return {
+        "total_input_file_count": total_input if isinstance(total_input, int) else None,
+        "accepted_input_file_count": accepted_input if isinstance(accepted_input, int) else None,
+        "selected_filter_engine": selected_engine or None,
+        "effective_filter_engine": effective_engine or None,
+        "fallback_reason": fallback_reason or None,
+    }
+
+
 def _lightweight_result_json(row: AppSaTask, payload: dict | None, result_file: str | None = None) -> dict | None:
     if not isinstance(payload, dict):
         return None
+    preprocess_summary = _build_preprocess_summary(row, payload)
     if payload.get("result_externalized"):
         return {
             **payload,
             "result_file": payload.get("result_file") or result_file or (str(_task_result_path(row)) if _task_result_path(row) else None),
             "result_externalized": True,
+            "preprocess_summary": preprocess_summary,
         }
     total_tokens = payload.get("total_tokens") if isinstance(payload.get("total_tokens"), dict) else None
     modules = payload.get("modules") if isinstance(payload.get("modules"), list) else []
@@ -467,6 +554,7 @@ def _lightweight_result_json(row: AppSaTask, payload: dict | None, result_file: 
         "round_count": len(rounds),
         "total_duration_ms": payload.get("total_duration_ms"),
         "total_tokens": total_tokens,
+        "preprocess_summary": preprocess_summary,
     }
 
 
@@ -809,6 +897,7 @@ class TaskService:
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
                    per_page: int = 100, status: Optional[str] = None,
                    analysis_mode: Optional[str] = None,
+                   parent_task_id: Optional[str] = None,
                    sort_by: str = "created_at",
                    sort_order: str = "desc") -> dict:
         query = db.query(AppSaTask).filter(
@@ -817,6 +906,9 @@ class TaskService:
         )
         if status:
             query = query.filter(AppSaTask.status == status)
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        if normalized_parent_task_id:
+            query = query.filter(AppSaTask.parent_task_id == normalized_parent_task_id)
         sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), AppSaTask.created_at)
         order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         requested_mode = _normalize_analysis_mode(analysis_mode) if analysis_mode else None

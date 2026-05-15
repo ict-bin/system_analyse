@@ -66,6 +66,9 @@ class PipelineContext:
     filter_count: int = 0
     """过滤后文件总数"""
 
+    total_input_file_count: int = 0
+    """过滤前输入文件总数"""
+
     selected_filter_engine: str = "script"
     """配置选择的过滤引擎"""
 

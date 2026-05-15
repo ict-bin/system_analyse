@@ -11,6 +11,7 @@ pipeline/s0_filter.py — Stage 0: 文件过滤 + 目录探索 + 预扫描
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -43,6 +44,15 @@ def _restore_prescan_summary(ctx: PipelineContext) -> None:
     summary_file = workspace / "keyword_summary.txt"
     if summary_file.exists():
         ctx.prescan_summary = summary_file.read_text("utf-8", errors="replace")
+
+
+def _count_input_files(target_dir: str) -> int:
+    path = Path(target_dir)
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return 1
+    return sum(1 for item in path.rglob("*") if item.is_file())
 
 
 class FilterStage(BaseStage):
@@ -94,14 +104,27 @@ class FilterStage(BaseStage):
                 f"filter_engine={ctx.selected_filter_engine}"
             ),
         )
+        ctx.total_input_file_count = await asyncio.to_thread(_count_input_files, cfg.target_dir)
 
         if ctx.selected_filter_engine == "agent":
             try:
                 stats = await run_agent_filter_engine(ctx)
+                (workspace / "filter_summary.json").write_text(
+                    json.dumps({
+                        "total_input_file_count": ctx.total_input_file_count,
+                        "accepted_input_file_count": stats.file_count,
+                        "selected_filter_engine": ctx.selected_filter_engine,
+                        "effective_filter_engine": ctx.effective_filter_engine,
+                        "fallback_reason": ctx.filter_fallback_reason or None,
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
                 ctx.emit_event(
                     "stage_result",
                     stage="filter-engine",
                     status="passed",
+                    total_input_file_count=ctx.total_input_file_count,
+                    accepted_input_file_count=stats.file_count,
                     selected_engine=ctx.selected_filter_engine,
                     effective_engine=ctx.effective_filter_engine,
                     file_count=stats.file_count,
@@ -146,9 +169,21 @@ class FilterStage(BaseStage):
             ctx.emit_event("cli_output", stage="filter", text=_cli[:3000])
 
         load_script_filter_outputs(workspace, ctx)
+        (workspace / "filter_summary.json").write_text(
+            json.dumps({
+                "total_input_file_count": ctx.total_input_file_count,
+                "accepted_input_file_count": ctx.filter_count,
+                "selected_filter_engine": ctx.selected_filter_engine,
+                "effective_filter_engine": ctx.effective_filter_engine,
+                "fallback_reason": ctx.filter_fallback_reason or None,
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         ctx.emit_event("stage_result", stage="filter",
                        types=cfg.analyse_targets, file_count=ctx.filter_count,
+                       total_input_file_count=ctx.total_input_file_count,
+                       accepted_input_file_count=ctx.filter_count,
                        arch=arch_str,
                        security_focus_categories=list(cfg.security_focus_categories),
                        module_granularity=cfg.module_granularity,

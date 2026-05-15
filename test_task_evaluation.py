@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.service.task_service import TaskService
+from app.service.task_service import TaskService, _lightweight_result_json
 
 
 def _service_with_row(row):
@@ -193,3 +193,54 @@ def test_get_task_evaluation_missing_files_warns_when_module_files_list_missing(
 
         assert result["summary"]["missing_file_count"] == 0
         assert any("缺失 files.list" in warning for warning in result["warnings"])
+
+
+def test_lightweight_result_json_includes_preprocess_summary_from_workspace_and_input_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        input_root = Path(tmp) / "input"
+        (input_root / "nested").mkdir(parents=True)
+        (input_root / "a.bin").write_text("a", encoding="utf-8")
+        (input_root / "nested" / "b.bin").write_text("b", encoding="utf-8")
+
+        workspace = Path(tmp) / "sat_eval" / "run" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "filtered_files.txt").write_text("a.bin\n", encoding="utf-8")
+
+        row = SimpleNamespace(task_id="sat_eval", status="passed", output_path=tmp, input_path=str(input_root))
+        payload = {"status": "passed", "modules": [], "rounds": []}
+
+        result = _lightweight_result_json(row, payload)
+
+        assert result is not None
+        assert result["preprocess_summary"]["total_input_file_count"] == 2
+        assert result["preprocess_summary"]["accepted_input_file_count"] == 1
+
+
+def test_lightweight_result_json_prefers_filter_summary_when_present():
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "sat_eval" / "run" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "filter_summary.json").write_text(
+            json.dumps({
+                "total_input_file_count": 123,
+                "accepted_input_file_count": 45,
+                "selected_filter_engine": "agent",
+                "effective_filter_engine": "script",
+                "fallback_reason": "fallback",
+            }),
+            encoding="utf-8",
+        )
+
+        row = SimpleNamespace(task_id="sat_eval", status="passed", output_path=tmp, input_path=None)
+        payload = {"status": "passed", "modules": [], "rounds": [], "result_externalized": True}
+
+        result = _lightweight_result_json(row, payload)
+
+        assert result is not None
+        assert result["preprocess_summary"] == {
+            "total_input_file_count": 123,
+            "accepted_input_file_count": 45,
+            "selected_filter_engine": "agent",
+            "effective_filter_engine": "script",
+            "fallback_reason": "fallback",
+        }
