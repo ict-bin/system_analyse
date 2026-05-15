@@ -28,7 +28,7 @@ from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, build_granularity_hint,
-    archive_file, max_iter,
+    archive_file, max_iter, write_judge_feedback,
     module_has_nonempty_files,
     load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
@@ -326,7 +326,7 @@ class AnalyseStage(BaseStage):
                     model=j_model,
                     system_prompt=j_sys_prompt,
                     tools=cfg.judges.default_tools,
-                    cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                    cwd=str(workspace),  # workspace根, 避免双重modules/路径
                     session_file=judge_session,
                     **j_base,
                 )
@@ -445,14 +445,20 @@ class AnalyseStage(BaseStage):
                         + reflect_prompt
                     )
                     jfb = "\n".join(
-                        f"judge-{i}: {r['feedback'][:500]}"
+                        f"judge-{i}: {r['feedback']}"
                         for i, r in enumerate(judge_results))
                     feedback += "\n\n## Judge 上轮意见\n\n" + jfb
             else:
-                fail_fb = "\n".join(
-                    f"judge-{i}: {r['feedback'][:500]}"
-                    for i, r in enumerate(judge_results) if not r["pass"])
-                feedback = "# 评审意见（未通过）\n\n" + fail_fb + "\n\n请根据意见修正分析。"
+                fb_rel = write_judge_feedback(
+                    workspace, "s3_analyse", mod_name, attempt + 1, judge_results)
+                ctx.emit_event("log", level="info",
+                               msg=f"[S3] judge意见已写入 {fb_rel}")
+                feedback = f"评审未通过，完整意见请 read {fb_rel} ，阅后修正 modules/{mod_name}/module_report.md"
+                if report_path.exists():
+                    try:
+                        report_path.unlink()
+                    except OSError:
+                        pass
             if forced_pass:
                 if cp:
                     cp.mark_done(f"s3_modules/{mod_name}", forced=True)
@@ -587,14 +593,14 @@ class AnalyseStage(BaseStage):
                         break
                     feedback = "# 自查要求\n\n" + reflect_refine
                     jfb = "\n".join(
-                        f"judge-{i}: {r['feedback'][:500]}"
+                        f"judge-{i}: {r['feedback']}"
                         for i, r in enumerate(judge_results))
                     feedback += "\n\n## Judge 上轮意见\n\n" + jfb
                 else:
-                    fail_fb = "\n".join(
-                        f"judge-{i}: {r['feedback'][:500]}"
-                        for i, r in enumerate(judge_results) if not r["pass"])
-                    feedback = f"# 评审意见\n\n{fail_fb}"
+                    _fb_redo = write_judge_feedback(
+                        workspace, "s2_refine", mod_name, attempt + 1, judge_results)
+                    feedback = f"评审未通过，完整意见请 read {{_fb_redo}}"
+                    feedback = f"评审未通过，完整意见请 read {_fb_redo}"
             else:
                 raise StageError(f"Stage 2-redo 模块 {mod_name} 重分类未通过")
 

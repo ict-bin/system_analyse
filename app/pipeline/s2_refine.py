@@ -29,7 +29,7 @@ from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, build_granularity_hint,
-    archive_file, max_iter,
+    archive_file, max_iter, write_judge_feedback,
     SUB_WORKER_THRESHOLD, collect_file_summaries,
     load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
@@ -490,7 +490,7 @@ class RefineStage(BaseStage):
                         + reflect_prompt
                     )
                     jfb = "\n".join(
-                        f"judge-{i}: {r['feedback'][:500]}"
+                        f"judge-{i}: {r['feedback']}"
                         for i, r in enumerate(judge_results))
                     feedback += "\n\n## Judge 上轮意见\n\n" + jfb
             else:
@@ -507,9 +507,11 @@ class RefineStage(BaseStage):
                     ctx.emit_event("log", level="info",
                                    msg=(f"[S2] {mod_name}: recovered {len(recovered)} files "
                                         f"(skip_restore={skip_restore})"))
-                fail_fb = "\n".join(
-                    f"judge-{i}: {r['feedback'][:500]}"
-                    for i, r in enumerate(judge_results) if not r["pass"])
+                fb_rel = write_judge_feedback(
+                    workspace, "s2_refine", mod_name, attempt + 1, judge_results)
+                ctx.emit_event("log", level="info",
+                               msg=f"[S2] judge 意见已写入 {fb_rel}")
+                fail_fb = str(fb_rel)
                 if "missing" in fail_fb.lower() or "丢失" in fail_fb or "遗漏" in fail_fb:
                     guidance = (
                         "\n\n⚠️ **文件丢失！** "
@@ -538,7 +540,11 @@ class RefineStage(BaseStage):
                     )
                 else:
                     guidance = "\n\n请根据评审意见调整拆分策略。"
-                feedback = "# 评审意见（未通过）\n\n" + fail_fb + guidance
+                feedback = (
+                    "请先阅读 judge 完整意见：\n"
+                    + f"```\nread {fail_fb}\n```\n"
+                    + guidance
+                )
                 if recovered:
                     rec_list = chr(10).join(f"  - {f}" for f in recovered[:30])
                     feedback += (

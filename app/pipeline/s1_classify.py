@@ -24,7 +24,8 @@ from .filter_engine import normalize_filter_engine
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, StageError,
-    max_rounds_exceeded_treated_as_passed,
+    max_rounds_exceeded_treated_as_passed, write_judge_feedback,
+    max_iter,
 )
 
 
@@ -566,11 +567,12 @@ class ClassifyStage(BaseStage):
                     + reflect_prompt
                 )
             else:
-                # judge 失败
-                fail_fb = "\n".join(
-                    f"judge-{i}: {r['feedback'][:500]}"
-                    for i, r in enumerate(judge_results)
-                )
+                # judge 失败 — 写完整意见到 judge_output/s1_classify/
+                fb_rel = write_judge_feedback(
+                    workspace, "s1_classify", None, attempt + 1, judge_results)
+                ctx.emit_event("log", level="info",
+                               msg=f"[S1] judge 意见已写入 {fb_rel}")
+                fail_fb = str(fb_rel)
                 # 问题6：注入增量修复指导，防止 Worker 全量重写分类脚本
                 current_mods = discover_modules(str(workspace))
                 total_classified = 0
@@ -600,8 +602,9 @@ class ClassifyStage(BaseStage):
                     f"  然后重新运行 `bash classify_framework.sh`（全量重建）\n"
                 )
                 feedback = (
-                    f"# 上轮评审不通过（第 {attempt+1} 轮）\n\n"
-                    f"## Judge 上轮意见\n\n{fail_fb}\n\n"
+                    f"# 上轮评审不通过（第 {attempt + 1} 轮）\n\n"
+                    "Judge 完整意见已写入文件，请先阅读：\n"
+                    f"```\nread {fail_fb}\n```\n\n"
                     + incremental_guidance
                     + reflect_prompt
                 )

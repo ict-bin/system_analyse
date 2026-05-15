@@ -133,12 +133,16 @@ async def run_agent_with_stage_guard(
     context: str,
     heartbeat_payload_factory=None,
     heartbeat_interval: float | None = None,
-    timeout_seconds: float | None = None,
+    timeout_seconds: float | None = None,  # deprecated — no longer enforced; kept for API compat
     **kwargs,
 ) -> AgentResult:
-    """Run an agent with heartbeat events and a hard timeout."""
+    """Run an agent with periodic heartbeat events.
+
+    超时定时器已移除：每个模块的文件量固定，不应人为限制分析时间。
+    心跳每 30s 发送一次，用于监控进度，但不会强制终止会话。
+    timeout_seconds 参数保留以兼容调用方签名，但不再生效。
+    """
     heartbeat_every = heartbeat_interval or _DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS
-    stage_timeout = timeout_seconds or float(getattr(ctx.cfg, "agent_timeout_seconds", _DEFAULT_AGENT_TIMEOUT_SECONDS) or _DEFAULT_AGENT_TIMEOUT_SECONDS)
 
     def _payload(heartbeat_index: int) -> dict:
         if callable(heartbeat_payload_factory):
@@ -152,30 +156,13 @@ async def run_agent_with_stage_guard(
     started_monotonic = time.monotonic()
     try:
         while True:
-            elapsed = time.monotonic() - started_monotonic
-            if stage_timeout and elapsed >= stage_timeout:
-                payload = _payload(heartbeat_index)
-                payload["elapsed_seconds"] = round(elapsed, 3)
-                payload["timeout_seconds"] = stage_timeout
-                ctx.emit_event(
-                    "log",
-                    level="error",
-                    msg=(
-                        f"Stage {stage} 智能体会话超时：已等待 {int(elapsed)} 秒，"
-                        f"超过阈值 {int(stage_timeout)} 秒"
-                    ),
-                )
-                ctx.emit_event("stage_result", stage=stage, status="timeout", **payload)
-                raise StageError(
-                    f"Stage {stage} 智能体会话超时：等待返回超过 {int(stage_timeout)} 秒"
-                )
             try:
                 return await asyncio.wait_for(asyncio.shield(agent_task), timeout=heartbeat_every)
             except asyncio.TimeoutError:
                 heartbeat_index += 1
+                elapsed = time.monotonic() - started_monotonic
                 payload = _payload(heartbeat_index)
-                payload["elapsed_seconds"] = round(time.monotonic() - started_monotonic, 3)
-                payload["timeout_seconds"] = stage_timeout
+                payload["elapsed_seconds"] = round(elapsed, 3)
                 ctx.emit_event("stage", stage=stage, **payload)
     finally:
         if not agent_task.done():
@@ -731,6 +718,45 @@ def archive_file(output_dir: Path, name: str, content: str) -> None:
         (output_dir / name).write_text(content, encoding="utf-8")
     except OSError:
         pass
+
+
+def write_judge_feedback(
+    workspace: "Path",
+    stage_key: str,
+    module_name: "str | None",
+    attempt: int,
+    judge_results: list[dict],
+) -> Path:
+    """将本轮所有 Judge 的完整意见（不截断）写入独立文件，返回相对于 workspace 的路径。
+
+    存储结构：
+      有模块：workspace/judge_output/<stage_key>/<module_name>/feedback_a<attempt>.md
+      无模块：workspace/judge_output/<stage_key>/feedback_a<attempt>.md
+
+    stage_key 约定：
+      s1_classify    — Stage 1 粗分类（全局，module_name=None）
+      s1_security    — Stage 1.5 安全维度过滤（全局，module_name=None）
+      s2_refine      — Stage 2 细分（按模块）
+      s3_analyse     — Stage 3 分析（按模块）
+      s4_completeness — Stage 4a 完整性检查（全局，module_name=None）
+      s4_report      — Stage 4b 最终报告（全局，module_name=None）
+    """
+    if module_name:
+        out_dir = workspace / "judge_output" / stage_key / module_name
+    else:
+        out_dir = workspace / "judge_output" / stage_key
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_file = out_dir / f"feedback_a{attempt}.md"
+    lines: list[str] = [f"# Judge 评审意见（第 {attempt} 轮）\n"]
+    for i, r in enumerate(judge_results):
+        passed_str = "✅ 通过" if r.get("pass") else "❌ 不通过"
+        lines.append(f"## Judge-{i}  {passed_str}  分数={r.get('score', '?')}\n")
+        lines.append((r.get("feedback") or "(无意见)") + "\n")
+    out_file.write_text("\n".join(lines), encoding="utf-8")
+
+    # 返回相对于 workspace 的 Path（Worker prompt 中可直接 read 该路径）
+    return out_file.relative_to(workspace)
 
 
 # ─── ELF / 文件预读 ──────────────────────────────────────────────────────────

@@ -15,6 +15,18 @@ Stage 2 负责两件事：
 
 **哪怕遗漏 1 个文件，直接 0 分、不通过。没有例外。**
 
+# 工作目录说明
+
+**Judge 的 cwd = workspace 根目录。** 所有路径都相对于 workspace：
+
+| 要读的内容 | 正确路径 | 错误示例（不要用） |
+|-----------|---------|------------|
+| 模块文件列表 | `cat modules/<模块>/files.list` | `cat /input/modules/<模块>/files.list` |
+| 快照 | `cat .s2_snapshots/<模块>.snapshot` | 任何包含 `/input/` 的绝对路径 |
+| 删除列表 | `cat modules/<模块>/deleted/files.list` | 源码目录下找同名目录 |
+
+⚠️ **S2 Judge 不需要访问源码文件，只需检查 modules/ 工作区目录结构。**
+
 # 步骤
 
 ## 1. 运行拆分完整性校验（必做）

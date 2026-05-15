@@ -35,6 +35,7 @@ from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_checked, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, StageError,
+    write_judge_feedback,
 )
 
 _BACKUP_DIR_NAME = "modules_pre_filter_backup"
@@ -344,15 +345,23 @@ class SecurityFocusFilterStage(BaseStage):
                                  removed=removed_count)
                 return
 
-            # ── 未通过：从 Judge 输出中提取结构化修正列表注入下轮 ────────────
+            # ── 未通过：写完整 judge 意见到文件 + 提取结构化修正列表 ────────────
             if not max_reached:
+                fb_rel = write_judge_feedback(
+                    workspace, "s1_security", None, attempt + 1, judge_results)
+                ctx.emit_event("log", level="info",
+                               msg=f"[S1.5] judge 意见已写入 {fb_rel}")
                 corrections_parts: list[str] = []
                 for i, rec in enumerate(judge_records):
                     raw = rec.get("raw_output", "")
                     corrections_parts.append(
                         f"### Judge-{i}（分数 {rec['score']}）修正列表\n\n{raw}"
                     )
-                judge_corrections = "\n\n".join(corrections_parts)
+                judge_corrections = (
+                    f"请先阅读 judge 完整意见：\n"
+                    f"```\nread {fb_rel}\n```\n\n"
+                    + "\n\n".join(corrections_parts)
+                )
 
         raise StageError(
             f"安全维度过滤阶段未通过，已达最大轮数 {s_cfg.max_rounds}。"

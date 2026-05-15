@@ -13,8 +13,12 @@
 - **ELF 文件**（`.so`/`.ko`/可执行文件）：读 `details/<相对路径>.json` 获取完整符号表、依赖库、危险调用
   例：`read details/rootfs_main/module/libfoo.so.json`
   JSON 中包含：`symbols`（导出函数）、`imports`（外部调用）、`needed`（依赖库）、`strings_head`
-- **文本文件**（`.c`/`.h`/脚本/配置）：读 `target/<相对路径>` 获取源码
-  例：`read target/src/auth.c`
+- **文本文件**（`.c`/`.h`/`.go`/脚本/配置）：读 `target/<rel_path>` 获取源码
+  其中 `rel_path` 来自 `modules/{mod_name}/files.list` 中的行（去掉前导目录名即可）
+  例：`read target/src/daemon/modules/image/oci_storage.c`
+  ⚠️ **不要**用 `iSulad-master/src/...` 这样的路径（会 ENOENT）
+  ⚠️ **不要**用容器绝对路径 `/data/files/...` 或 `/workspace/...`
+  ⚠️ `target/` 是相对 workspace 的符号链接，永远从这里访问源码
 - **严禁** 调用 `bash` 运行 nm / readelf / strings / file 命令
 
 ---

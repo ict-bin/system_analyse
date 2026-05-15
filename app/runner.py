@@ -404,6 +404,7 @@ async def _run_with_context_overflow_recovery(
         retry_delay=retry_delay,
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
+        session_file=session_file,
     )
     if not _is_context_overflow_error(result.error):
         return result
@@ -573,6 +574,7 @@ async def _run_with_pi_retry(
     retry_delay: float,
     pi_max_retries: int,
     pi_retry_delay: float,
+    session_file: str | None = None,  # 穿透给内层用于「继续」判断
 ) -> AgentResult:
     """外层循环：处理 pi 进程拉起失败、崩溃、致命错误。"""
     # cwd 不存在是致命错误（目录被删除等），不进入重试
@@ -602,6 +604,7 @@ async def _run_with_pi_retry(
                 on_stream=on_stream,
                 max_retries=max_retries,
                 retry_delay=retry_delay,
+                session_file=session_file,
             )
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
@@ -664,6 +667,43 @@ async def _run_with_pi_retry(
 # ─── 内层：API 级重试 ────────────────────────────────────────────────────────
 
 
+
+
+def _session_has_assistant_content(session_file: "str | None") -> bool:
+    """检查 session jsonl 中是否已有完整的 assistant 消息输出。
+
+    用于判断 pi 重试时应发原始 prompt 还是短指令「继续」。
+    """
+    if not session_file:
+        return False
+    try:
+        p = Path(session_file)
+        if not p.exists() or p.stat().st_size < 50:
+            return False
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                msg = obj.get("message") or {}
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    content = msg.get("content") or []
+                    if isinstance(content, list):
+                        text = "".join(
+                            c.get("text", "") for c in content if isinstance(c, dict)
+                        )
+                    else:
+                        text = str(content)
+                    if len(text.strip()) > 10:
+                        return True
+    except Exception:
+        pass
+    return False
+
 async def _run_with_api_retry(
     *,
     args: list[str],
@@ -674,9 +714,16 @@ async def _run_with_api_retry(
     on_stream: Callable[[str], None] | None,
     max_retries: int,
     retry_delay: float,
+    session_file: str | None = None,  # 用于「继续」判断
 ) -> AgentResult:
-    """内层循环：启动 pi 子进程，处理 API 级错误重试。"""
+    """内层循环：启动 pi 子进程，处理 API 级错误重试。
+
+    会话已有内容时的重试策略：
+    - session_file 已有 assistant 输出 → 发「继续完成上次未完成的任务」
+    - 否则重发原始 prompt
+    """
     api_attempt = 0
+    effective_prompt = prompt  # 首次使用原始 prompt
 
     while True:
         result = AgentResult()
@@ -711,7 +758,7 @@ async def _run_with_api_retry(
 
             # 发送初始 prompt（无 ARG_MAX 限制）
             prompt_cmd = json.dumps(
-                {"type": "prompt", "message": prompt},
+                {"type": "prompt", "message": effective_prompt},
                 ensure_ascii=False,
             ) + chr(10)
             proc.stdin.write(prompt_cmd.encode("utf-8"))
@@ -853,6 +900,10 @@ async def _run_with_api_retry(
                 )
                 if on_stream:
                     on_stream(f"\n⚠️ {kind}错误，{delay:.0f}s 后重试 ({label})...\n")
+                # session 已有内容时发「继续」而非重复完整 prompt
+                if _session_has_assistant_content(session_file):
+                    effective_prompt = "继续完成上次未完成的任务。"
+                    _log_warn("session 已有内容，重试时发送「继续」而非重复完整 prompt")
                 await asyncio.sleep(delay)
                 continue
             else:

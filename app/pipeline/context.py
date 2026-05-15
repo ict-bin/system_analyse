@@ -150,6 +150,25 @@ class PipelineContext:
         path.parent.mkdir(parents=True, exist_ok=True)
         return str(path)
 
+    def judge_feedback_path(
+        self,
+        stage_key: str,
+        module_name: "str | None",
+        attempt: int,
+    ) -> str:
+        """返回 judge feedback 文件的相对路径字符串（相对于 workspace）。
+
+        供各阶段 Worker 的 prompt 引用，格式：
+          有模块: judge_output/<stage_key>/<module_name>/feedback_a<attempt>.md
+          无模块: judge_output/<stage_key>/feedback_a<attempt>.md
+
+        对应 write_judge_feedback() 的写入路径，读取时直接 `read <returned_path>`。
+        """
+        if module_name:
+            return f"judge_output/{stage_key}/{module_name}/feedback_a{attempt}.md"
+        else:
+            return f"judge_output/{stage_key}/feedback_a{attempt}.md"
+
     def emit_event(self, event_type: str, **data):
         """便捷 emit，自动带 task_id"""
         from ..models import SwarmEvent
