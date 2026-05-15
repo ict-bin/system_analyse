@@ -18,6 +18,7 @@ pipeline/s4_report.py — Stage 4: 最终报告
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import shutil
 import time
