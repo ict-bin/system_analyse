@@ -38,14 +38,20 @@ def load_detail(details_dir: Path, rel: str) -> dict:
         return {}
 
 
+def _first_n_list(v, n: int = 20) -> list:
+    if not isinstance(v, list):
+        return []
+    return v[:n]
+
+
 def score_file(rel: str, detail: dict) -> tuple[int, list[str], list[str]]:
     text = " ".join([
         rel.lower(),
         str(detail.get("summary", "")).lower(),
-        " ".join(str(x).lower() for x in detail.get("functions", [])[:20]),
-        " ".join(str(x).lower() for x in detail.get("symbols", [])[:20]),
-        " ".join(str(x).lower() for x in detail.get("imports", [])[:20]),
-        " ".join(str(x).lower() for x in detail.get("keywords", [])[:20]),
+        " ".join(str(x).lower() for x in _first_n_list(detail.get("functions"))),
+        " ".join(str(x).lower() for x in _first_n_list(detail.get("symbols"))),
+        " ".join(str(x).lower() for x in _first_n_list(detail.get("imports"))),
+        " ".join(str(x).lower() for x in _first_n_list(detail.get("keywords"))),
     ])
     cats = []
     hits = []
