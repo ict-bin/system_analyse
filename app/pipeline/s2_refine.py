@@ -36,7 +36,7 @@ from .helpers import (
     enforce_filter_constraint,
     archive_module_deletions, get_module_deleted_files, restore_module_for_retry,
     fix_orphan_dirs_before_judge, build_s2_diagnose_report,
-    module_has_nonempty_files,
+    module_has_nonempty_files, commit_split_plan, split_plan_exists, list_split_candidate_modules,
 )
 
 
@@ -292,8 +292,13 @@ class RefineStage(BaseStage):
 
             ctx.emit_event("stage", stage=2, module=mod_name, attempt=attempt + 1)
 
-            mods_before = set(discover_modules(str(workspace)))
-            prompt_parts = [f"检查模块 `{mod_name}` 是否需要细分。"]
+            prompt_parts = [
+                f"当前正式已存在模块（禁止直接修改它们，只能通过 split/_merge_to 提交候选合并）：{', '.join(sorted(discover_modules(str(workspace))))}",
+                f"检查模块 `{mod_name}` 是否需要细分。",
+                f"如需拆分，只能在 `modules/{mod_name}/split/` 下创建候选子模块，禁止直接创建/修改正式 `modules/<其他模块>` 目录。",
+                f"若某些文件应并入已有模块，请写入 `modules/{mod_name}/split/_merge_to/<目标模块>/files.list` 作为候选迁移清单。",
+                f"Judge 通过后，Python 会依据 split 草稿正式提交拆分与合并。",
+            ]
             if file_summary:
                 prompt_parts.append("\n\n## 文件摘要（子 Worker 已分析）\n\n" + file_summary)
             if feedback:
@@ -317,23 +322,9 @@ class RefineStage(BaseStage):
             )
             ctx.tokens += ar.token_usage
 
-            mods_after = set(discover_modules(str(workspace)))
-            new_ones = sorted(
-                (mods_after - mods_before) - self._refined - self._in_progress
-            )
-
-            # 清理孤儿子模块目录：Worker 创建了目录但未写入 files.list
-            # （常见于 Worker 询问用户确认而中途退出）
-            import shutil as _shutil_orphan
-            for _nm in list(new_ones):
-                _sub_dir = get_modules_root(str(workspace)) / _nm
-                if _sub_dir.exists() and not (_sub_dir / "files.list").exists():
-                    _shutil_orphan.rmtree(str(_sub_dir), ignore_errors=True)
-                    new_ones = [m for m in new_ones if m != _nm]
-                    mods_after.discard(_nm)
-
-            was_split = (mod_name not in mods_after
-                         and bool(mods_after - mods_before - self._refined - self._in_progress))
+            split_new_modules = list_split_candidate_modules(mod_dir)
+            new_ones = [nm for nm in split_new_modules if nm != mod_name]
+            was_split = split_plan_exists(mod_dir)
             ctx.emit_event("stage_result", stage=2, module=mod_name,
                            split=was_split, new_modules=new_ones)
 
@@ -464,11 +455,13 @@ class RefineStage(BaseStage):
 
             if voted_pass:
                 if attempt + 1 >= s_cfg.min_rounds:
-                    # 归档 modules/<mod>/deleted/ → workspace/deleted.list
+                    commit_info = {"applied": False, "new_modules": [], "merged_targets": [], "retained_parent": False}
+                    if was_split:
+                        commit_info = commit_split_plan(workspace, mod_name)
+                        new_ones = list(commit_info.get("new_modules") or [])
                     await archive_module_deletions(
                         workspace, mod_name, mod_dir, self._deleted_lock, ctx
                     )
-                    # 若原模块已被拆分（files.list 已移除），Python 做 rm -rf
                     if mod_dir.exists() and not (mod_dir / "files.list").exists():
                         import shutil as _shutil
                         _shutil.rmtree(str(mod_dir), ignore_errors=True)
@@ -556,6 +549,9 @@ class RefineStage(BaseStage):
                     )
 
             if forced_pass:
+                if was_split:
+                    commit_info = commit_split_plan(workspace, mod_name)
+                    new_ones = list(commit_info.get("new_modules") or [])
                 await archive_module_deletions(
                     workspace, mod_name, mod_dir, self._deleted_lock, ctx
                 )

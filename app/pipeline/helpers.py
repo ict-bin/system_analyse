@@ -452,54 +452,165 @@ def process_module_recover(mod_dir):
         f.write(nl.join(recover_files) + nl)
     shutil.rmtree(str(mod_dir / 'recover'), ignore_errors=True)
     return recover_files
+
+
+def list_split_candidate_modules(mod_dir: "Path") -> list[str]:
+    """列出 modules/<mod>/split/ 下的候选子模块名（不含 _merge_to）。"""
+    split_dir = mod_dir / "split"
+    if not split_dir.exists() or not split_dir.is_dir():
+        return []
+    names: list[str] = []
+    for d in sorted(split_dir.iterdir()):
+        if not d.is_dir() or d.name.startswith("_"):
+            continue
+        if module_has_nonempty_files(d):
+            names.append(d.name)
+    return names
+
+
+def split_plan_exists(mod_dir: "Path") -> bool:
+    return bool(list_split_candidate_modules(mod_dir) or (mod_dir / "split" / "_merge_to").exists())
+
+
+def read_split_merge_targets(mod_dir: "Path") -> dict[str, list[str]]:
+    """读取 split/_merge_to/<target>/files.list。"""
+    merge_root = mod_dir / "split" / "_merge_to"
+    result: dict[str, list[str]] = {}
+    if not merge_root.exists() or not merge_root.is_dir():
+        return result
+    for d in sorted(merge_root.iterdir()):
+        if not d.is_dir():
+            continue
+        files = read_module_files(d)
+        if files:
+            result[d.name] = files
+    return result
+
+
+def _write_unique_files(path: "Path", files: list[str]) -> None:
+    uniq = sorted({f.strip() for f in files if str(f).strip()})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if uniq:
+        path.write_text("\n".join(uniq) + "\n", encoding="utf-8")
+    else:
+        path.write_text("", encoding="utf-8")
+
+
+
+def commit_split_plan(workspace: "Path", mod_name: str) -> dict[str, list[str] | bool]:
+    """将 modules/<mod>/split 下的候选拆分结果正式提交到 modules/ 根目录。
+
+    支持：
+    - modules/<mod>/split/<child>/files.list      → 新子模块或保留父模块(mod_name)
+    - modules/<mod>/split/_merge_to/<dst>/files.list → 并入其他模块
+
+    返回：
+      {
+        "applied": bool,
+        "new_modules": [...],
+        "merged_targets": [...],
+        "retained_parent": bool,
+      }
+    """
+    mods_root = get_modules_root(str(workspace))
+    mod_dir = mods_root / mod_name
+    split_dir = mod_dir / "split"
+    if not split_dir.exists() or not split_dir.is_dir():
+        return {"applied": False, "new_modules": [], "merged_targets": [], "retained_parent": False}
+
+    snapshot_path = workspace / ".s2_snapshots" / f"{mod_name}.snapshot"
+    snap_files = set(read_module_files(snapshot_path)) if snapshot_path.exists() else set()
+    deleted_files = set(read_module_files(mod_dir / "deleted"))
+
+    child_map: dict[str, set[str]] = {}
+    retained_parent = False
+    for child in list_split_candidate_modules(mod_dir):
+        files = set(read_module_files(split_dir / child))
+        if files:
+            child_map[child] = files
+            if child == mod_name:
+                retained_parent = True
+
+    merge_map = {name: set(files) for name, files in read_split_merge_targets(mod_dir).items()}
+
+    covered = set().union(*child_map.values()) if child_map else set()
+    for files in merge_map.values():
+        covered |= files
+    covered |= deleted_files
+
+    if snap_files and covered != snap_files:
+        missing = sorted(snap_files - covered)
+        extra = sorted(covered - snap_files)
+        raise StageError(
+            f"split 提交前校验失败: missing={len(missing)} extra={len(extra)}"
+            + (f" missing示例={missing[:5]}" if missing else "")
+            + (f" extra示例={extra[:5]}" if extra else "")
+        )
+
+    new_modules: list[str] = []
+    merged_targets: list[str] = []
+
+    for child, files in child_map.items():
+        target_dir = mods_root / child
+        target_file = target_dir / "files.list"
+        if child == mod_name:
+            _write_unique_files(target_file, sorted(files))
+        else:
+            existing = set(read_module_files(target_dir)) if target_file.exists() else set()
+            _write_unique_files(target_file, sorted(existing | files))
+            new_modules.append(child)
+
+    for target, files in merge_map.items():
+        target_dir = mods_root / target
+        target_file = target_dir / "files.list"
+        existing = set(read_module_files(target_dir)) if target_file.exists() else set()
+        _write_unique_files(target_file, sorted(existing | files))
+        merged_targets.append(target)
+
+    if mod_name not in child_map:
+        if (mod_dir / "deleted").exists():
+            (mod_dir / "files.list").unlink(missing_ok=True)
+        else:
+            shutil.rmtree(str(mod_dir), ignore_errors=True)
+    else:
+        _write_unique_files(mod_dir / "files.list", sorted(child_map[mod_name]))
+
+    shutil.rmtree(str(split_dir), ignore_errors=True)
+    return {
+        "applied": True,
+        "new_modules": sorted(set(new_modules)),
+        "merged_targets": sorted(set(merged_targets)),
+        "retained_parent": retained_parent,
+    }
+
+
 def restore_module_for_retry(
     mod_name: str,
     mod_dir: "Path",
     workspace: "Path",
     refined_set: set[str],
 ) -> None:
-    """重试前恢复模块状态（Python 接管，不靠 Worker bash 自清理）。
+    """重试前恢复模块状态（split 草稿模式）。
 
     1. 恢复快照 → mod_dir/files.list
-    2. rm -rf 上一轮 Worker 新建的子模块（不在 refined_set 中的新增模块）
+    2. 删除 mod_dir/split/（上一轮候选拆分草稿）
     3. 清空 mod_dir/deleted/（如存在）
     4. 清理 workspace 根下与此模块相关的孤儿目录（路径写错导致）
     """
-    mods_root = get_modules_root(str(workspace))
     snapshot_path = workspace / ".s2_snapshots" / f"{mod_name}.snapshot"
 
-    # 1. 恢复快照
     if snapshot_path.exists():
         mod_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(snapshot_path), str(mod_dir / "files.list"))
 
-    # 2. 删除上一轮新建的子模块
-    # 条件：必须同时满足以下三者，避免误删并行 Worker 的合法模块
-    #   a) 以 mod_name + "_" 严格前缀开头（含下划线分隔符，避免 auth 误删 authenticate）
-    #   b) 无快照文件（证明是本轮新建，不是原有模块）
-    #   c) 不在 refined_set 中（证明未被其他并行 Worker 完成处理）
-    current_mods = set(discover_modules(str(workspace)))
-    for m in current_mods:
-        if m == mod_name:
-            continue
-        if m in refined_set:
-            continue
-        sub_snap = workspace / ".s2_snapshots" / f"{m}.snapshot"
-        is_new_sub = (
-            m.startswith(mod_name + "_")  # 严格子模块前缀（含下划线）
-            and not sub_snap.exists()      # 无快照 = 本轮新建
-        )
-        if is_new_sub:
-            shutil.rmtree(str(mods_root / m), ignore_errors=True)
+    split_dir = mod_dir / "split"
+    if split_dir.exists():
+        shutil.rmtree(str(split_dir), ignore_errors=True)
 
-    # 3. 清空 deleted/
     deleted_dir = mod_dir / "deleted"
     if deleted_dir.exists():
         shutil.rmtree(str(deleted_dir), ignore_errors=True)
 
-    # 4. 清理 workspace 根下与此模块相关的孤儿目录
-    #    孤儿目录特征：在 workspace 根下（不在 modules/）、包含 files.list、
-    #    名称含 mod_name、且无对应快照（非正规模块）
     _clean_orphan_dirs(workspace, mod_name, refined_set)
 
 

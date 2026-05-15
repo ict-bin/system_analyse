@@ -8,8 +8,8 @@
 # 职责
 
 Stage 2 负责两件事：
-1. **拆分**：功能混杂的大模块拆成子模块
-2. **迁移错分文件**：明显属于其他领域的文件应已移到正确模块
+1. **拆分**：功能混杂的大模块拆成子模块（先写入 `modules/<模块>/split/` 草稿）
+2. **迁移错分文件**：明显属于其他领域的文件应先写入 `modules/<模块>/split/_merge_to/<目标模块>/files.list` 候选迁移清单
 
 评审内容：
 1. **文件零遗漏**（铁律）：快照文件全部在某个模块中（本模块子模块 或 已迁移到其他模块）
@@ -74,7 +74,8 @@ echo "path/to/wrongly_deleted_file.c" >> modules/$MOD/recover/files.list
 ## 3. 评审模块合理性
 
 ```bash
-cat modules/<当前模块>/files.list   # 或各子模块 files.list
+cat modules/<当前模块>/files.list
+find modules/<当前模块>/split -name files.list -type f 2>/dev/null | sort | xargs -r -I{} sh -c 'echo "--- {}"; cat "{}"'
 ```
 
 判断：

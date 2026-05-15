@@ -22,7 +22,11 @@ Stage 2 做两件事：
      - ❌ `unknown_core`、`misc_crypto`（无语义前缀）
    - 若子模块名与已有模块重名，才加最短必要前缀区分
 3. **所有文件操作必须用 bash 脚本**
-4. **原模块目录清理规则（重要变更）**：
+4. **拆分草稿目录规则（最高优先级）**：若需要拆分，**只能**在 `modules/$MOD/split/` 下创建候选拆分草稿，禁止直接创建正式 `modules/<子模块>` 或直接修改其他正式模块。
+   - 新子模块草稿：`modules/$MOD/split/<子模块>/files.list`
+   - 并入已有模块草稿：`modules/$MOD/split/_merge_to/<已有模块>/files.list`
+   - Judge 通过后，Python 会依据 split 草稿正式提交拆分与合并
+5. **原模块目录清理规则（重要变更）**：
    - 若**未创建** `deleted/` 子文件夹：拆分完成后正常 `rm -rf modules/$MOD`
    - 若**已创建** `deleted/` 子文件夹：**不要自行 rm -rf 原模块目录**——只需删除 `modules/$MOD/files.list`，Python 将在 Judge 通过后清理
 
@@ -114,32 +118,22 @@ rmdir modules/$MOD/recover 2>/dev/null || true
 
 ## 3. 迁移错分文件（如有必要）
 
-若发现某文件明显属于其他已有模块（如 auth 模块里有 libvrrp.so 路由协议文件），将其迁移：
+若发现某文件明显属于其他已有模块（如 auth 模块里有 libvrrp.so 路由协议文件），**不要直接修改目标正式模块**，而是写入候选迁移草稿：
 
 ```bash
 #!/bin/bash
 set -e
-SRC_MOD="<当前模块名>"   # 如 auth
-DST_MOD="<目标模块名>"   # 如 routing
+SRC_MOD="<当前模块名>"
+DST_MOD="<目标模块名>"
 FILE="<相对路径>"
-
-# 问题3：同时锁源和目标，防止并发 Worker 竟争导致文件丢失
-(
-  flock -x 200  # 锁目标
-  flock -x 201  # 锁源
-  # 从源模块删除
-  grep -vxF "$FILE" modules/$SRC_MOD/files.list > /tmp/src_new_$$.txt \
-      && mv /tmp/src_new_$$.txt modules/$SRC_MOD/files.list
-  # 追加到目标模块（去重）
-  if ! grep -qxF "$FILE" modules/$DST_MOD/files.list 2>/dev/null; then
-      echo "$FILE" >> modules/$DST_MOD/files.list
-  fi
-) 200>modules/$DST_MOD/files.list.lock \
-  201>modules/$SRC_MOD/files.list.lock
-echo "已迁移 $(basename $FILE) → $DST_MOD"
+mkdir -p modules/$SRC_MOD/split/_merge_to/$DST_MOD
+if ! grep -qxF "$FILE" modules/$SRC_MOD/split/_merge_to/$DST_MOD/files.list 2>/dev/null; then
+    echo "$FILE" >> modules/$SRC_MOD/split/_merge_to/$DST_MOD/files.list
+fi
+sort -u modules/$SRC_MOD/split/_merge_to/$DST_MOD/files.list -o modules/$SRC_MOD/split/_merge_to/$DST_MOD/files.list
 ```
 
-> **目标模块必须已存在**。若目标模块不存在，将文件归入功能最接近的子模块即可。
+> **目标模块必须已存在**。Judge 通过后，Python 会执行真正的合并与去重。
 
 ## 4. 拆分操作（如需要）
 
@@ -149,52 +143,35 @@ set -e
 MOD="<当前模块名>"  # 如 crypto_certs
 BEFORE=$(wc -l < modules/$MOD/files.list)
 echo "拆分前: $BEFORE 个文件"
+rm -rf modules/$MOD/split
+mkdir -p modules/$MOD/split/mbedtls_crypto modules/$MOD/split/mbedtls_ssl modules/$MOD/split/mbedtls_docs
 
-# 按实际功能/技术栈命名（不加父模块前缀）
-# 例：crypto_certs 模块含 mbedtls 库，应拆分为：
-mkdir -p modules/mbedtls_crypto modules/mbedtls_ssl modules/mbedtls_docs
-
-# ── 路径自检（问题2：防止孤儿目录）──────────────────────────────────────────
 for sub in mbedtls_crypto mbedtls_ssl mbedtls_docs; do
-    if [ ! -d "modules/$sub" ]; then
-        echo "❌ 错误：modules/$sub 未创建成功，检查当前工作目录："
-        pwd && ls -la | head -20
+    if [ ! -d "modules/$MOD/split/$sub" ]; then
+        echo "❌ 错误：modules/$MOD/split/$sub 未创建成功"
         exit 1
     fi
 done
-echo "✅ 路径自检通过，所有子模块在 modules/ 下"
-# ─────────────────────────────────────────────────────────────────────────────
+echo "✅ 路径自检通过，所有候选子模块在 modules/$MOD/split/ 下"
 
-# 按关键词分类到子模块
-grep -iE 'aes|sha|rsa|ecp|bignum|cipher|hash' modules/$MOD/files.list > modules/mbedtls_crypto/files.list || true
-grep -iE 'ssl|tls|x509|pkcs' modules/$MOD/files.list > modules/mbedtls_ssl/files.list || true
-grep -iE 'README|doc|CHANGE|LICENSE|AUTHORS' modules/$MOD/files.list > modules/mbedtls_docs/files.list || true
+grep -iE 'aes|sha|rsa|ecp|bignum|cipher|hash' modules/$MOD/files.list > modules/$MOD/split/mbedtls_crypto/files.list || true
+grep -iE 'ssl|tls|x509|pkcs' modules/$MOD/files.list > modules/$MOD/split/mbedtls_ssl/files.list || true
+grep -iE 'README|doc|CHANGE|LICENSE|AUTHORS' modules/$MOD/files.list > modules/$MOD/split/mbedtls_docs/files.list || true
 
-# 未匹配的归入功能最接近的子模块（兜底，保证无遗漏）
-cat modules/mbedtls_*/files.list 2>/dev/null | sort > /tmp/moved_$$.txt
+cat modules/$MOD/split/*/files.list 2>/dev/null | sort > /tmp/moved_$$.txt
 sort modules/$MOD/files.list > /tmp/orig_$$.txt
-comm -23 /tmp/orig_$$.txt /tmp/moved_$$.txt >> modules/mbedtls_crypto/files.list || true
+comm -23 /tmp/orig_$$.txt /tmp/moved_$$.txt >> modules/$MOD/split/mbedtls_crypto/files.list || true
 
-# 去重
-for f in modules/mbedtls_*/files.list; do sort -u "$f" -o "$f"; done
+for f in modules/$MOD/split/*/files.list; do sort -u "$f" -o "$f"; done
 
-# 校验：拆分后总数 == 拆分前
-AFTER=$(cat modules/mbedtls_*/files.list | sort -u | wc -l)
-echo "拆分后: $AFTER 个文件"
+AFTER=$(cat modules/$MOD/split/*/files.list | sort -u | wc -l)
+echo "拆分草稿后: $AFTER 个文件"
 [ "$BEFORE" -eq "$AFTER" ] && echo "✅ 完整" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
 
-# 删除原模块目录（快照已保存在 .s2_snapshots/ 中）
-# 若已创建 deleted/，只删 files.list （不要 rm -rf 整个目录）。若无 deleted/，可直接 rm -rf
-if [ -d "modules/$MOD/deleted" ]; then
-    rm -f modules/$MOD/files.list
-    echo "已删除 files.list，deleted/ 由 Python 安排归档和清理"
-else
-    rm -rf modules/$MOD
-fi
 rm -f /tmp/moved_$$.txt /tmp/orig_$$.txt
 ```
 
-> ⚠️ **第二轮重试时**：Python 已自动从快照恢复 `files.list` 并删除上轮子模块，你只需按新策略重新拆分即可。无需手动清理上轮残留文件。
+> ⚠️ **第二轮重试时**：Python 会自动从快照恢复 `files.list` 并删除 `modules/$MOD/split/` 草稿，你只需按新策略重新生成 split 草稿即可。
 
 
 ## ⚠️ 重试时必须先读诊断报告（问题1/4）

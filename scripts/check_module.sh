@@ -43,11 +43,14 @@ fi
 sort -u "$SNAPSHOT" > /tmp/cm_snap_$$.txt
 SNAP_COUNT=$(wc -l < /tmp/cm_snap_$$.txt)
 
-# Step 1: 收集本模块 + 子模块的文件 + 本模块 deleted/ 子文件夹
+# Step 1: 收集本模块 + split 候选子模块 + split/_merge_to/* + 本模块 deleted/
 > /tmp/cm_local_$$.txt
 [ -f "$MODULES_ROOT/$MOD_NAME/files.list" ] && \
     grep -v "^$" "$MODULES_ROOT/$MOD_NAME/files.list" >> /tmp/cm_local_$$.txt 2>/dev/null
-for sub in "$MODULES_ROOT"/${MOD_NAME}_*/files.list; do
+for sub in "$MODULES_ROOT/$MOD_NAME"/split/*/files.list; do
+    [ -f "$sub" ] && grep -v "^$" "$sub" >> /tmp/cm_local_$$.txt
+done
+for sub in "$MODULES_ROOT/$MOD_NAME"/split/_merge_to/*/files.list; do
     [ -f "$sub" ] && grep -v "^$" "$sub" >> /tmp/cm_local_$$.txt
 done
 # ★ 将 deleted/ 子文件夹中的文件也视为已处理（待归档的排除文件）
@@ -58,7 +61,7 @@ fi
 sort -u /tmp/cm_local_$$.txt > /tmp/cm_local_sorted_$$.txt
 LOCAL_COUNT=$(wc -l < /tmp/cm_local_sorted_$$.txt)
 
-# Step 2: 找出在快照中但不在本模块/子模块的文件（可能已迁移）
+# Step 2: 找出在快照中但不在本模块/split草稿中的文件（可能已迁移）
 comm -23 /tmp/cm_snap_$$.txt /tmp/cm_local_sorted_$$.txt > /tmp/cm_maybe_migrated_$$.txt
 MAYBE_MIGRATED=$(wc -l < /tmp/cm_maybe_migrated_$$.txt)
 
@@ -89,7 +92,7 @@ if [ "$MAYBE_MIGRATED" -gt 0 ]; then
 fi
 
 echo "快照文件数: $SNAP_COUNT"
-echo "本模块+子模块: $LOCAL_COUNT"
+echo "本模块+split草稿: $LOCAL_COUNT"
 echo "已迁移到其他模块: $MIGRATED_OK"
 echo "Missing files: $TRULY_MISSING"
 
