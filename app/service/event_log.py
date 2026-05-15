@@ -59,23 +59,19 @@ def append_events(path: Optional[Path], new_events: list[dict]) -> bool:
         return False
 
 
-def write_final(path: Optional[Path], all_events: list[dict]) -> bool:
-    """原子写：全量 events + 末行 __final__ 标记（tmp → rename）。
+def write_final(path: Optional[Path], all_events: list[dict]) -> bool:  # noqa: ARG001
+    """追加 __final__ 标记到 events.jsonl。
 
-    在任务完成/失败时调用，保证 events.jsonl 是完整快照。
+    events 已由 append_events 增量写入，此函数只负责追加结束标记。
+    all_events 参数保留以兼容调用方签名，但不再用于写入（避免 resume 场景
+    下用当前轮 event_buffer 覆盖历史事件）。
     """
     if path is None:
         return False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = Path(str(path) + ".tmp")
-        lines = "".join(
-            json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n"
-            for e in all_events
-        )
-        lines += json.dumps(_FINAL_MARKER, separators=(",", ":")) + "\n"
-        tmp.write_text(lines, encoding="utf-8")
-        tmp.replace(path)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(_FINAL_MARKER, ensure_ascii=False, separators=(",", ":")) + "\n")
         return True
     except Exception as exc:
         logger.warning("write_final failed path=%s: %s", path, exc)
