@@ -49,7 +49,11 @@ cat modules/<模块名>/files.list   # 查看文件构成
 
 **Step 2** — 逐模块判断相关性：
 
-必须先查看 `modules/<模块名>/files.list`，必要时再抽查 `details/<path>.json`，**不能只看模块名**。
+必须先查看 `modules/<模块名>/files.list`，优先抽查 `details/<path>.json`，**不能只看模块名**。
+如果 details 信息不足、摘要为空、或无法判断是否属于安全维度，**允许进一步查看源代码**：
+```bash
+read target/<path>
+```
 
 | 情况 | 操作 |
 |------|------|
@@ -106,4 +110,5 @@ ls modules/
 - 只操作 `modules/` 目录，**不要修改或删除** `modules_pre_filter_backup/`
 - 不要删除 `modules/` 目录本身，只删其中的子目录
 - **保留原则**：模块中哪怕有一个安全相关文件，也不能以"无用模块"为由删除整个模块
-- **严禁仅凭模块名删除**：必须结合 `files.list`，必要时结合 `details/<path>.json` 中的文件信息判断
+- **严禁仅凭模块名删除**：必须结合 `files.list`，优先结合 `details/<path>.json` 中的文件信息判断
+- **允许读源码兜底**：若 details 不足以判断，可进一步 `read target/<path>` 查看源代码后再决定是否删除

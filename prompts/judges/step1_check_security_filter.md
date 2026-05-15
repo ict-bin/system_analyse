@@ -15,8 +15,11 @@ cat modules_pre_filter_backup/<模块名>/files.list
 # 查看被保留模块
 cat modules/<模块名>/files.list
 
-# 必要时抽查具体文件详情
+# 优先抽查具体文件详情
 read details/<path>.json
+
+# 若 details 不足以判断，允许进一步查看源代码
+read target/<path>
 ```
 
 **Step 2** — 核查被删除的模块：
@@ -27,6 +30,7 @@ read details/<path>.json
 | 该模块中是否有任何安全相关文件（协议实现/API/解析/输入处理/资源控制等）？ | 有→误删，需恢复 |
 | 是否符合指定安全维度？（仅当有安全维度约束时）| 无关→删除正确 |
 | 模块名看似普通，但 files.list/details 显示与安全维度相关 | 误删，需恢复 |
+| details 信息不足，但查看源代码后可确认与安全维度相关 | 误删，需恢复 |
 
 **Step 3** — 核查被保留的模块：
 
