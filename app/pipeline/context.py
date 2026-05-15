@@ -4,6 +4,7 @@ pipeline/context.py — 流水线上下文（各阶段共享的状态容器）
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,9 @@ if TYPE_CHECKING:
     from ..models import TaskConfig, TokenUsage, SwarmEvent, AgentInstanceConfig
     from .evaluation import EvaluationRecorder
     from .checkpoint import CheckpointManager
+
+
+logger = logging.getLogger("sa.pipeline")
 
 
 @dataclass
@@ -150,6 +154,65 @@ class PipelineContext:
         """便捷 emit，自动带 task_id"""
         from ..models import SwarmEvent
         self.emit(SwarmEvent(type=event_type, task_id=self.task_id, data=data))
+        self._log_module_event(event_type, data)
+
+    def _log_module_event(self, event_type: str, data: dict) -> None:
+        """将带模块信息的阶段事件镜像到服务日志，便于排查卡在哪个模块。"""
+        module_name = str(data.get("module") or data.get("module_name") or "").strip()
+        modules = [str(item).strip() for item in (data.get("modules") or []) if str(item).strip()]
+        if not module_name and not modules:
+            return
+
+        stage = data.get("stage")
+        prefix = f"[{stage}]" if stage not in (None, "") else f"[{event_type}]"
+        level_name = str(data.get("level") or "info").lower()
+        level = {
+            "debug": logging.DEBUG,
+            "warn": logging.WARNING,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+        }.get(level_name, logging.INFO)
+
+        if event_type == "stage":
+            if module_name:
+                attempt = data.get("attempt")
+                suffix = f" 第{attempt}轮" if attempt else ""
+                logger.log(level, "%s 开始处理模块: %s%s", prefix, module_name, suffix)
+                return
+            logger.log(level, "%s 开始处理模块集合: %s", prefix, ", ".join(modules))
+            return
+
+        if event_type == "stage_result":
+            if module_name:
+                extra_parts: list[str] = []
+                if "split" in data:
+                    extra_parts.append(f"split={bool(data.get('split'))}")
+                if data.get("new_modules"):
+                    extra_parts.append("new_modules=" + ", ".join(str(item) for item in (data.get("new_modules") or [])))
+                suffix = f" ({'; '.join(extra_parts)})" if extra_parts else ""
+                logger.log(level, "%s 模块处理完成: %s%s", prefix, module_name, suffix)
+                return
+            logger.log(level, "%s 模块集合处理完成: %s", prefix, ", ".join(modules))
+            return
+
+        if event_type == "judge_eval" and module_name:
+            judge_id = data.get("judge_id") or "judge"
+            passed = data.get("passed")
+            score = data.get("score")
+            logger.log(level, "%s 模块评审: %s judge=%s passed=%s score=%s", prefix, module_name, judge_id, passed, score)
+            return
+
+        if event_type == "reflect" and module_name:
+            round_no = data.get("round")
+            suffix = f" 第{round_no}轮" if round_no else ""
+            logger.log(level, "%s 模块进入反思: %s%s", prefix, module_name, suffix)
+            return
+
+        if event_type == "reclassify" and module_name:
+            logger.log(level, "%s 模块需要重新分类: %s", prefix, module_name)
+            return
+
+        logger.log(level, "%s 模块相关事件: %s", prefix, module_name or ", ".join(modules))
 
     def record_evaluation_round(self, **kwargs):
         """Best-effort round evaluation persistence; never breaks analysis."""
