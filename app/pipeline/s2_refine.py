@@ -28,7 +28,7 @@ from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
-    discover_modules, get_modules_root, load_prompt, build_granularity_hint,
+    discover_modules, get_modules_root, load_prompt, load_granularity_prompt, build_granularity_hint,
     archive_file, max_iter, write_judge_feedback,
     SUB_WORKER_THRESHOLD, collect_file_summaries,
     load_details_for_module,
@@ -267,14 +267,16 @@ class RefineStage(BaseStage):
                 target_dir=cfg.target_dir,
             )
 
-        w_sys_prompt = load_prompt(cfg, "step2_refine", "workers")
-        j_sys_prompt = load_prompt(cfg, "step2_check_refine", "judges")
-        reflect_prompt = load_prompt(cfg, "reflect_refine", "workers")
+        granularity = getattr(cfg, "module_granularity", "fine") or "fine"
+        w_sys_prompt = load_granularity_prompt(cfg, "step2_refine", granularity, "workers")
+        j_sys_prompt = load_granularity_prompt(cfg, "step2_check_refine", granularity, "judges")
+        reflect_prompt = load_granularity_prompt(cfg, "reflect_refine", granularity, "workers")
 
-        # ── 粒度约束注入 ───────────────────────────────────────────────────────────────
-        _gran_hint = build_granularity_hint(getattr(cfg, "module_granularity", "fine") or "fine")
-        if _gran_hint:
+        # 兼容旧 prompt：若粒度专用提示词未完全内嵌，再追加统一提示
+        _gran_hint = build_granularity_hint(granularity)
+        if _gran_hint and _gran_hint not in w_sys_prompt:
             w_sys_prompt += _gran_hint
+        if _gran_hint and _gran_hint not in j_sys_prompt:
             j_sys_prompt += _gran_hint
 
         feedback = ""

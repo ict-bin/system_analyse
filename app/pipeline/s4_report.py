@@ -29,7 +29,7 @@ from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
-    discover_modules, get_modules_root, load_prompt,
+    discover_modules, get_modules_root, load_prompt, load_granularity_prompt,
     archive_file, max_iter, pre_read_module, pre_read_module_with_details,
     generate_modules_list, strip_target_prefix, write_judge_feedback,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
@@ -122,9 +122,10 @@ class CompletenessCheckStage(BaseStage):
 
         s_cfg_refine = cfg.stages.refine
         s_cfg_analyse = cfg.stages.analyse
-        w_sys_refine = load_prompt(cfg, "step2_refine", "workers")
-        w_sys_analyse = load_prompt(cfg, "step3_analyse", "workers")
-        j_sys_analyse = load_prompt(cfg, "step3_check_analyse", "judges")
+        granularity = getattr(cfg, "module_granularity", "fine") or "fine"
+        w_sys_refine = load_granularity_prompt(cfg, "step2_refine", granularity, "workers")
+        w_sys_analyse = load_granularity_prompt(cfg, "step3_analyse", granularity, "workers")
+        j_sys_analyse = load_granularity_prompt(cfg, "step3_check_analyse", granularity, "judges")
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
 
@@ -323,7 +324,7 @@ class FinalReportStage(BaseStage):
             # ── 并行 per-module 验收 judge ─────────────────────────────────────
             if has_report and ctx.j_cfgs:
                 _final_mods = discover_modules(str(workspace))
-                _j_sys = load_prompt(cfg, "step3_check_analyse", "judges")
+                _j_sys = load_granularity_prompt(cfg, "step3_check_analyse", granularity, "judges")
                 _sem_pm = asyncio.Semaphore(cfg.parallel_modules)
                 _pm_failed: list[str] = []
                 _pm_lock = asyncio.Lock()

@@ -309,6 +309,46 @@ def load_prompt(source, name: str, role: str | None = None) -> str:
     return ""
 
 
+def load_granularity_prompt(source, base_name: str, granularity: str, role: str | None = None) -> str:
+    """按粒度加载独立提示词；找不到时再回退到通用提示词。"""
+    gran = (granularity or "fine").strip().lower()
+    candidates: list[str] = []
+    if gran == "coarse":
+        candidates.append(base_name.replace("step2_", "step2_coarse_").replace("step3_", "step3_coarse_"))
+        candidates.append(base_name.replace("reflect_", "reflect_coarse_"))
+    elif gran == "fine":
+        candidates.append(base_name.replace("step2_", "step2_fine_").replace("step3_", "step3_fine_"))
+        candidates.append(base_name.replace("reflect_", "reflect_fine_"))
+
+    # judges: step2_check_refine -> step2_check_coarse_refine / step2_check_fine_refine
+    if base_name.startswith("step2_check_"):
+        suffix = base_name[len("step2_check_"):]
+        if gran == "coarse":
+            candidates.insert(0, f"step2_check_coarse_{suffix}")
+        elif gran == "fine":
+            candidates.insert(0, f"step2_check_fine_{suffix}")
+    if base_name.startswith("step3_check_"):
+        suffix = base_name[len("step3_check_"):]
+        if gran == "coarse":
+            candidates.insert(0, f"step3_check_coarse_{suffix}")
+        elif gran == "fine":
+            candidates.insert(0, f"step3_check_fine_{suffix}")
+
+    # 去重保序
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c and c not in seen and c != base_name:
+            seen.add(c)
+            ordered.append(c)
+
+    for name in ordered:
+        p = load_prompt(source, name, role)
+        if p:
+            return p
+    return load_prompt(source, base_name, role)
+
+
 # ── 通用小工具 ─────────────────────────────────────────────────────────────────
 
 def max_iter(s_cfg) -> int:

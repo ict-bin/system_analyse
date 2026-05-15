@@ -27,7 +27,7 @@ from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
-    discover_modules, get_modules_root, load_prompt, build_granularity_hint,
+    discover_modules, get_modules_root, load_prompt, load_granularity_prompt, build_granularity_hint,
     archive_file, max_iter, write_judge_feedback,
     module_has_nonempty_files,
     load_details_for_module,
@@ -57,14 +57,16 @@ class AnalyseStage(BaseStage):
                            msg=f"[S3] 整体 checkpoint 已完成，跳过({len(ctx.analysed_modules)}个模块)")
             return
 
-        w_sys_prompt = load_prompt(cfg, "step3_analyse", "workers")
-        j_sys_prompt = load_prompt(cfg, "step3_check_analyse", "judges")
-        reflect_prompt = load_prompt(cfg, "reflect_analyse", "workers")
+        granularity = getattr(cfg, "module_granularity", "fine") or "fine"
+        w_sys_prompt = load_granularity_prompt(cfg, "step3_analyse", granularity, "workers")
+        j_sys_prompt = load_granularity_prompt(cfg, "step3_check_analyse", granularity, "judges")
+        reflect_prompt = load_granularity_prompt(cfg, "reflect_analyse", granularity, "workers")
 
-        # ── 粒度约束注入（S3 Worker 和 Judge）───────────────────────────────────────────
-        _gran_hint = build_granularity_hint(getattr(cfg, "module_granularity", "fine") or "fine")
-        if _gran_hint:
+        # 兼容旧 prompt：若粒度专用提示词未完全内嵌，再追加统一提示
+        _gran_hint = build_granularity_hint(granularity)
+        if _gran_hint and _gran_hint not in w_sys_prompt:
             w_sys_prompt += _gran_hint
+        if _gran_hint and _gran_hint not in j_sys_prompt:
             j_sys_prompt += _gran_hint
 
         final_modules = discover_modules(str(workspace))
