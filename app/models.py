@@ -431,12 +431,13 @@ class ServiceConfig(BaseModel):
         description=(
             "模块划分粒度:\n"
             "  fine   = 子组件级（默认）: 一个组件做一件事，\n"
-            "           拆分条件: 文件数>20 且 子模块种类>=3，或功能属于不同子系统\n"
+            "           拆分依据: 职责边界清晰、建议子模块稳定、功能属于不同子系统\n"
+            "           不使用文件数量作为拆分阈值\n"
             "           示例: ssh → ssh_server + ssh_client + ssh_config\n"
             "  coarse = 协议/服务级: 一个 RFC/守护进程 = 一个模块，\n"
-            "           拆分条件: 内存完全独立的顶层协议且文件数>15，\n"
-            "           禁止拆分: client/server/config/utils 共居, 文件数<=30, \n"
-            "           S2 的 'files>20 强制拆分' 规则在此模式下被禁用\n"
+            "           拆分依据: 是否存在完全独立的顶层协议/服务且彼此无依赖\n"
+            "           禁止拆分: client/server/config/utils 共居、同协议子版本共居\n"
+            "           所有基于文件数的拆分/禁拆规则在此模式下无效\n"
             "           示例: ssh_server + ssh_client + ssh_config → ssh"
         ),
     )
