@@ -83,6 +83,82 @@ def _build_security_focus_section(sec_cats: list[str]) -> str:
     )
 
 
+# ── classify_framework.sh 生成逻辑 ─────────────────────────────────────────────
+
+_CLASSIFY_BODY_START = "    # ↓↓↓ 在此填写分类逻辑（仅改此函数体）↓↓↓"
+_CLASSIFY_BODY_END   = "    # ↑↑↑ 在此填写分类逻辑 ↑↑↑"
+_CLASSIFY_BODY_PLACEHOLDER = '    echo "other"'
+_CLASSIFY_FRAMEWORK_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent.parent.parent / "scripts" / "classify_framework_template.sh"
+)
+
+
+def _extract_classify_body(framework_path: Path) -> str | None:
+    """从已有框架脚本中提取 Worker 填写的函数体（标记区域之间的内容）。
+    若文件不存在、标记未找到或仍为占位符，返回 None。"""
+    if not framework_path.exists():
+        return None
+    try:
+        content = framework_path.read_text("utf-8", errors="replace")
+        s = content.find(_CLASSIFY_BODY_START)
+        e = content.find(_CLASSIFY_BODY_END)
+        if s == -1 or e == -1 or e <= s:
+            return None
+        body = content[s + len(_CLASSIFY_BODY_START): e].strip("\n")
+        if not body or body.strip() in ('echo "other"', "echo 'other'"):
+            return None
+        return body
+    except Exception:
+        return None
+
+
+def _write_classify_framework(workspace: Path) -> None:
+    """向 workspace 写入 classify_framework.sh。
+
+    每次 attempt 调用：基础设施部分始终从模板刷新（防止 Worker 误改框架），
+    Worker 已实现的 classify_file() 函数体自动保留注入。
+    """
+    framework_path = workspace / "classify_framework.sh"
+    existing_body = _extract_classify_body(framework_path)
+
+    # 读取模板（优先从文件读，出错时 fallback 到内嵌最简框架）
+    try:
+        template = _CLASSIFY_FRAMEWORK_TEMPLATE_PATH.read_text("utf-8")
+    except Exception:
+        # 最简 fallback：直接给 Worker 一个可用但无基础设施的脚本
+        template = (
+            "#!/usr/bin/env bash\n"
+            f"# classify_framework_template.sh 未找到，使用最简框架\n"
+            f"WORKSPACE=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")\" && pwd)\"\n"
+            f"SOURCE=\"$WORKSPACE/filtered_files.txt\"\n"
+            f"MODULES_DIR=\"$WORKSPACE/modules\"\n"
+            f"DELETED_DIR=\"$WORKSPACE/deleted\"\n"
+            f"classify_file() {{\n"
+            f"{_CLASSIFY_BODY_START}\n\n"
+            f"{_CLASSIFY_BODY_PLACEHOLDER}\n\n"
+            f"{_CLASSIFY_BODY_END}\n"
+            f"}}\n"
+        )
+
+    # 将 Worker 已有函数体注入模板（保留跨 attempt 的分类逻辑）
+    s = template.find(_CLASSIFY_BODY_START)
+    e = template.find(_CLASSIFY_BODY_END)
+    if s != -1 and e != -1 and e > s:
+        body = existing_body if existing_body else _CLASSIFY_BODY_PLACEHOLDER
+        prefix = template[: s + len(_CLASSIFY_BODY_START)]
+        suffix = template[e:]
+        content = prefix + "\n\n" + body + "\n\n" + suffix
+    else:
+        content = template  # 标记未找到，原样写入
+
+    framework_path.write_text(content, encoding="utf-8")
+    try:
+        import os as _os
+        _os.chmod(str(framework_path), 0o755)
+    except Exception:
+        pass
+
+
 # ── S1 deleted/recover/ lifecycle helpers ────────────────────────────────────
 
 def _archive_s1_deleted(workspace):
@@ -231,6 +307,9 @@ class ClassifyStage(BaseStage):
         for attempt in range(max_iter):
             round_started = utc_now_iso()
             round_start_ts = time.time()
+
+            # 每次 attempt 开始前刷新框架脚本（保留 Worker 已实现的函数体）
+            _write_classify_framework(workspace)
 
             # Pre-retry: clear old deleted/, pop recover/ for feedback
             recover_files = []
@@ -509,15 +588,16 @@ class ClassifyStage(BaseStage):
                 coverage = f"{total_classified}/{filtered_total}" if filtered_total > 0 else str(total_classified)
                 incremental_guidance = (
                     f"\n\n## ⚠️ 增量修复要求（必读）\n\n"
-                    f"当前状态：{len(current_mods)} 个模块，已分类 {coverage} 个文件。"
-                    f"现有分类基本正确，**请不要重写整个分类脚本**。\n\n"
-                    f"正确做法：只针对 judge 指出的遗漏文件做增量补充：\n"
-                    f"```bash\n"
-                    f"# 示例：只将遗漏文件追加到已有模块\n"
-                    f"echo 'path/to/missing_file.c' >> modules/最合适的模块名/files.list\n"
-                    f"# 然后重新校验覆盖率\n"
-                    f"bash /app/scripts/check_classification.sh {cfg.target_dir} .\n"
-                    f"```\n"
+                    f"当前状态：{len(current_mods)} 个模块，已分类 {coverage} 个文件。\n\n"
+                    f"请优先使用 `bash classify_framework.sh --check` 查看当前展示的遗漏文件数：\n\n"
+                    f"• 若遗漏 ≤ 20 个（推荐，速度快）：\n"
+                    f"  ```bash\n"
+                    f"  echo 'path/to/missing_file.c' >> modules/<模块名>/files.list\n"
+                    f"  bash classify_framework.sh --check   # 仅校验，不重跑分类\n"
+                    f"  ```\n\n"
+                    f"• 若遗漏 > 20 个或模块结构有问题：\n"
+                    f"  改进 classify_framework.sh 中的 classify_file() 函数体，\n"
+                    f"  然后重新运行 `bash classify_framework.sh`（全量重建）\n"
                 )
                 feedback = (
                     f"# 上轮评审不通过（第 {attempt+1} 轮）\n\n"
