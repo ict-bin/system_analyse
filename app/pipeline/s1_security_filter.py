@@ -26,7 +26,6 @@ stage_num=1（与 ClassifyStage 相同），Pipeline stable-sort 保证顺序。
 from __future__ import annotations
 
 import shutil
-import subprocess
 import time
 from pathlib import Path
 
@@ -137,30 +136,6 @@ class SecurityFocusFilterStage(BaseStage):
         ctx.emit_event("log", level="info",
                        msg=f"[安全维度过滤] 备份已创建：{backup}")
 
-        # ── 先由脚本生成模块级文件信息摘要（降低仅看模块名误删风险） ───────────────
-        analysis_md = workspace / "security_filter_analysis.md"
-        try:
-            r = subprocess.run(
-                [
-                    "python3",
-                    "/app/scripts/analyse_security_filter_modules.py",
-                    str(workspace),
-                    str(analysis_md),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if r.returncode == 0 and analysis_md.exists():
-                ctx.emit_event("log", level="info",
-                               msg=f"[S1.5] 模块级文件信息摘要已生成: {analysis_md}")
-            else:
-                ctx.emit_event("log", level="warn",
-                               msg=f"[S1.5] 生成模块级文件信息摘要失败: {r.stderr[:300]}")
-        except Exception as e:
-            ctx.emit_event("log", level="warn",
-                           msg=f"[S1.5] 生成模块级文件信息摘要异常: {e}")
-
         # ── W+J 循环 ──────────────────────────────────────────────────────────
         filter_session = str(ctx.sess_dir / "security_filter.jsonl")
         w_base = dict(
@@ -198,9 +173,9 @@ class SecurityFocusFilterStage(BaseStage):
                     + "\n".join(f"- `{m}`" for m in sorted(current_modules))
                     + f"\n\n## 目录路径\n\n"
                     f"- 模块目录：`{modules_root}`\n"
-                    f"- 备份目录：`{backup}`（**只读，不要修改**）\n"
-                    f"- 模块文件信息摘要：`{analysis_md}`\n\n"
-                    f"**先 `read security_filter_analysis.md`，必须结合模块内文件信息判断，不能只看模块名。**\n"
+                    f"- 备份目录：`{backup}`（**只读，不要修改**）\n\n"
+                    f"**必须结合模块内文件信息判断，不能只看模块名。**\n"
+                    f"请先查看 `modules/<模块名>/files.list`，必要时再结合 `details/<path>.json` 判断。\n"
                     f"逐模块判断相关性，对每个**无关**模块执行删除：\n"
                     f"```bash\n"
                     f"rm -rf {modules_root}/<模块名>\n"
@@ -216,9 +191,9 @@ class SecurityFocusFilterStage(BaseStage):
                     + "\n".join(f"- `{m}`" for m in sorted(current_modules))
                     + f"\n\n## 目录路径\n\n"
                     f"- 模块目录：`{modules_root}`\n"
-                    f"- 备份目录：`{backup}`（可从此处恢复误删模块）\n"
-                    f"- 模块文件信息摘要：`{analysis_md}`\n\n"
-                    f"**先 `read security_filter_analysis.md`，必须结合模块内文件信息判断，不能只看模块名。**\n\n"
+                    f"- 备份目录：`{backup}`（可从此处恢复误删模块）\n\n"
+                    f"**必须结合模块内文件信息判断，不能只看模块名。**\n"
+                    f"请先查看 `modules/<模块名>/files.list`，必要时再结合 `details/<path>.json` 判断。\n\n"
                     f"## Judge 要求的修正操作\n\n"
                     f"{judge_corrections}\n\n"
                     f"**操作指令：**\n\n"
@@ -269,7 +244,7 @@ class SecurityFocusFilterStage(BaseStage):
                     + f"\n\n## 被删除：{len(removed_mods)} 个\n\n"
                     + "\n".join(f"- `{m}`" for m in removed_mods)
                     + f"\n\n备份目录 `{backup}` 可供读取 files.list 核查。\n"
-                    + f"模块级文件信息摘要：`{analysis_md}`（先 read，再判断误删/漏删）。\n\n"
+                    + f"请先查看被删模块与保留模块的 `files.list`，必要时抽查 `details/<path>.json`，再判断误删/漏删。\n\n"
                     f"请验证过滤质量，并在意见末尾输出结构化修正列表（即使全部正确也要输出空列表）：\n\n"
                     f"```\n"
                     f"## 需恢复（误删）:\n"

@@ -49,17 +49,13 @@ cat modules/<模块名>/files.list   # 查看文件构成
 
 **Step 2** — 逐模块判断相关性：
 
-**必须先读模块级文件信息摘要：**
-```bash
-read security_filter_analysis.md
-```
-
-然后再结合 `modules/<模块名>/files.list` 判断，**不能只看模块名**。
+必须先查看 `modules/<模块名>/files.list`，必要时再抽查 `details/<path>.json`，**不能只看模块名**。
 
 | 情况 | 操作 |
 |------|------|
 | 模块内文件信息体现安全维度关键词/接口/解析/输入处理行为 | **保留** |
 | 模块名看似普通，但模块内存在安全相关文件 | **保留** |
+| 无法从模块名判断，但从 files.list / details 能看出与安全维度相关 | **保留** |
 | 模块明显属于无用模块（已由任务 A 处理）| 已删，跳过 |
 | 无法判断 | **保留**（宁可多保留，不误删） |
 
@@ -85,7 +81,7 @@ rm -rf modules/<模块名>
 ```
 
 > 只按 Judge 修正列表操作，不要改动其他模块。
-> 修正前仍应先 `read security_filter_analysis.md`，核对 Judge 要恢复/删除的模块是否与模块内文件信息一致。
+> 修正前仍应先查看对应模块的 `files.list`，必要时再查 `details/<path>.json`，核对 Judge 要恢复/删除的模块是否与模块内文件信息一致。
 
 ---
 
@@ -110,4 +106,4 @@ ls modules/
 - 只操作 `modules/` 目录，**不要修改或删除** `modules_pre_filter_backup/`
 - 不要删除 `modules/` 目录本身，只删其中的子目录
 - **保留原则**：模块中哪怕有一个安全相关文件，也不能以"无用模块"为由删除整个模块
-- **严禁仅凭模块名删除**：必须结合 `security_filter_analysis.md` 或 `files.list` 中的文件信息判断
+- **严禁仅凭模块名删除**：必须结合 `files.list`，必要时结合 `details/<path>.json` 中的文件信息判断

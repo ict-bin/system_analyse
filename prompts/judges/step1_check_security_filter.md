@@ -9,14 +9,14 @@
 
 **Step 1** — 了解差异（已在 prompt 中列出，可进一步核查）：
 ```bash
-# 先查看脚本生成的模块级文件信息摘要
-read security_filter_analysis.md
-
 # 查看被删除模块的文件构成（在备份中）
 cat modules_pre_filter_backup/<模块名>/files.list
 
 # 查看被保留模块
 cat modules/<模块名>/files.list
+
+# 必要时抽查具体文件详情
+read details/<path>.json
 ```
 
 **Step 2** — 核查被删除的模块：
@@ -26,7 +26,7 @@ cat modules/<模块名>/files.list
 | 该模块是否真的是纯测试/构建/文档/CI 代码？ | 是→删除正确 |
 | 该模块中是否有任何安全相关文件（协议实现/API/解析/输入处理/资源控制等）？ | 有→误删，需恢复 |
 | 是否符合指定安全维度？（仅当有安全维度约束时）| 无关→删除正确 |
-| 脚本摘要已提示“倾向保留”，但 Worker 仍删除 | 高度可疑，优先要求恢复 |
+| 模块名看似普通，但 files.list/details 显示与安全维度相关 | 误删，需恢复 |
 
 **Step 3** — 核查被保留的模块：
 
