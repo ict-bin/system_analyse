@@ -30,7 +30,7 @@ from .helpers import (
     run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt,
     archive_file, max_iter, pre_read_module, pre_read_module_with_details,
-    generate_modules_list, strip_target_prefix,
+    generate_modules_list, strip_target_prefix, write_judge_feedback,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
 )
@@ -223,7 +223,7 @@ class CompletenessCheckStage(BaseStage):
                             model=ctx.jm("analyse", j_item),
                             system_prompt=j_sys_analyse,
                             tools=cfg.judges.default_tools,
-                            cwd=str(mod_dir) if mod_dir.exists() else str(workspace),
+                            cwd=str(workspace),  # workspace根, 避免双重modules/路径
                             session_file=judge_session,
                             **j_base,
                         )
@@ -235,10 +235,9 @@ class CompletenessCheckStage(BaseStage):
 
                     if check_voting(judge_results, s_cfg_analyse.pass_mode, ctx.j_count):
                         break
-                    fail_fb = "\n".join(
-                        f"judge-{i}: {r['feedback'][:500]}"
-                        for i, r in enumerate(judge_results) if not r["pass"])
-                    feedback = f"# 评审意见\n\n{fail_fb}"
+                    fb_redo = write_judge_feedback(
+                        workspace, "s3_analyse", mod_name, attempt + 1, judge_results)
+                    feedback = f"评审未通过，完整意见请 read {fb_redo}"
                 else:
                     raise StageError(f"Stage 4a 补做模块 {mod_name} 分析未通过")
             except PiFatalError:
@@ -320,6 +319,64 @@ class FinalReportStage(BaseStage):
             has_report = (workspace / "final_report.md").exists()
             ctx.emit_event("stage_result", stage="4b", has_report=has_report)
 
+            # ── 并行 per-module 验收 judge ─────────────────────────────────────
+            if has_report and ctx.j_cfgs:
+                _final_mods = discover_modules(str(workspace))
+                _j_sys = load_prompt(cfg, "step3_check_analyse", "judges")
+                _sem_pm = asyncio.Semaphore(cfg.parallel_modules)
+                _pm_failed: list[str] = []
+                _pm_lock = asyncio.Lock()
+
+                async def _check_one_module_pm(mod_name_pm: str) -> None:
+                    async with _sem_pm:
+                        jpm_sess = ctx.session_path(
+                            "judges", "final_check", mod_name_pm,
+                            f"final-check-a{attempt + 1}-j0.jsonl",
+                        )
+                        try:
+                            jpm_ar = await run_agent_with_stage_guard(
+                                ctx=ctx, stage="4b-check",
+                                context=f"s4b-check-{mod_name_pm}",
+                                heartbeat_payload_factory=lambda beat, m=mod_name_pm: {
+                                    "module": m, "heartbeat": beat},
+                                prompt=f"最终验收：评审模块 `{mod_name_pm}` 的分析报告完整性。",
+                                model=ctx.jm("analyse", ctx.j_cfgs[0]),
+                                system_prompt=_j_sys,
+                                tools=cfg.judges.default_tools,
+                                cwd=str(workspace),
+                                session_file=jpm_sess,
+                                cancel_event=ctx.cancel_event,
+                                max_retries=cfg.agent_max_retries,
+                                retry_delay=cfg.agent_retry_delay,
+                                pi_max_retries=cfg.pi_max_retries,
+                                pi_retry_delay=cfg.pi_retry_delay,
+                            )
+                            ctx.tokens += jpm_ar.token_usage
+                            _pm_parsed = parse_eval_md(jpm_ar.output or "")
+                            if not _pm_parsed["pass"]:
+                                async with _pm_lock:
+                                    _pm_failed.append(mod_name_pm)
+                                write_judge_feedback(
+                                    workspace, "s4_completeness", mod_name_pm,
+                                    attempt + 1, [_pm_parsed])
+                        except Exception as _exc_pm:
+                            ctx.emit_event("log", level="warn",
+                                           msg=f"[S4b-check] {mod_name_pm} 异常: {_exc_pm}")
+
+                await asyncio.gather(*[_check_one_module_pm(m) for m in _final_mods])
+
+                if _pm_failed:
+                    _sum = workspace / "judge_output" / "s4_completeness" / "module_check_summary.md"
+                    _sum.parent.mkdir(parents=True, exist_ok=True)
+                    _sum.write_text(
+                        f"# 最终验收失败模块（第 {attempt + 1} 轮）\n\n"
+                        + "\n".join(f"- {m}" for m in _pm_failed),
+                        encoding="utf-8",
+                    )
+                    ctx.emit_event("log", level="warn",
+                                   msg=f"[S4b-check] {len(_pm_failed)} 个模块未通过，详见 judge_output/s4_completeness/")
+
+            # ── 全局 Judge ───────────────────────────────────────────────────────
             judge_results = []
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
@@ -413,11 +470,11 @@ class FinalReportStage(BaseStage):
                         + reflect_report
                     )
             else:
-                fail_fb = "\n".join(
-                    f"judge-{i}: {r['feedback'][:500]}"
-                    for i, r in enumerate(judge_results) if not r["pass"])
-                feedback = (f"# 评审意见（未通过）\n\n{fail_fb}"
-                            "\n\n请根据意见修正 final_report.md。")
+                fb4 = write_judge_feedback(
+                    workspace, "s4_report", None, attempt + 1, judge_results)
+                ctx.emit_event("log", level="info",
+                               msg=f"[S4b] judge意见已写入 {fb4}")
+                feedback = f"评审未通过，完整意见请 read {fb4} ，阅后修正 final_report.md"
             if forced_pass:
                 break
         else:
