@@ -29,7 +29,7 @@ from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
-from .helpers import read_one_elf, run_agent_checked, load_prompt
+from .helpers import read_one_elf, run_agent_with_stage_guard, load_prompt
 
 # 源码函数签名 grep 模式（C/C++）
 _C_FUNC_RE = re.compile(
@@ -364,8 +364,16 @@ class SubReaderStage(BaseStage):
                     if needed:
                         parts.append(f"依赖: {', '.join(needed)}")
 
-                ar = await run_agent_checked(
+                batch_no = i // batch_size + 1
+                ar = await run_agent_with_stage_guard(
+                    ctx=ctx,
+                    stage="sub_reader_llm",
                     context=f"s0-sub-reader-llm-batch{i // batch_size + 1}",
+                    heartbeat_payload_factory=lambda beat, batch_no=batch_no, batch_size=len(batch): {
+                        "heartbeat": beat,
+                        "batch": batch_no,
+                        "batch_size": batch_size,
+                    },
                     prompt="\n".join(parts),
                     model=cfg.workers.model_for("sub_read"),
                     system_prompt=sub_prompt,

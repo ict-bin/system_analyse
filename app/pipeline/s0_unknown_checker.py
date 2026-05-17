@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
-from .helpers import run_agent_checked, load_prompt
+from .helpers import run_agent_with_stage_guard, load_prompt
 
 
 class UnknownCheckerStage(BaseStage):
@@ -92,8 +92,15 @@ class UnknownCheckerStage(BaseStage):
                 f"对每个文件运行 `file` 命令并分析结果，然后输出 JSON 数组。"
             )
             session = str(ctx.sess_dir / f"unknown-checker-batch{batch_start // BATCH + 1}.jsonl")
-            ar = await run_agent_checked(
+            ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="unknown_checker",
                 context=f"s0-unknown-checker-batch{batch_start // BATCH + 1}",
+                heartbeat_payload_factory=lambda beat, batch_no=batch_start // BATCH + 1, batch_size=len(batch): {
+                    "heartbeat": beat,
+                    "batch": batch_no,
+                    "batch_size": batch_size,
+                },
                 prompt=prompt,
                 model=cfg.workers.model_for("explore"),
                 system_prompt=checker_prompt,

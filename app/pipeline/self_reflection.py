@@ -388,19 +388,34 @@ class SelfReflectionService:
             cancel_ev = asyncio.Event()
 
             # 调用 LLM（无工具调用，纯推理）
-            ar = await run_agent(
-                prompt=user_prompt,
-                model=model,
-                system_prompt=system_prompt,
-                tools=[],           # 纯推理，无工具
-                session_file=None,  # 无 session，每次全新 context
-                thinking_level="off",
-                max_retries=3,
-                retry_delay=10,
-                pi_max_retries=1,
-                pi_retry_delay=5,
-                cancel_event=cancel_ev,
+            agent_task = asyncio.create_task(
+                run_agent(
+                    prompt=user_prompt,
+                    model=model,
+                    system_prompt=system_prompt,
+                    tools=[],           # 纯推理，无工具
+                    session_file=None,  # 无 session，每次全新 context
+                    thinking_level="off",
+                    max_retries=3,
+                    retry_delay=10,
+                    pi_max_retries=1,
+                    pi_retry_delay=5,
+                    cancel_event=cancel_ev,
+                )
             )
+            timeout_seconds = max(60.0, float(getattr(cfg, "agent_timeout_seconds", 1800.0) or 1800.0))
+            try:
+                ar = await asyncio.wait_for(agent_task, timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                cancel_ev.set()
+                agent_task.cancel()
+                await asyncio.gather(agent_task, return_exceptions=True)
+                logger.warning(
+                    "[self-reflection] 任务 %s 自省分析超时（%.1fs），已终止",
+                    task_id,
+                    timeout_seconds,
+                )
+                return
 
             # 写入报告
             content = ar.output or "(LLM 未返回输出)"

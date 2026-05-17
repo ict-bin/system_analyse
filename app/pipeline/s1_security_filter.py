@@ -33,7 +33,7 @@ from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
 from .helpers import (
-    run_agent_checked, parse_eval_md, check_voting,
+    run_agent_with_stage_guard, parse_eval_md, check_voting,
     discover_modules, get_modules_root, load_prompt, StageError,
     write_judge_feedback,
 )
@@ -208,8 +208,15 @@ class SecurityFocusFilterStage(BaseStage):
                     f"完成后输出 `<result>` 摘要（执行了哪些恢复/删除操作）。"
                 ]
 
-            ar = await run_agent_checked(
+            ar = await run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="security_filter",
                 context=f"s1-security-filter-a{attempt+1}",
+                heartbeat_payload_factory=lambda beat, attempt_no=attempt + 1: {
+                    "heartbeat": beat,
+                    "attempt": attempt_no,
+                    "role": "worker",
+                },
                 prompt="\n".join(prompt_parts),
                 model=filter_model,
                 system_prompt=worker_system_prompt,
@@ -253,8 +260,16 @@ class SecurityFocusFilterStage(BaseStage):
                     f"- <模块名>  # 原因说明\n"
                     f"```"
                 )
-                j_ar = await run_agent_checked(
+                j_ar = await run_agent_with_stage_guard(
+                    ctx=ctx,
+                    stage="security_filter_judge",
                     context=f"s1-security-filter-judge{j_idx}-a{attempt+1}",
+                    heartbeat_payload_factory=lambda beat, attempt_no=attempt + 1, judge_id=j_idx: {
+                        "heartbeat": beat,
+                        "attempt": attempt_no,
+                        "role": "judge",
+                        "judge_id": f"judge-{judge_id}",
+                    },
                     prompt=j_prompt,
                     model=j_model,
                     tools=cfg.judges.default_tools,

@@ -20,7 +20,7 @@ _ROLE_READONLY_FIELDS = {"system_prompt_dir"}
 _RUNTIME_SETTINGS_CONFIG_KEY = "runtime_settings"
 _DEFAULT_RUNTIME_SETTINGS: Dict[str, Any] = {
     "worker_task_concurrency": 4,
-    "agent_timeout_seconds": 7200.0,
+    "agent_timeout_seconds": 1800.0,
 }
 
 
@@ -62,7 +62,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "agent_max_retries": 5,
     "agent_retry_delay": 3,
     "pi_max_retries": -1,
-    "agent_timeout_seconds": 7200.0,
+    "agent_timeout_seconds": 1800.0,
     "pi_retry_delay": 5,
     "stages": {
         "classify":    {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
@@ -118,9 +118,9 @@ class ConfigService:
         except (TypeError, ValueError):
             worker_task_concurrency = 4
         try:
-            agent_timeout_seconds = float(payload.get("agent_timeout_seconds") or 7200.0)
+            agent_timeout_seconds = float(payload.get("agent_timeout_seconds") or 1800.0)
         except (TypeError, ValueError):
-            agent_timeout_seconds = 7200.0
+            agent_timeout_seconds = 1800.0
         return {
             "worker_task_concurrency": max(1, worker_task_concurrency),
             "agent_timeout_seconds": max(60.0, agent_timeout_seconds),

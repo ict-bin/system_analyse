@@ -51,6 +51,7 @@ from app.pipeline import (
     EvaluationRecorder,
 )
 from app.runner import AgentResult
+from app.pipeline.helpers import run_agent_with_stage_guard
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -456,6 +457,40 @@ def test_pipeline_fatal_error_propagates():
         except (PiFatalError, StageError) as e:
             assert "致命错误" in str(e)
     print("  ✅ Pipeline PiFatalError 正确传播")
+
+
+def test_run_agent_with_stage_guard_enforces_timeout():
+    """Agent 超过单次会话硬超时后应取消执行并抛 StageError。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp)
+        cancelled = {"value": False}
+
+        async def slow_agent(**_kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled["value"] = True
+                raise
+            return make_ar("unexpected")
+
+        async def run_case():
+            with patch("app.pipeline.helpers.run_agent", side_effect=slow_agent):
+                try:
+                    await run_agent_with_stage_guard(
+                        ctx=ctx,
+                        stage="test",
+                        context="timeout-case",
+                        timeout_seconds=0.05,
+                        heartbeat_interval=10,
+                    )
+                    assert False, "应抛出 StageError"
+                except StageError as e:
+                    assert "智能体会话超时" in str(e)
+
+        _arun(run_case())
+        assert cancelled["value"] is True
+        assert any(ev["type"] == "stage_timeout" for ev in EVENTS)
+    print("  ✅ run_agent_with_stage_guard 硬超时生效")
 
 
 # ─── 6. FilterStage ─────────────────────────────────────────────────────────────
@@ -1001,6 +1036,7 @@ TESTS = [
     test_pipeline_stage_order,
     test_pipeline_error_propagates,
     test_pipeline_fatal_error_propagates,
+    test_run_agent_with_stage_guard_enforces_timeout,
     # stage 0
     test_filter_stage_no_script,
     test_filter_stage_with_script,

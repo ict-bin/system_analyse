@@ -26,7 +26,7 @@ _DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS = max(
 )
 _DEFAULT_AGENT_TIMEOUT_SECONDS = max(
     60.0,
-    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_AGENT_TIMEOUT_SECONDS", "7200")),
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_AGENT_TIMEOUT_SECONDS", "1800")),
 )
 
 
@@ -132,16 +132,22 @@ async def run_agent_with_stage_guard(
     context: str,
     heartbeat_payload_factory=None,
     heartbeat_interval: float | None = None,
-    timeout_seconds: float | None = None,  # deprecated — no longer enforced; kept for API compat
+    timeout_seconds: float | None = None,
     **kwargs,
 ) -> AgentResult:
-    """Run an agent with periodic heartbeat events.
-
-    超时定时器已移除：每个模块的文件量固定，不应人为限制分析时间。
-    心跳每 30s 发送一次，用于监控进度，但不会强制终止会话。
-    timeout_seconds 参数保留以兼容调用方签名，但不再生效。
-    """
-    heartbeat_every = heartbeat_interval or _DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS
+    """Run an agent with periodic heartbeat events and a hard stage timeout."""
+    heartbeat_every = max(1.0, float(heartbeat_interval or _DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS))
+    configured_timeout = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else getattr(ctx.cfg, "agent_timeout_seconds", _DEFAULT_AGENT_TIMEOUT_SECONDS)
+    )
+    try:
+        timeout_limit = float(configured_timeout)
+    except (TypeError, ValueError):
+        timeout_limit = _DEFAULT_AGENT_TIMEOUT_SECONDS
+    if timeout_limit <= 0:
+        timeout_limit = _DEFAULT_AGENT_TIMEOUT_SECONDS
 
     def _payload(heartbeat_index: int) -> dict:
         if callable(heartbeat_payload_factory):
@@ -155,11 +161,46 @@ async def run_agent_with_stage_guard(
     started_monotonic = time.monotonic()
     try:
         while True:
+            elapsed = time.monotonic() - started_monotonic
+            remaining = timeout_limit - elapsed
+            if remaining <= 0:
+                agent_task.cancel()
+                await asyncio.gather(agent_task, return_exceptions=True)
+                payload = _payload(heartbeat_index + 1)
+                payload.update({
+                    "elapsed_seconds": round(elapsed, 3),
+                    "timeout_seconds": round(timeout_limit, 3),
+                    "status": "timeout",
+                    "level": "error",
+                })
+                ctx.emit_event("stage_timeout", stage=stage, **payload)
+                raise StageError(
+                    f"[{context}] 智能体会话超时: "
+                    f"elapsed={elapsed:.1f}s, timeout={timeout_limit:.1f}s"
+                )
             try:
-                return await asyncio.wait_for(asyncio.shield(agent_task), timeout=heartbeat_every)
+                return await asyncio.wait_for(
+                    asyncio.shield(agent_task),
+                    timeout=min(heartbeat_every, remaining),
+                )
             except asyncio.TimeoutError:
-                heartbeat_index += 1
                 elapsed = time.monotonic() - started_monotonic
+                if elapsed >= timeout_limit:
+                    agent_task.cancel()
+                    await asyncio.gather(agent_task, return_exceptions=True)
+                    payload = _payload(heartbeat_index + 1)
+                    payload.update({
+                        "elapsed_seconds": round(elapsed, 3),
+                        "timeout_seconds": round(timeout_limit, 3),
+                        "status": "timeout",
+                        "level": "error",
+                    })
+                    ctx.emit_event("stage_timeout", stage=stage, **payload)
+                    raise StageError(
+                        f"[{context}] 智能体会话超时: "
+                        f"elapsed={elapsed:.1f}s, timeout={timeout_limit:.1f}s"
+                    )
+                heartbeat_index += 1
                 payload = _payload(heartbeat_index)
                 payload["elapsed_seconds"] = round(elapsed, 3)
                 ctx.emit_event("stage", stage=stage, **payload)
