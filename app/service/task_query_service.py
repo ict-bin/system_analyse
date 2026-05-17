@@ -199,6 +199,26 @@ class TaskQueryService:
             return None
         return count if count > 0 else None
 
+    @staticmethod
+    def _detect_report_generation(final_report_markdown: str | None) -> tuple[str, str]:
+        if not final_report_markdown:
+            return "missing", "未生成"
+        marker = re.search(
+            r"REPORT_GENERATION_TYPE:\s*([a-zA-Z_ -]+)",
+            final_report_markdown[:2000],
+            flags=re.IGNORECASE,
+        )
+        value = (marker.group(1).strip().lower() if marker else "")
+        if value == "program":
+            return "program", "程序汇总报告"
+        if value == "ai":
+            return "ai", "AI 汇总报告"
+        if "程序汇总报告" in final_report_markdown[:2000]:
+            return "program", "程序汇总报告"
+        if "AI 汇总报告" in final_report_markdown[:2000]:
+            return "ai", "AI 汇总报告"
+        return "unknown", "未知来源报告"
+
     def get_task_result(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         output_root = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
@@ -300,6 +320,7 @@ class TaskQueryService:
             summary["high_risk_module_count"] = high_risk_modules_counted
         if summary["total_file_count"] == 0 and total_files_counted:
             summary["total_file_count"] = total_files_counted
+        report_generation_type, report_generation_label = self._detect_report_generation(final_report_markdown)
 
         return {
             "task_id": row.task_id,
@@ -308,6 +329,8 @@ class TaskQueryService:
             "output_root": str(output_root) if output_root else None,
             "final_report_path": str(final_report_path) if final_report_path else None,
             "modules_list_path": str(modules_list_path) if modules_list_path else None,
+            "report_generation_type": report_generation_type,
+            "report_generation_label": report_generation_label,
             "final_report_markdown": final_report_markdown,
             "modules": modules,
             "summary": summary,

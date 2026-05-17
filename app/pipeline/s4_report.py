@@ -37,6 +37,122 @@ from .helpers import (
 )
 
 
+def _extract_first(pattern: str, text: str, default: str = "") -> str:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else default
+
+
+def _ensure_report_generation_marker(report_path: Path, generation_type: str) -> None:
+    if not report_path.exists():
+        return
+    text = report_path.read_text("utf-8", errors="replace")
+    if "REPORT_GENERATION_TYPE:" in text[:1000]:
+        return
+    normalized = "program" if generation_type == "program" else "ai"
+    label = "程序汇总报告" if normalized == "program" else "AI 汇总报告"
+    description = (
+        "该报告由系统分析服务根据各模块 module_report.md 自动汇总生成。"
+        if normalized == "program"
+        else "该报告由最终报告智能体读取模块级分析结果后汇总生成。"
+    )
+    prefix = (
+        f"<!-- REPORT_GENERATION_TYPE: {normalized} -->\n"
+        f"<!-- REPORT_GENERATION_LABEL: {label} -->\n\n"
+        f"> **报告生成方式：{label}**。{description}\n\n"
+    )
+    report_path.write_text(prefix + text, encoding="utf-8")
+
+
+def _write_fallback_final_report(workspace: Path, modules: list[str]) -> bool:
+    """Write a deterministic final report if the LLM stopped before creating it."""
+    if not modules:
+        return False
+
+    rows: list[dict[str, object]] = []
+    for module_name in modules:
+        report_path = get_modules_root(str(workspace)) / module_name / "module_report.md"
+        if not report_path.exists():
+            continue
+        text = report_path.read_text("utf-8", errors="replace")
+        risk_level = _extract_first(r"RISK_LEVEL:\s*([^>\n]+)", text, "未知")
+        risk_score_text = _extract_first(r"RISK_SCORE:\s*(\d+)", text, "0")
+        try:
+            risk_score = int(risk_score_text)
+        except ValueError:
+            risk_score = 0
+        rows.append({
+            "module": module_name,
+            "risk_level": risk_level,
+            "risk_score": risk_score,
+            "high": text.count("🔴"),
+            "medium": text.count("🟡"),
+            "low": text.count("🟢"),
+        })
+
+    if not rows:
+        return False
+
+    rows.sort(key=lambda item: (-int(item["risk_score"]), str(item["module"])))
+    high_modules = [item for item in rows if str(item["risk_level"]).startswith("高")]
+    medium_modules = [item for item in rows if str(item["risk_level"]).startswith("中")]
+    total_high = sum(int(item["high"]) for item in rows)
+    total_medium = sum(int(item["medium"]) for item in rows)
+    total_low = sum(int(item["low"]) for item in rows)
+
+    lines = [
+        "<!-- REPORT_GENERATION_TYPE: program -->",
+        "<!-- REPORT_GENERATION_LABEL: 程序汇总报告 -->",
+        "",
+        "# 系统安全分析最终报告",
+        "",
+        "> **报告生成方式：程序汇总报告**。该报告由系统分析服务根据各模块 `module_report.md` 自动汇总生成。原因：最终报告智能体未在本轮执行中写出 `final_report.md`，系统使用已完成的模块级分析结果生成兜底总报告。",
+        "",
+        "## 1. 总览",
+        "",
+        f"- 已发现 {len(rows)} 个模块",
+        f"- 高风险模块：{len(high_modules)} 个",
+        f"- 中风险模块：{len(medium_modules)} 个",
+        f"- 高风险威胁标记：{total_high} 个",
+        f"- 中风险威胁标记：{total_medium} 个",
+        f"- 低风险威胁标记：{total_low} 个",
+        "",
+        "## 2. 风险最高模块",
+        "",
+        "| 排名 | 模块 | 风险等级 | 风险评分 | 高/中/低风险标记 |",
+        "|---:|---|---|---:|---|",
+    ]
+    for rank, item in enumerate(rows[:20], start=1):
+        lines.append(
+            f"| {rank} | `{item['module']}` | {item['risk_level']} | "
+            f"{item['risk_score']} | {item['high']} / {item['medium']} / {item['low']} |"
+        )
+
+    lines.extend([
+        "",
+        "## 3. 全量模块清单",
+        "",
+        "| 模块 | 风险等级 | 风险评分 | 高/中/低风险标记 |",
+        "|---|---|---:|---|",
+    ])
+    for item in rows:
+        lines.append(
+            f"| `{item['module']}` | {item['risk_level']} | "
+            f"{item['risk_score']} | {item['high']} / {item['medium']} / {item['low']} |"
+        )
+
+    lines.extend([
+        "",
+        "## 4. 后续建议",
+        "",
+        "1. 优先复核风险评分最高的模块及其高风险 STRIDE 条目。",
+        "2. 对网络暴露面、认证授权、明文协议、输入解析和资源耗尽类风险进行专项验证。",
+        "3. 如需更完整的自然语言总结，可在修复最终报告智能体输出后重试最终报告阶段。",
+    ])
+
+    (workspace / "final_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
 class CompletenessCheckStage(BaseStage):
     """Stage 4a: 完整性检查（缺失模块回 Stage 2+3 补做）"""
 
@@ -319,6 +435,15 @@ class FinalReportStage(BaseStage):
             )
             ctx.tokens += ar.token_usage
 
+            if not (workspace / "final_report.md").exists():
+                fallback_modules = discover_modules(str(workspace))
+                if _write_fallback_final_report(workspace, fallback_modules):
+                    ctx.emit_event(
+                        "log",
+                        level="warn",
+                        msg="[S4b] final_report.md 未由智能体生成，已根据模块报告生成兜底最终报告",
+                    )
+
             has_report = (workspace / "final_report.md").exists()
             ctx.emit_event("stage_result", stage="4b", has_report=has_report)
 
@@ -429,7 +554,7 @@ class FinalReportStage(BaseStage):
                 )
 
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
-            final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
+            final_pass = has_report and voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter(s_cfg)
             forced_pass = max_reached and has_report and max_rounds_exceeded_treated_as_passed(cfg)
             ctx.record_evaluation_round(
@@ -462,7 +587,7 @@ class FinalReportStage(BaseStage):
                 artifact_paths=[str(workspace / "final_report.md")],
                 extra={"has_report": has_report},
             )
-            if voted_pass:
+            if voted_pass and has_report:
                 if attempt + 1 >= s_cfg.min_rounds:
                     break
                 else:
@@ -472,6 +597,14 @@ class FinalReportStage(BaseStage):
                         f"# 自查要求（第 {attempt+1} 轮，需至少 {s_cfg.min_rounds} 轮）\n\n"
                         + reflect_report
                     )
+            elif not has_report:
+                ctx.emit_event("log", level="warn",
+                               msg="[S4b] final_report.md 未生成，本轮不能通过，进入下一轮修正")
+                feedback = (
+                    "上一轮没有生成 final_report.md。必须直接写入该文件；"
+                    "不要只输出说明文字。请先用已有 modules/*/module_report.md 汇总，"
+                    "然后使用 write 工具或 shell 重定向创建 final_report.md。"
+                )
             else:
                 fb4 = write_judge_feedback(
                     workspace, "s4_report", None, attempt + 1, judge_results)
@@ -484,6 +617,10 @@ class FinalReportStage(BaseStage):
             raise StageError(f"Stage 4b 最终报告未通过，已达最大轮数 {s_cfg.max_rounds}")
 
         # ── 写 checkpoint（在归档前确认报告已生成） ─────────────────────────────
+        if not (workspace / "final_report.md").exists():
+            raise StageError("Stage 4b 最终报告阶段结束但 final_report.md 未生成")
+        _ensure_report_generation_marker(workspace / "final_report.md", "ai")
+
         if cp and (workspace / "final_report.md").exists():
             cp.mark_done("s4_report")
 
