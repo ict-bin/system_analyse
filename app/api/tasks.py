@@ -85,6 +85,8 @@ class TaskResultResponse(BaseModel):
     final_report_path: Optional[str] = None
     modules_list_path: Optional[str] = None
     final_report_markdown: Optional[str] = None
+    report_generation_type: Optional[str] = None
+    report_generation_label: Optional[str] = None
     modules: list[TaskResultModuleResponse] = Field(default_factory=list)
     summary: TaskResultSummaryResponse
     warnings: list[str] = Field(default_factory=list)
