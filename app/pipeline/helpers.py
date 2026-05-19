@@ -28,16 +28,6 @@ _DEFAULT_AGENT_TIMEOUT_SECONDS = max(
     60.0,
     float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_AGENT_TIMEOUT_SECONDS", "1800")),
 )
-_DEFAULT_MODEL_STUCK_TIMEOUT_SECONDS: float = max(
-    30.0,
-    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_MODEL_STUCK_TIMEOUT_SECONDS", "1800")),
-)
-_DEFAULT_MODEL_STUCK_MAX_RETRIES: int = max(
-    1,
-    int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_MODEL_STUCK_MAX_RETRIES", "3")),
-)
-
-
 
 class StageError(Exception):
     pass
@@ -151,40 +141,15 @@ async def run_agent_with_stage_guard(
     context: str,
     heartbeat_payload_factory=None,
     heartbeat_interval: float | None = None,
-    timeout_seconds: float | None = None,  # deprecated — kept for call-site compat
+    timeout_seconds: float | None = None,  # deprecated — kept for API compat
     **kwargs,
 ) -> AgentResult:
-    """Run an agent with heartbeat events and backend-model stuck detection.
+    """Run an agent with periodic heartbeat events.
 
-    卡死检测设计原则：
-    - 必须基于 session 文件的 mtime 变化判断模型是否有输出
-    - 必须不获取 mtime 时立即重置计时器 --- 防止两次输出间隔当刻正好跳过心跳间隔
-    - 只允许 stuck_timeout 秒内持续无 token 输出才触发，不是当弹就发
-    - 激活时向同一 session 发送「继续」，不是用原来 prompt
-      「继续」仅在 session 已有 assistant 内容时发送，否则重发原 prompt
-    - 重试次数上限 model_stuck_max_retries（与 pi_max_retries 独立）
-    - 这里的重试不与 run_agent 内部的 pi_max_retries 重叠——前者针对“无响应”，后者针对“崩溃”
+    卡死检测已下沉到 runner._run_with_api_retry 内层（per-pi-process 级别）。
+    这里只负责心跳事件。
     """
-    heartbeat_every = max(1.0, float(heartbeat_interval or _DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS))
-
-    # ── stuck 检测参数 ───────────────────────────────────────────────────────
-    _stuck_timeout_raw = getattr(ctx.cfg, "model_stuck_timeout", _DEFAULT_MODEL_STUCK_TIMEOUT_SECONDS)
-    try:
-        stuck_timeout = float(_stuck_timeout_raw)
-    except (TypeError, ValueError):
-        stuck_timeout = _DEFAULT_MODEL_STUCK_TIMEOUT_SECONDS
-    if stuck_timeout <= 0:
-        stuck_timeout = 0.0  # 0 = disabled
-
-    _stuck_max_raw = getattr(ctx.cfg, "model_stuck_max_retries", _DEFAULT_MODEL_STUCK_MAX_RETRIES)
-    try:
-        stuck_max_retries = max(0, int(_stuck_max_raw))
-    except (TypeError, ValueError):
-        stuck_max_retries = _DEFAULT_MODEL_STUCK_MAX_RETRIES
-
-    session_file_path: str = str(kwargs.get("session_file") or "")
-    stuck_retry_count = 0
-    run_kwargs = dict(kwargs)
+    heartbeat_every = heartbeat_interval or _DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS
 
     def _payload(heartbeat_index: int) -> dict:
         if callable(heartbeat_payload_factory):
@@ -193,78 +158,23 @@ async def run_agent_with_stage_guard(
                 return dict(payload)
         return {}
 
-    # ── outer loop: stuck-retry 外层 ─────────────────────────────────────────
-    while True:
-        agent_task = asyncio.create_task(run_agent_checked(context=context, **run_kwargs))
-        heartbeat_index = 0
-        started_monotonic = time.monotonic()
-
-        # 每次启动新 pi 时重新读取 mtime 基线
-        last_mtime = _get_session_mtime(session_file_path)
-        last_active_monotonic = time.monotonic()
-
-        try:
-            # ── inner loop: heartbeat + mtime 监控 ──────────────────────────
-            while True:
-                try:
-                    return await asyncio.wait_for(
-                        asyncio.shield(agent_task),
-                        timeout=heartbeat_every,
-                    )
-                except asyncio.TimeoutError:
-                    heartbeat_index += 1
-                    elapsed = time.monotonic() - started_monotonic
-
-                    # ── mtime 变化检查：只要文件新写入就重置活跃时刻 ──
-                    cur_mtime = _get_session_mtime(session_file_path)
-                    if cur_mtime != last_mtime:
-                        last_mtime = cur_mtime
-                        last_active_monotonic = time.monotonic()
-
-                    idle_secs = time.monotonic() - last_active_monotonic
-
-                    # ── 心跳事件 ──────────────────────────────────────────────
-                    payload = _payload(heartbeat_index)
-                    payload["elapsed_seconds"] = round(elapsed, 3)
-                    ctx.emit_event("stage", stage=stage, **payload)
-
-                    # ── stuck 检测：仅在 stuck_timeout>0 且真正无输出时触发 ──
-                    if stuck_timeout > 0 and idle_secs >= stuck_timeout:
-                        if stuck_retry_count >= stuck_max_retries:
-                            agent_task.cancel()
-                            await asyncio.gather(agent_task, return_exceptions=True)
-                            raise StageError(
-                                f"[{context}] 后端模型无响应超过 {idle_secs:.0f}s，"
-                                f"已激活重试 {stuck_retry_count} 次，放弃"
-                            )
-
-                        # kill 当前 pi 进程
-                        agent_task.cancel()
-                        await asyncio.gather(agent_task, return_exceptions=True)
-
-                        stuck_retry_count += 1
-                        ctx.emit_event(
-                            "log", level="warn",
-                            msg=(
-                                f"[{context}] 后端模型 {idle_secs:.0f}s 无 token 输出，"
-                                f"发送激活指令 "
-                                f"(第 {stuck_retry_count}/{stuck_max_retries} 次)"
-                            ),
-                        )
-
-                        # 准备新调用参数：有 assistant 内容就发「继续」，否则重发原 prompt
-                        run_kwargs = dict(kwargs)
-                        from ..runner import _session_has_assistant_content  # noqa: PLC0415
-                        if session_file_path and _session_has_assistant_content(session_file_path):
-                            run_kwargs["prompt"] = "继续"
-
-                        break  # 跳出内层心跳循环，进入外层重试
-
-        finally:
-            # agent_task 已当场取消时这里是 no-op；异常传播时确保清理
-            if not agent_task.done():
-                agent_task.cancel()
-                await asyncio.gather(agent_task, return_exceptions=True)
+    agent_task = asyncio.create_task(run_agent_checked(context=context, **kwargs))
+    heartbeat_index = 0
+    started_monotonic = time.monotonic()
+    try:
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(agent_task), timeout=heartbeat_every)
+            except asyncio.TimeoutError:
+                heartbeat_index += 1
+                elapsed = time.monotonic() - started_monotonic
+                payload = _payload(heartbeat_index)
+                payload["elapsed_seconds"] = round(elapsed, 3)
+                ctx.emit_event("stage", stage=stage, **payload)
+    finally:
+        if not agent_task.done():
+            agent_task.cancel()
+            await asyncio.gather(agent_task, return_exceptions=True)
 
 # ── 模块目录发现 ──────────────────────────────────────────────────────────────
 

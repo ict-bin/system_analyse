@@ -33,6 +33,18 @@ logger = logging.getLogger("sa.runner")
 _MAX_BACKOFF = 30  # 退避上限 30s
 _BACKOFF_SCHEDULE = (3.0, 5.0, 10.0, 15.0, 30.0)  # 固定退避序列
 _QUERY_ENGINE_401_MAX_RETRIES = 10
+
+# ── per-pi-process 卡死检测默认值 ─────────────────────────────────────────────
+# 全局配置通过 task_config.model_stuck_timeout / model_stuck_max_activations 注入
+# 环境变量可覆盖代码默认值（与 config.json 同级，优先级：config.json > 环境变量 > 代码默认）
+_DEFAULT_PI_STUCK_TIMEOUT: float = max(
+    30.0,
+    float(os.environ.get("SECFLOW_SA_MODEL_STUCK_TIMEOUT", "1800")),
+)
+_DEFAULT_PI_STUCK_MAX_ACTIVATIONS: int = max(
+    1,
+    int(os.environ.get("SECFLOW_SA_MODEL_STUCK_MAX_ACTIVATIONS", "5")),
+)
 _DEFAULT_CONTEXT_WINDOW = 128_000
 _SINGLE_INPUT_CONTEXT_RATIO = 0.75
 _PROMPT_TOKEN_OVERHEAD = 128
@@ -409,6 +421,8 @@ async def _run_with_context_overflow_recovery(
     retry_delay: float,
     pi_max_retries: int,
     pi_retry_delay: float,
+    model_stuck_timeout: float | None = None,
+    model_stuck_max_activations: int | None = None,
 ) -> AgentResult:
     result = await _run_with_pi_retry(
         args=args,
@@ -422,6 +436,8 @@ async def _run_with_context_overflow_recovery(
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
         session_file=session_file,
+        model_stuck_timeout=model_stuck_timeout,
+        model_stuck_max_activations=model_stuck_max_activations,
     )
     if not _is_context_overflow_error(result.error):
         return result
@@ -500,22 +516,20 @@ async def run_agent(
     session_file: str | None = None,
     on_stream: Callable[[str], None] | None = None,
     cancel_event: asyncio.Event | None = None,
-    max_retries: int = 3,  # API 错误最大重试（-1=无限）
-    retry_delay: float = 10.0,  # API 重试首次等待
-    pi_max_retries: int = -1,  # pi 进程最大重试（-1=无限）
-    pi_retry_delay: float = 10.0,  # pi 进程重试首次等待
+    max_retries: int = 3,
+    retry_delay: float = 10.0,
+    pi_max_retries: int = -1,
+    pi_retry_delay: float = 10.0,
+    model_stuck_timeout: float | None = None,
+    model_stuck_max_activations: int | None = None,
 ) -> AgentResult:
     """
-    运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
+    运行单个 pi Agent 子进程（双层重试 + 致命错误检测 + per-pi-process stuck 监测）。
 
     外层：pi 进程级重试（拉起失败、崩溃、被 kill）
     内层：API 级重试（连接超时、限流、服务器错误）
+    内层：per-pi stuck 监测（并行进程间独立计时）
     致命：Model not found / Unauthorized → 不重试，result.fatal=True
-
-    注意：本函数不设任何执行时间上限。模型推理时间本质上不可预测（大模型
-    单次生成可能远超数分钟），任何固定时限都会造成 session 污染（超时后以
-    相同 session_file 重启 pi → 注入第二条 user 消息）。上层保护由
-    run_agent_with_stage_guard（触发 StageError，不重试）负责。
     """
     try:
         pi_cmd = _find_pi_command()
@@ -557,6 +571,8 @@ async def run_agent(
             retry_delay=retry_delay,
             pi_max_retries=pi_max_retries,
             pi_retry_delay=pi_retry_delay,
+            model_stuck_timeout=model_stuck_timeout,
+            model_stuck_max_activations=model_stuck_max_activations,
         )
     finally:
         if sys_tmp_file and os.path.exists(sys_tmp_file):
@@ -591,7 +607,9 @@ async def _run_with_pi_retry(
     retry_delay: float,
     pi_max_retries: int,
     pi_retry_delay: float,
-    session_file: str | None = None,  # 穿透给内层用于「继续」判断
+    session_file: str | None = None,
+    model_stuck_timeout: float | None = None,
+    model_stuck_max_activations: int | None = None,
 ) -> AgentResult:
     """外层循环：处理 pi 进程拉起失败、崩溃、致命错误。"""
     # cwd 不存在是致命错误（目录被删除等），不进入重试
@@ -622,6 +640,8 @@ async def _run_with_pi_retry(
                 max_retries=max_retries,
                 retry_delay=retry_delay,
                 session_file=session_file,
+                model_stuck_timeout=model_stuck_timeout,
+                model_stuck_max_activations=model_stuck_max_activations,
             )
 
             # ── 致命错误检测（在 pi 进程重试前拦截）──
@@ -731,17 +751,31 @@ async def _run_with_api_retry(
     on_stream: Callable[[str], None] | None,
     max_retries: int,
     retry_delay: float,
-    session_file: str | None = None,  # 用于「继续」判断
+    session_file: str | None = None,
+    model_stuck_timeout: float | None = None,
+    model_stuck_max_activations: int | None = None,
 ) -> AgentResult:
-    """内层循环：启动 pi 子进程，处理 API 级错误重试。
+    """内层循环：启动 pi 子进程，处理 API 级错误重试 + per-pi-process stuck 监测。
 
-    会话已有内容时的重试策略：
-    - session_file 已有 assistant 输出 → 发「继续完成上次未完成的任务」
-    - 否则重发原始 prompt
+    stuck 监测：每个 pi 子进程有独立的 mtime 计时器，并行进程不干扰。
+    激活阶段：kill pi + 新 pi + 「继续」或原 prompt。
+    重启阶段：激活超次限，重启 pi 继承 session 发「继续」。
     """
+    # ── stuck 参数 ──
+    _stuck_timeout: float = (
+        float(model_stuck_timeout) if model_stuck_timeout is not None
+        else _DEFAULT_PI_STUCK_TIMEOUT
+    )
+    _stuck_max_act: int = (
+        max(0, int(model_stuck_max_activations)) if model_stuck_max_activations is not None
+        else _DEFAULT_PI_STUCK_MAX_ACTIVATIONS
+    )
+    activation_count: int = 0
+    restart_count: int = 0
+
     api_attempt = 0
     query_engine_401_failures = 0
-    effective_prompt = prompt  # 首次使用原始 prompt
+    effective_prompt = prompt
 
     while True:
         result = AgentResult()
@@ -782,9 +816,41 @@ async def _run_with_api_retry(
             proc.stdin.write(prompt_cmd.encode("utf-8"))
             await proc.stdin.drain()
 
+            # ── per-pi-process stuck 监测：记录 session mtime 基线 ──
+            _pi_last_mtime: float = 0.0
+            _pi_last_active: float = time.monotonic()
+            if _stuck_timeout > 0 and session_file:
+                try:
+                    _pi_last_mtime = os.path.getmtime(session_file)
+                except OSError:
+                    _pi_last_mtime = 0.0
+            _pi_stuck_triggered: bool = False
+
             buffer = b""
             while True:
-                chunk = await proc.stdout.read(4096)
+                # 2s 轮询粒度读取 stdout，两次 read 间检查 mtime
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=2.0)
+                except asyncio.TimeoutError:
+                    chunk = b""
+
+                # ── mtime 变化 → 有 token 输出 → 重置计时器 ──
+                if _stuck_timeout > 0 and session_file:
+                    try:
+                        _cur_mtime = os.path.getmtime(session_file)
+                    except OSError:
+                        _cur_mtime = _pi_last_mtime
+                    if _cur_mtime != _pi_last_mtime:
+                        _pi_last_mtime = _cur_mtime
+                        _pi_last_active = time.monotonic()
+
+                # ── stuck 检测 ──
+                if _stuck_timeout > 0:
+                    _idle = time.monotonic() - _pi_last_active
+                    if _idle >= _stuck_timeout:
+                        _pi_stuck_triggered = True
+                        break
+
                 if not chunk:
                     break
                 buffer += chunk
@@ -798,6 +864,41 @@ async def _run_with_api_retry(
                         break
                 if agent_ended:
                     break
+
+            # ── stuck 触发 → kill pi，决定激活还是重启 ──
+            if _pi_stuck_triggered:
+                _idle_secs = time.monotonic() - _pi_last_active
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                if activation_count < _stuck_max_act:
+                    activation_count += 1
+                    _action = f"激活(第{activation_count}/{_stuck_max_act}次)"
+                else:
+                    restart_count += 1
+                    activation_count = 0
+                    _action = f"重启(第{restart_count}次，已达激活上限)"
+                _log_warn(
+                    f"[stuck] pi 进程 {_idle_secs:.0f}s 无 token 输出，"
+                    f"{_action}，继承 session 发送激活指令"
+                )
+                if on_stream:
+                    on_stream(
+                        f"\n⚠️ 后端模型 {_idle_secs:.0f}s 无响应，"
+                        f"{_action}...\n"
+                    )
+                if session_file and _session_has_assistant_content(session_file):
+                    effective_prompt = "继续"
+                else:
+                    effective_prompt = prompt
+                api_attempt = 0
+                query_engine_401_failures = 0
+                continue
             if buffer.strip():
                 _process_line(
                     buffer.decode("utf-8", errors="replace"), result, on_stream

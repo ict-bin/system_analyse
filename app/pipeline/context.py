@@ -345,6 +345,8 @@ class PipelineContext:
             "retry_delay": self.cfg.agent_retry_delay,
             "pi_max_retries": self.cfg.pi_max_retries,
             "pi_retry_delay": self.cfg.pi_retry_delay,
+            "model_stuck_timeout": getattr(self.cfg, "model_stuck_timeout", 1800.0),
+            "model_stuck_max_activations": getattr(self.cfg, "model_stuck_max_activations", 5),
         }
 
     def make_j_base(self) -> dict:
@@ -356,4 +358,6 @@ class PipelineContext:
             "retry_delay": self.cfg.agent_retry_delay,
             "pi_max_retries": self.cfg.pi_max_retries,
             "pi_retry_delay": self.cfg.pi_retry_delay,
+            "model_stuck_timeout": getattr(self.cfg, "model_stuck_timeout", 1800.0),
+            "model_stuck_max_activations": getattr(self.cfg, "model_stuck_max_activations", 5),
         }
