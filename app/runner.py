@@ -623,6 +623,12 @@ async def _run_with_pi_retry(
         return r
 
     pi_attempt = 0
+    # ── 连续快速崩溃检测（crash-loop 保护）──────────────────────────────────
+    # 若进程在极短时间内（< _PI_CRASH_LOOP_WINDOW 秒）连续崩溃 _PI_CRASH_LOOP_MAX 次，
+    # 判定为程序 bug（非网络抖动），直接终止任务，避免无限重试掩盖错误。
+    _PI_CRASH_LOOP_MAX: int = int(os.environ.get("SECFLOW_SA_PI_CRASH_LOOP_MAX", "5"))
+    _PI_CRASH_LOOP_WINDOW: float = float(os.environ.get("SECFLOW_SA_PI_CRASH_LOOP_WINDOW", "60"))
+    _crash_times: list[float] = []
 
     while True:
         if cancel_event and cancel_event.is_set():
@@ -683,6 +689,24 @@ async def _run_with_pi_retry(
 
             if _should_retry(pi_attempt, pi_max_retries, cancel_event):
                 delay = _backoff(pi_retry_delay, pi_attempt)
+
+                # ── crash-loop 检测：记录本次崩溃时刻，清理过期窗口外的记录 ──
+                _now = time.monotonic()
+                _crash_times.append(_now)
+                _crash_times[:] = [t for t in _crash_times if _now - t <= _PI_CRASH_LOOP_WINDOW]
+                if len(_crash_times) >= _PI_CRASH_LOOP_MAX:
+                    _msg = (
+                        f"pi 进程在 {_PI_CRASH_LOOP_WINDOW:.0f}s 内连续崩溃 {len(_crash_times)} 次，"
+                        f"判定为程序 bug（非网络抖动），终止任务。\n"
+                        f"最近一次错误: {exc}"
+                    )
+                    _log_error(_msg)
+                    r = AgentResult()
+                    r.exit_code = -1
+                    r.error = _msg
+                    r.fatal = True  # 标记为 fatal 以便上层结束任务
+                    return r
+
                 _log_warn(
                     f"pi 进程失败 [{label}], {delay:.0f}s 后重试: {exc}\n"
                     f"    命令: {_cmd_preview(args)}"
