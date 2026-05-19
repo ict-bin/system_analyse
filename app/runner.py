@@ -853,11 +853,13 @@ async def _run_with_api_retry(
 
             buffer = b""
             while True:
-                # 2s 轮询粒度读取 stdout，两次 read 间检查 mtime
+                # 2s 轮询粒度读取 stdout，超时仅用于 stuck 检测，不代表 EOF
+                _is_timeout = False
                 try:
                     chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=2.0)
                 except asyncio.TimeoutError:
                     chunk = b""
+                    _is_timeout = True
 
                 # ── mtime 变化 → 有 token 输出 → 重置计时器 ──
                 if _stuck_timeout > 0 and session_file:
@@ -876,6 +878,9 @@ async def _run_with_api_retry(
                         _pi_stuck_triggered = True
                         break
 
+                # timeout 不是 EOF，继续等待；只有真正的 pipe EOF（chunk=b"" 且非 timeout）才退出
+                if _is_timeout:
+                    continue
                 if not chunk:
                     break
                 buffer += chunk
