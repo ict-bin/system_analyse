@@ -136,3 +136,44 @@ def test_render_metrics_exposes_system_analysis_effectiveness_and_checkpoint(mon
     assert 'secflow_sa_checkpoint_tasks{state="partial"} 1' in rendered
     assert 'secflow_sa_checkpoint_module_done_total{stage="s2"} 1' in rendered
     assert 'secflow_sa_checkpoint_module_done_total{stage="s3"} 1' in rendered
+
+
+def test_render_metrics_exposes_real_worker_runtime_snapshot(monkeypatch, tmp_path: Path):
+    row = SimpleNamespace(
+        task_id="sat_worker_metrics",
+        status="running",
+        created_at=None,
+        started_at=None,
+        finished_at=None,
+        result_json={},
+        error=None,
+        output_path=str(tmp_path),
+        is_deleted=False,
+    )
+    _install_fake_db(monkeypatch, [row])
+    monkeypatch.setattr(
+        metrics,
+        "get_worker_runtime_health",
+        lambda: {
+            "worker_running_tasks": 2,
+            "running_task_count": 2,
+            "worker_task_concurrency": 4,
+            "worker_last_global_capacity_remaining": 3,
+            "worker_global_limit_reached": False,
+            "worker_loop_fresh": True,
+            "worker_control_claim_enabled": True,
+            "worker_control_drain_mode": False,
+        },
+    )
+    monkeypatch.setattr(metrics, "get_worker_runtime_settings", lambda: {"worker_task_concurrency": 4})
+
+    rendered = metrics.render_metrics()
+
+    assert 'secflow_sa_worker_runtime{kind="capacity"} 4' in rendered
+    assert 'secflow_sa_worker_runtime{kind="running"} 2' in rendered
+    assert 'secflow_sa_worker_runtime{kind="available_slots"} 2' in rendered
+    assert 'secflow_sa_worker_runtime{kind="global_capacity_remaining"} 3' in rendered
+    assert 'secflow_sa_worker_runtime{kind="loop_fresh"} 1' in rendered
+    assert 'secflow_sa_worker_runtime{kind="claim_enabled"} 1' in rendered
+    assert 'secflow_sa_worker_runtime{kind="drain_mode"} 0' in rendered
+    assert 'secflow_sa_worker_utilization_ratio 0.500000' in rendered

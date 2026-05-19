@@ -219,6 +219,19 @@ def _render_task_metrics() -> list[str]:
         int(worker_health.get("running_task_count") or 0),
         1 if rows else 0,
     )
+    worker_running_tasks = max(0, int(worker_health.get("worker_running_tasks") or worker_health.get("running_task_count") or 0))
+    worker_capacity = max(0, int(worker_health.get("worker_task_concurrency") or worker_settings.get("worker_task_concurrency") or worker_gauge))
+    worker_available_slots = max(0, worker_capacity - worker_running_tasks)
+    worker_utilization_ratio = (worker_running_tasks / worker_capacity) if worker_capacity > 0 else 0.0
+    worker_global_remaining = worker_health.get("worker_last_global_capacity_remaining")
+    try:
+        worker_global_remaining_value = int(worker_global_remaining) if worker_global_remaining is not None else -1
+    except (TypeError, ValueError):
+        worker_global_remaining_value = -1
+    worker_global_limit_reached = 1 if bool(worker_health.get("worker_global_limit_reached")) else 0
+    worker_loop_fresh = 1 if bool(worker_health.get("worker_loop_fresh")) else 0
+    worker_claim_enabled = 1 if bool(worker_health.get("worker_control_claim_enabled", True)) else 0
+    worker_drain_mode = 1 if bool(worker_health.get("worker_control_drain_mode")) else 0
 
     lines = [
         "# HELP secflow_sa_db_up Database query path for metrics is available.",
@@ -255,6 +268,19 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_sa_workers Number of worker slots or active workers.",
         "# TYPE secflow_sa_workers gauge",
         f"secflow_sa_workers {worker_gauge}",
+        "# HELP secflow_sa_worker_runtime Worker runtime snapshot by kind.",
+        "# TYPE secflow_sa_worker_runtime gauge",
+        f'secflow_sa_worker_runtime{{kind="capacity"}} {worker_capacity}',
+        f'secflow_sa_worker_runtime{{kind="running"}} {worker_running_tasks}',
+        f'secflow_sa_worker_runtime{{kind="available_slots"}} {worker_available_slots}',
+        f'secflow_sa_worker_runtime{{kind="global_capacity_remaining"}} {worker_global_remaining_value}',
+        f'secflow_sa_worker_runtime{{kind="global_limit_reached"}} {worker_global_limit_reached}',
+        f'secflow_sa_worker_runtime{{kind="loop_fresh"}} {worker_loop_fresh}',
+        f'secflow_sa_worker_runtime{{kind="claim_enabled"}} {worker_claim_enabled}',
+        f'secflow_sa_worker_runtime{{kind="drain_mode"}} {worker_drain_mode}',
+        "# HELP secflow_sa_worker_utilization_ratio Current worker slot utilization ratio.",
+        "# TYPE secflow_sa_worker_utilization_ratio gauge",
+        f"secflow_sa_worker_utilization_ratio {_fmt(worker_utilization_ratio)}",
         "# HELP secflow_sa_judges Aggregated judge session count.",
         "# TYPE secflow_sa_judges gauge",
         f"secflow_sa_judges {judge_session_gauge}",
