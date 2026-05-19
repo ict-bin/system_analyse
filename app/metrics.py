@@ -89,8 +89,29 @@ def _render_task_metrics() -> list[str]:
     worker_session_gauge = judge_session_gauge = total_session_gauge = 0
     stage_duration: dict[tuple[str, str], float] = defaultdict(float)
     stage_rounds: dict[tuple[str, str], int] = defaultdict(int)
+    stage_records_total: dict[tuple[str, str], int] = defaultdict(int)
     stage_tokens: dict[tuple[str, str], int] = defaultdict(int)
     stage_cost: dict[tuple[str, str], float] = defaultdict(float)
+    stage_vote_pass_total: dict[tuple[str, str], int] = defaultdict(int)
+    stage_vote_fail_total: dict[tuple[str, str], int] = defaultdict(int)
+    stage_judge_score_sum: dict[tuple[str, str], float] = defaultdict(float)
+    stage_judge_score_count: dict[tuple[str, str], int] = defaultdict(int)
+    stage_review_pass_rate_sum: dict[tuple[str, str], float] = defaultdict(float)
+    stage_review_pass_rate_count: dict[tuple[str, str], int] = defaultdict(int)
+    stage_round_index_sum: dict[tuple[str, str], int] = defaultdict(int)
+    stage_round_index_count: dict[tuple[str, str], int] = defaultdict(int)
+    module_total = module_completed_total = module_failed_total = 0
+    effectiveness_first_round_pass_rate_sum = 0.0
+    effectiveness_first_round_pass_rate_count = 0
+    effectiveness_final_module_pass_rate_sum = 0.0
+    effectiveness_final_module_pass_rate_count = 0
+    effectiveness_multi_round_pass_rate_sum = 0.0
+    effectiveness_multi_round_pass_rate_count = 0
+    effectiveness_reflection_round_total = 0
+    effectiveness_reclassify_total = 0
+    checkpoint_any_tasks = checkpoint_partial_tasks = checkpoint_overall_done_tasks = 0
+    checkpoint_stage_done_total: dict[str, int] = defaultdict(int)
+    checkpoint_module_done_total: dict[str, int] = defaultdict(int)
 
     for row in rows:
         status = str(row.status or "unknown")
@@ -126,15 +147,42 @@ def _render_task_metrics() -> list[str]:
         eval_records = _load_stage_records(_task_run_root(row))
         if isinstance(eval_summary, dict):
             retry_total += max(0, int(eval_summary.get("round_count") or 0) - int(eval_summary.get("module_count") or 0))
+            module_total += int(eval_summary.get("module_count") or 0)
+            module_completed_total += int(eval_summary.get("completed_module_count") or 0)
+            module_failed_total += int(eval_summary.get("failed_module_count") or 0)
+            effectiveness = eval_summary.get("effectiveness") if isinstance(eval_summary.get("effectiveness"), dict) else {}
+            if effectiveness:
+                effectiveness_first_round_pass_rate_sum += float(effectiveness.get("first_round_pass_rate") or 0.0)
+                effectiveness_first_round_pass_rate_count += 1
+                effectiveness_final_module_pass_rate_sum += float(effectiveness.get("final_module_pass_rate") or 0.0)
+                effectiveness_final_module_pass_rate_count += 1
+                effectiveness_multi_round_pass_rate_sum += float(effectiveness.get("multi_round_pass_rate") or 0.0)
+                effectiveness_multi_round_pass_rate_count += 1
+                effectiveness_reflection_round_total += int(effectiveness.get("reflection_round_count") or 0)
+                effectiveness_reclassify_total += int(effectiveness.get("reclassify_count") or 0)
         for record in eval_records:
             stage = str(record.get("stage") or "unknown")
             stage_status = str(record.get("status") or "unknown")
             key = (stage, stage_status)
             stage_duration[key] += max(0.0, float(record.get("duration_ms") or 0.0) / 1000.0)
             stage_rounds[key] += 1
+            stage_records_total[key] += 1
             metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
             stage_tokens[key] += int(metrics.get("token_total") or 0)
             stage_cost[key] += float(metrics.get("cost") or 0.0)
+            if "avg_judge_score" in metrics:
+                stage_judge_score_sum[key] += float(metrics.get("avg_judge_score") or 0.0)
+                stage_judge_score_count[key] += 1
+            if "review_pass_rate" in metrics:
+                stage_review_pass_rate_sum[key] += float(metrics.get("review_pass_rate") or 0.0)
+                stage_review_pass_rate_count[key] += 1
+            if bool(metrics.get("passed_by_vote")):
+                stage_vote_pass_total[key] += 1
+            else:
+                stage_vote_fail_total[key] += 1
+            if record.get("stage_round") is not None:
+                stage_round_index_sum[key] += int(record.get("stage_round") or 0)
+                stage_round_index_count[key] += 1
             worker = record.get("worker") if isinstance(record.get("worker"), dict) else {}
             if worker.get("session_file"):
                 worker_session_gauge += 1
@@ -143,6 +191,18 @@ def _render_task_metrics() -> list[str]:
             judge_session_gauge += len(judges)
             total_session_gauge += sum(1 for judge in judges if isinstance(judge, dict) and judge.get("session_file"))
         total_session_gauge += _count_session_files(_task_run_root(row) / "sessions")
+        checkpoint_summary = _load_checkpoint_summary(row)
+        if checkpoint_summary is not None:
+            checkpoint_any_tasks += 1
+            if bool(checkpoint_summary.get("overall_done")):
+                checkpoint_overall_done_tasks += 1
+            else:
+                checkpoint_partial_tasks += 1
+            for stage_name, stage_payload in (checkpoint_summary.get("stages") or {}).items():
+                if isinstance(stage_payload, dict) and stage_payload.get("done"):
+                    checkpoint_stage_done_total[str(stage_name)] += 1
+            checkpoint_module_done_total["s2"] += int(checkpoint_summary.get("s2_done_count") or 0)
+            checkpoint_module_done_total["s3"] += int(checkpoint_summary.get("s3_done_count") or 0)
 
         classification = _classify_failure(row.error, result_json)
         if classification == "timeout":
@@ -238,18 +298,79 @@ def _render_task_metrics() -> list[str]:
         "# TYPE secflow_sa_stage_duration_seconds gauge",
         "# HELP secflow_sa_stage_rounds Aggregated stage round count by stage and status.",
         "# TYPE secflow_sa_stage_rounds gauge",
+        "# HELP secflow_sa_stage_records_total Aggregated stage record count by stage and status.",
+        "# TYPE secflow_sa_stage_records_total gauge",
         "# HELP secflow_sa_stage_token_total Aggregated stage tokens by stage and status.",
         "# TYPE secflow_sa_stage_token_total gauge",
         "# HELP secflow_sa_stage_cost_total Aggregated stage cost by stage and status.",
         "# TYPE secflow_sa_stage_cost_total gauge",
+        "# HELP secflow_sa_stage_vote_pass_total Aggregated vote-passed records by stage and status.",
+        "# TYPE secflow_sa_stage_vote_pass_total gauge",
+        "# HELP secflow_sa_stage_vote_fail_total Aggregated vote-failed records by stage and status.",
+        "# TYPE secflow_sa_stage_vote_fail_total gauge",
+        "# HELP secflow_sa_stage_judge_score Aggregated stage judge score summary by stage and status.",
+        "# TYPE secflow_sa_stage_judge_score summary",
+        "# HELP secflow_sa_stage_review_pass_rate Aggregated stage review pass rate summary by stage and status.",
+        "# TYPE secflow_sa_stage_review_pass_rate summary",
+        "# HELP secflow_sa_stage_round_index Aggregated stage_round index summary by stage and status.",
+        "# TYPE secflow_sa_stage_round_index summary",
+        "# HELP secflow_sa_module_total Aggregated module count from evaluation summaries.",
+        "# TYPE secflow_sa_module_total gauge",
+        f"secflow_sa_module_total {module_total}",
+        "# HELP secflow_sa_module_completed_total Aggregated completed module count from evaluation summaries.",
+        "# TYPE secflow_sa_module_completed_total gauge",
+        f"secflow_sa_module_completed_total {module_completed_total}",
+        "# HELP secflow_sa_module_failed_total Aggregated failed module count from evaluation summaries.",
+        "# TYPE secflow_sa_module_failed_total gauge",
+        f"secflow_sa_module_failed_total {module_failed_total}",
+        "# HELP secflow_sa_effectiveness_first_round_pass_rate Aggregated first round pass rate summary.",
+        "# TYPE secflow_sa_effectiveness_first_round_pass_rate summary",
+        f"secflow_sa_effectiveness_first_round_pass_rate_count {effectiveness_first_round_pass_rate_count}",
+        f"secflow_sa_effectiveness_first_round_pass_rate_sum {_fmt(effectiveness_first_round_pass_rate_sum)}",
+        "# HELP secflow_sa_effectiveness_final_module_pass_rate Aggregated final module pass rate summary.",
+        "# TYPE secflow_sa_effectiveness_final_module_pass_rate summary",
+        f"secflow_sa_effectiveness_final_module_pass_rate_count {effectiveness_final_module_pass_rate_count}",
+        f"secflow_sa_effectiveness_final_module_pass_rate_sum {_fmt(effectiveness_final_module_pass_rate_sum)}",
+        "# HELP secflow_sa_effectiveness_multi_round_pass_rate Aggregated multi-round final pass rate summary.",
+        "# TYPE secflow_sa_effectiveness_multi_round_pass_rate summary",
+        f"secflow_sa_effectiveness_multi_round_pass_rate_count {effectiveness_multi_round_pass_rate_count}",
+        f"secflow_sa_effectiveness_multi_round_pass_rate_sum {_fmt(effectiveness_multi_round_pass_rate_sum)}",
+        "# HELP secflow_sa_effectiveness_reflection_round_total Aggregated reflection rounds from evaluation summaries.",
+        "# TYPE secflow_sa_effectiveness_reflection_round_total counter",
+        f"secflow_sa_effectiveness_reflection_round_total {effectiveness_reflection_round_total}",
+        "# HELP secflow_sa_effectiveness_reclassify_total Aggregated reclassify count from evaluation summaries.",
+        "# TYPE secflow_sa_effectiveness_reclassify_total counter",
+        f"secflow_sa_effectiveness_reclassify_total {effectiveness_reclassify_total}",
+        "# HELP secflow_sa_checkpoint_tasks Aggregated checkpoint task coverage by state.",
+        "# TYPE secflow_sa_checkpoint_tasks gauge",
+        f'secflow_sa_checkpoint_tasks{{state="any"}} {checkpoint_any_tasks}',
+        f'secflow_sa_checkpoint_tasks{{state="partial"}} {checkpoint_partial_tasks}',
+        f'secflow_sa_checkpoint_tasks{{state="overall_done"}} {checkpoint_overall_done_tasks}',
+        "# HELP secflow_sa_checkpoint_stage_done_total Aggregated stage-level completed checkpoint count.",
+        "# TYPE secflow_sa_checkpoint_stage_done_total gauge",
+        "# HELP secflow_sa_checkpoint_module_done_total Aggregated module-level completed checkpoint count.",
+        "# TYPE secflow_sa_checkpoint_module_done_total gauge",
     ])
-    for key in sorted(set(stage_rounds) | set(stage_duration) | set(stage_tokens) | set(stage_cost)):
+    for key in sorted(set(stage_rounds) | set(stage_duration) | set(stage_tokens) | set(stage_cost) | set(stage_records_total) | set(stage_vote_pass_total) | set(stage_vote_fail_total) | set(stage_judge_score_sum) | set(stage_review_pass_rate_sum) | set(stage_round_index_sum)):
         stage, stage_status = key
         labels = _labels(stage=stage, status=stage_status)
         lines.append(f"secflow_sa_stage_duration_seconds{labels} {_fmt(stage_duration.get(key, 0.0))}")
         lines.append(f"secflow_sa_stage_rounds{labels} {stage_rounds.get(key, 0)}")
+        lines.append(f"secflow_sa_stage_records_total{labels} {stage_records_total.get(key, 0)}")
         lines.append(f"secflow_sa_stage_token_total{labels} {stage_tokens.get(key, 0)}")
         lines.append(f"secflow_sa_stage_cost_total{labels} {_fmt(stage_cost.get(key, 0.0))}")
+        lines.append(f"secflow_sa_stage_vote_pass_total{labels} {stage_vote_pass_total.get(key, 0)}")
+        lines.append(f"secflow_sa_stage_vote_fail_total{labels} {stage_vote_fail_total.get(key, 0)}")
+        lines.append(f"secflow_sa_stage_judge_score_count{labels} {stage_judge_score_count.get(key, 0)}")
+        lines.append(f"secflow_sa_stage_judge_score_sum{labels} {_fmt(stage_judge_score_sum.get(key, 0.0))}")
+        lines.append(f"secflow_sa_stage_review_pass_rate_count{labels} {stage_review_pass_rate_count.get(key, 0)}")
+        lines.append(f"secflow_sa_stage_review_pass_rate_sum{labels} {_fmt(stage_review_pass_rate_sum.get(key, 0.0))}")
+        lines.append(f"secflow_sa_stage_round_index_count{labels} {stage_round_index_count.get(key, 0)}")
+        lines.append(f"secflow_sa_stage_round_index_sum{labels} {_fmt(float(stage_round_index_sum.get(key, 0)))}")
+    for stage_name in sorted(checkpoint_stage_done_total):
+        lines.append(f"secflow_sa_checkpoint_stage_done_total{_labels(stage=stage_name)} {checkpoint_stage_done_total[stage_name]}")
+    for stage_name in sorted(checkpoint_module_done_total):
+        lines.append(f"secflow_sa_checkpoint_module_done_total{_labels(stage=stage_name)} {checkpoint_module_done_total[stage_name]}")
     _append_ai_alias_metrics(
         lines,
         prefix="secflow_sa",
@@ -280,6 +401,13 @@ def _task_run_root(row: AppSaTask) -> Path | None:
     return Path(row.output_path) / row.task_id / "run"
 
 
+def _task_workspace(row: AppSaTask) -> Path | None:
+    run_root = _task_run_root(row)
+    if run_root is None:
+        return None
+    return run_root / "workspace"
+
+
 def _load_json(path: Path | None) -> dict[str, Any] | None:
     if path is None or not path.is_file():
         return None
@@ -304,6 +432,21 @@ def _load_stage_records(run_root: Path | None) -> list[dict[str, Any]]:
             if isinstance(payload, dict):
                 records.append(payload)
     return records
+
+
+def _load_checkpoint_summary(row: AppSaTask) -> dict[str, Any] | None:
+    workspace = _task_workspace(row)
+    if workspace is None:
+        return None
+    checkpoint_dir = workspace / ".checkpoint"
+    if not checkpoint_dir.is_dir():
+        return None
+    try:
+        from .pipeline.checkpoint import CheckpointManager
+
+        return CheckpointManager(workspace).load_summary()
+    except Exception:
+        return None
 
 
 def _count_session_files(path: Path | None) -> int:
