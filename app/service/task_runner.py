@@ -25,7 +25,7 @@ logger = logging.getLogger("sa.task_runner")
 @dataclass
 class TaskRunnerDependencies:
     get_db: Callable[[], object]
-    acquire_execution_lock: Callable[[str | None, str, int], object | None]
+    acquire_execution_lock: Callable[[Session, str | None, str, int], object | None]
     clear_task_execution_lock: Callable[[str | None, str], None]
     flush_stages: Callable[[str, list[dict]], None]  # kept for legacy _execute_task path
     load_svc_config_from_db: Callable[[Session, str], object]
@@ -142,7 +142,7 @@ class TaskRunner:
                     row.lease_epoch,
                 )
                 raise RuntimeError("task lease lost before execute")
-            self._deps.acquire_execution_lock(row.output_path, task_id, lease_epoch)
+            self._deps.acquire_execution_lock(db, row.output_path, task_id, lease_epoch)
             svc = self._deps.load_svc_config_from_db(db, row.project_id)
             tcfg = dict(row.task_config_json or {})
             if tcfg.get("analyse_targets"):
