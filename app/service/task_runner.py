@@ -62,6 +62,10 @@ class TaskRunner:
 
         def on_event(event: SwarmEvent) -> None:
             nonlocal last_stage_flush_ts, last_stage_flush_count
+            # 心跳事件仅用于实时监控，不写入 events.jsonl
+            # （它们是 "Worker 还在运行" 信号，不是业务状态变化）
+            if event.type == "heartbeat":
+                return
             event_buffer.append({"ts": _time.time(), "type": event.type, "data": dict(event.data)})
             now_ts = _time.time()
             buffered_count = len(event_buffer) - last_stage_flush_count
