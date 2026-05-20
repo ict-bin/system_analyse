@@ -33,6 +33,9 @@ from .helpers import (
     load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
+    commit_split_plan, split_plan_exists,
+    archive_module_deletions, restore_module_for_retry,
+    fix_orphan_dirs_before_judge,
 )
 
 
@@ -502,6 +505,7 @@ class AnalyseStage(BaseStage):
             j_sys_refine += _gran_hint
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
+        _redo_deleted_lock: asyncio.Lock = asyncio.Lock()  # 保护 deleted.list 并发写入
 
         for mod_name in to_reclassify:
             mod_dir = mods_root / mod_name
@@ -530,6 +534,10 @@ class AnalyseStage(BaseStage):
                                             f"（{len(_flist)}个文件，{len(_unclear)}个需补充）"))
 
             for attempt in range(max_iter(s_cfg_refine)):
+                # 重试前恢复干净状态：从快照还原 files.list，清除上轮 split/ 和 deleted/
+                if attempt > 0:
+                    restore_module_for_retry(mod_name, mod_dir, workspace, set())
+
                 ctx.emit_event("stage", stage="2-redo", module=mod_name, attempt=attempt + 1)
 
                 ar = await run_agent_with_stage_guard(
@@ -556,6 +564,12 @@ class AnalyseStage(BaseStage):
                     if _rm:
                         ctx.emit_event("log", level="warn",
                                        msg=f"[S3-2redo过滤] 补先移除 {_rm} 个越界条目")
+
+                # 孤儿目录修复（Worker bash 路径拼写错误导致 MISSING）
+                orphan_fixed = fix_orphan_dirs_before_judge(workspace, mod_name, set())
+                if orphan_fixed:
+                    ctx.emit_event("log", level="warn",
+                                   msg=f"[S3-2redo孤儿修复] {mod_name}: 自动移入modules/ {orphan_fixed}")
 
                 judge_results = []
                 eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
@@ -594,6 +608,13 @@ class AnalyseStage(BaseStage):
                 voted_pass = check_voting(judge_results, s_cfg_refine.pass_mode, ctx.j_count)
                 if voted_pass:
                     if attempt + 1 >= s_cfg_refine.min_rounds:
+                        # 提交 split 草稿（若 Worker 创建了拆分计划）
+                        if split_plan_exists(mod_dir):
+                            commit_split_plan(workspace, mod_name)
+                        # 归档 deleted/ → workspace/deleted.list
+                        await archive_module_deletions(
+                            workspace, mod_name, mod_dir, _redo_deleted_lock, ctx
+                        )
                         break
                     feedback = "# 自查要求\n\n" + reflect_refine
                     jfb = "\n".join(

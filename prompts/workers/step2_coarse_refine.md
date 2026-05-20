@@ -22,7 +22,7 @@
 4. **拆分草稿目录规则（最高优先级）**：若需要拆分，**只能**在 `modules/$MOD/split/` 下创建候选子模块，禁止直接创建正式 `modules/<子模块>` 目录。
    - 新子模块草稿：`modules/$MOD/split/<子模块>/files.list`
    - 并入已有模块草稿：`modules/$MOD/split/_merge_to/<已有模块>/files.list`
-   - Judge 通过后，Python 会依据 split 草稿正式提交拆分与合并
+   - ❌ **禁止使用 `modules/$MOD/split/_deleted/`**：这不是合法路径，Python 不会处理它。需要排除的文件必须写入 `modules/$MOD/deleted/files.list`（在 `split/` 之外，见下方
 
 
 # ⚠️ 边界违规文件处理（security_focus 模式下专用）
