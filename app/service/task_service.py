@@ -98,6 +98,147 @@ _RISK_SCORE_RE = re.compile(r"<!--\s*RISK_SCORE:\s*(\d+)\s*-->")
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,2})\s+(.+)$", re.MULTILINE)
 _SESSION_THINKING_LEVEL_MAP = {"off": "off", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "x-high": "xhigh"}
 
+
+def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return {"key": key, "label": label, "value": text}
+
+
+def _task_abnormal_reason(row: AppSaTask) -> dict | None:
+    status = str(row.status or "")
+    if status not in {"failed", "error", "cancelled"}:
+        return None
+    if isinstance(row.latest_abnormal_reason_json, dict):
+        return dict(row.latest_abnormal_reason_json)
+    result_json = _load_task_result_json(row) or {}
+    stages_payload = read_events(_events_path(row.output_path, row.task_id), row.stages_json) or {}
+    events = stages_payload.get("events") if isinstance(stages_payload, dict) else []
+    latest_event = next((event for event in reversed(events or []) if isinstance(event, dict) and (event.get("error") or event.get("event") in {"task_error", "stage_failed", "cancelled"})), None)
+    message = str(
+        row.error
+        or result_json.get("error")
+        or result_json.get("completion_reason")
+        or (latest_event or {}).get("error")
+        or (latest_event or {}).get("message")
+        or ""
+    ).strip()
+    if status == "cancelled":
+        code = "user_cancelled"
+        category = "cancel"
+        title = "任务已取消"
+    elif "lease" in message.lower() or "租约" in message:
+        code = "lease_lost"
+        category = "runtime"
+        title = "任务租约丢失"
+    elif "cancel" in message.lower() or "取消" in message:
+        code = "runtime_interrupted"
+        category = "runtime"
+        title = "运行时中断"
+    elif "dispatch" in message.lower() or "调度" in message:
+        code = "dispatch_failed"
+        category = "runtime"
+        title = "调度失败"
+    elif "dependency" in message.lower() or "timeout" in message.lower() or "503" in message or "502" in message:
+        code = "dependency_unavailable"
+        category = "runtime"
+        title = "依赖不可用"
+    else:
+        code = "unknown_abnormal" if status == "error" else "orchestration_failed"
+        category = "orchestration"
+        title = "任务异常结束"
+    return {
+        "is_abnormal": True,
+        "category": category,
+        "code": code,
+        "title": title,
+        "message": message or "任务以非正常状态结束。",
+        "terminal": True,
+        "source_layer": "task",
+        "status": status,
+        "service": "system-analysis",
+        "stage_name": str((latest_event or {}).get("stage") or (latest_event or {}).get("stage_name") or "").strip() or None,
+        "item_key": None,
+        "downstream_task_id": None,
+        "downstream_service": None,
+        "first_seen_at": isoformat_local(row.started_at),
+        "last_seen_at": isoformat_local(row.finished_at or row.updated_at),
+        "evidence": [
+            item for item in [
+                _abnormal_evidence("status", "状态", row.status),
+                _abnormal_evidence("error", "原始错误", row.error),
+                _abnormal_evidence("latest_event", "最近事件", (latest_event or {}).get("event")),
+            ] if item is not None
+        ],
+        "recommended_action": "查看任务结果、事件时间线和运行观测，确认是调度、租约还是模型执行阶段先失败。",
+        "related_event_ids": [],
+    }
+
+
+def _abnormal_reason_event(reason: dict, *, event_id: str | None = None) -> dict:
+    timestamp = str(reason.get("last_seen_at") or isoformat_local(now_local()) or "")
+    return {
+        "ts": _time.time(),
+        "timestamp": timestamp,
+        "event": "abnormal_reason_recorded",
+        "type": "abnormal_reason_recorded",
+        "event_id": event_id or f"abn-{uuid.uuid4().hex[:12]}",
+        "message": str(reason.get("title") or "任务异常结束"),
+        "level": "warning" if str(reason.get("status") or "") == "cancelled" else "error",
+        "data": {"reason": dict(reason)},
+    }
+
+
+def _abnormal_reason_history(row: AppSaTask) -> list[dict]:
+    stages_payload = read_events(_events_path(row.output_path, row.task_id), row.stages_json) or {}
+    events = stages_payload.get("events") if isinstance(stages_payload, dict) else []
+    history: list[dict] = []
+    for event in reversed(events or []):
+        if not isinstance(event, dict):
+            continue
+        if event.get("event") != "abnormal_reason_recorded":
+            continue
+        payload = event.get("data") if isinstance(event.get("data"), dict) else {}
+        reason = payload.get("reason") if isinstance(payload.get("reason"), dict) else None
+        if not isinstance(reason, dict):
+            continue
+        history.append(
+            {
+                "event_id": event.get("event_id"),
+                "created_at": event.get("timestamp") or event.get("ts"),
+                "reason": reason,
+            }
+        )
+        if len(history) >= 10:
+            break
+    return history
+
+
+def _sync_task_abnormal_reason(row: AppSaTask) -> tuple[dict | None, bool]:
+    reason = _task_abnormal_reason(row)
+    next_payload = dict(reason) if isinstance(reason, dict) else None
+    changed = row.latest_abnormal_reason_json != next_payload
+    if row.latest_abnormal_reason_json != next_payload:
+        row.latest_abnormal_reason_json = next_payload
+        flag_modified(row, "latest_abnormal_reason_json")
+    return next_payload, changed
+
+
+def _record_abnormal_reason(row: AppSaTask, reason: dict | None, *, changed: bool) -> None:
+    if not changed or not isinstance(reason, dict):
+        return
+    event = _abnormal_reason_event(reason)
+    path = _events_path(row.output_path, row.task_id)
+    if path is not None:
+        append_events(path, [event])
+        return
+    payload = row.stages_json if isinstance(row.stages_json, dict) else {}
+    events = list(payload.get("events") or [])
+    events.append(event)
+    row.stages_json = {**payload, "events": events, "final": bool(payload.get("final", False))}
+    flag_modified(row, "stages_json")
+
 def get_worker_runtime_health() -> dict:
     return _get_dispatcher_runtime_health(len(_running_tasks))
 
@@ -1151,6 +1292,10 @@ class TaskService:
             from fastapi import HTTPException
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
         row = self._task_repository.restart_task_in_place(db, row)
+        row.latest_abnormal_reason_json = None
+        flag_modified(row, "latest_abnormal_reason_json")
+        db.commit()
+        db.refresh(row)
         # 清除上次运行目录（含 .checkpoint/），当次从零开始
         if row.output_path:
             import shutil as _shutil
@@ -1177,6 +1322,10 @@ class TaskService:
             hint = f" 缺失产物: {', '.join(missing[:6])}" if missing else ""
             raise HTTPException(400, f"断点不可续跑: {health['reason']}。请使用重启（restart）代替续跑。{hint}")
         row = self._task_repository.resume_task_in_place(db, row)
+        row.latest_abnormal_reason_json = None
+        flag_modified(row, "latest_abnormal_reason_json")
+        db.commit()
+        db.refresh(row)
         _clear_task_execution_lock(row.output_path, task_id)
         _cleanup_resume_intermediate_files(row.output_path, task_id)
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
@@ -1195,6 +1344,10 @@ class TaskService:
         if at and not at.done():
             at.cancel()
         row = self._task_repository.cancel_task_in_place(db, row)
+        reason, changed = _sync_task_abnormal_reason(row)
+        _record_abnormal_reason(row, reason, changed=changed)
+        db.commit()
+        db.refresh(row)
         _clear_task_execution_lock(row.output_path, task_id)
         return self._row_to_dict(row)
 
@@ -1472,6 +1625,9 @@ class TaskService:
             _flush_stages(task_id, event_buffer)
             db.expire(row); db.refresh(row)
             if row.status == "cancelled":
+                reason, changed = _sync_task_abnormal_reason(row)
+                _record_abnormal_reason(row, reason, changed=changed)
+                db.commit()
                 return
             row.status = result.status.value if result else "error"
             row.finished_at = now_local()
@@ -1485,6 +1641,8 @@ class TaskService:
                 row.result_json = _lightweight_result_json(row, result_payload, result_file)
                 if result.error:
                     row.error = result.error
+            reason, changed = _sync_task_abnormal_reason(row)
+            _record_abnormal_reason(row, reason, changed=changed)
             db.commit()
             # —— 自省分析（异步后台，不阻塞任务完成） ——
             try:
@@ -1517,6 +1675,8 @@ class TaskService:
                     _prev2 = r.stages_json
                     _prev_events2 = _prev2["events"] if isinstance(_prev2, dict) and isinstance(_prev2.get("events"), list) else []
                     r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
+                    reason, changed = _sync_task_abnormal_reason(r)
+                    _record_abnormal_reason(r, reason, changed=changed)
                     db.commit()
             except Exception:
                 pass
@@ -1570,6 +1730,7 @@ class TaskService:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         analysis_mode = _infer_analysis_mode(row, include_config=include_heavy)
+        abnormal_reason = _task_abnormal_reason(row)
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_origin_payload(row),
@@ -1589,6 +1750,11 @@ class TaskService:
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
+            "abnormal_reason": abnormal_reason,
+            "abnormal_reason_history": _abnormal_reason_history(row) if include_heavy else [],
+            "abnormal_reason_title": (abnormal_reason or {}).get("title"),
+            "abnormal_reason_code": (abnormal_reason or {}).get("code"),
+            "abnormal_reason_category": (abnormal_reason or {}).get("category"),
         }
 
 
