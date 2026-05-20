@@ -18,6 +18,7 @@ _SessionLocal = None
 _MIGRATIONS = [
     # Add stages_json column for real-time stage tracking (added 2026-05)
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN stages_json JSON NULL",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN latest_abnormal_reason_json JSON NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN task_origin_type VARCHAR(32) NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN analysis_mode VARCHAR(32) NULL",
     "ALTER TABLE secflow_app_sa_tasks ADD COLUMN parent_project_id VARCHAR(100) NULL",

@@ -49,6 +49,7 @@ class AppSaTask(Base):
     # New tasks no longer write to this field. Do NOT remove until all rows
     # have been migrated by scripts/migrate_stages_to_file.py.
     stages_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    latest_abnormal_reason_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
