@@ -148,6 +148,24 @@ def _clear_task_execution_lock(output_path: str | None, task_id: str) -> None:
         pass
 
 
+def _read_task_execution_lock_payload(lock_path: Path | None) -> dict[str, object] | None:
+    if not lock_path or not lock_path.exists():
+        return None
+    try:
+        payload = json.loads(lock_path.read_text("utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _coerce_lock_epoch(value: object) -> int | None:
+    try:
+        epoch = int(value)  # type: ignore[arg-type]
+    except Exception:
+        return None
+    return epoch if epoch >= 0 else None
+
+
 def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) -> None:
     """断点续做前清理上次中断留下的中间文件。
 
@@ -1306,7 +1324,7 @@ class TaskService:
         _running_task_epochs.pop(task_id, None)
 
     @staticmethod
-    def _acquire_execution_lock(output_path: str | None, task_id: str, lease_epoch: int) -> Path | None:
+    def _acquire_execution_lock(db: Session, output_path: str | None, task_id: str, lease_epoch: int) -> Path | None:
         lock_path = _task_execution_lock_path(output_path, task_id)
         if not lock_path:
             return None
@@ -1317,15 +1335,62 @@ class TaskService:
             "lease_epoch": lease_epoch,
             "acquired_at": isoformat_local(now_local()),
         }
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            raise RuntimeError(f"task execution lock already exists: {lock_path}")
-        try:
-            os.write(fd, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
-        finally:
-            os.close(fd)
-        return lock_path
+        for attempt in range(2):
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                row = db.query(AppSaTask).filter_by(task_id=task_id).first()
+                lock_payload = _read_task_execution_lock_payload(lock_path)
+                lock_worker = str((lock_payload or {}).get("worker_instance_id") or "").strip()
+                lock_epoch = _coerce_lock_epoch((lock_payload or {}).get("lease_epoch"))
+                row_worker = str(getattr(row, "dispatcher_instance_id", "") or "").strip()
+                row_epoch = int(getattr(row, "lease_epoch", 0) or 0)
+                row_status = str(getattr(row, "status", "") or "").strip()
+                row_lease_expires_at = getattr(row, "lease_expires_at", None)
+                lock_is_stale = (
+                    row is None
+                    or row_status != "running"
+                    or (row_lease_expires_at is not None and row_lease_expires_at < now_local())
+                    or lock_epoch is None
+                    or lock_epoch != row_epoch
+                    or (lock_worker and row_worker and lock_worker != row_worker)
+                    or row_epoch != int(lease_epoch or 0)
+                    or row_worker != WORKER_INSTANCE_ID
+                )
+                if lock_is_stale and attempt == 0:
+                    logger.warning(
+                        "detected stale task execution lock; clearing and retrying: task_id=%s lock_path=%s "
+                        "lock_worker_instance_id=%s lock_lease_epoch=%s row_status=%s row_worker_instance_id=%s "
+                        "row_lease_epoch=%s row_lease_expires_at=%s requested_lease_epoch=%s requested_worker_instance_id=%s",
+                        task_id,
+                        lock_path,
+                        lock_worker or "-",
+                        lock_epoch if lock_epoch is not None else "-",
+                        row_status or "-",
+                        row_worker or "-",
+                        row_epoch,
+                        isoformat_local(row_lease_expires_at) if row_lease_expires_at else "-",
+                        lease_epoch,
+                        WORKER_INSTANCE_ID,
+                    )
+                    _clear_task_execution_lock(output_path, task_id)
+                    continue
+                raise RuntimeError(
+                    "task execution lock already exists: "
+                    f"{lock_path} "
+                    f"(lock_worker_instance_id={lock_worker or '-'}, "
+                    f"lock_lease_epoch={lock_epoch if lock_epoch is not None else '-'}, "
+                    f"row_status={row_status or '-'}, "
+                    f"row_worker_instance_id={row_worker or '-'}, "
+                    f"row_lease_epoch={row_epoch}, "
+                    f"row_lease_expires_at={isoformat_local(row_lease_expires_at) if row_lease_expires_at else '-'})"
+                )
+            try:
+                os.write(fd, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+            finally:
+                os.close(fd)
+            return lock_path
+        raise RuntimeError(f"failed to acquire task execution lock after stale-lock cleanup retry: {lock_path}")
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
         """软删除任务记录，并可选删除输出目录下的任务文件。运行中任务不允许删除。"""
