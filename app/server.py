@@ -110,7 +110,9 @@ def _db_pool_overrides(svc_yaml) -> tuple[int, int, int, int]:
 def _should_run_db_migrations() -> bool:
     raw = os.environ.get("SECFLOW_SYSTEM_ANALYSE_DB_AUTO_MIGRATE")
     if raw is None:
-        return _service_role() == "all"
+        # "all" = 单 pod 开发模式；"api" = 生产模式下由 API pod 统一执行 DDL 迁移
+        # runner/worker 多副本不跑迁移，避免并发 ALTER（迁移幂等但不必要竞争）
+        return _service_role() in {"all", "api"}
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
