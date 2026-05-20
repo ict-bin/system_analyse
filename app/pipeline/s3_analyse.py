@@ -506,6 +506,7 @@ class AnalyseStage(BaseStage):
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
         _redo_deleted_lock: asyncio.Lock = asyncio.Lock()  # 保护 deleted.list 并发写入
+        all_merged_targets: list[str] = []  # 收集所有 2-redo 中通过 _merge_to 接收了新文件的已有模块
 
         for mod_name in to_reclassify:
             mod_dir = mods_root / mod_name
@@ -610,7 +611,15 @@ class AnalyseStage(BaseStage):
                     if attempt + 1 >= s_cfg_refine.min_rounds:
                         # 提交 split 草稿（若 Worker 创建了拆分计划）
                         if split_plan_exists(mod_dir):
-                            commit_split_plan(workspace, mod_name)
+                            _commit_info = commit_split_plan(workspace, mod_name)
+                            # 收集 _merge_to 涉及的已有模块（它们的 S3 报告已过时）
+                            _mt = _commit_info.get("merged_targets") or []
+                            for _m in _mt:
+                                if _m not in all_merged_targets:
+                                    all_merged_targets.append(_m)
+                                    ctx.emit_event("log", level="info",
+                                                   msg=(f"[S3-2redo] {mod_name} 拆分将 {len(_mt)} 个文件并入已有模块"
+                                                        f"，将对 {_mt} 重新运行 S3 分析"))
                         # 归档 deleted/ → workspace/deleted.list
                         await archive_module_deletions(
                             workspace, mod_name, mod_dir, _redo_deleted_lock, ctx
@@ -629,16 +638,45 @@ class AnalyseStage(BaseStage):
             else:
                 raise StageError(f"Stage 2-redo 模块 {mod_name} 重分类未通过")
 
-        # Stage 3-redo: 只处理新子模块 + 原始模块（files.list 非空）
+        # Stage 3-redo: 分三类收集需要重新分析的模块
+        #
+        # 1. 新子模块（split 产生，不在 original_modules 里）
+        # 2. 被重分类的模块本身（to_reclassify，若 files.list 非空）
+        # 3. 通过 _merge_to 接收了新文件的已有模块（merged_targets）
+        #    ——这类模块的 S3 报告是在合并前写的，文件数已过时，必须重新分析
         new_mods = discover_modules(str(workspace))
-        redo_analyse = []
+        redo_analyse: list[str] = []
+        seen: set[str] = set()
+
+        def _add_redo(m: str) -> None:
+            if m not in seen:
+                seen.add(m)
+                redo_analyse.append(m)
+
         for m in new_mods:
             if m not in original_modules:
-                redo_analyse.append(m)
+                # 类型1：split 产生的全新子模块
+                _add_redo(m)
             elif m in to_reclassify:
+                # 类型2：被重分类的模块自身（保留了部分文件）
                 flist = mods_root / m / "files.list"
                 if flist.exists() and flist.stat().st_size > 0:
-                    redo_analyse.append(m)
+                    _add_redo(m)
+
+        # 类型3：通过 _merge_to 接收了新文件的已有模块
+        # all_merged_targets 在上面的 2-redo commit 循环里收集
+        for m in all_merged_targets:
+            flist = mods_root / m / "files.list"
+            if flist.exists() and flist.stat().st_size > 0:
+                _add_redo(m)
+
+        # 清除 merged_targets 的旧 S3 checkpoint，使 _analyse_module 真正重跑
+        if redo_analyse and ctx.checkpoint:
+            for m in all_merged_targets:
+                if m in seen:
+                    ctx.checkpoint.clear(f"s3_modules/{m}")
+                    ctx.emit_event("log", level="info",
+                                   msg=f"[S3-redo] 清除 {m} 旧 S3 checkpoint（merge 后文件数已变）")
 
         if redo_analyse:
             ctx.emit_event("stage", stage="3-redo", modules=redo_analyse)
