@@ -170,7 +170,7 @@ async def run_agent_with_stage_guard(
                 elapsed = time.monotonic() - started_monotonic
                 payload = _payload(heartbeat_index)
                 payload["elapsed_seconds"] = round(elapsed, 3)
-                ctx.emit_event("stage", stage=stage, **payload)
+                ctx.emit_event("heartbeat", stage=stage, **payload)
     finally:
         if not agent_task.done():
             agent_task.cancel()
