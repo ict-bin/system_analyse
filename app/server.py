@@ -48,8 +48,8 @@ from .orchestrator import Orchestrator
 from .service.service_role import is_api_role as _is_api_service_role
 from .service.service_role import is_dispatcher_role as _is_dispatcher_service_role
 from .service.service_role import is_runner_role as _is_runner_service_role
+from .service.runtime_bootstrap import get_runtime_bootstrap
 from .service.service_role import service_role as _normalized_service_role
-from .service.llm_provider_sync import sync_providers_to_pi, validate_pi_models_file
 
 load_dotenv()
 configure_container_logging("01-system_analyse")
@@ -121,75 +121,12 @@ def _should_run_db_migrations() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- startup ---
-    svc_yaml = get_service_yaml()
-    db_url = svc_yaml.database.url
-
-    try:
-        sync_ok = await sync_providers_to_pi(
-            base_url=svc_yaml.configcenter.base_url,
-            token=svc_yaml.auth_service.service_machine_token,
-            timeout=svc_yaml.configcenter.timeout,
-        )
-        if not sync_ok:
-            logger.warning("Startup LLM Provider sync failed, runtime models.json may be stale")
-        else:
-            validation = validate_pi_models_file()
-            logger.info(
-                "Startup runtime models ready: path=%s providers=%s models=%s",
-                validation["path"],
-                validation["provider_count"],
-                validation["model_count"],
-            )
-    except Exception as exc:
-        logger.warning("Startup LLM Provider sync/validation failed: %s", exc, exc_info=True)
-
-    try:
-        from .db import init_db
-        pool_size, max_overflow, pool_timeout, pool_recycle = _db_pool_overrides(svc_yaml)
-        init_db(
-            db_url,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-            pool_recycle=pool_recycle,
-            run_migrations=_should_run_db_migrations(),
-        )
-        logger.info(
-            "DB initialized: %s:%s/%s (role=%s pool_size=%s max_overflow=%s pool_timeout=%s pool_recycle=%s run_migrations=%s)",
-            svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name,
-            _service_role(), pool_size, max_overflow, pool_timeout, pool_recycle, _should_run_db_migrations(),
-        )
-    except Exception as exc:
-        logger.warning("DB init failed (management APIs will be unavailable): %s", exc)
-
-    if _is_api_role():
-        try:
-            from .service.registry_service import get_registry_service
-            registry = get_registry_service()
-            await registry.register()
-            registry.start()
-        except Exception as exc:
-            logger.warning("Registry startup failed: %s", exc)
-
-        from .api import router as mgmt_router
-        app.include_router(mgmt_router)
-
-    if _is_manager_role() or _is_runner_role():
-        from .service.task_service import get_task_service
-        await get_task_service().start_worker_loop()
+    await get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
 
     yield
 
     # --- shutdown ---
-    try:
-        if _is_manager_role() or _is_runner_role():
-            from .service.task_service import get_task_service
-            await get_task_service().stop_worker_loop()
-        if _is_api_role():
-            from .service.registry_service import get_registry_service
-            get_registry_service().stop()
-    except Exception:
-        pass
+    await get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).stop()
 
 
 # ─── Application ──────────────────────────────────────────────────────────────
@@ -239,6 +176,7 @@ def _health_status() -> dict:
     from .service.task_service import get_worker_runtime_health
 
     role = _service_role()
+    bootstrap = get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).status()
     worker_health = get_worker_runtime_health()
     db_ok = ping_db()
     worker_claim_paused = bool(
@@ -258,6 +196,11 @@ def _health_status() -> dict:
         "status": "ok" if ready else "degraded",
         "role": role,
         "db_ok": db_ok,
+        "bootstrap_db_ready": bootstrap["db_ready"],
+        "bootstrap_ready": bootstrap["ready"],
+        "bootstrap_phase": bootstrap["phase"],
+        "bootstrap_error": bootstrap["error"],
+        "bootstrap_attempts": bootstrap["attempts"],
         "worker_ok": worker_ok,
         "worker_claim_paused": worker_claim_paused,
         **worker_health,
