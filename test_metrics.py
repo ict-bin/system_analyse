@@ -117,6 +117,11 @@ def test_render_metrics_exposes_system_analysis_effectiveness_and_checkpoint(mon
     _install_fake_db(monkeypatch, [row])
     monkeypatch.setattr(metrics, "get_worker_runtime_health", lambda: {"running_task_count": 1})
     monkeypatch.setattr(metrics, "get_worker_runtime_settings", lambda: {"worker_task_concurrency": 2})
+    monkeypatch.setattr(
+        metrics,
+        "build_worker_slot_cluster_snapshot",
+        lambda _db: SimpleNamespace(workers=[]),
+    )
 
     rendered = metrics.render_metrics()
 
@@ -166,6 +171,28 @@ def test_render_metrics_exposes_real_worker_runtime_snapshot(monkeypatch, tmp_pa
         },
     )
     monkeypatch.setattr(metrics, "get_worker_runtime_settings", lambda: {"worker_task_concurrency": 4})
+    monkeypatch.setattr(
+        metrics,
+        "build_worker_slot_cluster_snapshot",
+        lambda _db: SimpleNamespace(
+            workers=[
+                SimpleNamespace(
+                    worker_id="sa-runner-a:abcd1234",
+                    host_name="sa-runner-a",
+                    healthy=True,
+                    source="runner_registry",
+                    max_concurrent_jobs=4,
+                    running_jobs=2,
+                    available_slots=2,
+                    last_heartbeat_at=None,
+                    active_jobs=[
+                        SimpleNamespace(status="running"),
+                        SimpleNamespace(status="running"),
+                    ],
+                )
+            ]
+        ),
+    )
 
     rendered = metrics.render_metrics()
 
@@ -177,3 +204,6 @@ def test_render_metrics_exposes_real_worker_runtime_snapshot(monkeypatch, tmp_pa
     assert 'secflow_sa_worker_runtime{kind="claim_enabled"} 1' in rendered
     assert 'secflow_sa_worker_runtime{kind="drain_mode"} 0' in rendered
     assert 'secflow_sa_worker_utilization_ratio 0.500000' in rendered
+    assert 'secflow_sa_cluster_worker_runtime{worker_id="sa-runner-a:abcd1234",host_name="sa-runner-a",healthy="true",source="runner_registry",kind="capacity"} 4' in rendered
+    assert 'secflow_sa_cluster_worker_runtime{worker_id="sa-runner-a:abcd1234",host_name="sa-runner-a",healthy="true",source="runner_registry",kind="running_jobs"} 2' in rendered
+    assert 'secflow_sa_cluster_worker_active_jobs{worker_id="sa-runner-a:abcd1234",host_name="sa-runner-a",status="running"} 2' in rendered

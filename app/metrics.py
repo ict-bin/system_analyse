@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from .db.models import AppSaTask
 from .service.task_service import get_worker_runtime_health, get_worker_runtime_settings
+from .service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
 
 _REQUEST_LOCK = threading.Lock()
 _REQUEST_TOTAL = defaultdict(int)
@@ -232,6 +233,7 @@ def _render_task_metrics() -> list[str]:
     worker_loop_fresh = 1 if bool(worker_health.get("worker_loop_fresh")) else 0
     worker_claim_enabled = 1 if bool(worker_health.get("worker_control_claim_enabled", True)) else 0
     worker_drain_mode = 1 if bool(worker_health.get("worker_control_drain_mode")) else 0
+    cluster_snapshot = build_worker_slot_cluster_snapshot(db) if db_up else None
 
     lines = [
         "# HELP secflow_sa_db_up Database query path for metrics is available.",
@@ -281,6 +283,12 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_sa_worker_utilization_ratio Current worker slot utilization ratio.",
         "# TYPE secflow_sa_worker_utilization_ratio gauge",
         f"secflow_sa_worker_utilization_ratio {_fmt(worker_utilization_ratio)}",
+        "# HELP secflow_sa_cluster_worker_runtime Worker cluster runtime snapshot by worker and kind.",
+        "# TYPE secflow_sa_cluster_worker_runtime gauge",
+        "# HELP secflow_sa_cluster_worker_active_jobs Worker cluster active jobs snapshot by worker and status.",
+        "# TYPE secflow_sa_cluster_worker_active_jobs gauge",
+        "# HELP secflow_sa_cluster_worker_last_heartbeat_timestamp_seconds Worker cluster last heartbeat timestamp in unix seconds.",
+        "# TYPE secflow_sa_cluster_worker_last_heartbeat_timestamp_seconds gauge",
         "# HELP secflow_sa_judges Aggregated judge session count.",
         "# TYPE secflow_sa_judges gauge",
         f"secflow_sa_judges {judge_session_gauge}",
@@ -393,6 +401,24 @@ def _render_task_metrics() -> list[str]:
         lines.append(f"secflow_sa_stage_review_pass_rate_sum{labels} {_fmt(stage_review_pass_rate_sum.get(key, 0.0))}")
         lines.append(f"secflow_sa_stage_round_index_count{labels} {stage_round_index_count.get(key, 0)}")
         lines.append(f"secflow_sa_stage_round_index_sum{labels} {_fmt(float(stage_round_index_sum.get(key, 0)))}")
+    if cluster_snapshot is not None:
+        for worker in cluster_snapshot.workers:
+            base_labels = {
+                "worker_id": worker.worker_id,
+                "host_name": worker.host_name,
+                "healthy": "true" if worker.healthy else "false",
+                "source": worker.source,
+            }
+            lines.append(f"secflow_sa_cluster_worker_runtime{_labels(**base_labels, kind='capacity')} {worker.max_concurrent_jobs}")
+            lines.append(f"secflow_sa_cluster_worker_runtime{_labels(**base_labels, kind='running_jobs')} {worker.running_jobs}")
+            lines.append(f"secflow_sa_cluster_worker_runtime{_labels(**base_labels, kind='available_slots')} {worker.available_slots}")
+            heartbeat_ts = worker.last_heartbeat_at.timestamp() if worker.last_heartbeat_at else 0.0
+            lines.append(f"secflow_sa_cluster_worker_last_heartbeat_timestamp_seconds{_labels(worker_id=worker.worker_id, host_name=worker.host_name)} {_fmt(heartbeat_ts)}")
+            status_counts_by_worker: dict[str, int] = defaultdict(int)
+            for job in worker.active_jobs:
+                status_counts_by_worker[str(job.status or "unknown")] += 1
+            for status, count in sorted(status_counts_by_worker.items()):
+                lines.append(f"secflow_sa_cluster_worker_active_jobs{_labels(worker_id=worker.worker_id, host_name=worker.host_name, status=status)} {count}")
     for stage_name in sorted(checkpoint_stage_done_total):
         lines.append(f"secflow_sa_checkpoint_stage_done_total{_labels(stage=stage_name)} {checkpoint_stage_done_total[stage_name]}")
     for stage_name in sorted(checkpoint_module_done_total):

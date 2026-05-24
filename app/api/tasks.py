@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
+from app.time_utils import isoformat_local
 from app.service.task_service import generate_prompt_from_path, get_task_service
 
 from . import router
@@ -193,6 +195,50 @@ class TaskEvaluationResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class WorkerActiveJobResponse(BaseModel):
+    task_id: str
+    task_name: str
+    status: str
+    analysis_mode: str | None = None
+    parent_task_id: str | None = None
+    parent_task_type: str | None = None
+    task_origin_type: str | None = None
+    input_path: str
+    started_at: str | None = None
+    updated_at: str | None = None
+    dispatch_started_at: str | None = None
+    execution_owner_id: str | None = None
+    execution_lease_until: str | None = None
+    lease_epoch: int = 0
+    mapped: bool = True
+    mapping_reason: str = "matched_dispatcher_instance_id"
+
+
+class WorkerCapacityResponse(BaseModel):
+    worker_id: str
+    host_name: str
+    healthy: bool
+    max_concurrent_jobs: int
+    running_jobs: int = 0
+    available_slots: int = 0
+    source: str = "runner_registry"
+    last_heartbeat_at: str | None = None
+    active_jobs: list[WorkerActiveJobResponse] = Field(default_factory=list)
+    error: str | None = None
+
+
+class WorkerClusterCapacityResponse(BaseModel):
+    worker_count: int = 0
+    healthy_workers: int = 0
+    stale_workers: int = 0
+    total_capacity: int = 0
+    busy_slots: int = 0
+    available_slots: int = 0
+    queued_jobs: int = 0
+    updated_at: str | None = None
+    workers: list[WorkerCapacityResponse] = Field(default_factory=list)
+
+
 @router.post("/tasks", status_code=201)
 async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     analysis_mode = body.analysis_mode or body.parent_task_type
@@ -266,6 +312,59 @@ async def list_tasks(
         parent_task_id=parent_task_id,
         sort_by=sort_by,
         sort_order=sort_order,
+    )
+
+
+@router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
+async def get_worker_cluster_capacity(
+    project_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    snapshot = build_worker_slot_cluster_snapshot(db, project_id=project_id)
+    return WorkerClusterCapacityResponse(
+        worker_count=snapshot.worker_count,
+        healthy_workers=snapshot.healthy_workers,
+        stale_workers=snapshot.stale_workers,
+        total_capacity=snapshot.total_capacity,
+        busy_slots=snapshot.busy_slots,
+        available_slots=snapshot.available_slots,
+        queued_jobs=snapshot.queued_jobs,
+        updated_at=isoformat_local(snapshot.updated_at),
+        workers=[
+            WorkerCapacityResponse(
+                worker_id=worker.worker_id,
+                host_name=worker.host_name,
+                healthy=worker.healthy,
+                max_concurrent_jobs=worker.max_concurrent_jobs,
+                running_jobs=worker.running_jobs,
+                available_slots=worker.available_slots,
+                source=worker.source,
+                last_heartbeat_at=isoformat_local(worker.last_heartbeat_at),
+                active_jobs=[
+                    WorkerActiveJobResponse(
+                        task_id=job.task_id,
+                        task_name=job.task_name,
+                        status=job.status,
+                        analysis_mode=job.analysis_mode,
+                        parent_task_id=job.parent_task_id,
+                        parent_task_type=job.parent_task_type,
+                        task_origin_type=job.task_origin_type,
+                        input_path=job.input_path,
+                        started_at=isoformat_local(job.started_at),
+                        updated_at=isoformat_local(job.updated_at),
+                        dispatch_started_at=isoformat_local(job.dispatch_started_at),
+                        execution_owner_id=job.execution_owner_id,
+                        execution_lease_until=isoformat_local(job.execution_lease_until),
+                        lease_epoch=job.lease_epoch,
+                        mapped=job.mapped,
+                        mapping_reason=job.mapping_reason,
+                    )
+                    for job in worker.active_jobs
+                ],
+                error=worker.error,
+            )
+            for worker in snapshot.workers
+        ],
     )
 
 
