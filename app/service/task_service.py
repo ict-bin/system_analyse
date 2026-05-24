@@ -1731,6 +1731,10 @@ class TaskService:
             return isoformat_local(dt)
         analysis_mode = _infer_analysis_mode(row, include_config=include_heavy)
         abnormal_reason = _task_abnormal_reason(row)
+        task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
+        run_root = str(Path(task_root) / "run") if task_root else None
+        workspace_root = str(Path(run_root) / "workspace") if run_root else None
+        output_root = str(Path(task_root) / "output") if task_root else None
         return {
             "task_id": row.task_id, "project_id": row.project_id,
             **_origin_payload(row),
@@ -1738,6 +1742,10 @@ class TaskService:
             "analysis_mode_label": _analysis_mode_label(analysis_mode),
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "output_path": row.output_path,
+            "task_root": task_root,
+            "run_root": run_root,
+            "workspace_root": workspace_root,
+            "output_root": output_root,
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
             "error": row.error,
