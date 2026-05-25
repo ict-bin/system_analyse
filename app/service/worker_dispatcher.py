@@ -12,6 +12,7 @@ from typing import Callable
 
 from sqlalchemy.orm import Session
 
+from app.agent_process import cleanup_orphan_pi_processes
 from app.db.models import AppSaTask
 from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
 from app.service.task_repository import TaskRepository
@@ -31,6 +32,10 @@ WORKER_IDLE_BACKOFF_MAX_SECONDS = max(
 WORKER_STALE_SWEEP_INTERVAL_SECONDS = max(
     5.0,
     float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_STALE_SWEEP_INTERVAL", "30")),
+)
+ORPHAN_PI_SWEEP_INTERVAL_SECONDS = max(
+    10.0,
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ORPHAN_PI_SWEEP_INTERVAL", "30")),
 )
 MAX_RUNNING_TASKS_GLOBAL = max(0, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_MAX_RUNNING_TASKS_GLOBAL", "0")))
 GLOBAL_CLAIM_LOCK_KEY = str(
@@ -78,6 +83,7 @@ class WorkerRuntimeState:
     control_reason: str | None = None
     control_updated_at: str | None = None
     current_worker_task_concurrency: int = WORKER_TASK_CONCURRENCY
+    last_orphan_pi_sweep_ts: float = 0.0
 
     def snapshot(self, running_tasks_count: int) -> dict:
         now_ts = _time.time()
@@ -106,6 +112,7 @@ class WorkerRuntimeState:
             "worker_control_pause_claim_until_ts": self.control_pause_claim_until_ts or None,
             "worker_control_reason": self.control_reason,
             "worker_control_updated_at": self.control_updated_at,
+            "worker_last_orphan_pi_sweep_ts": self.last_orphan_pi_sweep_ts or None,
             "worker_poll_interval_seconds": WORKER_POLL_INTERVAL_SECONDS,
             "worker_poll_jitter_seconds": WORKER_POLL_JITTER_SECONDS,
             "worker_task_concurrency": self.current_worker_task_concurrency,
@@ -216,6 +223,12 @@ class WorkerDispatcher:
         try:
             current_concurrency = self._resolve_worker_task_concurrency(db)
             _runtime_state.current_worker_task_concurrency = current_concurrency
+            if (
+                _runtime_state.last_orphan_pi_sweep_ts <= 0.0
+                or (now_ts - _runtime_state.last_orphan_pi_sweep_ts) >= ORPHAN_PI_SWEEP_INTERVAL_SECONDS
+            ):
+                cleanup_orphan_pi_processes(logger.warning, label="sa_worker_dispatcher")
+                _runtime_state.last_orphan_pi_sweep_ts = now_ts
             available_slots = max(0, current_concurrency - self._get_running_tasks_count())
             if available_slots <= 0:
                 return 0

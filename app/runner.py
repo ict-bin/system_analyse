@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from .agent_process import AgentProcessHandle, find_pi_command
 from .models import TokenUsage
 
 logger = logging.getLogger("sa.runner")
@@ -129,6 +130,16 @@ def _fmt_max(n: int) -> str:
     return "∞" if n < 0 else str(n)
 
 
+def _normalize_timeout_seconds(timeout_seconds: float | int | None) -> float | None:
+    if timeout_seconds is None:
+        return None
+    try:
+        value = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _should_retry(
     failures: int, max_retries: int, cancel: asyncio.Event | None
 ) -> bool:
@@ -224,18 +235,7 @@ def _format_context_overflow_failure(
     )
 
 def _find_pi_command() -> list[str]:
-    pi_bin = os.environ.get("PI_BIN")
-    if pi_bin and os.path.isfile(pi_bin):
-        return [pi_bin]
-    pi_path = shutil.which("pi")
-    if pi_path:
-        return [pi_path]
-    npx = shutil.which("npx")
-    if npx:
-        return [npx, "pi"]
-    raise FileNotFoundError(
-        "找不到 'pi'。请安装: npm install -g @mariozechner/pi-coding-agent"
-    )
+    return find_pi_command()
 
 
 def _build_args(
@@ -519,6 +519,9 @@ async def run_agent(
     cancel_event: asyncio.Event | None = None,
     max_retries: int = 3,
     retry_delay: float = 10.0,
+    run_timeout_seconds: float | int | None = None,
+    timeout_retry_enabled: bool = True,
+    timeout_max_retries: int = 3,
     pi_max_retries: int = -1,
     pi_retry_delay: float = 10.0,
     model_stuck_timeout: float | None = None,
@@ -554,27 +557,57 @@ async def run_agent(
         )
         args.extend(["--append-system-prompt", sys_tmp_file])
 
+    timeout_seconds = _normalize_timeout_seconds(run_timeout_seconds)
+    timeout_failures = 0
     try:
-        return await _run_with_context_overflow_recovery(
-            pi_cmd=pi_cmd,
-            args=args,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model=model,
-            tools=tools,
-            thinking_level=thinking_level,
-            session_file=session_file,
-            cwd=os.path.abspath(cwd),
-            env=env,
-            cancel_event=cancel_event,
-            on_stream=on_stream,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            pi_max_retries=pi_max_retries,
-            pi_retry_delay=pi_retry_delay,
-            model_stuck_timeout=model_stuck_timeout,
-            model_stuck_max_activations=model_stuck_max_activations,
-        )
+        while True:
+            try:
+                coro = _run_with_context_overflow_recovery(
+                    pi_cmd=pi_cmd,
+                    args=args,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model=model,
+                    tools=tools,
+                    thinking_level=thinking_level,
+                    session_file=session_file,
+                    cwd=os.path.abspath(cwd),
+                    env=env,
+                    cancel_event=cancel_event,
+                    on_stream=on_stream,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
+                    pi_max_retries=pi_max_retries,
+                    pi_retry_delay=pi_retry_delay,
+                    model_stuck_timeout=model_stuck_timeout,
+                    model_stuck_max_activations=model_stuck_max_activations,
+                )
+                return await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
+            except asyncio.TimeoutError:
+                timeout_failures += 1
+                result = AgentResult()
+                result.error = (
+                    f"agent run timed out after {timeout_seconds:.0f}s"
+                    if timeout_seconds else
+                    "agent run timed out"
+                )
+                result.exit_code = -1
+                can_retry = timeout_retry_enabled and (
+                    timeout_max_retries < 0 or timeout_failures <= timeout_max_retries
+                )
+                if not can_retry or (cancel_event and cancel_event.is_set()):
+                    return result
+                delay = _backoff(retry_delay, timeout_failures)
+                _log_warn(
+                    f"agent 单次输入超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
+                    f"{delay:.0f}s 后重试: {result.error}"
+                )
+                if on_stream:
+                    on_stream(
+                        f"\n⏱️ 智能体执行超时，{delay:.0f}s 后重试 "
+                        f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
+                    )
+                await asyncio.sleep(delay)
     finally:
         if sys_tmp_file and os.path.exists(sys_tmp_file):
             try:
@@ -806,24 +839,24 @@ async def _run_with_api_retry(
         result = AgentResult()
 
         # ── 拉起子进程（OSError 由外层 catch）──
-        proc = await asyncio.create_subprocess_exec(
+        handle = await AgentProcessHandle.spawn(
             *args,
             cwd=cwd,
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,  # RPC: 通过 stdin 发送 prompt
+            stdin=asyncio.subprocess.PIPE,
+            logger=_log_warn,
+            label="system-agent",
         )
+        proc = handle.proc
 
         cancel_task = None
         if cancel_event:
 
             async def _cancel_monitor():
                 await cancel_event.wait()
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
+                await handle.terminate_tree(reason="cancel_event")
 
             cancel_task = asyncio.create_task(_cancel_monitor())
 
@@ -898,14 +931,7 @@ async def _run_with_api_retry(
             # ── stuck 触发 → kill pi，决定激活还是重启 ──
             if _pi_stuck_triggered:
                 _idle_secs = time.monotonic() - _pi_last_active
-                try:
-                    proc.terminate()
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                await handle.terminate_tree(reason="stuck_recovery")
                 if activation_count < _stuck_max_act:
                     activation_count += 1
                     _action = f"激活(第{activation_count}/{_stuck_max_act}次)"
@@ -968,33 +994,18 @@ async def _run_with_api_retry(
                 result.exit_code = proc.returncode or 0
             except asyncio.TimeoutError:
                 _log_warn("pi 进程未在 15s 内退出，强制终止")
-                proc.kill()
-                await proc.wait()
+                await handle.terminate_tree(reason="exit_timeout")
                 result.exit_code = -1
 
         except asyncio.CancelledError:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            await handle.terminate_tree(reason="task_cancelled")
             raise
         except Exception as e:
             # 管道断裂、进程被杀等
             _log_warn(f"pi 进程读取异常: {e}")
             result.error = f"pi process read error: {e}"
             result.exit_code = -1
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            await handle.terminate_tree(reason=f"read_exception:{type(e).__name__}")
 
         finally:
             if cancel_task:
@@ -1003,6 +1014,11 @@ async def _run_with_api_retry(
                     await cancel_task
                 except asyncio.CancelledError:
                     pass
+            await handle.terminate_tree(
+                reason="finally_cleanup",
+                term_timeout=2.0,
+                kill_timeout=2.0,
+            )
 
         # ── 提取输出 ──
         for msg in reversed(result.messages):
