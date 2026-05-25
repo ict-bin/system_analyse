@@ -68,6 +68,25 @@ _MIGRATIONS = [
     # 覆盖 list_running_tasks 的 WHERE+ORDER BY
     "CREATE INDEX ix_sa_tasks_running_order "
     "ON secflow_app_sa_tasks (is_deleted, status, dispatch_started_at, created_at)",
+    (
+        "CREATE TABLE IF NOT EXISTS secflow_app_sa_task_event ("
+        "  id VARCHAR(48) NOT NULL,"
+        "  task_id VARCHAR(64) NOT NULL,"
+        "  project_id VARCHAR(100) NOT NULL,"
+        "  stage_name VARCHAR(64) NULL,"
+        "  level VARCHAR(16) NOT NULL DEFAULT 'info',"
+        "  event_type VARCHAR(64) NOT NULL,"
+        "  message TEXT NOT NULL,"
+        "  payload_json JSON NULL,"
+        "  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  PRIMARY KEY (id),"
+        "  KEY ix_sa_task_event_task_id (task_id),"
+        "  KEY ix_sa_task_event_project_id (project_id),"
+        "  KEY ix_sa_task_event_stage_name (stage_name),"
+        "  KEY ix_sa_task_event_event_type (event_type),"
+        "  KEY ix_sa_task_event_created_at (created_at)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    ),
 ]
 
 

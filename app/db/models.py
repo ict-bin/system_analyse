@@ -66,6 +66,22 @@ class AppSaTask(Base):
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
+class AppSaTaskEvent(Base):
+    """Structured task/stage timeline events for execution trace analysis."""
+
+    __tablename__ = "secflow_app_sa_task_event"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    stage_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    level: Mapped[str] = mapped_column(String(16), nullable=False, default="info")
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+
+
 class AppSaPromptTemplate(Base):
     """Reusable prompt templates for secflow-app-system-analyse."""
     __tablename__ = "secflow_app_sa_prompt_templates"

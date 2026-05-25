@@ -195,6 +195,23 @@ class TaskEvaluationResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class TaskTimelineEventResponse(BaseModel):
+    id: str
+    task_id: str
+    project_id: str
+    stage_name: Optional[str] = None
+    level: str
+    event_type: str
+    message: str
+    payload_json: Optional[dict[str, Any]] = None
+    created_at: Optional[str] = None
+
+
+class TaskTimelineResponse(BaseModel):
+    task_id: str
+    events: list[TaskTimelineEventResponse] = Field(default_factory=list)
+
+
 class WorkerActiveJobResponse(BaseModel):
     task_id: str
     task_name: str
@@ -371,6 +388,11 @@ async def get_worker_cluster_capacity(
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task(db, task_id)
+
+
+@router.get("/tasks/{task_id}/timeline", response_model=TaskTimelineResponse)
+async def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_timeline(db, task_id)
 
 
 @router.put("/tasks/{task_id}/origin")

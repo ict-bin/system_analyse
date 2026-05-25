@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import load_service_config
-from app.db.models import AppSaTask
+from app.db.models import AppSaTask, AppSaTaskEvent
 from app.logging_utils import log_event
 from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
 from app.service.task_query_service import TaskQueryService
@@ -97,6 +97,28 @@ _RISK_LEVEL_RE = re.compile(r"<!--\s*RISK_LEVEL:\s*([^\-][^>]*)-->")
 _RISK_SCORE_RE = re.compile(r"<!--\s*RISK_SCORE:\s*(\d+)\s*-->")
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,2})\s+(.+)$", re.MULTILINE)
 _SESSION_THINKING_LEVEL_MAP = {"off": "off", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "x-high": "xhigh"}
+_TIMELINE_PAYLOAD_MAX_STRING_LENGTH = 2000
+
+
+def _clip_timeline_payload_value(value: object) -> object:
+    if isinstance(value, str):
+        return value if len(value) <= _TIMELINE_PAYLOAD_MAX_STRING_LENGTH else value[:_TIMELINE_PAYLOAD_MAX_STRING_LENGTH] + "..."
+    if isinstance(value, list):
+        return [_clip_timeline_payload_value(item) for item in value[:20]]
+    if isinstance(value, dict):
+        return {str(k): _clip_timeline_payload_value(v) for k, v in value.items()}
+    return value
+
+
+def _sanitize_timeline_payload(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    sanitized: dict[str, object] = {}
+    for key, value in payload.items():
+        if value in (None, "", [], {}):
+            continue
+        sanitized[str(key)] = _clip_timeline_payload_value(value)
+    return sanitized or None
 
 
 def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
@@ -1015,6 +1037,7 @@ class TaskService:
                 write_task_result_json=_write_task_result_json,
                 lightweight_result_json=_lightweight_result_json,
                 remove_running_task=self._remove_running_task,
+                record_timeline_event=self._record_timeline_event,
                 task_repository=self._task_repository,
             ),
             settings=TaskRunnerSettings(
@@ -1031,6 +1054,7 @@ class TaskService:
             cleanup_resume_files=_cleanup_resume_intermediate_files,
             claim_task_lease=self._claim_task_lease,
             spawn_task=self._on_task_claimed,
+            record_timeline_event=self._record_timeline_event,
             select_dispatch_target=self._select_dispatch_target,
             get_running_tasks_count=lambda: len(_running_tasks),
             load_runtime_control=self._load_runtime_control,
@@ -1123,6 +1147,32 @@ class TaskService:
             result["effective_config_json"] = row.task_config_json or {}
             result["effective_config_source"] = {}
         return result
+
+    def get_timeline(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        events = (
+            db.query(AppSaTaskEvent)
+            .filter(AppSaTaskEvent.task_id == row.task_id)
+            .order_by(AppSaTaskEvent.created_at.asc(), AppSaTaskEvent.id.asc())
+            .all()
+        )
+        return {
+            "task_id": row.task_id,
+            "events": [
+                {
+                    "id": event.id,
+                    "task_id": event.task_id,
+                    "project_id": event.project_id,
+                    "stage_name": event.stage_name,
+                    "level": event.level,
+                    "event_type": event.event_type,
+                    "message": event.message,
+                    "payload_json": event.payload_json if isinstance(event.payload_json, dict) else None,
+                    "created_at": isoformat_local(event.created_at),
+                }
+                for event in events
+            ],
+        }
 
     def repair_task_origin(self, db: Session, task_id: str, analysis_mode: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -1280,6 +1330,16 @@ class TaskService:
             lease_epoch=0,
         )
         db.add(row); db.commit(); db.refresh(row)
+        self._record_timeline_event(
+            task_id=task_id,
+            project_id=project_id,
+            event_type="task_created",
+            message="任务已创建",
+            payload={
+                "analysis_mode": mode,
+                "task_origin_type": row.task_origin_type,
+            },
+        )
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id,
                   analysis_mode=mode,
@@ -1306,6 +1366,13 @@ class TaskService:
                 except Exception as _e:
                     logger.warning("Failed to clean task dir %s: %s", task_root, _e)
         _clear_task_execution_lock(row.output_path, task_id)
+        self._record_timeline_event(
+            task_id=task_id,
+            project_id=row.project_id,
+            event_type="task_restarted",
+            message="任务已重启",
+            payload={"analysis_mode": _infer_analysis_mode(row)},
+        )
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
@@ -1328,6 +1395,13 @@ class TaskService:
         db.refresh(row)
         _clear_task_execution_lock(row.output_path, task_id)
         _cleanup_resume_intermediate_files(row.output_path, task_id)
+        self._record_timeline_event(
+            task_id=task_id,
+            project_id=row.project_id,
+            event_type="task_resumed",
+            message="任务已续跑",
+            payload={"analysis_mode": _infer_analysis_mode(row)},
+        )
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
@@ -1349,6 +1423,14 @@ class TaskService:
         db.commit()
         db.refresh(row)
         _clear_task_execution_lock(row.output_path, task_id)
+        self._record_timeline_event(
+            task_id=task_id,
+            project_id=row.project_id,
+            event_type="task_cancelled",
+            message="任务已取消",
+            level="warning",
+            payload={"status": row.status},
+        )
         return self._row_to_dict(row)
 
     @staticmethod
@@ -1693,6 +1775,54 @@ class TaskService:
             from fastapi import HTTPException
             raise HTTPException(404, f"任务不存在: {task_id}")
         return row
+
+    @staticmethod
+    def _record_timeline_event(
+        *,
+        task_id: str,
+        project_id: str | None,
+        event_type: str,
+        message: str,
+        level: str = "info",
+        stage_name: str | None = None,
+        payload: dict | None = None,
+        created_at: datetime | None = None,
+    ) -> None:
+        if not task_id or not project_id or not event_type or not message:
+            return
+        sanitized_payload = _sanitize_timeline_payload(payload)
+        db_gen = None
+        db: Session | None = None
+        try:
+            from app.db import get_db as _get_db
+
+            db_gen = _get_db()
+            db = next(db_gen)
+            event = AppSaTaskEvent(
+                id=f"sae_{uuid.uuid4().hex[:24]}",
+                task_id=task_id,
+                project_id=project_id,
+                stage_name=str(stage_name).strip() or None if stage_name is not None else None,
+                level=str(level or "info").strip() or "info",
+                event_type=str(event_type).strip(),
+                message=str(message).strip(),
+                payload_json=sanitized_payload,
+                created_at=created_at or now_local(),
+            )
+            db.add(event)
+            db.commit()
+        except Exception:
+            try:
+                if db is not None:
+                    db.rollback()
+            except Exception:
+                pass
+        finally:
+            if db_gen is not None:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
 
     @staticmethod
     @staticmethod

@@ -23,7 +23,7 @@ class FakeRepository:
         self.lock_calls = 0
 
     def recover_stale_running_tasks(self, db, *, now, lease_timeout_seconds, clear_task_execution_lock, cleanup_resume_files=None):
-        return 0
+        return []
 
     def list_pending_tasks(self, db, limit: int):
         return list(self.pending_rows[:limit])
@@ -57,6 +57,7 @@ class WorkerDispatcherGlobalLimitTests(unittest.TestCase):
             cleanup_resume_files=lambda output_path, task_id: None,
             claim_task_lease=lambda db, row, dispatch_target: claimed.append((row.task_id, dispatch_target)) or 1,
             spawn_task=lambda task_id, lease_epoch, dispatch_target: spawned.append((task_id, lease_epoch, dispatch_target)),
+            record_timeline_event=lambda **kwargs: None,
             select_dispatch_target=lambda db: "runner-a",
             get_running_tasks_count=lambda: 0,
             load_runtime_control=lambda db: {},
@@ -85,6 +86,7 @@ class WorkerDispatcherGlobalLimitTests(unittest.TestCase):
             cleanup_resume_files=lambda output_path, task_id: None,
             claim_task_lease=lambda db, row, dispatch_target: 1,
             spawn_task=lambda task_id, lease_epoch, dispatch_target: None,
+            record_timeline_event=lambda **kwargs: None,
             select_dispatch_target=lambda db: "runner-a",
             get_running_tasks_count=lambda: 0,
             load_runtime_control=lambda db: {},
@@ -116,6 +118,7 @@ class WorkerDispatcherGlobalLimitTests(unittest.TestCase):
             cleanup_resume_files=lambda output_path, task_id: None,
             claim_task_lease=lambda db, row, dispatch_target: claimed.append((row.task_id, dispatch_target)) or len(claimed),
             spawn_task=lambda task_id, lease_epoch, dispatch_target: spawned.append((task_id, lease_epoch, dispatch_target)),
+            record_timeline_event=lambda **kwargs: None,
             select_dispatch_target=lambda db: "runner-a",
             get_running_tasks_count=lambda: 0,
             load_runtime_control=lambda db: {},
@@ -145,6 +148,7 @@ class WorkerDispatcherGlobalLimitTests(unittest.TestCase):
             cleanup_resume_files=lambda output_path, task_id: None,
             claim_task_lease=lambda db, row, dispatch_target: claimed.append((row.task_id, dispatch_target)) or 1,
             spawn_task=lambda task_id, lease_epoch, dispatch_target: None,
+            record_timeline_event=lambda **kwargs: None,
             select_dispatch_target=lambda db: "runner-a",
             get_running_tasks_count=lambda: 0,
             load_runtime_control=lambda db: {"claim_enabled": False, "reason": "maintenance"},
@@ -171,6 +175,7 @@ class WorkerDispatcherGlobalLimitTests(unittest.TestCase):
             cleanup_resume_files=lambda output_path, task_id: None,
             claim_task_lease=lambda db, row, dispatch_target: claimed.append((row.task_id, dispatch_target)) or 1,
             spawn_task=lambda task_id, lease_epoch, dispatch_target: None,
+            record_timeline_event=lambda **kwargs: None,
             select_dispatch_target=lambda db: "runner-a",
             get_running_tasks_count=lambda: 0,
             load_runtime_control=lambda db: {"claim_enabled": True, "drain_mode": True, "reason": "draining"},

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time as _time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -35,6 +36,7 @@ class TaskRunnerDependencies:
     write_task_result_json: Callable[[object, dict], str | None]
     lightweight_result_json: Callable[[object, dict | None, str | None], dict | None]
     remove_running_task: Callable[[str], None]
+    record_timeline_event: Callable[..., None]
     task_repository: TaskRepository
 
 
@@ -57,8 +59,93 @@ class TaskRunner:
         output_path_for_lock: str | None = None
         last_stage_flush_ts = 0.0
         last_stage_flush_count = 0
+        emitted_stage_states: set[tuple[str, str]] = set()
+        task_snapshot = None
         # events_file 在 _prepare_task_execution 返回后才可知，先用 None
         events_file: Path | None = None
+
+        def _normalize_stage_name(raw: object) -> str | None:
+            text = str(raw or "").strip()
+            return text or None
+
+        def _build_stage_payload(data: dict) -> dict | None:
+            payload: dict[str, object] = {}
+            for src_key, dst_key in (
+                ("module", "module"),
+                ("module_name", "module_name"),
+                ("attempt", "attempt"),
+                ("modules", "modules"),
+                ("split", "split"),
+                ("new_modules", "new_modules"),
+                ("duration_ms", "duration_ms"),
+                ("duration_seconds", "duration_seconds"),
+                ("elapsed_ms", "elapsed_ms"),
+                ("elapsed_seconds", "elapsed_seconds"),
+                ("file_count", "file_count"),
+                ("module_count", "module_count"),
+                ("lease_epoch", "lease_epoch"),
+            ):
+                value = data.get(src_key)
+                if value not in (None, "", [], {}):
+                    payload[dst_key] = value
+            if events_file is not None:
+                payload["events_file"] = str(events_file)
+            return payload or None
+
+        def _message_for_stage(event_type: str, stage_name: str, data: dict) -> str:
+            module_name = str(data.get("module") or data.get("module_name") or "").strip()
+            suffix = f"（模块: {module_name}）" if module_name else ""
+            mapping = {
+                "stage_started": f"阶段开始: {stage_name}{suffix}",
+                "stage_finished": f"阶段完成: {stage_name}{suffix}",
+                "stage_failed": f"阶段失败: {stage_name}{suffix}",
+                "stage_timeout": f"阶段超时: {stage_name}{suffix}",
+                "stage_skipped": f"阶段跳过: {stage_name}{suffix}",
+            }
+            return mapping.get(event_type, f"阶段事件: {stage_name}{suffix}")
+
+        def _record_stage_timeline_if_needed(event: SwarmEvent) -> None:
+            stage_name = _normalize_stage_name(event.data.get("stage"))
+            if not stage_name:
+                return
+            raw_type = str(event.type or "").strip().lower()
+            data = dict(event.data or {})
+            timeline_type: str | None = None
+            if raw_type == "stage":
+                timeline_type = "stage_started"
+            elif raw_type == "stage_result":
+                if bool(data.get("skipped")):
+                    timeline_type = "stage_skipped"
+                elif bool(data.get("timeout")):
+                    timeline_type = "stage_timeout"
+                elif data.get("error") or str(data.get("status") or "").strip().lower() in {"failed", "error"}:
+                    timeline_type = "stage_failed"
+                else:
+                    timeline_type = "stage_finished"
+            elif raw_type in {"stage_timeout", "timeout"}:
+                timeline_type = "stage_timeout"
+            elif raw_type in {"stage_failed", "stage_error"}:
+                timeline_type = "stage_failed"
+            elif raw_type == "stage_skipped":
+                timeline_type = "stage_skipped"
+            if not timeline_type:
+                return
+            dedupe_key = (timeline_type, stage_name)
+            if dedupe_key in emitted_stage_states:
+                return
+            emitted_stage_states.add(dedupe_key)
+            payload = _build_stage_payload(data)
+            if data.get("error"):
+                payload = {**(payload or {}), "error": str(data.get("error"))}
+            self._deps.record_timeline_event(
+                task_id=task_id,
+                project_id=getattr(task_snapshot, "project_id", None),
+                stage_name=stage_name,
+                event_type=timeline_type,
+                message=_message_for_stage(timeline_type, stage_name, data),
+                level="error" if timeline_type in {"stage_failed", "stage_timeout"} else "info",
+                payload=payload,
+            )
 
         def on_event(event: SwarmEvent) -> None:
             nonlocal last_stage_flush_ts, last_stage_flush_count
@@ -67,6 +154,7 @@ class TaskRunner:
             if event.type == "heartbeat":
                 return
             event_buffer.append({"ts": _time.time(), "type": event.type, "data": dict(event.data)})
+            _record_stage_timeline_if_needed(event)
             now_ts = _time.time()
             buffered_count = len(event_buffer) - last_stage_flush_count
             if (
@@ -86,6 +174,16 @@ class TaskRunner:
         try:
             task_snapshot, cfg = self._prepare_task_execution(task_id, lease_epoch, on_event)
             output_path_for_lock = task_snapshot.output_path
+            self._deps.record_timeline_event(
+                task_id=task_id,
+                project_id=task_snapshot.project_id,
+                event_type="task_started",
+                message="任务开始执行",
+                payload={
+                    "runner_instance_id": WORKER_INSTANCE_ID,
+                    "lease_epoch": lease_epoch,
+                },
+            )
             # 现在可以确定 events_file 路径
             events_file = events_path(task_snapshot.output_path, task_id)
             # 如果在 _prepare 期间 on_event 已经被触发过（极少发生），补刷一次
@@ -242,6 +340,19 @@ class TaskRunner:
         try:
             row = self._deps.task_repository.get_task(db, task_id)
             if not row or row.status == "cancelled":
+                if row and row.status == "cancelled":
+                    self._deps.record_timeline_event(
+                        task_id=task_id,
+                        project_id=row.project_id,
+                        event_type="task_failed",
+                        message="任务已取消",
+                        level="warning",
+                        payload={
+                            "runner_instance_id": WORKER_INSTANCE_ID,
+                            "lease_epoch": lease_epoch,
+                            "status": row.status,
+                        },
+                    )
                 return
             result_json = None
             result_error = None
@@ -262,6 +373,27 @@ class TaskRunner:
             )
             if not updated:
                 return
+            final_status = result.status.value if result else "error"
+            event_type = "task_finished" if final_status == "passed" else "task_failed"
+            level = "info" if event_type == "task_finished" else "error"
+            payload: dict[str, object] = {
+                "runner_instance_id": WORKER_INSTANCE_ID,
+                "lease_epoch": lease_epoch,
+                "status": final_status,
+            }
+            duration_ms = getattr(result, "total_duration_ms", None) if result is not None else None
+            if duration_ms not in (None, ""):
+                payload["duration_ms"] = duration_ms
+            if result_error:
+                payload["error"] = str(result_error)
+            self._deps.record_timeline_event(
+                task_id=task_id,
+                project_id=row.project_id,
+                event_type=event_type,
+                message="任务执行完成" if event_type == "task_finished" else "任务执行失败",
+                level=level,
+                payload=payload,
+            )
         finally:
             try:
                 next(db_gen)
@@ -280,11 +412,26 @@ class TaskRunner:
             db_gen = self._deps.get_db()
             db = next(db_gen)
             try:
+                row = self._deps.task_repository.get_task(db, task_id)
+                project_id = getattr(row, "project_id", None)
                 self._deps.task_repository.finalize_task_error(
                     db,
                     task_id=task_id,
                     lease_epoch=lease_epoch,
                     error=str(exc),
+                )
+                self._deps.record_timeline_event(
+                    task_id=task_id,
+                    project_id=project_id,
+                    event_type="task_error",
+                    message="任务执行异常结束",
+                    level="error",
+                    payload={
+                        "runner_instance_id": WORKER_INSTANCE_ID,
+                        "lease_epoch": lease_epoch,
+                        "error": str(exc),
+                        "events_file": str(events_file) if events_file is not None else None,
+                    },
                 )
             finally:
                 try:

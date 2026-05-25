@@ -138,6 +138,7 @@ class WorkerDispatcher:
         cleanup_resume_files: Callable[[str | None, str], None],
         claim_task_lease: Callable[[Session, AppSaTask, str], int | None],
         spawn_task: Callable[[str, int, str], None],
+        record_timeline_event: Callable[..., None],
         select_dispatch_target: Callable[[Session], str | None],
         get_running_tasks_count: Callable[[], int],
         load_runtime_control: Callable[[Session], dict],
@@ -148,6 +149,7 @@ class WorkerDispatcher:
         self._cleanup_resume_files = cleanup_resume_files
         self._claim_task_lease = claim_task_lease
         self._spawn_task = spawn_task
+        self._record_timeline_event = record_timeline_event
         self._select_dispatch_target = select_dispatch_target
         self._get_running_tasks_count = get_running_tasks_count
         self._load_runtime_control = load_runtime_control
@@ -289,13 +291,27 @@ class WorkerDispatcher:
             and (now_ts - _runtime_state.last_stale_recovery_ts) < WORKER_STALE_SWEEP_INTERVAL_SECONDS
         ):
             return
-        self._task_repository.recover_stale_running_tasks(
+        recovered_rows = self._task_repository.recover_stale_running_tasks(
             db,
             now=now,
             lease_timeout_seconds=TASK_LEASE_TIMEOUT_SECONDS,
             clear_task_execution_lock=self._clear_task_execution_lock,
             cleanup_resume_files=self._cleanup_resume_files,
         )
+        for stale in recovered_rows:
+            self._record_timeline_event(
+                task_id=stale.task_id,
+                project_id=stale.project_id,
+                event_type="task_lease_recovered",
+                message="任务租约过期，已回收并重新排队",
+                level="warning",
+                payload={
+                    "dispatcher_instance_id": WORKER_INSTANCE_ID,
+                    "lease_epoch": int(getattr(stale, "lease_epoch", 0) or 0),
+                    "recovered_from_instance_id": getattr(stale, "dispatcher_instance_id", None),
+                    "lease_expires_at": stale.lease_expires_at.isoformat() if getattr(stale, "lease_expires_at", None) else None,
+                },
+            )
         _runtime_state.last_stale_recovery_ts = now_ts
 
     def _claim_pending_tasks(self, db: Session, available_slots: int, current_concurrency: int) -> int:
@@ -314,6 +330,17 @@ class WorkerDispatcher:
             claimed_count += 1
             _runtime_state.last_claim_success_ts = _time.time()
             _runtime_state.last_claimed_task_id = row.task_id
+            self._record_timeline_event(
+                task_id=row.task_id,
+                project_id=getattr(row, "project_id", None),
+                event_type="task_dispatched",
+                message="任务已被调度器认领",
+                payload={
+                    "dispatcher_instance_id": dispatch_target,
+                    "lease_epoch": lease_epoch,
+                    "manager_instance_id": WORKER_INSTANCE_ID,
+                },
+            )
             self._spawn_task(row.task_id, lease_epoch, dispatch_target)
         return claimed_count
 
