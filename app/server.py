@@ -37,6 +37,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from .build_info import build_service_meta
 from .config import (
     CONFIG_DIR, TARGET_DIR,
     build_task_config, get_service_yaml, load_service_config,
@@ -221,6 +222,7 @@ async def health():
     base = _health_status()
     return {
         **base,
+        **build_service_meta(),
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
     }

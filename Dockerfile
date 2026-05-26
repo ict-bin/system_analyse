@@ -1,5 +1,7 @@
 FROM m.daocloud.io/docker.io/library/ubuntu:24.04
 
+ARG SECFLOW_BUILD_VERSION=""
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
@@ -25,6 +27,7 @@ COPY prompts/           ./prompts/
 COPY scripts/           ./scripts/
 COPY config.example.json .env.example ./
 COPY requirements.txt ./
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
 # 修复 Windows CRLF + 添加执行权限
 RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true
