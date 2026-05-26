@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from fastapi import Depends, Query
@@ -12,8 +13,43 @@ from app.db import get_db
 from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
 from app.time_utils import isoformat_local
 from app.service.task_service import generate_prompt_from_path, get_task_service
+from app.db.models import AppSaTask
+from .deps import ensure_admin_user, ensure_project_access, get_current_user
 
 from . import router
+
+logger = logging.getLogger(__name__)
+
+
+def _audit_agent_kill_event(
+    *,
+    db: Session,
+    project_id: str | None,
+    operator: str,
+    event_type: str,
+    message: str,
+    payload: dict[str, object],
+    task_id: str | None = None,
+) -> None:
+    if not task_id or not project_id:
+        return
+    row = db.query(AppSaTask).filter(AppSaTask.task_id == task_id, AppSaTask.is_deleted.is_(False)).first()
+    if row is None:
+        return
+    from app.service.task_service import TaskQueryService
+
+    TaskQueryService._record_timeline_event(
+        task_id=task_id,
+        project_id=project_id,
+        event_type=event_type,
+        message=message,
+        level="warning",
+        stage_name="agent_observability",
+        payload={
+            "operator": operator,
+            **payload,
+        },
+    )
 
 
 class TaskCreateRequest(BaseModel):
@@ -203,6 +239,7 @@ class TaskTimelineEventResponse(BaseModel):
     level: str
     event_type: str
     message: str
+    payload: Optional[dict[str, Any]] = None
     payload_json: Optional[dict[str, Any]] = None
     created_at: Optional[str] = None
 
@@ -210,6 +247,13 @@ class TaskTimelineEventResponse(BaseModel):
 class TaskTimelineResponse(BaseModel):
     task_id: str
     events: list[TaskTimelineEventResponse] = Field(default_factory=list)
+
+
+class TaskActionResponse(BaseModel):
+    status: str = "ok"
+    task_id: str
+    message: str
+    deleted_event_count: int = 0
 
 
 class WorkerActiveJobResponse(BaseModel):
@@ -254,6 +298,95 @@ class WorkerClusterCapacityResponse(BaseModel):
     queued_jobs: int = 0
     updated_at: str | None = None
     workers: list[WorkerCapacityResponse] = Field(default_factory=list)
+
+
+class AgentProcessSnapshotResponse(BaseModel):
+    pod_name: str
+    pid: int
+    pgid: Optional[int] = None
+    ppid: Optional[int] = None
+    command: str
+    cwd: Optional[str] = None
+    rss_bytes: Optional[int] = None
+    session_file: Optional[str] = None
+    session_id: Optional[str] = None
+    task_id: Optional[str] = None
+    task_name: Optional[str] = None
+    task_status: Optional[str] = None
+    stage_key: Optional[str] = None
+    role_kind: Optional[str] = None
+    owner_kind: str
+    owner_reason: str
+    kill_allowed: bool = False
+    kill_block_reason: Optional[str] = None
+    termination_state: str
+
+
+class AgentSessionSnapshotResponse(BaseModel):
+    pod_name: str
+    session_file: str
+    session_id: Optional[str] = None
+    task_id: Optional[str] = None
+    task_name: Optional[str] = None
+    stage_key: Optional[str] = None
+    role_kind: Optional[str] = None
+    display_name: str
+    line_count: int = 0
+    last_event_at: Optional[str] = None
+    live: bool = False
+    has_process: bool = False
+    process_pid: Optional[int] = None
+    orphan_session: bool = False
+    parse_warnings: list[str] = Field(default_factory=list)
+
+
+class AgentTaskOwnershipSnapshotResponse(BaseModel):
+    task_id: str
+    task_name: str
+    task_status: str
+    stage_key: Optional[str] = None
+    pod_name: str
+    process_count: int = 0
+    session_count: int = 0
+    agent_roles: list[str] = Field(default_factory=list)
+    process_pids: list[int] = Field(default_factory=list)
+    session_ids: list[str] = Field(default_factory=list)
+    ownership_status: str
+
+
+class AgentPodSnapshotResponse(BaseModel):
+    pod_name: str
+    process_count: int = 0
+    orphan_process_count: int = 0
+    session_count: int = 0
+    orphan_session_count: int = 0
+
+
+class AgentObservabilitySummaryResponse(BaseModel):
+    pod_name: str
+    active_processes: int = 0
+    orphan_processes: int = 0
+    unknown_processes: int = 0
+    killable_orphan_processes: int = 0
+    orphan_sessions: int = 0
+    scanned_at: Optional[float] = None
+    scan_errors: int = 0
+
+
+class AgentProcessKillItemResponse(BaseModel):
+    pid: int
+    pgid: Optional[int] = None
+    status: str
+    reason: Optional[str] = None
+
+
+class AgentProcessKillResponse(BaseModel):
+    requested: int
+    matched: int
+    succeeded: int
+    failed: int
+    skipped: int
+    items: list[AgentProcessKillItemResponse] = Field(default_factory=list)
 
 
 @router.post("/tasks", status_code=201)
@@ -385,6 +518,246 @@ async def get_worker_cluster_capacity(
     )
 
 
+@router.get("/agent-observability/summary", response_model=AgentObservabilitySummaryResponse)
+async def get_agent_observability_summary(
+    project_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    if project_id:
+        await ensure_project_access(project_id, token)
+    from app.service.agent_observability import get_agent_observability_service
+
+    return get_agent_observability_service().build_snapshot(db, project_id=project_id)["summary"]
+
+
+@router.get("/agent-observability/processes", response_model=list[AgentProcessSnapshotResponse])
+async def list_agent_processes(
+    project_id: Optional[str] = Query(None),
+    pod: Optional[str] = Query(None),
+    task_id: Optional[str] = Query(None),
+    stage_key: Optional[str] = Query(None),
+    role_kind: Optional[str] = Query(None),
+    owner_kind: Optional[str] = Query(None),
+    kill_allowed: Optional[bool] = Query(None),
+    orphan_only: bool = Query(False),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    if project_id:
+        await ensure_project_access(project_id, token)
+    from app.service.agent_observability import get_agent_observability_service
+
+    rows = list(get_agent_observability_service().build_snapshot(db, project_id=project_id)["processes"])
+    if pod:
+        rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
+    if task_id:
+        rows = [row for row in rows if str(row.get("task_id") or "") == task_id]
+    if stage_key:
+        rows = [row for row in rows if str(row.get("stage_key") or "") == stage_key]
+    if role_kind:
+        rows = [row for row in rows if str(row.get("role_kind") or "") == role_kind]
+    if owner_kind:
+        rows = [row for row in rows if str(row.get("owner_kind") or "") == owner_kind]
+    if kill_allowed is not None:
+        rows = [row for row in rows if bool(row.get("kill_allowed")) is bool(kill_allowed)]
+    if orphan_only:
+        rows = [row for row in rows if str(row.get("owner_kind") or "") == "orphan"]
+    return rows
+
+
+@router.get("/agent-observability/sessions", response_model=list[AgentSessionSnapshotResponse])
+async def list_agent_sessions(
+    project_id: Optional[str] = Query(None),
+    pod: Optional[str] = Query(None),
+    task_id: Optional[str] = Query(None),
+    stage_key: Optional[str] = Query(None),
+    role_kind: Optional[str] = Query(None),
+    live_only: bool = Query(False),
+    orphan_only: bool = Query(False),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    if project_id:
+        await ensure_project_access(project_id, token)
+    from app.service.agent_observability import get_agent_observability_service
+
+    rows = list(get_agent_observability_service().build_snapshot(db, project_id=project_id)["sessions"])
+    if pod:
+        rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
+    if task_id:
+        rows = [row for row in rows if str(row.get("task_id") or "") == task_id]
+    if stage_key:
+        rows = [row for row in rows if str(row.get("stage_key") or "") == stage_key]
+    if role_kind:
+        rows = [row for row in rows if str(row.get("role_kind") or "") == role_kind]
+    if live_only:
+        rows = [row for row in rows if bool(row.get("live"))]
+    if orphan_only:
+        rows = [row for row in rows if bool(row.get("orphan_session"))]
+    return rows
+
+
+@router.get("/agent-observability/sessions/content")
+async def get_agent_session_content(
+    project_id: Optional[str] = Query(None),
+    task_id: str = Query(...),
+    session_file: str = Query(...),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    if project_id:
+      await ensure_project_access(project_id, token)
+    return get_task_service().get_task_session_file(db, task_id, session_file)
+
+
+@router.get("/agent-observability/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
+async def list_agent_tasks(
+    project_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    if project_id:
+        await ensure_project_access(project_id, token)
+    from app.service.agent_observability import get_agent_observability_service
+
+    return get_agent_observability_service().build_snapshot(db, project_id=project_id)["tasks"]
+
+
+@router.get("/agent-observability/pods", response_model=list[AgentPodSnapshotResponse])
+async def list_agent_pods(
+    project_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    if project_id:
+        await ensure_project_access(project_id, token)
+    from app.service.agent_observability import get_agent_observability_service
+
+    return get_agent_observability_service().build_snapshot(db, project_id=project_id)["pods"]
+
+
+@router.post("/agent-observability/processes/{pid}/kill", response_model=AgentProcessKillResponse)
+async def kill_agent_process(
+    pid: int,
+    project_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    user, token = user_and_token
+    ensure_admin_user(user)
+    if project_id:
+        await ensure_project_access(project_id, token)
+    from app.service.agent_observability import get_agent_observability_service
+
+    snapshot = get_agent_observability_service().build_snapshot(db, project_id=project_id)
+    matched = [row for row in snapshot["processes"] if int(row.get("pid") or -1) == pid]
+    if not matched:
+        return AgentProcessKillResponse(requested=1, matched=0, succeeded=0, failed=0, skipped=1, items=[])
+    row = matched[0]
+    if not row.get("kill_allowed"):
+        return AgentProcessKillResponse(
+            requested=1,
+            matched=1,
+            succeeded=0,
+            failed=0,
+            skipped=1,
+            items=[AgentProcessKillItemResponse(pid=pid, pgid=row.get("pgid"), status="skipped", reason=row.get("kill_block_reason"))],
+        )
+    logger.warning(
+        "system-agent-manual-kill operator=%s project_id=%s pid=%s pgid=%s task_id=%s session_file=%s owner_reason=%s",
+        user.get("username") or user.get("name") or "unknown",
+        project_id,
+        pid,
+        row.get("pgid"),
+        row.get("task_id"),
+        row.get("session_file"),
+        row.get("owner_reason"),
+    )
+    _audit_agent_kill_event(
+        db=db,
+        project_id=project_id,
+        operator=user.get("username") or user.get("name") or "unknown",
+        event_type="agent_process_manual_kill",
+        message=f"管理员手工终止孤儿智能体进程 pid={pid}",
+        payload={
+            "pid": pid,
+            "pgid": row.get("pgid"),
+            "pod_name": row.get("pod_name"),
+            "session_file": row.get("session_file"),
+            "owner_reason": row.get("owner_reason"),
+            "kill_mode": "local",
+        },
+        task_id=row.get("task_id"),
+    )
+    result = get_agent_observability_service().kill_process(pid)
+    return AgentProcessKillResponse(
+        requested=1,
+        matched=1,
+        succeeded=1 if result.get("status") in {"killed", "gone"} else 0,
+        failed=1 if result.get("status") == "failed" else 0,
+        skipped=0,
+        items=[AgentProcessKillItemResponse(**result)],
+    )
+
+
+@router.post("/agent-observability/processes/kill-all-orphans", response_model=AgentProcessKillResponse)
+async def kill_all_orphan_processes(
+    project_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    user, token = user_and_token
+    ensure_admin_user(user)
+    if project_id:
+        await ensure_project_access(project_id, token)
+    from app.service.agent_observability import get_agent_observability_service
+
+    snapshot = get_agent_observability_service().build_snapshot(db, project_id=project_id)
+    killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "orphan" and row.get("kill_allowed")]
+    logger.warning(
+        "system-agent-bulk-kill operator=%s project_id=%s count=%s pids=%s",
+        user.get("username") or user.get("name") or "unknown",
+        project_id,
+        len(killable),
+        [row.get("pid") for row in killable],
+    )
+    for row in killable:
+        _audit_agent_kill_event(
+            db=db,
+            project_id=project_id,
+            operator=user.get("username") or user.get("name") or "unknown",
+            event_type="agent_process_bulk_manual_kill",
+            message=f"管理员批量终止孤儿智能体进程 pid={int(row.get('pid') or 0)}",
+            payload={
+                "pid": int(row.get("pid") or 0),
+                "pgid": row.get("pgid"),
+                "pod_name": row.get("pod_name"),
+                "session_file": row.get("session_file"),
+                "owner_reason": row.get("owner_reason"),
+                "kill_mode": "local_bulk",
+            },
+            task_id=row.get("task_id"),
+        )
+    items = [get_agent_observability_service().kill_process(int(row["pid"])) for row in killable]
+    succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
+    failed = sum(1 for item in items if item.get("status") == "failed")
+    return AgentProcessKillResponse(
+        requested=len(killable),
+        matched=len(killable),
+        succeeded=succeeded,
+        failed=failed,
+        skipped=0,
+        items=[AgentProcessKillItemResponse(**item) for item in items],
+    )
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task(db, task_id)
@@ -393,6 +766,20 @@ async def get_task(task_id: str, db: Session = Depends(get_db)):
 @router.get("/tasks/{task_id}/timeline", response_model=TaskTimelineResponse)
 async def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_timeline(db, task_id)
+
+
+@router.delete("/tasks/{task_id}/timeline", response_model=TaskActionResponse)
+async def clear_task_timeline(task_id: str, db: Session = Depends(get_db)):
+    deleted_event_count = get_task_service().clear_timeline(db, task_id)
+    db.commit()
+    return TaskActionResponse(status="ok", task_id=task_id, message="任务时间线已清空", deleted_event_count=deleted_event_count)
+
+
+@router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=TaskActionResponse)
+async def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db)):
+    deleted_event_count = get_task_service().delete_timeline_event(db, task_id, event_id)
+    db.commit()
+    return TaskActionResponse(status="ok", task_id=task_id, message="事件已删除", deleted_event_count=deleted_event_count)
 
 
 @router.put("/tasks/{task_id}/origin")

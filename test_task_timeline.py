@@ -13,6 +13,7 @@ from app.service.task_service import TaskService
 class _FakeTaskQuery:
     def __init__(self, rows):
         self._rows = rows
+        self._deleted = 0
 
     def filter(self, *args, **kwargs):
         return self
@@ -22,6 +23,13 @@ class _FakeTaskQuery:
 
     def all(self):
         return list(self._rows)
+
+    def delete(self, synchronize_session=False):
+        del synchronize_session
+        deleted = len(self._rows)
+        self._rows.clear()
+        self._deleted = deleted
+        return deleted
 
 
 class _FakeDb:
@@ -67,7 +75,47 @@ def test_get_timeline_returns_events_in_order():
     assert payload["task_id"] == "sat_1"
     assert [item["id"] for item in payload["events"]] == ["e1", "e2"]
     assert payload["events"][1]["stage_name"] == "1"
+    assert payload["events"][1]["payload"] == {"module_count": 3}
     assert payload["events"][1]["payload_json"] == {"module_count": 3}
+
+
+def test_clear_timeline_deletes_all_events():
+    service = object.__new__(TaskService)
+    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id)
+    rows = [
+        SimpleNamespace(id="e1"),
+        SimpleNamespace(id="e2"),
+    ]
+
+    deleted = TaskService.clear_timeline(service, _FakeDb(rows), "sat_1")
+
+    assert deleted == 2
+    assert rows == []
+
+
+def test_delete_timeline_event_deletes_single_event():
+    service = object.__new__(TaskService)
+    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id)
+
+    class _SingleDeleteQuery(_FakeTaskQuery):
+        def delete(self, synchronize_session=False):
+            del synchronize_session
+            if self._rows:
+                self._rows.pop(0)
+                return 1
+            return 0
+
+    class _SingleDeleteDb(_FakeDb):
+        def query(self, model):
+            del model
+            return _SingleDeleteQuery(self.rows)
+
+    rows = [SimpleNamespace(id="evt-1"), SimpleNamespace(id="evt-2")]
+
+    deleted = TaskService.delete_timeline_event(service, _SingleDeleteDb(rows), "sat_1", "evt-1")
+
+    assert deleted == 1
+    assert len(rows) == 1
 
 
 def test_record_timeline_event_sanitizes_large_payload(monkeypatch):

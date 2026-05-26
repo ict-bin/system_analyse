@@ -1167,12 +1167,31 @@ class TaskService:
                     "level": event.level,
                     "event_type": event.event_type,
                     "message": event.message,
+                    "payload": event.payload_json if isinstance(event.payload_json, dict) else None,
                     "payload_json": event.payload_json if isinstance(event.payload_json, dict) else None,
                     "created_at": isoformat_local(event.created_at),
                 }
                 for event in events
             ],
         }
+
+    def clear_timeline(self, db: Session, task_id: str) -> int:
+        row = self._get_or_404(db, task_id)
+        deleted = (
+            db.query(AppSaTaskEvent)
+            .filter(AppSaTaskEvent.task_id == row.task_id)
+            .delete(synchronize_session=False)
+        )
+        return int(deleted or 0)
+
+    def delete_timeline_event(self, db: Session, task_id: str, event_id: str) -> int:
+        row = self._get_or_404(db, task_id)
+        deleted = (
+            db.query(AppSaTaskEvent)
+            .filter(AppSaTaskEvent.task_id == row.task_id, AppSaTaskEvent.id == event_id)
+            .delete(synchronize_session=False)
+        )
+        return int(deleted or 0)
 
     def repair_task_origin(self, db: Session, task_id: str, analysis_mode: str) -> dict:
         row = self._get_or_404(db, task_id)
