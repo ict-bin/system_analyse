@@ -441,7 +441,7 @@ class AgentProcessKillResponse(BaseModel):
 
 
 @router.post("/tasks", status_code=201)
-async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
+def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     analysis_mode = body.analysis_mode or body.parent_task_type
     prompt = body.prompt_content
     if not prompt or not prompt.strip():
@@ -492,7 +492,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
 
 
 @router.get("/tasks", response_model=TaskListResponse)
-async def list_tasks(
+def list_tasks(
     project_id: str = Query(...),
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=1000),
@@ -517,7 +517,7 @@ async def list_tasks(
 
 
 @router.get("/workers/cluster-capacity/summary", response_model=WorkerClusterCapacitySummaryResponse)
-async def get_worker_cluster_capacity_summary(
+def get_worker_cluster_capacity_summary(
     project_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -535,7 +535,7 @@ async def get_worker_cluster_capacity_summary(
 
 
 @router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
-async def get_worker_cluster_capacity(
+def get_worker_cluster_capacity(
     project_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -828,84 +828,84 @@ async def kill_all_orphan_processes(
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, db: Session = Depends(get_db)):
+def get_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task(db, task_id)
 
 
 @router.get("/tasks/{task_id}/timeline", response_model=TaskTimelineResponse)
-async def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
+def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_timeline(db, task_id)
 
 
 @router.delete("/tasks/{task_id}/timeline", response_model=TaskActionResponse)
-async def clear_task_timeline(task_id: str, db: Session = Depends(get_db)):
+def clear_task_timeline(task_id: str, db: Session = Depends(get_db)):
     deleted_event_count = get_task_service().clear_timeline(db, task_id)
     db.commit()
     return TaskActionResponse(status="ok", task_id=task_id, message="任务时间线已清空", deleted_event_count=deleted_event_count)
 
 
 @router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=TaskActionResponse)
-async def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db)):
+def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db)):
     deleted_event_count = get_task_service().delete_timeline_event(db, task_id, event_id)
     db.commit()
     return TaskActionResponse(status="ok", task_id=task_id, message="事件已删除", deleted_event_count=deleted_event_count)
 
 
 @router.put("/tasks/{task_id}/origin")
-async def repair_task_origin(task_id: str, body: TaskOriginRepairRequest, db: Session = Depends(get_db)):
+def repair_task_origin(task_id: str, body: TaskOriginRepairRequest, db: Session = Depends(get_db)):
     return get_task_service().repair_task_origin(db, task_id, body.analysis_mode)
 
 
 @router.get("/tasks/{task_id}/result", response_model=TaskResultResponse)
-async def get_task_result(task_id: str, db: Session = Depends(get_db)):
+def get_task_result(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task_result(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions", response_model=list[TaskSessionMetaResponse])
-async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
+def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().list_task_sessions(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions/index", response_model=TaskSessionIndexResponse)
-async def get_task_session_index(task_id: str, db: Session = Depends(get_db)):
+def get_task_session_index(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task_session_index(db, task_id)
 
 
 @router.get("/tasks/{task_id}/sessions/file", response_model=TaskSessionFileResponse)
-async def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db)):
+def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db)):
     return get_task_service().get_task_session_file(db, task_id, path)
 
 
 @router.get("/tasks/{task_id}/evaluation", response_model=TaskEvaluationResponse)
-async def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
+def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task_evaluation(db, task_id)
 
 
 @router.post("/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str, db: Session = Depends(get_db)):
+def cancel_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().cancel_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/restart", status_code=201)
-async def restart_task(task_id: str, db: Session = Depends(get_db)):
+def restart_task(task_id: str, db: Session = Depends(get_db)):
     """Reset and restart an existing task in-place, reusing the same task ID."""
     return get_task_service().restart_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/resume", status_code=201)
-async def resume_task(task_id: str, db: Session = Depends(get_db)):
+def resume_task(task_id: str, db: Session = Depends(get_db)):
     """Resume a task from Stage 3 (断点续跑), reusing the same task ID."""
     return get_task_service().resume_task(db, task_id)
 
 
 @router.get("/tasks/{task_id}/resume-check")
-async def get_task_resume_check(task_id: str, db: Session = Depends(get_db)):
+def get_task_resume_check(task_id: str, db: Session = Depends(get_db)):
     """返回任务当前是否适合断点续跑，以及缺失的关键产物。"""
     return get_task_service().get_resume_check(db, task_id)
 
 
 @router.delete("/tasks/{task_id}", status_code=204)
-async def delete_task(
+def delete_task(
     task_id: str,
     delete_files: bool = True,
     db: Session = Depends(get_db),
@@ -915,7 +915,7 @@ async def delete_task(
 
 
 @router.get("/tasks/{task_id}/reflection")
-async def get_task_reflection(task_id: str, db: Session = Depends(get_db)):
+def get_task_reflection(task_id: str, db: Session = Depends(get_db)):
     """返回任务的自省分析报告列表和最新报告内容。"""
     from app.db.models import AppSaTask
     from fastapi import HTTPException
@@ -970,7 +970,7 @@ async def get_task_reflection(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/tasks/{task_id}/logs")
-async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
+def get_task_logs(task_id: str, db: Session = Depends(get_db)):
     """Return events stream for the task (from events.jsonl file, with DB fallback)."""
     from app.db.models import AppSaTask
     from app.service.event_log import read_events, events_path
@@ -993,13 +993,13 @@ async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/generate-prompt")
-async def generate_prompt(body: GeneratePromptRequest):
+def generate_prompt(body: GeneratePromptRequest):
     """Auto-generate a prompt from an input path."""
     return {"prompt": generate_prompt_from_path(body.input_path)}
 
 
 @router.get("/tasks/{task_id}/checkpoint")
-async def get_task_checkpoint(task_id: str, db: Session = Depends(get_db)):
+def get_task_checkpoint(task_id: str, db: Session = Depends(get_db)):
     """返回任务的断点续跑状态摘要。
 
     用于前端展示各阶段/模块的完成情况。
