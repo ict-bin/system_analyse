@@ -10,7 +10,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
+from app.service.worker_slot_snapshot import (
+    build_worker_slot_cluster_detail,
+    build_worker_slot_cluster_summary,
+)
 from app.time_utils import isoformat_local
 from app.service.task_service import generate_prompt_from_path, get_task_service
 from app.db.models import AppSaTask
@@ -256,6 +259,43 @@ class TaskActionResponse(BaseModel):
     deleted_event_count: int = 0
 
 
+class TaskListItemResponse(BaseModel):
+    task_id: str
+    project_id: str
+    analysis_mode: str | None = None
+    analysis_mode_label: str | None = None
+    task_origin_type: str | None = None
+    parent_project_id: str | None = None
+    parent_task_id: str | None = None
+    parent_task_type: str | None = None
+    parent_stage_name: str | None = None
+    parent_stage_item_id: str | None = None
+    parent_stage_item_key: str | None = None
+    origin_label: str | None = None
+    parent_task_display: str | None = None
+    task_name: str
+    status: str
+    abnormal_reason: dict[str, Any] | None = None
+    abnormal_reason_title: str | None = None
+    abnormal_reason_code: str | None = None
+    abnormal_reason_category: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    dispatcher_instance_id: str | None = None
+    dispatch_started_at: str | None = None
+    lease_epoch: int = 0
+    lease_expires_at: str | None = None
+
+
+class TaskListResponse(BaseModel):
+    items: list[TaskListItemResponse] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    per_page: int = 100
+
+
 class WorkerActiveJobResponse(BaseModel):
     task_id: str
     task_name: str
@@ -298,6 +338,17 @@ class WorkerClusterCapacityResponse(BaseModel):
     queued_jobs: int = 0
     updated_at: str | None = None
     workers: list[WorkerCapacityResponse] = Field(default_factory=list)
+
+
+class WorkerClusterCapacitySummaryResponse(BaseModel):
+    worker_count: int = 0
+    healthy_workers: int = 0
+    stale_workers: int = 0
+    total_capacity: int = 0
+    busy_slots: int = 0
+    available_slots: int = 0
+    queued_jobs: int = 0
+    updated_at: str | None = None
 
 
 class AgentProcessSnapshotResponse(BaseModel):
@@ -440,7 +491,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     )
 
 
-@router.get("/tasks")
+@router.get("/tasks", response_model=TaskListResponse)
 async def list_tasks(
     project_id: str = Query(...),
     page: int = Query(1, ge=1),
@@ -465,12 +516,30 @@ async def list_tasks(
     )
 
 
+@router.get("/workers/cluster-capacity/summary", response_model=WorkerClusterCapacitySummaryResponse)
+async def get_worker_cluster_capacity_summary(
+    project_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    snapshot = build_worker_slot_cluster_summary(db, project_id=project_id)
+    return WorkerClusterCapacitySummaryResponse(
+        worker_count=snapshot.worker_count,
+        healthy_workers=snapshot.healthy_workers,
+        stale_workers=snapshot.stale_workers,
+        total_capacity=snapshot.total_capacity,
+        busy_slots=snapshot.busy_slots,
+        available_slots=snapshot.available_slots,
+        queued_jobs=snapshot.queued_jobs,
+        updated_at=isoformat_local(snapshot.updated_at),
+    )
+
+
 @router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
 async def get_worker_cluster_capacity(
     project_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    snapshot = build_worker_slot_cluster_snapshot(db, project_id=project_id)
+    snapshot = build_worker_slot_cluster_detail(db, project_id=project_id)
     return WorkerClusterCapacityResponse(
         worker_count=snapshot.worker_count,
         healthy_workers=snapshot.healthy_workers,

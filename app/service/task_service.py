@@ -100,6 +100,12 @@ _SESSION_THINKING_LEVEL_MAP = {"off": "off", "minimal": "minimal", "low": "low",
 _TIMELINE_PAYLOAD_MAX_STRING_LENGTH = 2000
 
 
+def _invalidate_slot_summary_cache(project_id: str | None) -> None:
+    from app.service.worker_slot_snapshot import invalidate_worker_slot_summary_cache
+
+    invalidate_worker_slot_summary_cache(project_id=project_id)
+
+
 def _clip_timeline_payload_value(value: object) -> object:
     if isinstance(value, str):
         return value if len(value) <= _TIMELINE_PAYLOAD_MAX_STRING_LENGTH else value[:_TIMELINE_PAYLOAD_MAX_STRING_LENGTH] + "..."
@@ -196,6 +202,26 @@ def _task_abnormal_reason(row: AppSaTask) -> dict | None:
         "recommended_action": "查看任务结果、事件时间线和运行观测，确认是调度、租约还是模型执行阶段先失败。",
         "related_event_ids": [],
     }
+
+
+def _lightweight_task_abnormal_reason(row: AppSaTask) -> dict | None:
+    if str(row.status or "") not in {"failed", "error", "cancelled"}:
+        return None
+    if isinstance(row.latest_abnormal_reason_json, dict):
+        return dict(row.latest_abnormal_reason_json)
+    if str(row.status or "") == "cancelled":
+        return {
+            "is_abnormal": True,
+            "category": "cancel",
+            "code": "user_cancelled",
+            "title": "任务已取消",
+            "message": str(row.error or "任务已取消").strip() or "任务已取消",
+            "terminal": True,
+            "source_layer": "task",
+            "status": str(row.status or ""),
+            "service": "system-analysis",
+        }
+    return None
 
 
 def _abnormal_reason_event(reason: dict, *, event_id: str | None = None) -> dict:
@@ -1096,21 +1122,12 @@ class TaskService:
         order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         requested_mode = _normalize_analysis_mode(analysis_mode) if analysis_mode else None
         if requested_mode:
-            all_rows = (
-                query.options(*self._list_load_options())
-                .filter(or_(AppSaTask.analysis_mode == requested_mode, AppSaTask.parent_task_type == requested_mode))
+            query = query.filter(AppSaTask.analysis_mode == requested_mode)
+        total = query.count()
+        rows = (query.options(*self._list_load_options())
                 .order_by(order_expr, AppSaTask.id.desc())
-                .all()
-            )
-            filtered = [row for row in all_rows if _infer_analysis_mode(row, include_config=False) == requested_mode]
-            total = len(filtered)
-            rows = filtered[(page - 1) * per_page:page * per_page]
-        else:
-            total = query.count()
-            rows = (query.options(*self._list_load_options())
-                    .order_by(order_expr, AppSaTask.id.desc())
-                    .offset((page - 1) * per_page).limit(per_page).all())
-        return {"items": [self._row_to_dict(r, include_heavy=False) for r in rows],
+                .offset((page - 1) * per_page).limit(per_page).all())
+        return {"items": [self._row_to_list_item(r) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
 
     def get_task(self, db: Session, task_id: str) -> dict:
@@ -1666,6 +1683,7 @@ class TaskService:
         # 软删除
         row.is_deleted = True
         db.commit()
+        _invalidate_slot_summary_cache(row.project_id)
 
     async def _execute_task(self, task_id: str) -> None:
         from app.db import get_db
@@ -1689,6 +1707,7 @@ class TaskService:
             if row.started_at is None:
                 row.started_at = now_local()
             db.commit()
+            _invalidate_slot_summary_cache(row.project_id)
             svc = _load_svc_config_from_db(db, row.project_id)
             # Apply per-task config overrides (analyse_targets, binary_arch, etc.)
             tcfg = row.task_config_json or {}
@@ -1729,6 +1748,7 @@ class TaskService:
                 reason, changed = _sync_task_abnormal_reason(row)
                 _record_abnormal_reason(row, reason, changed=changed)
                 db.commit()
+                _invalidate_slot_summary_cache(row.project_id)
                 return
             row.status = result.status.value if result else "error"
             row.finished_at = now_local()
@@ -1745,6 +1765,7 @@ class TaskService:
             reason, changed = _sync_task_abnormal_reason(row)
             _record_abnormal_reason(row, reason, changed=changed)
             db.commit()
+            _invalidate_slot_summary_cache(row.project_id)
             # —— 自省分析（异步后台，不阻塞任务完成） ——
             try:
                 from app.pipeline.self_reflection import get_self_reflection_service
@@ -1779,6 +1800,7 @@ class TaskService:
                     reason, changed = _sync_task_abnormal_reason(r)
                     _record_abnormal_reason(r, reason, changed=changed)
                     db.commit()
+                    _invalidate_slot_summary_cache(r.project_id)
             except Exception:
                 pass
         finally:
@@ -1871,15 +1893,49 @@ class TaskService:
                 AppSaTask.updated_at,
                 AppSaTask.started_at,
                 AppSaTask.finished_at,
+                AppSaTask.dispatcher_instance_id,
+                AppSaTask.dispatch_started_at,
+                AppSaTask.lease_epoch,
+                AppSaTask.lease_expires_at,
+                AppSaTask.latest_abnormal_reason_json,
             ),
         )
+
+    @staticmethod
+    def _row_to_list_item(row: AppSaTask) -> dict:
+        def fmt(dt: datetime | None) -> str | None:
+            return isoformat_local(dt)
+
+        analysis_mode = _normalize_analysis_mode(row.analysis_mode)
+        abnormal_reason = _lightweight_task_abnormal_reason(row)
+        return {
+            "task_id": row.task_id,
+            "project_id": row.project_id,
+            **_origin_payload(row),
+            "analysis_mode": analysis_mode,
+            "analysis_mode_label": _analysis_mode_label(analysis_mode),
+            "task_name": row.task_name,
+            "status": row.status,
+            "created_at": fmt(row.created_at),
+            "updated_at": fmt(row.updated_at),
+            "started_at": fmt(row.started_at),
+            "finished_at": fmt(row.finished_at),
+            "dispatcher_instance_id": row.dispatcher_instance_id,
+            "dispatch_started_at": fmt(row.dispatch_started_at),
+            "lease_epoch": int(row.lease_epoch or 0),
+            "lease_expires_at": fmt(row.lease_expires_at),
+            "abnormal_reason": abnormal_reason,
+            "abnormal_reason_title": (abnormal_reason or {}).get("title"),
+            "abnormal_reason_code": (abnormal_reason or {}).get("code"),
+            "abnormal_reason_category": (abnormal_reason or {}).get("category"),
+        }
 
     @staticmethod
     def _row_to_dict(row: AppSaTask, *, include_heavy: bool = True) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         analysis_mode = _infer_analysis_mode(row, include_config=include_heavy)
-        abnormal_reason = _task_abnormal_reason(row)
+        abnormal_reason = _task_abnormal_reason(row) if include_heavy else _lightweight_task_abnormal_reason(row)
         task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
         run_root = str(Path(task_root) / "run") if task_root else None
         workspace_root = str(Path(run_root) / "workspace") if run_root else None

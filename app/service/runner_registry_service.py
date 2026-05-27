@@ -92,6 +92,9 @@ class RunnerRegistryService:
                 row = AppSaModelsConfig(config_key=key, config_json=payload)
                 db.add(row)
             db.commit()
+            from app.service.worker_slot_snapshot import invalidate_worker_slot_summary_cache
+
+            invalidate_worker_slot_summary_cache()
         finally:
             try:
                 next(db_gen)

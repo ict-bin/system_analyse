@@ -62,6 +62,12 @@ _MIGRATIONS = [
     "CREATE INDEX ix_sa_tasks_project_created_id ON secflow_app_sa_tasks (project_id, created_at, id)",
     "CREATE INDEX ix_sa_tasks_project_deleted_status_created_id ON secflow_app_sa_tasks (project_id, is_deleted, status, created_at, id)",
     "CREATE INDEX ix_sa_tasks_project_deleted_mode_created_id ON secflow_app_sa_tasks (project_id, is_deleted, analysis_mode, created_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_parent_created_id ON secflow_app_sa_tasks (project_id, is_deleted, parent_task_id, created_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_updated_id ON secflow_app_sa_tasks (project_id, is_deleted, updated_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_status_updated_id ON secflow_app_sa_tasks (project_id, is_deleted, status, updated_at, id)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_dispatcher_status ON secflow_app_sa_tasks (project_id, is_deleted, dispatcher_instance_id, status)",
+    "CREATE INDEX ix_sa_tasks_project_deleted_status_dispatcher ON secflow_app_sa_tasks (project_id, is_deleted, status, dispatcher_instance_id)",
+    "CREATE INDEX ix_sa_tasks_deleted_dispatcher_status ON secflow_app_sa_tasks (is_deleted, dispatcher_instance_id, status)",
     # 覆盖 list_tasks_assigned_to_instance 的 WHERE+ORDER BY，消除 filesort（1038 Out of sort memory）
     "CREATE INDEX ix_sa_tasks_runner_assign "
     "ON secflow_app_sa_tasks (dispatcher_instance_id, is_deleted, status, dispatch_started_at, created_at)",

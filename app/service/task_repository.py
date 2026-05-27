@@ -12,6 +12,12 @@ from app.service.event_log import clear_events, events_path, strip_final_marker
 from app.time_utils import now_local
 
 
+def _invalidate_slot_summary_for_project(project_id: str | None) -> None:
+    from app.service.worker_slot_snapshot import invalidate_worker_slot_summary_cache
+
+    invalidate_worker_slot_summary_cache(project_id=project_id)
+
+
 _ERROR_MAX_LEN = 65535
 
 
@@ -166,6 +172,7 @@ class TaskRepository:
         flag_modified(row, "task_config_json")
         db.commit()
         db.refresh(row)
+        _invalidate_slot_summary_for_project(row.project_id)
         # 同步清除 events.jsonl（重跑从头）
         clear_events(events_path(row.output_path, row.task_id))
         return row
@@ -196,6 +203,7 @@ class TaskRepository:
         flag_modified(row, "task_config_json")
         db.commit()
         db.refresh(row)
+        _invalidate_slot_summary_for_project(row.project_id)
         # 续跑保留 events.jsonl（历史日志续写），但删除文件末尾的 __FINAL__ 标记。
         # 这样新运行的事件就展现为未完成状态，避免 final=True 误报。
         strip_final_marker(events_path(row.output_path, row.task_id))
@@ -210,12 +218,14 @@ class TaskRepository:
         row.lease_expires_at = None
         db.commit()
         db.refresh(row)
+        _invalidate_slot_summary_for_project(row.project_id)
         return row
 
     @staticmethod
     def soft_delete_task(db: Session, row: AppSaTask) -> None:
         row.is_deleted = True
         db.commit()
+        _invalidate_slot_summary_for_project(row.project_id)
 
     @staticmethod
     def recover_stale_running_tasks(
@@ -249,6 +259,8 @@ class TaskRepository:
             cleanup_resume_files(stale.output_path, stale.task_id)
         if stale_rows:
             db.commit()
+            for project_id in {str(row.project_id or "").strip() or None for row in stale_rows}:
+                _invalidate_slot_summary_for_project(project_id)
         return stale_rows
 
     @staticmethod
@@ -282,6 +294,7 @@ class TaskRepository:
             db.rollback()
             return None
         db.commit()
+        _invalidate_slot_summary_for_project(row.project_id)
         return lease_epoch
 
     @staticmethod
@@ -316,6 +329,8 @@ class TaskRepository:
             db.rollback()
             return False
         db.commit()
+        row_project_id = db.query(AppSaTask.project_id).filter(AppSaTask.task_id == task_id).scalar()
+        _invalidate_slot_summary_for_project(str(row_project_id or "").strip() or None)
         return True
 
     @staticmethod
@@ -341,6 +356,8 @@ class TaskRepository:
             synchronize_session=False,
         )
         db.commit()
+        row_project_id = db.query(AppSaTask.project_id).filter(AppSaTask.task_id == task_id).scalar()
+        _invalidate_slot_summary_for_project(str(row_project_id or "").strip() or None)
         return bool(updated)
 
     @staticmethod
@@ -379,6 +396,8 @@ class TaskRepository:
             db.rollback()
             return False
         db.commit()
+        row_project_id = db.query(AppSaTask.project_id).filter(AppSaTask.task_id == task_id).scalar()
+        _invalidate_slot_summary_for_project(str(row_project_id or "").strip() or None)
         return True
 
     @staticmethod
@@ -405,4 +424,5 @@ class TaskRepository:
         if int(row.lease_epoch or 0) != lease_epoch:
             return False
         db.commit()
+        _invalidate_slot_summary_for_project(row.project_id)
         return True

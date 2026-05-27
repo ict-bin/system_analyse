@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 
 from sqlalchemy.orm import Session
 
@@ -61,6 +62,18 @@ class SaClusterCapacitySnapshot:
     workers: list[SaWorkerSnapshot] = field(default_factory=list)
 
 
+_SUMMARY_CACHE_TTL_SECONDS = 5.0
+_summary_cache: dict[tuple[str | None, str], tuple[float, SaClusterCapacitySnapshot]] = {}
+
+
+def invalidate_worker_slot_summary_cache(*, project_id: str | None = None) -> None:
+    if project_id is None:
+        _summary_cache.clear()
+        return
+    for cache_key in [key for key in _summary_cache if key[0] in {None, project_id}]:
+        _summary_cache.pop(cache_key, None)
+
+
 def _normalize_worker_id(worker_id: str | None) -> str:
     return str(worker_id or "").strip()
 
@@ -89,18 +102,34 @@ def _infer_analysis_mode(row: AppSaTask) -> str | None:
     return None
 
 
-def build_worker_slot_cluster_snapshot(db: Session, *, project_id: str | None = None) -> SaClusterCapacitySnapshot:
-    query = db.query(AppSaTask).filter(AppSaTask.is_deleted.is_(False))
+def _count_queued_jobs(db: Session, *, project_id: str | None = None) -> int:
+    query = db.query(AppSaTask).filter(
+        AppSaTask.is_deleted.is_(False),
+        AppSaTask.status == "pending",
+        (AppSaTask.dispatcher_instance_id.is_(None)) | (AppSaTask.dispatcher_instance_id == ""),
+    )
+    if project_id:
+        query = query.filter(AppSaTask.project_id == project_id)
+    return int(query.count() or 0)
+
+
+def _build_base_worker_snapshot(
+    *,
+    db: Session,
+    project_id: str | None = None,
+    include_active_jobs: bool,
+) -> SaClusterCapacitySnapshot:
+    query = db.query(AppSaTask).filter(
+        AppSaTask.is_deleted.is_(False),
+        AppSaTask.dispatcher_instance_id.isnot(None),
+        AppSaTask.dispatcher_instance_id != "",
+        AppSaTask.status.notin_(list(_TERMINAL_STATUSES)),
+    )
     if project_id:
         query = query.filter(AppSaTask.project_id == project_id)
     rows = query.all()
     now = now_local()
-    queued_jobs = sum(
-        1
-        for row in rows
-        if str(getattr(row, "status", "") or "").strip() == "pending"
-        and not _normalize_worker_id(getattr(row, "dispatcher_instance_id", None))
-    )
+    queued_jobs = _count_queued_jobs(db, project_id=project_id)
 
     active_runner_rows = get_runner_registry_service().list_active_runners(db)
     runner_map = {
@@ -131,35 +160,33 @@ def build_worker_slot_cluster_snapshot(db: Session, *, project_id: str | None = 
         runner_live = bool(runner)
         healthy = runner_live or lease_live
 
-        active_rows = [
-            row for row in owner_rows
-            if str(getattr(row, "status", "") or "").strip() not in _TERMINAL_STATUSES
-        ]
-        if not active_rows and not runner_live and not lease_live:
+        if not owner_rows and not runner_live and not lease_live:
             continue
 
-        active_jobs = [
-            SaWorkerActiveJobSnapshot(
-                task_id=row.task_id,
-                task_name=row.task_name,
-                status=str(getattr(row, "status", "") or ""),
-                analysis_mode=_infer_analysis_mode(row),
-                parent_task_id=getattr(row, "parent_task_id", None),
-                parent_task_type=getattr(row, "parent_task_type", None),
-                task_origin_type=getattr(row, "task_origin_type", None),
-                input_path=str(getattr(row, "input_path", "") or ""),
-                started_at=getattr(row, "started_at", None),
-                updated_at=getattr(row, "updated_at", None),
-                dispatch_started_at=getattr(row, "dispatch_started_at", None),
-                execution_owner_id=getattr(row, "dispatcher_instance_id", None),
-                execution_lease_until=getattr(row, "lease_expires_at", None),
-                lease_epoch=int(getattr(row, "lease_epoch", 0) or 0),
-            )
-            for row in active_rows
-        ]
-        active_jobs.sort(key=_job_sort_key)
+        active_jobs: list[SaWorkerActiveJobSnapshot] = []
+        if include_active_jobs:
+            active_jobs = [
+                SaWorkerActiveJobSnapshot(
+                    task_id=row.task_id,
+                    task_name=row.task_name,
+                    status=str(getattr(row, "status", "") or ""),
+                    analysis_mode=_infer_analysis_mode(row),
+                    parent_task_id=getattr(row, "parent_task_id", None),
+                    parent_task_type=getattr(row, "parent_task_type", None),
+                    task_origin_type=getattr(row, "task_origin_type", None),
+                    input_path=str(getattr(row, "input_path", "") or ""),
+                    started_at=getattr(row, "started_at", None),
+                    updated_at=getattr(row, "updated_at", None),
+                    dispatch_started_at=getattr(row, "dispatch_started_at", None),
+                    execution_owner_id=getattr(row, "dispatcher_instance_id", None),
+                    execution_lease_until=getattr(row, "lease_expires_at", None),
+                    lease_epoch=int(getattr(row, "lease_epoch", 0) or 0),
+                )
+                for row in owner_rows
+            ]
+            active_jobs.sort(key=_job_sort_key)
 
-        running_jobs = sum(1 for row in active_rows if str(getattr(row, "status", "") or "").strip() == "running")
+        occupied_slots = len(owner_rows)
         max_concurrent_jobs = max(1, int((runner or {}).get("capacity") or default_capacity))
         source = "runner_registry" if runner else "task_lease_fallback"
         error: str | None = None
@@ -174,8 +201,8 @@ def build_worker_slot_cluster_snapshot(db: Session, *, project_id: str | None = 
                 host_name=_parse_host_name(worker_id),
                 healthy=healthy,
                 max_concurrent_jobs=max_concurrent_jobs,
-                running_jobs=running_jobs,
-                available_slots=max(0, max_concurrent_jobs - running_jobs) if healthy else 0,
+                running_jobs=occupied_slots,
+                available_slots=max(0, max_concurrent_jobs - occupied_slots) if healthy else 0,
                 source=source,
                 last_heartbeat_at=latest_heartbeat,
                 active_jobs=active_jobs,
@@ -195,3 +222,22 @@ def build_worker_slot_cluster_snapshot(db: Session, *, project_id: str | None = 
         updated_at=now,
         workers=worker_snapshots,
     )
+
+
+def build_worker_slot_cluster_snapshot(db: Session, *, project_id: str | None = None) -> SaClusterCapacitySnapshot:
+    return build_worker_slot_cluster_detail(db, project_id=project_id)
+
+
+def build_worker_slot_cluster_summary(db: Session, *, project_id: str | None = None) -> SaClusterCapacitySnapshot:
+    cache_key = (project_id, "summary")
+    now_ts = time.monotonic()
+    cached = _summary_cache.get(cache_key)
+    if cached and now_ts - cached[0] <= _SUMMARY_CACHE_TTL_SECONDS:
+        return cached[1]
+    snapshot = _build_base_worker_snapshot(db=db, project_id=project_id, include_active_jobs=False)
+    _summary_cache[cache_key] = (now_ts, snapshot)
+    return snapshot
+
+
+def build_worker_slot_cluster_detail(db: Session, *, project_id: str | None = None) -> SaClusterCapacitySnapshot:
+    return _build_base_worker_snapshot(db=db, project_id=project_id, include_active_jobs=True)
