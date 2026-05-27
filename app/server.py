@@ -43,7 +43,7 @@ from .config import (
     build_task_config, get_service_yaml, load_service_config,
 )
 from .logging_utils import configure_container_logging, log_event
-from .metrics import observe_request as observe_metrics_request, render_metrics
+from .metrics import normalize_http_route, observe_http_request as observe_metrics_request, observe_http_request_inflight, render_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
 from .service.service_role import is_api_role as _is_api_service_role
@@ -153,9 +153,18 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.middleware("http")
 async def collect_request_metrics(request, call_next):
     started = _time.perf_counter()
-    response = await call_next(request)
-    observe_metrics_request(request.method, request.url.path, response.status_code, _time.perf_counter() - started)
-    return response
+    response = None
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    normalized_route = normalize_http_route(str(path))
+    observe_http_request_inflight(request.method, normalized_route, 1)
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        status_code = response.status_code if response is not None else 500
+        observe_metrics_request(request.method, str(path), status_code, _time.perf_counter() - started)
+        observe_http_request_inflight(request.method, normalized_route, -1)
 
 _svc_config = None
 
