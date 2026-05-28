@@ -386,6 +386,27 @@ class FinalReportStage(BaseStage):
         workspace = ctx.workspace
         final_out_dir = ctx.final_out_dir
 
+        # ── 0 模块快速路径：安全过滤后无相关模块，无需运行任何 LLM——直接写说明文件 ────────
+        _sec_cats: list = getattr(cfg, "security_focus_categories", ["all"])
+        _all_mods = discover_modules(str(workspace))
+        if not _all_mods and "all" not in _sec_cats:
+            _no_mod_report = (
+                f"# 分析任务已完成（安全过滤后无相关模块）\n\n"
+                f"经 Stage 1.5 安全维度过滤，目标中所有模块均与指定安全维度无关，"
+                f"无需进行后续分析。\n\n"
+                f"## 指定安全维度\n\n"
+                + "\n".join(f"- `{c}`" for c in _sec_cats)
+                + f"\n\n## 结论\n\n"
+                f"目标中不包含与指定安全维度相关的组件。"
+                f"若需分析全量内容，可将 `security_focus_categories` 设置为 `[\"all\"]` 重新运行任务。\n"
+            )
+            (workspace / "final_report.md").write_text(_no_mod_report, encoding="utf-8")
+            ctx.emit_event("log", level="info",
+                           msg="[S4b] 0 个安全相关模块，已写入说明报告，跳过 LLM")
+            # 后续干跡存模块目录和模块列表
+            from .helpers import discover_modules as _dm  # noqa
+            return
+
         # ── checkpoint 跳过（checkpoint + final_report.md 双重确认） ────────────
         if cp and cp.is_done("s4_report"):
             report_dst = final_out_dir / "final_report.md"
