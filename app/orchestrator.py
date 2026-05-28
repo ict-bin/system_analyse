@@ -274,8 +274,36 @@ class Orchestrator:
             await pipeline.run(ctx)
             result.status = TaskStatus.PASSED
             result.total_tokens = ctx.tokens
-            # 过滤结果为 0 文件：流水线已正常终止，写说明报告
-            if ctx.filter_count == 0:
+            # 安全过滤后 0 个模块：正常结束，写"无安全相关模块"说明报告
+            filtered_all_modules = (
+                ctx.filter_count > 0
+                and not (final_out_dir / "final_report.md").exists()
+                and not list(get_modules_root(str(workspace)).glob("*/files.list")) if final_out_dir.exists() else False
+            )
+            _sec_cats: list = getattr(cfg, "security_focus_categories", ["all"])
+            _no_modules_after_filter = (
+                ctx.filter_count > 0
+                and "all" not in _sec_cats
+                and not (final_out_dir / "final_report.md").exists()
+            )
+            if _no_modules_after_filter:
+                _no_mod_report = (
+                    f"# 分析任务已完成（安全过滤后无关联模块）\n\n"
+                    f"**任务 ID**：`{task_id}`\n\n"
+                    f"## 结果\n\n"
+                    f"经 Stage 1.5 安全维度过滤，所有模块均与指定安全维度无关，"
+                    f"流水线已正常完成，无需进行后续分析。\n\n"
+                    f"## 指定安全维度\n\n"
+                    + "\n".join(f"- `{c}`" for c in _sec_cats)
+                    + f"\n\n## 结论\n\n"
+                    f"目标中不包含与指定安全维度（{'  '.join(_sec_cats)}）相关的组件或文件。"
+                    f"若需分析全量内容，可将 `security_focus_categories` 设置为 `[\"all\"]` 重新运行任务。\n"
+                )
+                (final_out_dir / "final_report.md").write_text(_no_mod_report, encoding="utf-8")
+                self._emit("log", level="info",
+                           msg=f"[S1.5过滤] 所有模块均被安全过滤删除，已写入说明报告")
+            # S0 过滤结果为 0 文件：流水线已正常终止，写说明报告
+            elif ctx.filter_count == 0:
                 _zero_report = (
                     f"# 分析任务已完成（过滤结果为 0 个文件）\n\n"
                     f"**任务 ID**：`{task_id}`\n\n"

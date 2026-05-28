@@ -169,6 +169,8 @@ class SecurityFocusFilterStage(BaseStage):
                 prompt_parts = [
                     f"# 安全维度过滤任务（第 1 轮 — 全量审查）\n\n"
                     f"## 指定安全维度（只保留与此相关的模块）\n\n{cat_desc}\n\n"
+                    f"⚠️ **删除全部模块是合法且正确的结果**：若所有模块均与安全维度无关，\n"
+                    f"应全部删除，`modules/` 为空目录是完全合法的输出。不要因担心流水线空距而保留无关模块。\n\n"
                     f"## 当前全部模块（共 {len(current_modules)} 个）\n\n"
                     + "\n".join(f"- `{m}`" for m in sorted(current_modules))
                     + f"\n\n## 目录路径\n\n"
@@ -244,10 +246,12 @@ class SecurityFocusFilterStage(BaseStage):
                 j_prompt = (
                     f"# 安全维度过滤评审（第 {attempt+1} 轮）\n\n"
                     f"## 指定安全维度\n\n{cat_desc}\n\n"
+                    f"⚠️ **空结果是合法的**：若全部模块均与安全维度无关，过滤后 0 个模块保留是完全正确的结果。\n\n"
                     f"## 过滤前（备份）：{len(backup_mods)} 个模块\n\n"
                     + "\n".join(f"- `{m}`" for m in sorted(backup_mods))
-                    + f"\n\n## 过滤后（当前）：{len(kept_modules)} 个模块\n\n"
-                    + "\n".join(f"- `{m}`" for m in sorted(kept_modules))
+                    + f"\n\n## 过滤后（当前）：{len(kept_modules)} 个模块"
+                    + ("\n\n（无——所有模块已删除）" if not kept_modules else
+                       "\n\n" + "\n".join(f"- `{m}`" for m in sorted(kept_modules)))
                     + f"\n\n## 被删除：{len(removed_mods)} 个\n\n"
                     + "\n".join(f"- `{m}`" for m in removed_mods)
                     + f"\n\n备份目录 `{backup}` 可供读取 files.list 核查。\n"

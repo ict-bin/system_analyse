@@ -110,19 +110,19 @@ class PromptOverrideConfig(BaseModel):
 class StageLoopConfig(BaseModel):
     """单个阶段的循环控制"""
     min_rounds: int = Field(default=2, description="最少运行轮数（强制反思）")
-    max_rounds: int = Field(default=5, description="最多迭代轮数，-1=无限")
+    max_rounds: int = Field(default=-1, description="最多迭代轮数，-1=无限")
     pass_mode: str = Field(default="majority", description="majority=半数以上, all=全部judge通过")
 
 
 class StagesConfig(BaseModel):
-    classify: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=5))
+    classify: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=-1))
     security_filter: StageLoopConfig = Field(
-        default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=3, pass_mode="all"),
+        default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=-1, pass_mode="all"),
         description="安全维度过滤阶段（S1后），security_focus_categories != ['all'] 时生效",
     )
-    refine: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=3))
-    analyse: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=2, max_rounds=5))
-    final_check: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=1))
+    refine: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=-1))
+    analyse: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=-1))
+    final_check: StageLoopConfig = Field(default_factory=lambda: StageLoopConfig(min_rounds=1, max_rounds=-1))
 
 
 # ─── 分析目标文件类型 ───────────────────────────────────────────────────
