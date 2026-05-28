@@ -363,7 +363,14 @@ class AgentProcessSnapshotResponse(BaseModel):
     ppid: Optional[int] = None
     command: str
     cwd: Optional[str] = None
+    exe: Optional[str] = None
     rss_bytes: Optional[int] = None
+    runtime_kind: Optional[str] = None
+    match_source: Optional[str] = None
+    match_confidence: Optional[str] = None
+    workspace_root: Optional[str] = None
+    session_arg_path: Optional[str] = None
+    open_session_paths: list[str] = Field(default_factory=list)
     session_file: Optional[str] = None
     session_id: Optional[str] = None
     task_id: Optional[str] = None
@@ -424,6 +431,9 @@ class AgentPodSnapshotResponse(BaseModel):
     active_task_count: int = 0
     last_scanned_at: Optional[float] = None
     scan_errors: int = 0
+    processes: list[AgentProcessSnapshotResponse] = Field(default_factory=list)
+    tasks: list[AgentTaskOwnershipSnapshotResponse] = Field(default_factory=list)
+    sessions: list[AgentSessionSnapshotResponse] = Field(default_factory=list)
 
 
 class AgentObservabilitySummaryResponse(BaseModel):
@@ -452,6 +462,7 @@ class AgentRuntimeAggregateSummaryResponse(BaseModel):
     aggregate_sources: int = 0
     aggregate_fanout_errors: int = 0
     aggregate_failed_targets: list[str] = Field(default_factory=list)
+    aggregate_all_sources_failed: bool = False
     scanned_at: Optional[float] = None
 
 
@@ -581,13 +592,15 @@ async def _build_agent_aggregate_snapshot(project_id: str | None, token: str, db
             pod_rows.append(item)
             seen_pod_keys.add(pod_name)
 
-    if not sources:
+    all_sources_failed = bool(workers) and sources == 0 and fanout_errors > 0
+    if not workers:
         merged_processes = list(local.get("processes") or [])
         merged_sessions = list(local.get("sessions") or [])
         merged_tasks = list(local.get("tasks") or [])
         pod_rows = list(local.get("pods") or [])
         sources = 1
         partial = False
+        all_sources_failed = False
 
     summary = {
         "pod_name": "system-analyse-aggregate",
@@ -603,6 +616,7 @@ async def _build_agent_aggregate_snapshot(project_id: str | None, token: str, db
         "aggregate_sources": sources,
         "aggregate_fanout_errors": fanout_errors,
         "aggregate_failed_targets": failed_targets,
+        "aggregate_all_sources_failed": all_sources_failed,
     }
     return {
         "summary": summary,
@@ -634,6 +648,7 @@ def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
             "aggregate_sources": int(summary.get("aggregate_sources") or 0),
             "aggregate_fanout_errors": int(summary.get("aggregate_fanout_errors") or 0),
             "aggregate_failed_targets": list(summary.get("aggregate_failed_targets") or []),
+            "aggregate_all_sources_failed": bool(summary.get("aggregate_all_sources_failed")),
             "scanned_at": summary.get("scanned_at"),
         },
         "pods": pods,

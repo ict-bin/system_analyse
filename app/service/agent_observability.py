@@ -3,9 +3,10 @@ from __future__ import annotations
 import contextlib
 import os
 import pathlib
+import shlex
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -21,6 +22,25 @@ POD_NAME = (
     or "system-analyse-pod"
 )
 
+_SESSION_ARG_KEYS = {
+    "--session",
+    "--session-file",
+    "--session_path",
+    "--session-path",
+    "--resume",
+}
+_AGENT_TOKENS: tuple[tuple[str, str], ...] = (
+    ("claude-code", "claude-code"),
+    ("claude", "claude"),
+    ("opencode", "opencode"),
+    ("codex", "codex"),
+    ("npx pi", "pi"),
+    (" pi ", "pi"),
+    ("/pi", "pi"),
+)
+_WRAPPER_NAMES = {"node", "npm", "npx", "pnpm", "yarn", "python", "python3", "uv"}
+_ACTIVE_TASK_STATUSES = {"running", "pending", "queued", "dispatching"}
+
 
 @dataclass
 class SaAgentProcessSnapshot:
@@ -30,7 +50,14 @@ class SaAgentProcessSnapshot:
     ppid: int | None
     command: str
     cwd: str | None
+    exe: str | None
     rss_bytes: int | None
+    runtime_kind: str | None
+    match_source: str | None
+    match_confidence: str | None
+    workspace_root: str | None
+    session_arg_path: str | None
+    open_session_paths: list[str]
     session_file: str | None
     session_id: str | None
     task_id: str | None
@@ -52,6 +79,66 @@ def _read_text(path: pathlib.Path) -> str:
         return ""
 
 
+def _normalize_path(raw: str | None) -> str | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        return str(pathlib.Path(value).resolve(strict=False))
+    except Exception:
+        return value
+
+
+def _infer_runtime_kind(command: str, exe: str | None) -> str | None:
+    normalized = f" {command.lower()} "
+    for token, runtime_kind in _AGENT_TOKENS:
+        if token in normalized:
+            return runtime_kind
+    exe_name = pathlib.Path(exe or "").name.lower()
+    if exe_name in {"pi", "claude", "claude-code", "codex", "opencode"}:
+        return exe_name
+    if exe_name in _WRAPPER_NAMES:
+        for runtime_name in ("claude-code", "claude", "codex", "opencode", "pi"):
+            if runtime_name in normalized:
+                return runtime_name
+    return None
+
+
+def _extract_session_arg_path(command: str) -> str | None:
+    with contextlib.suppress(Exception):
+        tokens = shlex.split(command)
+        for index, token in enumerate(tokens):
+            if token in _SESSION_ARG_KEYS and index + 1 < len(tokens):
+                return _normalize_path(tokens[index + 1])
+            for key in _SESSION_ARG_KEYS:
+                prefix = f"{key}="
+                if token.startswith(prefix):
+                    return _normalize_path(token[len(prefix):])
+    return None
+
+
+def _collect_open_session_paths(proc_dir: pathlib.Path) -> list[str]:
+    rows: list[str] = []
+    fd_dir = proc_dir / "fd"
+    if not fd_dir.exists():
+        return rows
+    with contextlib.suppress(Exception):
+        for fd_entry in fd_dir.iterdir():
+            with contextlib.suppress(Exception):
+                target = os.readlink(fd_entry)
+                normalized = _normalize_path(target)
+                if normalized and normalized.endswith((".jsonl", ".json")):
+                    rows.append(normalized)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in rows:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
 def _iter_agent_processes() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for proc_dir in pathlib.Path("/proc").iterdir():
@@ -62,7 +149,11 @@ def _iter_agent_processes() -> list[dict[str, Any]]:
             command = (proc_dir / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
         except Exception:
             continue
-        if " pi " not in f" {command} " and "/pi" not in command and " npx pi" not in command and "node" not in command:
+        exe = None
+        with contextlib.suppress(Exception):
+            exe = os.readlink(proc_dir / "exe")
+        runtime_kind = _infer_runtime_kind(command, exe)
+        if runtime_kind is None:
             continue
         ppid = pgid = None
         rss_bytes = None
@@ -80,8 +171,70 @@ def _iter_agent_processes() -> list[dict[str, Any]]:
                 if len(parts) >= 2:
                     rss_bytes = int(parts[1]) * 1024
                 break
-        rows.append({"pid": pid, "ppid": ppid, "pgid": pgid, "command": command, "cwd": cwd, "rss_bytes": rss_bytes})
+        rows.append({
+            "pid": pid,
+            "ppid": ppid,
+            "pgid": pgid,
+            "command": command,
+            "cwd": cwd,
+            "exe": exe,
+            "rss_bytes": rss_bytes,
+            "runtime_kind": runtime_kind,
+            "session_arg_path": _extract_session_arg_path(command),
+            "open_session_paths": _collect_open_session_paths(proc_dir),
+        })
     return rows
+
+
+def _task_roots(row: AppSaTask) -> list[str]:
+    roots: list[str] = []
+    for item in [getattr(row, "output_path", None), getattr(row, "input_path", None)]:
+        normalized = _normalize_path(item)
+        if normalized:
+            roots.append(normalized)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in roots:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _path_belongs_to_root(path_value: str | None, root: str | None) -> bool:
+    if not path_value or not root:
+        return False
+    try:
+        pathlib.Path(path_value).relative_to(pathlib.Path(root))
+        return True
+    except Exception:
+        return False
+
+
+def _match_session(
+    proc: dict[str, Any],
+    *,
+    session_by_abs_path: dict[str, dict[str, Any]],
+    session_by_rel_path: dict[str, dict[str, Any]],
+    task_roots_by_id: dict[str, list[str]],
+) -> tuple[dict[str, Any] | None, str | None, str | None, str | None]:
+    for candidate in [proc.get("session_arg_path"), *(proc.get("open_session_paths") or [])]:
+        normalized = _normalize_path(candidate)
+        if normalized and normalized in session_by_abs_path:
+            return session_by_abs_path[normalized], "session_path", "high", None
+    cwd = _normalize_path(proc.get("cwd"))
+    for task_id, roots in task_roots_by_id.items():
+        for root in roots:
+            if _path_belongs_to_root(cwd, root):
+                for session in session_by_abs_path.values():
+                    if str(session.get("task_id") or "") == task_id:
+                        return session, "task_root", "medium", root
+                return None, "task_root", "medium", root
+    for rel_path, session in session_by_rel_path.items():
+        if rel_path and rel_path in str(proc.get("command") or ""):
+            return session, "session_relpath", "low", None
+    return None, None, None, None
 
 
 class AgentObservabilityService:
@@ -95,6 +248,9 @@ class AgentObservabilityService:
         active_worker_ids = {str(worker.worker_id or "") for worker in cluster_snapshot.workers if worker.healthy}
 
         session_nodes: list[dict[str, Any]] = []
+        session_by_rel_path: dict[str, dict[str, Any]] = {}
+        session_by_abs_path: dict[str, dict[str, Any]] = {}
+        task_roots_by_id = {row.task_id: _task_roots(row) for row in task_rows}
         for row in task_rows:
             index = get_task_service().get_task_session_index(db, row.task_id)
             for node in index.get("nodes") or []:
@@ -102,88 +258,112 @@ class AgentObservabilityService:
                 item["task_id"] = row.task_id
                 item["task_name"] = row.task_name
                 item["task_status"] = row.status
+                relative_path = str(node.get("relative_path") or "")
+                item["relative_path"] = relative_path
                 session_nodes.append(item)
+                if relative_path:
+                    session_by_rel_path[relative_path] = item
+                for root in task_roots_by_id.get(row.task_id, []):
+                    absolute = _normalize_path(pathlib.Path(root) / relative_path)
+                    if absolute:
+                        session_by_abs_path[absolute] = item
 
         processes: list[dict[str, Any]] = []
         for proc in _iter_agent_processes():
-            matched = next((node for node in session_nodes if str(node.get("relative_path") or "") in str(proc.get("cwd") or "")), None)
+            matched, match_source, match_confidence, workspace_root = _match_session(
+                proc,
+                session_by_abs_path=session_by_abs_path,
+                session_by_rel_path=session_by_rel_path,
+                task_roots_by_id=task_roots_by_id,
+            )
+            owner_kind = "unknown"
+            kill_allowed = False
+            owner_reason = "未匹配到任务或会话"
+            kill_block_reason = "仅明确孤儿进程可手工终止"
+            session_file = proc.get("session_arg_path")
+            session_id = None
+            task_id = None
+            task_name = None
+            task_status = None
+            stage_key = None
+            role_kind = None
             if matched:
-                owner_kind = "unknown"
-                kill_allowed = False
-                owner_reason = "未完成归属判定"
-                kill_block_reason = "仅明确孤儿进程可手工终止"
-                task_row = task_by_id.get(str(matched.get("task_id") or ""))
-                task_status = str(matched.get("task_status") or "")
-                if task_status in {"running", "pending"}:
-                    worker_id = str(getattr(task_row, "dispatcher_instance_id", "") or "")
-                    lease_expires_at = getattr(task_row, "lease_expires_at", None) if task_row is not None else None
-                    lease_live = bool(lease_expires_at and lease_expires_at.timestamp() >= time.time())
-                    if worker_id and worker_id in active_worker_ids:
-                        owner_kind = "tracked"
-                        owner_reason = "已关联活动任务，且 dispatcher worker 心跳正常"
-                        kill_block_reason = "进程仍归属于活动任务"
-                    elif lease_live or bool(matched.get("is_active")):
-                        owner_kind = "unknown"
-                        owner_reason = "活动任务 lease/session 仍活跃，进入保护态"
-                        kill_block_reason = "存在活动运行信号，禁止手工终止"
-                    else:
-                        owner_kind = "unknown"
-                        owner_reason = "活动任务存在但 worker 心跳缺失，进入保护态"
-                        kill_allowed = True
-                        kill_block_reason = None
+                session_file = session_file or str(matched.get("relative_path") or "") or None
+                session_id = str((matched.get("session_header") or {}).get("id") or matched.get("session_name") or "") or None
+                task_id = str(matched.get("task_id") or "") or None
+                task_name = str(matched.get("task_name") or "") or None
+                task_status = str(matched.get("task_status") or "") or None
+                stage_key = str(matched.get("stage_key") or "") or None
+                role_kind = str(matched.get("role") or "") or None
+            elif match_source == "task_root":
+                workspace_root = workspace_root or _normalize_path(proc.get("cwd"))
+                for current_task_id, roots in task_roots_by_id.items():
+                    if any(_path_belongs_to_root(proc.get("cwd"), root) for root in roots):
+                        task_row = task_by_id.get(current_task_id)
+                        if task_row is not None:
+                            task_id = task_row.task_id
+                            task_name = task_row.task_name
+                            task_status = task_row.status
+                        break
+            task_row = task_by_id.get(task_id or "")
+            if task_row is not None and str(task_status or "").strip() in {"running", "pending"}:
+                worker_id = str(getattr(task_row, "dispatcher_instance_id", "") or "")
+                lease_expires_at = getattr(task_row, "lease_expires_at", None)
+                lease_live = bool(lease_expires_at and lease_expires_at.timestamp() >= time.time())
+                if worker_id and worker_id in active_worker_ids:
+                    owner_kind = "tracked"
+                    owner_reason = "已归属到活跃任务，且 dispatcher worker 心跳正常"
+                    kill_block_reason = "进程仍归属于活动任务"
+                elif lease_live or bool(matched and matched.get("is_active")):
+                    owner_kind = "unknown"
+                    owner_reason = "活动任务 lease/session 仍活跃，进入保护态"
+                    kill_block_reason = "存在活动任务运行信号，禁止手工终止"
                 else:
-                    if bool(matched.get("is_active")):
-                        owner_kind = "unknown"
-                        owner_reason = "终态任务但 session 仍活跃，暂不允许终止"
-                        kill_block_reason = "存在 live session，进入保护态"
-                    else:
-                        owner_kind = "orphan"
-                        owner_reason = "仅匹配终态任务/失活会话，且无活动 dispatcher"
-                        kill_allowed = True
-                        kill_block_reason = None
-                processes.append(SaAgentProcessSnapshot(
+                    owner_kind = "unknown"
+                    owner_reason = "任务仍在运行态，但 worker/lease 信号不完整"
+                    kill_allowed = True
+                    kill_block_reason = None
+            elif task_id:
+                owner_kind = "orphan"
+                owner_reason = "已归属到终态任务，且无活跃 worker 信号"
+                kill_allowed = True
+                kill_block_reason = None
+            elif match_source == "task_root":
+                owner_kind = "unknown"
+                owner_reason = "已按任务根路径归属，但缺少会话级精确证据"
+            else:
+                kill_allowed = True
+                kill_block_reason = None
+            processes.append(
+                SaAgentProcessSnapshot(
                     pod_name=POD_NAME,
                     pid=int(proc["pid"]),
                     pgid=proc.get("pgid"),
                     ppid=proc.get("ppid"),
                     command=str(proc.get("command") or ""),
                     cwd=proc.get("cwd"),
+                    exe=proc.get("exe"),
                     rss_bytes=proc.get("rss_bytes"),
-                    session_file=matched.get("relative_path"),
-                    session_id=str((matched.get("session_header") or {}).get("id") or matched.get("session_name") or "") or None,
-                    task_id=matched.get("task_id"),
-                    task_name=matched.get("task_name"),
-                    task_status=matched.get("task_status"),
-                    stage_key=matched.get("stage_key"),
-                    role_kind=matched.get("role"),
+                    runtime_kind=proc.get("runtime_kind"),
+                    match_source=match_source,
+                    match_confidence=match_confidence,
+                    workspace_root=workspace_root,
+                    session_arg_path=proc.get("session_arg_path"),
+                    open_session_paths=list(proc.get("open_session_paths") or []),
+                    session_file=session_file,
+                    session_id=session_id,
+                    task_id=task_id,
+                    task_name=task_name,
+                    task_status=task_status,
+                    stage_key=stage_key,
+                    role_kind=role_kind,
                     owner_kind=owner_kind,
                     owner_reason=owner_reason,
                     kill_allowed=kill_allowed,
                     kill_block_reason=kill_block_reason,
                     termination_state="live",
-                ).__dict__)
-            else:
-                processes.append(SaAgentProcessSnapshot(
-                    pod_name=POD_NAME,
-                    pid=int(proc["pid"]),
-                    pgid=proc.get("pgid"),
-                    ppid=proc.get("ppid"),
-                    command=str(proc.get("command") or ""),
-                    cwd=proc.get("cwd"),
-                    rss_bytes=proc.get("rss_bytes"),
-                    session_file=None,
-                    session_id=None,
-                    task_id=None,
-                    task_name=None,
-                    task_status=None,
-                    stage_key=None,
-                    role_kind=None,
-                    owner_kind="unknown",
-                    owner_reason="未匹配到任务或会话",
-                    kill_allowed=True,
-                    kill_block_reason=None,
-                    termination_state="live",
-                ).__dict__)
+                ).__dict__
+            )
         sessions = [{
             "pod_name": POD_NAME,
             "session_file": str(node.get("relative_path") or ""),
@@ -222,7 +402,7 @@ class AgentObservabilityService:
         orphan_processes = [item for item in processes if item.get("owner_kind") == "orphan"]
         unknown_processes = [item for item in processes if item.get("owner_kind") == "unknown"]
         orphan_sessions = [item for item in sessions if item.get("orphan_session") and not item.get("has_process")]
-        active_task_statuses = {"running", "pending", "queued", "dispatching"}
+        scanned_at = time.time()
         return {
             "summary": {
                 "pod_name": POD_NAME,
@@ -232,7 +412,7 @@ class AgentObservabilityService:
                 "killable_orphan_processes": len([item for item in orphan_processes if item.get("kill_allowed")]),
                 "killable_suspected_orphan_processes": len([item for item in unknown_processes if item.get("kill_allowed")]),
                 "orphan_sessions": len(orphan_sessions),
-                "scanned_at": time.time(),
+                "scanned_at": scanned_at,
                 "scan_errors": 0,
             },
             "processes": processes,
@@ -249,9 +429,12 @@ class AgentObservabilityService:
                 "session_count": len(sessions),
                 "orphan_session_count": len(orphan_sessions),
                 "task_count": len(tasks),
-                "active_task_count": len([item for item in tasks if str(item.get("task_status") or "") in active_task_statuses]),
-                "last_scanned_at": time.time(),
+                "active_task_count": len([item for item in tasks if str(item.get("task_status") or "") in _ACTIVE_TASK_STATUSES]),
+                "last_scanned_at": scanned_at,
                 "scan_errors": 0,
+                "processes": processes,
+                "tasks": tasks,
+                "sessions": sessions,
             }],
         }
 
