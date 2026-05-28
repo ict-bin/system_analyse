@@ -129,7 +129,8 @@ class AgentObservabilityService:
                     else:
                         owner_kind = "unknown"
                         owner_reason = "活动任务存在但 worker 心跳缺失，进入保护态"
-                        kill_block_reason = "任务可能仍在切换或退出宽限期"
+                        kill_allowed = True
+                        kill_block_reason = None
                 else:
                     if bool(matched.get("is_active")):
                         owner_kind = "unknown"
@@ -179,8 +180,8 @@ class AgentObservabilityService:
                     role_kind=None,
                     owner_kind="unknown",
                     owner_reason="未匹配到任务或会话",
-                    kill_allowed=False,
-                    kill_block_reason="仅明确孤儿进程可手工终止",
+                    kill_allowed=True,
+                    kill_block_reason=None,
                     termination_state="live",
                 ).__dict__)
         sessions = [{
@@ -217,14 +218,20 @@ class AgentObservabilityService:
                 "session_ids": [str(item["session_id"]) for item in linked_sessions if item.get("session_id")],
                 "ownership_status": "partial" if linked_sessions and not linked_processes else "healthy",
             })
+        tracked_processes = [item for item in processes if item.get("owner_kind") == "tracked"]
+        orphan_processes = [item for item in processes if item.get("owner_kind") == "orphan"]
+        unknown_processes = [item for item in processes if item.get("owner_kind") == "unknown"]
+        orphan_sessions = [item for item in sessions if item.get("orphan_session") and not item.get("has_process")]
+        active_task_statuses = {"running", "pending", "queued", "dispatching"}
         return {
             "summary": {
                 "pod_name": POD_NAME,
-                "active_processes": len([item for item in processes if item.get("owner_kind") == "tracked"]),
-                "orphan_processes": len([item for item in processes if item.get("owner_kind") == "orphan"]),
-                "unknown_processes": len([item for item in processes if item.get("owner_kind") == "unknown"]),
-                "killable_orphan_processes": len([item for item in processes if item.get("kill_allowed")]),
-                "orphan_sessions": len([item for item in sessions if item.get("orphan_session") and not item.get("has_process")]),
+                "active_processes": len(tracked_processes),
+                "orphan_processes": len(orphan_processes),
+                "unknown_processes": len(unknown_processes),
+                "killable_orphan_processes": len([item for item in orphan_processes if item.get("kill_allowed")]),
+                "killable_suspected_orphan_processes": len([item for item in unknown_processes if item.get("kill_allowed")]),
+                "orphan_sessions": len(orphan_sessions),
                 "scanned_at": time.time(),
                 "scan_errors": 0,
             },
@@ -233,10 +240,18 @@ class AgentObservabilityService:
             "tasks": tasks,
             "pods": [{
                 "pod_name": POD_NAME,
+                "worker_id": POD_NAME,
+                "healthy": True,
                 "process_count": len(processes),
-                "orphan_process_count": len([item for item in processes if item.get("owner_kind") == "orphan"]),
+                "tracked_process_count": len(tracked_processes),
+                "orphan_process_count": len(orphan_processes),
+                "suspected_orphan_process_count": len(unknown_processes),
                 "session_count": len(sessions),
-                "orphan_session_count": len([item for item in sessions if item.get("orphan_session") and not item.get("has_process")]),
+                "orphan_session_count": len(orphan_sessions),
+                "task_count": len(tasks),
+                "active_task_count": len([item for item in tasks if str(item.get("task_status") or "") in active_task_statuses]),
+                "last_scanned_at": time.time(),
+                "scan_errors": 0,
             }],
         }
 
