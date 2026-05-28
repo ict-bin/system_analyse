@@ -179,14 +179,19 @@ async def run_agent_with_stage_guard(
 # ── 模块目录发现 ──────────────────────────────────────────────────────────────
 
 def get_modules_root(workspace: str | Path) -> Path:
-    """返回 modules 子目录（若存在），否则返回 workspace 本身。"""
+    """返回 modules 子目录（总是返回 workspace/modules/）。
+
+    旧行为是当 modules/ 不存在或无 files.list 时 fallback 到 workspace 本身，
+    会把 .pi、.checkpoint 等目录错误地当成模块。现在简化为：
+    - modules/ 目录存在 → 返回 workspace/modules/
+    - modules/ 目录不存在 → 创建并返回 workspace/modules/
+    永远不 fallback 到 workspace 根目录。
+    """
     workspace = Path(workspace)
     m = workspace / "modules"
-    if m.is_dir():
-        # 确认至少有一个模块有 files.list
-        if any((m / d / "files.list").exists() for d in m.iterdir() if d.is_dir()):
-            return m
-    return workspace
+    if not m.exists():
+        m.mkdir(parents=True, exist_ok=True)
+    return m
 
 
 def discover_modules(workspace: str | Path) -> list[str]:

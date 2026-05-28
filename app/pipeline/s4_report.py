@@ -453,10 +453,9 @@ class FinalReportStage(BaseStage):
                 _cur_mods = discover_modules(str(workspace))
                 if not _cur_mods:
                     raise StageError("Stage 4b: modules/ 为空，无法生成报告（不应到达此处）")
-                _mod_list_str = "\n".join(f"- `modules/{m}/module_report.md`" for m in sorted(_cur_mods))
                 prompt_parts = [
-                    f"以下是本任务的全部模块列表（共 {len(_cur_mods)} 个），请依次读取其 module_report.md 汇总成总报告：\n\n{_mod_list_str}\n\n"
-                    "生成最终分析总报告 final_report.md。只使用上述路径，不要在工作目录外搜索任何文件。"
+                    "读取所有模块的 module_report.md，生成最终分析总报告 final_report.md。\n"
+                    "提示：先用 `ls modules/` 获取模块名称列表，再逐个读取 `modules/<模块名>/module_report.md`。"
                 ]
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
