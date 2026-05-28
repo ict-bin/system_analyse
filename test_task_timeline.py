@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from fastapi import HTTPException
 
 from app.models import SwarmEvent, TaskResult, TaskStatus
 from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
@@ -23,6 +24,9 @@ class _FakeTaskQuery:
 
     def all(self):
         return list(self._rows)
+
+    def first(self):
+        return self._rows[0] if self._rows else None
 
     def delete(self, synchronize_session=False):
         del synchronize_session
@@ -81,7 +85,7 @@ def test_get_timeline_returns_events_in_order():
 
 def test_clear_timeline_deletes_all_events():
     service = object.__new__(TaskService)
-    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id)
+    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id, project_id="p1")
     rows = [
         SimpleNamespace(id="e1"),
         SimpleNamespace(id="e2"),
@@ -95,7 +99,7 @@ def test_clear_timeline_deletes_all_events():
 
 def test_delete_timeline_event_deletes_single_event():
     service = object.__new__(TaskService)
-    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id)
+    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id, project_id="p1")
 
     class _SingleDeleteQuery(_FakeTaskQuery):
         def delete(self, synchronize_session=False):
@@ -110,12 +114,164 @@ def test_delete_timeline_event_deletes_single_event():
             del model
             return _SingleDeleteQuery(self.rows)
 
-    rows = [SimpleNamespace(id="evt-1"), SimpleNamespace(id="evt-2")]
+    rows = [
+        SimpleNamespace(id="evt-1", event_type="task_created", stage_name=None, created_at=None),
+        SimpleNamespace(id="evt-2", event_type="task_started", stage_name="1", created_at=None),
+    ]
 
     deleted = TaskService.delete_timeline_event(service, _SingleDeleteDb(rows), "sat_1", "evt-1")
 
     assert deleted == 1
     assert len(rows) == 1
+
+
+def test_clear_timeline_recreates_audit_event(monkeypatch):
+    service = object.__new__(TaskService)
+    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id, project_id="p1")
+    recorded = []
+    monkeypatch.setattr(TaskService, "_record_task_operation_event", classmethod(lambda cls, **kwargs: recorded.append(kwargs)))
+    rows = [SimpleNamespace(id="e1"), SimpleNamespace(id="e2")]
+
+    deleted = TaskService.clear_timeline(service, _FakeDb(rows), "sat_1")
+
+    assert deleted == 2
+    assert rows == []
+    assert recorded[-1]["event_type"] == "timeline_cleared"
+    assert recorded[-1]["payload"]["deleted_event_count"] == 2
+
+
+def test_delete_timeline_event_recreates_audit_event(monkeypatch):
+    service = object.__new__(TaskService)
+    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id, project_id="p1")
+    recorded = []
+    monkeypatch.setattr(TaskService, "_record_task_operation_event", classmethod(lambda cls, **kwargs: recorded.append(kwargs)))
+
+    class _EventDeleteQuery(_FakeTaskQuery):
+        def first(self):
+            return self._rows[0] if self._rows else None
+
+        def delete(self, synchronize_session=False):
+            del synchronize_session
+            if self._rows:
+                self._rows.pop(0)
+                return 1
+            return 0
+
+    class _EventDeleteDb(_FakeDb):
+        def query(self, model):
+            del model
+            return _EventDeleteQuery(self.rows)
+
+    rows = [
+        SimpleNamespace(id="evt-1", event_type="task_created", stage_name=None, created_at=None),
+        SimpleNamespace(id="evt-2", event_type="task_started", stage_name="1", created_at=None),
+    ]
+
+    deleted = TaskService.delete_timeline_event(service, _EventDeleteDb(rows), "sat_1", "evt-1")
+
+    assert deleted == 1
+    assert len(rows) == 1
+    assert recorded[-1]["event_type"] == "timeline_event_deleted"
+    assert recorded[-1]["payload"]["deleted_event_id"] == "evt-1"
+    assert recorded[-1]["payload"]["deleted_event_type"] == "task_created"
+
+
+def test_cancel_terminal_task_records_noop_timeline_event(monkeypatch):
+    service = object.__new__(TaskService)
+    row = SimpleNamespace(task_id="sat_1", project_id="p1", status="passed")
+    service._get_or_404 = lambda db, task_id: row
+    service._row_to_dict = lambda current: {"task_id": current.task_id, "status": current.status}
+    recorded = []
+    monkeypatch.setattr(TaskService, "_record_task_operation_event", classmethod(lambda cls, **kwargs: recorded.append(kwargs)))
+
+    payload = TaskService.cancel_task(service, object(), "sat_1")
+
+    assert payload["status"] == "passed"
+    assert recorded[-1]["event_type"] == "task_cancel_requested_noop"
+    assert recorded[-1]["payload"]["reason"] == "task_already_terminal"
+
+
+def test_repair_task_origin_records_timeline_event(monkeypatch):
+    service = object.__new__(TaskService)
+    row = SimpleNamespace(
+        task_id="sat_1",
+        project_id="p1",
+        status="failed",
+        analysis_mode="binary",
+        task_origin_type="manual",
+        task_config_json={"resolved_config_snapshot": {"a": 1}, "keep": True},
+    )
+    service._get_or_404 = lambda db, task_id: row
+    service._row_to_dict = lambda current: {"task_id": current.task_id, "analysis_mode": current.analysis_mode}
+    recorded = []
+    monkeypatch.setattr(TaskService, "_record_task_operation_event", classmethod(lambda cls, **kwargs: recorded.append(kwargs)))
+
+    class _Db:
+        def commit(self):
+            return None
+
+        def refresh(self, current):
+            return None
+
+    payload = TaskService.repair_task_origin(service, _Db(), "sat_1", "source")
+
+    assert payload["analysis_mode"] == "source"
+    assert recorded[-1]["event_type"] == "task_origin_repaired"
+    assert recorded[-1]["payload"]["previous_analysis_mode"] == "binary"
+    assert recorded[-1]["payload"]["analysis_mode"] == "source"
+    assert recorded[-1]["payload"]["resolved_config_snapshot_cleared"] is True
+
+
+def test_rejected_repair_origin_records_rejected_event(monkeypatch):
+    service = object.__new__(TaskService)
+    row = SimpleNamespace(task_id="sat_1", project_id="p1", status="running", analysis_mode="binary", task_origin_type="manual")
+    service._get_or_404 = lambda db, task_id: row
+    recorded = []
+    monkeypatch.setattr(TaskService, "_record_task_operation_event", classmethod(lambda cls, **kwargs: recorded.append(kwargs)))
+
+    with pytest.raises(HTTPException):
+        TaskService.repair_task_origin(service, object(), "sat_1", "source")
+
+    assert recorded[-1]["event_type"] == "task_operation_rejected"
+    assert recorded[-1]["payload"]["reason"] == "task_running"
+
+
+def test_delete_task_records_timeline_event(monkeypatch):
+    service = object.__new__(TaskService)
+    row = SimpleNamespace(task_id="sat_1", project_id="p1", status="failed", output_path="/tmp/out", is_deleted=False)
+    service._get_or_404 = lambda db, task_id: row
+    recorded = []
+    monkeypatch.setattr(TaskService, "_record_task_operation_event", classmethod(lambda cls, **kwargs: recorded.append(kwargs)))
+    monkeypatch.setattr("app.service.task_service._invalidate_slot_summary_cache", lambda project_id: None)
+    monkeypatch.setattr("os.path.isdir", lambda path: True)
+    removed = []
+    monkeypatch.setattr("shutil.rmtree", lambda path: removed.append(path))
+
+    class _Db:
+        def commit(self):
+            return None
+
+    TaskService.delete_task(service, _Db(), "sat_1", delete_files=True)
+
+    assert row.is_deleted is True
+    assert removed == ["/tmp/out/sat_1"]
+    assert recorded[-1]["event_type"] == "task_deleted"
+    assert recorded[-1]["payload"]["delete_files"] is True
+    assert recorded[-1]["payload"]["files_deleted"] is True
+
+
+def test_rejected_delete_running_task_records_rejected_event(monkeypatch):
+    service = object.__new__(TaskService)
+    row = SimpleNamespace(task_id="sat_1", project_id="p1", status="running", output_path="/tmp/out")
+    service._get_or_404 = lambda db, task_id: row
+    recorded = []
+    monkeypatch.setattr(TaskService, "_record_task_operation_event", classmethod(lambda cls, **kwargs: recorded.append(kwargs)))
+
+    with pytest.raises(HTTPException):
+        TaskService.delete_task(service, object(), "sat_1", delete_files=True)
+
+    assert recorded[-1]["event_type"] == "task_operation_rejected"
+    assert recorded[-1]["payload"]["reason"] == "task_running"
 
 
 def test_record_timeline_event_sanitizes_large_payload(monkeypatch):

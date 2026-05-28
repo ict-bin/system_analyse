@@ -127,6 +127,13 @@ def _sanitize_timeline_payload(payload: dict | None) -> dict | None:
     return sanitized or None
 
 
+def _safe_isoformat(value: object) -> str | None:
+    if isinstance(value, datetime):
+        return isoformat_local(value)
+    text = str(value or "").strip()
+    return text or None
+
+
 def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
     text = str(value or "").strip()
     if not text:
@@ -1192,6 +1199,30 @@ class TaskService:
             ],
         }
 
+    @classmethod
+    def _record_task_operation_event(
+        cls,
+        *,
+        task_id: str,
+        project_id: str | None,
+        operation: str,
+        event_type: str,
+        message: str,
+        level: str = "info",
+        payload: dict | None = None,
+    ) -> None:
+        base_payload = {"operation": operation, "request_source": "task_api"}
+        if isinstance(payload, dict):
+            base_payload.update(payload)
+        cls._record_timeline_event(
+            task_id=task_id,
+            project_id=project_id,
+            event_type=event_type,
+            message=message,
+            level=level,
+            payload=base_payload,
+        )
+
     def clear_timeline(self, db: Session, task_id: str) -> int:
         row = self._get_or_404(db, task_id)
         deleted = (
@@ -1199,37 +1230,124 @@ class TaskService:
             .filter(AppSaTaskEvent.task_id == row.task_id)
             .delete(synchronize_session=False)
         )
-        return int(deleted or 0)
+        deleted_count = int(deleted or 0)
+        self._record_task_operation_event(
+            task_id=row.task_id,
+            project_id=row.project_id,
+            operation="clear_timeline",
+            event_type="timeline_cleared",
+            message="任务时间线已清空",
+            level="warning",
+            payload={
+                "deleted_event_count": deleted_count,
+            },
+        )
+        return deleted_count
 
     def delete_timeline_event(self, db: Session, task_id: str, event_id: str) -> int:
         row = self._get_or_404(db, task_id)
+        target = (
+            db.query(AppSaTaskEvent)
+            .filter(AppSaTaskEvent.task_id == row.task_id, AppSaTaskEvent.id == event_id)
+            .first()
+        )
+        if target is None:
+            return 0
         deleted = (
             db.query(AppSaTaskEvent)
             .filter(AppSaTaskEvent.task_id == row.task_id, AppSaTaskEvent.id == event_id)
             .delete(synchronize_session=False)
         )
-        return int(deleted or 0)
+        deleted_count = int(deleted or 0)
+        if deleted_count:
+            self._record_task_operation_event(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                operation="delete_timeline_event",
+                event_type="timeline_event_deleted",
+                message="任务时间线事件已删除",
+                level="warning",
+                payload={
+                    "deleted_event_id": target.id,
+                    "deleted_event_type": target.event_type,
+                    "deleted_event_stage_name": target.stage_name,
+                    "deleted_event_created_at": _safe_isoformat(target.created_at),
+                },
+            )
+        return deleted_count
 
     def repair_task_origin(self, db: Session, task_id: str, analysis_mode: str) -> dict:
         row = self._get_or_404(db, task_id)
+        previous_status = str(row.status or "")
+        previous_mode = str(row.analysis_mode or "").strip() or _infer_analysis_mode(row)
         if row.status in ("pending", "running"):
             from fastapi import HTTPException
+            self._record_task_operation_event(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                operation="repair_task_origin",
+                event_type="task_operation_rejected",
+                message="任务来源修复被拒绝",
+                level="error",
+                payload={
+                    "reason": "task_running",
+                    "status": previous_status,
+                    "before_status": previous_status,
+                    "after_status": previous_status,
+                    "changed": False,
+                },
+            )
             raise HTTPException(400, "任务处于运行态，不能修改来源信息")
         if str(row.task_origin_type or "").strip() not in ("", "manual"):
             from fastapi import HTTPException
+            self._record_task_operation_event(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                operation="repair_task_origin",
+                event_type="task_operation_rejected",
+                message="任务来源修复被拒绝",
+                level="error",
+                payload={
+                    "reason": "unsupported_task_origin_type",
+                    "status": previous_status,
+                    "before_status": previous_status,
+                    "after_status": previous_status,
+                    "changed": False,
+                    "task_origin_type": row.task_origin_type,
+                },
+            )
             raise HTTPException(400, "仅手动任务支持修改来源信息")
 
         normalized_mode = _normalize_analysis_mode(analysis_mode)
+        resolved_config_snapshot_cleared = False
         row.analysis_mode = normalized_mode
         if isinstance(row.task_config_json, dict) and "resolved_config_snapshot" in row.task_config_json:
             row.task_config_json = {
                 k: v for k, v in row.task_config_json.items()
                 if k != "resolved_config_snapshot"
             } or None
-            flag_modified(row, "task_config_json")
+            if hasattr(row, "_sa_instance_state"):
+                flag_modified(row, "task_config_json")
+            resolved_config_snapshot_cleared = True
 
         db.commit()
         db.refresh(row)
+        self._record_task_operation_event(
+            task_id=row.task_id,
+            project_id=row.project_id,
+            operation="repair_task_origin",
+            event_type="task_origin_repaired",
+            message="任务来源信息已修复",
+            payload={
+                "before_status": previous_status,
+                "after_status": str(row.status or ""),
+                "changed": previous_mode != normalized_mode or resolved_config_snapshot_cleared,
+                "previous_analysis_mode": previous_mode,
+                "analysis_mode": normalized_mode,
+                "task_origin_type": row.task_origin_type,
+                "resolved_config_snapshot_cleared": resolved_config_snapshot_cleared,
+            },
+        )
         log_event(
             logger,
             logging.INFO,
@@ -1366,12 +1484,16 @@ class TaskService:
             lease_epoch=0,
         )
         db.add(row); db.commit(); db.refresh(row)
-        self._record_timeline_event(
+        self._record_task_operation_event(
             task_id=task_id,
             project_id=project_id,
+            operation="create_task",
             event_type="task_created",
             message="任务已创建",
             payload={
+                "before_status": None,
+                "after_status": row.status,
+                "changed": True,
                 "analysis_mode": mode,
                 "task_origin_type": row.task_origin_type,
             },
@@ -1384,8 +1506,24 @@ class TaskService:
 
     def restart_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
+        previous_status = str(row.status or "")
         if row.status in ("pending", "running"):
             from fastapi import HTTPException
+            self._record_task_operation_event(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                operation="restart_task",
+                event_type="task_operation_rejected",
+                message="任务重启被拒绝",
+                level="error",
+                payload={
+                    "reason": "task_active",
+                    "status": previous_status,
+                    "before_status": previous_status,
+                    "after_status": previous_status,
+                    "changed": False,
+                },
+            )
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
         row = self._task_repository.restart_task_in_place(db, row)
         row.latest_abnormal_reason_json = None
@@ -1402,12 +1540,18 @@ class TaskService:
                 except Exception as _e:
                     logger.warning("Failed to clean task dir %s: %s", task_root, _e)
         _clear_task_execution_lock(row.output_path, task_id)
-        self._record_timeline_event(
+        self._record_task_operation_event(
             task_id=task_id,
             project_id=row.project_id,
+            operation="restart_task",
             event_type="task_restarted",
             message="任务已重启",
-            payload={"analysis_mode": _infer_analysis_mode(row)},
+            payload={
+                "before_status": previous_status,
+                "after_status": str(row.status or ""),
+                "changed": previous_status != str(row.status or ""),
+                "analysis_mode": _infer_analysis_mode(row),
+            },
         )
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id)
@@ -1417,12 +1561,44 @@ class TaskService:
         """断点续跑：保留已有 workspace 和 .checkpoint/ 目录，系统自动从中断处继续。"""
         from fastapi import HTTPException
         row = self._get_or_404(db, task_id)
+        previous_status = str(row.status or "")
         if row.status in ("pending", "running"):
+            self._record_task_operation_event(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                operation="resume_task",
+                event_type="task_operation_rejected",
+                message="任务续跑被拒绝",
+                level="error",
+                payload={
+                    "reason": "task_active",
+                    "status": previous_status,
+                    "before_status": previous_status,
+                    "after_status": previous_status,
+                    "changed": False,
+                },
+            )
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
         health = _inspect_resume_health(row)
         if not health["can_resume"]:
             missing = health.get("missing_artifacts") or []
             hint = f" 缺失产物: {', '.join(missing[:6])}" if missing else ""
+            self._record_task_operation_event(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                operation="resume_task",
+                event_type="task_operation_rejected",
+                message="任务续跑被拒绝",
+                level="error",
+                payload={
+                    "reason": str(health.get("reason") or "resume_not_allowed"),
+                    "status": previous_status,
+                    "before_status": previous_status,
+                    "after_status": previous_status,
+                    "changed": False,
+                    "missing_artifacts": missing,
+                },
+            )
             raise HTTPException(400, f"断点不可续跑: {health['reason']}。请使用重启（restart）代替续跑。{hint}")
         row = self._task_repository.resume_task_in_place(db, row)
         row.latest_abnormal_reason_json = None
@@ -1431,12 +1607,18 @@ class TaskService:
         db.refresh(row)
         _clear_task_execution_lock(row.output_path, task_id)
         _cleanup_resume_intermediate_files(row.output_path, task_id)
-        self._record_timeline_event(
+        self._record_task_operation_event(
             task_id=task_id,
             project_id=row.project_id,
+            operation="resume_task",
             event_type="task_resumed",
             message="任务已续跑",
-            payload={"analysis_mode": _infer_analysis_mode(row)},
+            payload={
+                "before_status": previous_status,
+                "after_status": str(row.status or ""),
+                "changed": previous_status != str(row.status or ""),
+                "analysis_mode": _infer_analysis_mode(row),
+            },
         )
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id)
@@ -1448,7 +1630,23 @@ class TaskService:
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
+        previous_status = str(row.status or "")
         if row.status in ("passed", "failed", "error", "cancelled"):
+            self._record_task_operation_event(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                operation="cancel_task",
+                event_type="task_cancel_requested_noop",
+                message="任务取消请求未改变状态",
+                level="warning",
+                payload={
+                    "before_status": previous_status,
+                    "after_status": previous_status,
+                    "changed": False,
+                    "reason": "task_already_terminal",
+                    "status": previous_status,
+                },
+            )
             return self._row_to_dict(row)
         at = _running_tasks.get(task_id)
         if at and not at.done():
@@ -1459,13 +1657,19 @@ class TaskService:
         db.commit()
         db.refresh(row)
         _clear_task_execution_lock(row.output_path, task_id)
-        self._record_timeline_event(
+        self._record_task_operation_event(
             task_id=task_id,
             project_id=row.project_id,
+            operation="cancel_task",
             event_type="task_cancelled",
             message="任务已取消",
             level="warning",
-            payload={"status": row.status},
+            payload={
+                "before_status": previous_status,
+                "after_status": str(row.status or ""),
+                "changed": previous_status != str(row.status or ""),
+                "status": row.status,
+            },
         )
         return self._row_to_dict(row)
 
@@ -1668,15 +1872,34 @@ class TaskService:
         import shutil as _shutil
         from fastapi import HTTPException
         row = self._get_or_404(db, task_id)
+        previous_status = str(row.status or "")
+        task_dir = os.path.join(row.output_path, task_id) if row.output_path else ""
+        files_deleted = False
         # 运行中的任务必须先取消，不允许直接删除
         if row.status == "running":
+            self._record_task_operation_event(
+                task_id=row.task_id,
+                project_id=row.project_id,
+                operation="delete_task",
+                event_type="task_operation_rejected",
+                message="任务删除被拒绝",
+                level="error",
+                payload={
+                    "reason": "task_running",
+                    "status": previous_status,
+                    "before_status": previous_status,
+                    "after_status": previous_status,
+                    "changed": False,
+                    "delete_files": delete_files,
+                },
+            )
             raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
         # 删除输出文件
         if delete_files and row.output_path:
-            task_dir = os.path.join(row.output_path, task_id)
             if os.path.isdir(task_dir):
                 try:
                     _shutil.rmtree(task_dir)
+                    files_deleted = True
                     logger.info("delete_task: removed task dir %s", task_dir)
                 except Exception as _e:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
@@ -1684,6 +1907,23 @@ class TaskService:
         row.is_deleted = True
         db.commit()
         _invalidate_slot_summary_cache(row.project_id)
+        self._record_task_operation_event(
+            task_id=row.task_id,
+            project_id=row.project_id,
+            operation="delete_task",
+            event_type="task_deleted",
+            message="任务已删除",
+            level="warning",
+            payload={
+                "before_status": previous_status,
+                "after_status": previous_status,
+                "changed": True,
+                "delete_files": delete_files,
+                "task_dir": task_dir or None,
+                "files_deleted": files_deleted,
+                "status_before_delete": previous_status,
+            },
+        )
 
     async def _execute_task(self, task_id: str) -> None:
         from app.db import get_db
