@@ -39,6 +39,8 @@ class SaWorkerActiveJobSnapshot:
 class SaWorkerSnapshot:
     worker_id: str
     host_name: str
+    pod_name: str | None
+    pod_ip: str | None
     healthy: bool
     max_concurrent_jobs: int
     running_jobs: int
@@ -199,6 +201,8 @@ def _build_base_worker_snapshot(
             SaWorkerSnapshot(
                 worker_id=worker_id,
                 host_name=_parse_host_name(worker_id),
+                pod_name=str((runner or {}).get("pod_name") or "").strip() or None,
+                pod_ip=str((runner or {}).get("pod_ip") or "").strip() or None,
                 healthy=healthy,
                 max_concurrent_jobs=max_concurrent_jobs,
                 running_jobs=occupied_slots,

@@ -82,6 +82,8 @@ class RunnerRegistryService:
                 "capacity": capacity,
                 "running_tasks": self._get_running_tasks_count(),
                 "role": "runner",
+                "pod_name": os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "",
+                "pod_ip": os.environ.get("POD_IP") or "",
                 "heartbeat_ts": now_local().isoformat(),
             }
             row = db.query(AppSaModelsConfig).filter_by(config_key=key).first()
@@ -125,6 +127,8 @@ class RunnerRegistryService:
                     "status": RUNNER_STATUS_ACTIVE,
                     "capacity": max(1, int(payload.get("capacity") or 1)),
                     "running_tasks": max(0, int(payload.get("running_tasks") or 0)),
+                    "pod_name": str(payload.get("pod_name") or "").strip() or None,
+                    "pod_ip": str(payload.get("pod_ip") or "").strip() or None,
                     "updated_at": row.updated_at,
                 }
             )
