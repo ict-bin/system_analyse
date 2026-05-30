@@ -28,6 +28,19 @@ logger = logging.getLogger(__name__)
 
 AGGREGATE_HTTP_PORT = int(os.environ.get("SA_AGENT_AGGREGATE_PORT", os.environ.get("PORT", "3000")))
 AGGREGATE_HTTP_TIMEOUT_SECONDS = float(os.environ.get("SA_AGENT_AGGREGATE_TIMEOUT_SECONDS", "5"))
+AGGREGATE_CACHE_TTL_SECONDS = max(2.0, float(os.environ.get("SA_AGENT_AGGREGATE_CACHE_TTL_SECONDS", "5")))
+_AGENT_AGGREGATE_CACHE: dict[str, dict[str, Any]] = {}
+_LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
+    "partial": False,
+    "sources": 0,
+    "fanout_errors": 0,
+    "duration_seconds": 0.0,
+    "cache_hit": False,
+    "cache_age_seconds": 0.0,
+    "failed_targets": [],
+    "cache_hits": 0,
+    "cache_misses": 0,
+}
 
 
 def _audit_agent_kill_event(
@@ -449,6 +462,15 @@ class AgentObservabilitySummaryResponse(BaseModel):
     orphan_sessions: int = 0
     scanned_at: Optional[float] = None
     scan_errors: int = 0
+    aggregate_mode: Optional[str] = None
+    aggregate_partial: Optional[bool] = None
+    aggregate_sources: Optional[int] = None
+    aggregate_fanout_errors: Optional[int] = None
+    aggregate_duration_seconds: Optional[float] = None
+    aggregate_cache_hit: Optional[bool] = None
+    aggregate_cache_age_seconds: Optional[float] = None
+    aggregate_failed_targets: list[str] = Field(default_factory=list)
+    aggregate_all_sources_failed: Optional[bool] = None
 
 
 class AgentRuntimeAggregateSummaryResponse(BaseModel):
@@ -519,6 +541,14 @@ def _aggregate_base_urls(worker: Any) -> list[str]:
     return targets
 
 
+def _agent_cache_key() -> str:
+    return "cluster"
+
+
+def _invalidate_agent_aggregate_cache() -> None:
+    _AGENT_AGGREGATE_CACHE.clear()
+
+
 async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None]:
     headers = _auth_headers_from_token(token)
     async with httpx.AsyncClient(timeout=AGGREGATE_HTTP_TIMEOUT_SECONDS) as client:
@@ -569,6 +599,25 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
     from app.service.agent_observability import get_agent_observability_service
     from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
 
+    now_ts = time.time()
+    cache_key = _agent_cache_key()
+    cached = _AGENT_AGGREGATE_CACHE.get(cache_key)
+    if cached and (now_ts - float(cached.get("created_at") or 0.0)) <= AGGREGATE_CACHE_TTL_SECONDS:
+        cache_age = now_ts - float(cached.get("created_at") or 0.0)
+        meta = cached.get("meta") or {}
+        _LAST_AGENT_AGGREGATE_META.update({
+            "partial": bool(meta.get("partial")),
+            "sources": int(meta.get("sources") or 0),
+            "fanout_errors": int(meta.get("fanout_errors") or 0),
+            "duration_seconds": float(meta.get("duration_seconds") or 0.0),
+            "cache_hit": True,
+            "cache_age_seconds": cache_age,
+            "failed_targets": list(meta.get("failed_targets") or []),
+            "cache_hits": int(_LAST_AGENT_AGGREGATE_META.get("cache_hits") or 0) + 1,
+        })
+        return cached["snapshot"]
+
+    started = time.perf_counter()
     local = get_agent_observability_service().build_snapshot(db, project_id=None)
     cluster_snapshot = build_worker_slot_cluster_snapshot(db, project_id=None)
     workers = [worker for worker in cluster_snapshot.workers if worker.healthy and (_resolve_worker_targets(pod_ip=worker.pod_ip, pod_name=worker.pod_name))]
@@ -645,19 +694,39 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
         "orphan_sessions": len([item for item in merged_sessions if bool(item.get("orphan_session"))]),
         "scanned_at": time.time(),
         "scan_errors": 0,
+        "aggregate_mode": "fanout",
         "aggregate_partial": partial,
         "aggregate_sources": sources,
         "aggregate_fanout_errors": fanout_errors,
+        "aggregate_duration_seconds": time.perf_counter() - started,
+        "aggregate_cache_hit": False,
+        "aggregate_cache_age_seconds": 0.0,
         "aggregate_failed_targets": failed_targets,
         "aggregate_all_sources_failed": all_sources_failed,
     }
-    return {
+    _LAST_AGENT_AGGREGATE_META.update({
+        "partial": partial,
+        "sources": sources,
+        "fanout_errors": fanout_errors,
+        "duration_seconds": summary["aggregate_duration_seconds"],
+        "cache_hit": False,
+        "cache_age_seconds": 0.0,
+        "failed_targets": failed_targets,
+        "cache_misses": int(_LAST_AGENT_AGGREGATE_META.get("cache_misses") or 0) + 1,
+    })
+    snapshot = {
         "summary": summary,
         "processes": merged_processes,
         "sessions": merged_sessions,
         "tasks": merged_tasks,
         "pods": pod_rows,
     }
+    _AGENT_AGGREGATE_CACHE[cache_key] = {
+        "created_at": now_ts,
+        "snapshot": snapshot,
+        "meta": dict(_LAST_AGENT_AGGREGATE_META),
+    }
+    return snapshot
 
 
 def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1017,11 +1086,15 @@ async def list_agent_aggregate_sessions(
 
 @router.get("/agent-observability/aggregate/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
 async def list_agent_aggregate_tasks(
+    pod: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    return (await _build_agent_aggregate_snapshot(token, db))["tasks"]
+    rows = list((await _build_agent_aggregate_snapshot(token, db))["tasks"])
+    if pod:
+        rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
+    return rows
 
 
 @router.get("/agent-observability/aggregate/pods", response_model=list[AgentPodSnapshotResponse])
@@ -1094,6 +1167,7 @@ async def kill_agent_process(
         task_id=row.get("task_id"),
     )
     result = get_agent_observability_service().kill_process(pid)
+    _invalidate_agent_aggregate_cache()
     return AgentProcessKillResponse(
         requested=1,
         matched=1,
@@ -1140,6 +1214,7 @@ async def kill_all_orphan_processes(
             task_id=row.get("task_id"),
         )
     items = [get_agent_observability_service().kill_process(int(row["pid"])) for row in killable]
+    _invalidate_agent_aggregate_cache()
     succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
     failed = sum(1 for item in items if item.get("status") == "failed")
     return AgentProcessKillResponse(
@@ -1208,6 +1283,7 @@ async def kill_all_agent_aggregate_suspected_orphans(
     succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
     failed = sum(1 for item in items if item.get("status") == "failed")
     skipped = sum(1 for item in items if item.get("status") == "skipped")
+    _invalidate_agent_aggregate_cache()
     return AgentProcessKillResponse(
         requested=len(killable),
         matched=len(killable),
