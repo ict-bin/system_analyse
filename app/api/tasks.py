@@ -28,8 +28,6 @@ logger = logging.getLogger(__name__)
 
 AGGREGATE_HTTP_PORT = int(os.environ.get("SA_AGENT_AGGREGATE_PORT", os.environ.get("PORT", "3000")))
 AGGREGATE_HTTP_TIMEOUT_SECONDS = float(os.environ.get("SA_AGENT_AGGREGATE_TIMEOUT_SECONDS", "5"))
-POD_DNS_SUFFIX = os.environ.get("K8S_POD_DNS_SUFFIX", "pod.cluster.local").strip() or "pod.cluster.local"
-POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "secflow-ns").strip() or "secflow-ns"
 
 
 def _audit_agent_kill_event(
@@ -505,11 +503,8 @@ def _snapshot_query_params() -> dict[str, Any]:
 def _resolve_worker_targets(*, pod_ip: str | None, pod_name: str | None) -> list[str]:
     targets: list[str] = []
     normalized_ip = str(pod_ip or "").strip()
-    normalized_name = str(pod_name or "").strip()
     if normalized_ip:
         targets.append(normalized_ip)
-    if normalized_name:
-        targets.append(f"{normalized_name}.{POD_NAMESPACE}.{POD_DNS_SUFFIX}")
     return targets
 
 

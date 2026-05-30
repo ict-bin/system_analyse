@@ -77,3 +77,8 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
     assert row["kill_allowed"] is True
     assert row["kill_block_reason"] is None
     assert snapshot["summary"]["killable_suspected_orphan_processes"] == 1
+
+
+def test_resolve_worker_targets_prefers_pod_ip_only() -> None:
+    assert tasks_api._resolve_worker_targets(pod_ip="10.0.0.9", pod_name="sa-worker-1") == ["10.0.0.9"]
+    assert tasks_api._resolve_worker_targets(pod_ip=None, pod_name="sa-worker-1") == []
