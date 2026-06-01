@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import or_
+from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -1136,6 +1137,39 @@ class TaskService:
                 .offset((page - 1) * per_page).limit(per_page).all())
         return {"items": [self._row_to_list_item(r) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
+
+    def get_task_stats(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        status: Optional[str] = None,
+        analysis_mode: Optional[str] = None,
+        parent_task_id: Optional[str] = None,
+    ) -> dict:
+        query = db.query(AppSaTask.status, func.count(AppSaTask.id)).filter(
+            AppSaTask.project_id == project_id,
+            AppSaTask.is_deleted.is_(False),
+        )
+        if status:
+            query = query.filter(AppSaTask.status == status)
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        if normalized_parent_task_id:
+            query = query.filter(AppSaTask.parent_task_id == normalized_parent_task_id)
+        requested_mode = _normalize_analysis_mode(analysis_mode) if analysis_mode else None
+        if requested_mode:
+            query = query.filter(AppSaTask.analysis_mode == requested_mode)
+        rows = query.group_by(AppSaTask.status).all()
+        counts = {str(task_status or ""): int(count or 0) for task_status, count in rows}
+        return {
+            "total": sum(counts.values()),
+            "pending": counts.get("pending", 0),
+            "running": counts.get("running", 0),
+            "passed": counts.get("passed", 0),
+            "failed": counts.get("failed", 0),
+            "error": counts.get("error", 0),
+            "cancelled": counts.get("cancelled", 0),
+        }
 
     def get_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)

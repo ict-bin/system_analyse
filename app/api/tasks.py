@@ -317,6 +317,16 @@ class TaskListResponse(BaseModel):
     per_page: int = 100
 
 
+class TaskListStatsResponse(BaseModel):
+    total: int = 0
+    pending: int = 0
+    running: int = 0
+    passed: int = 0
+    failed: int = 0
+    error: int = 0
+    cancelled: int = 0
+
+
 class WorkerActiveJobResponse(BaseModel):
     task_id: str
     task_name: str
@@ -867,6 +877,23 @@ def list_tasks(
         parent_task_id=parent_task_id,
         sort_by=sort_by,
         sort_order=sort_order,
+    )
+
+
+@router.get("/tasks/stats", response_model=TaskListStatsResponse)
+def get_task_stats(
+    project_id: str = Query(...),
+    status: Optional[str] = Query(None),
+    analysis_mode: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    return get_task_service().get_task_stats(
+        db,
+        project_id=project_id,
+        status=status,
+        analysis_mode=analysis_mode,
+        parent_task_id=parent_task_id,
     )
 
 
