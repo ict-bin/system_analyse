@@ -4,7 +4,7 @@ from app.api import tasks as tasks_api
 from app.service import agent_observability
 
 
-def test_build_agent_runtime_aggregate_counts_suspected_orphans() -> None:
+def test_build_agent_runtime_aggregate_counts_unknown_and_residual_processes() -> None:
     snapshot = {
         "summary": {
             "aggregate_partial": True,
@@ -19,12 +19,8 @@ def test_build_agent_runtime_aggregate_counts_suspected_orphans() -> None:
         ],
         "processes": [
             {"pid": 10, "owner_kind": "tracked", "kill_allowed": False},
-            {"pid": 20, "owner_kind": "orphan", "kill_allowed": True},
+            {"pid": 20, "owner_kind": "residual", "kill_allowed": True},
             {"pid": 30, "owner_kind": "unknown", "kill_allowed": True},
-        ],
-        "sessions": [
-            {"session_file": "a", "orphan_session": True},
-            {"session_file": "b", "orphan_session": False},
         ],
         "tasks": [{"task_id": "sat_1"}],
     }
@@ -34,9 +30,9 @@ def test_build_agent_runtime_aggregate_counts_suspected_orphans() -> None:
     assert runtime["summary"]["total_pods"] == 2
     assert runtime["summary"]["healthy_pods"] == 1
     assert runtime["summary"]["total_processes"] == 3
-    assert runtime["summary"]["orphan_processes"] == 1
-    assert runtime["summary"]["suspected_orphan_processes"] == 1
-    assert runtime["summary"]["killable_suspected_orphan_processes"] == 1
+    assert runtime["summary"]["residual_processes"] == 1
+    assert runtime["summary"]["unknown_processes"] == 1
+    assert runtime["summary"]["killable_unknown_processes"] == 1
     assert runtime["summary"]["aggregate_partial"] is True
     assert runtime["summary"]["aggregate_sources"] == 3
     assert runtime["summary"]["aggregate_failed_targets"] == ["sa-worker-2"]
@@ -76,9 +72,48 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
     assert row["owner_kind"] == "unknown"
     assert row["kill_allowed"] is True
     assert row["kill_block_reason"] is None
-    assert snapshot["summary"]["killable_suspected_orphan_processes"] == 1
+    assert snapshot["summary"]["killable_unknown_processes"] == 1
 
 
 def test_resolve_worker_targets_prefers_pod_ip_then_pod_name() -> None:
-    assert tasks_api._resolve_worker_targets(pod_ip="10.0.0.9", pod_name="sa-worker-1") == ["10.0.0.9"]
+    assert tasks_api._resolve_worker_targets(pod_ip="10.0.0.9", pod_name="sa-worker-1") == ["10.0.0.9", "sa-worker-1"]
     assert tasks_api._resolve_worker_targets(pod_ip=None, pod_name="sa-worker-1") == ["sa-worker-1"]
+
+
+def test_aggregate_base_urls_prefers_worker_http_port() -> None:
+    worker = SimpleNamespace(pod_ip="10.0.0.9", pod_name="sa-worker-1", http_port=8080)
+    assert tasks_api._aggregate_base_urls(worker) == [
+        "http://10.0.0.9:8080/api/app/system-analyse",
+        "http://sa-worker-1:8080/api/app/system-analyse",
+    ]
+
+
+def test_build_agent_runtime_aggregate_exposes_failed_target_details() -> None:
+    snapshot = {
+        "summary": {
+            "aggregate_partial": True,
+            "aggregate_sources": 1,
+            "aggregate_fanout_errors": 1,
+            "aggregate_failed_targets": ["sa-worker-2"],
+            "aggregate_failed_target_details": [
+                {
+                    "pod_name": "sa-worker-2",
+                    "pod_ip": "10.0.0.10",
+                    "http_port": 8080,
+                    "attempted_urls": ["http://10.0.0.10:8080/api/app/system-analyse"],
+                    "error_kind": "connection_refused",
+                    "status_code": None,
+                    "message": "connection refused",
+                }
+            ],
+            "aggregate_all_sources_failed": False,
+        },
+        "pods": [],
+        "processes": [],
+        "tasks": [],
+    }
+
+    runtime = tasks_api._build_agent_runtime_aggregate(snapshot)
+
+    assert runtime["summary"]["aggregate_failed_target_details"][0]["http_port"] == 8080
+    assert runtime["summary"]["aggregate_failed_target_details"][0]["error_kind"] == "connection_refused"

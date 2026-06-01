@@ -84,6 +84,7 @@ class RunnerRegistryService:
                 "role": "runner",
                 "pod_name": os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "",
                 "pod_ip": os.environ.get("POD_IP") or "",
+                "http_port": int(os.environ.get("PORT") or 8080),
                 "heartbeat_ts": now_local().isoformat(),
             }
             row = db.query(AppSaModelsConfig).filter_by(config_key=key).first()
@@ -129,6 +130,7 @@ class RunnerRegistryService:
                     "running_tasks": max(0, int(payload.get("running_tasks") or 0)),
                     "pod_name": str(payload.get("pod_name") or "").strip() or None,
                     "pod_ip": str(payload.get("pod_ip") or "").strip() or None,
+                    "http_port": max(1, int(payload.get("http_port") or 8080)),
                     "updated_at": row.updated_at,
                 }
             )

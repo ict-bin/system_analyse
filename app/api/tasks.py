@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import time
 import logging
 import os
+import time
+import asyncio
 from typing import Any, Optional
 
 import httpx
@@ -41,6 +42,7 @@ _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
     "cache_hits": 0,
     "cache_misses": 0,
 }
+AGGREGATE_CONCURRENCY = max(1, int(os.environ.get("SA_AGENT_AGGREGATE_CONCURRENCY", "8")))
 
 
 def _audit_agent_kill_event(
@@ -339,6 +341,7 @@ class WorkerCapacityResponse(BaseModel):
     host_name: str
     pod_name: str | None = None
     pod_ip: str | None = None
+    http_port: int | None = None
     healthy: bool
     max_concurrent_jobs: int
     running_jobs: int = 0
@@ -443,6 +446,7 @@ class AgentObservabilitySummaryResponse(BaseModel):
     aggregate_cache_hit: Optional[bool] = None
     aggregate_cache_age_seconds: Optional[float] = None
     aggregate_failed_targets: list[str] = Field(default_factory=list)
+    aggregate_failed_target_details: list[dict[str, Any]] = Field(default_factory=list)
     aggregate_all_sources_failed: Optional[bool] = None
     total_pods: Optional[int] = None
     healthy_pods: Optional[int] = None
@@ -461,6 +465,7 @@ class AgentRuntimeAggregateSummaryResponse(BaseModel):
     aggregate_sources: int = 0
     aggregate_fanout_errors: int = 0
     aggregate_failed_targets: list[str] = Field(default_factory=list)
+    aggregate_failed_target_details: list[dict[str, Any]] = Field(default_factory=list)
     aggregate_all_sources_failed: bool = False
     scanned_at: Optional[float] = None
 
@@ -507,14 +512,22 @@ def _resolve_worker_targets(*, pod_ip: str | None, pod_name: str | None) -> list
     return targets
 
 
+def _resolve_worker_http_port(worker: Any) -> int:
+    try:
+        return max(1, int(getattr(worker, "http_port", 0) or 8080))
+    except Exception:
+        return 8080
+
+
 def _aggregate_base_urls(worker: Any) -> list[str]:
     targets: list[str] = []
     pod_ip = str(getattr(worker, "pod_ip", "") or "").strip()
     pod_name = str(getattr(worker, "pod_name", "") or "").strip()
+    http_port = _resolve_worker_http_port(worker)
     for host in _resolve_worker_targets(pod_ip=pod_ip, pod_name=pod_name):
         if not host:
             continue
-        targets.append(f"http://{host}:{AGGREGATE_HTTP_PORT}/api/app/system-analyse")
+        targets.append(f"http://{host}:{http_port}/api/app/system-analyse")
     return targets
 
 
@@ -526,7 +539,7 @@ def _invalidate_agent_aggregate_cache() -> None:
     _AGENT_AGGREGATE_CACHE.clear()
 
 
-async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None]:
+async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None, dict[str, Any] | None]:
     headers = _auth_headers_from_token(token)
     async with httpx.AsyncClient(timeout=AGGREGATE_HTTP_TIMEOUT_SECONDS) as client:
         for base_url in urls:
@@ -534,13 +547,22 @@ async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: di
             try:
                 response = await client.get(url, headers=headers, params=params)
                 if response.status_code == 200:
-                    return response.json(), base_url
-            except Exception:
-                continue
-    return None, None
+                    return response.json(), base_url, None
+                logger.warning("system-agent-fanout http_error url=%s status=%s body=%s", url, response.status_code, response.text[:200])
+                return None, None, {"attempted_url": url, "error_kind": "http_error", "status_code": response.status_code, "message": response.text[:200]}
+            except httpx.ConnectTimeout:
+                logger.warning("system-agent-fanout connect_timeout url=%s", url)
+                return None, None, {"attempted_url": url, "error_kind": "connect_timeout", "status_code": None, "message": "connect timeout"}
+            except httpx.ConnectError:
+                logger.warning("system-agent-fanout connection_refused url=%s", url)
+                return None, None, {"attempted_url": url, "error_kind": "connection_refused", "status_code": None, "message": "connection refused"}
+            except Exception as exc:
+                logger.exception("system-agent-fanout transport_error url=%s", url)
+                return None, None, {"attempted_url": url, "error_kind": "transport_error", "status_code": None, "message": str(exc)}
+    return None, None, {"attempted_url": None, "error_kind": "no_target", "status_code": None, "message": "no target responded"}
 
 
-async def _fanout_post_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None]:
+async def _fanout_post_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None, dict[str, Any] | None]:
     headers = _auth_headers_from_token(token)
     async with httpx.AsyncClient(timeout=AGGREGATE_HTTP_TIMEOUT_SECONDS) as client:
         for base_url in urls:
@@ -548,10 +570,36 @@ async def _fanout_post_json(urls: list[str], *, path: str, token: str, params: d
             try:
                 response = await client.post(url, headers=headers, params=params)
                 if response.status_code == 200:
-                    return response.json(), base_url
-            except Exception:
-                continue
-    return None, None
+                    return response.json(), base_url, None
+                logger.warning("system-agent-fanout post_http_error url=%s status=%s body=%s", url, response.status_code, response.text[:200])
+                return None, None, {"attempted_url": url, "error_kind": "http_error", "status_code": response.status_code, "message": response.text[:200]}
+            except httpx.ConnectTimeout:
+                logger.warning("system-agent-fanout post_connect_timeout url=%s", url)
+                return None, None, {"attempted_url": url, "error_kind": "connect_timeout", "status_code": None, "message": "connect timeout"}
+            except httpx.ConnectError:
+                logger.warning("system-agent-fanout post_connection_refused url=%s", url)
+                return None, None, {"attempted_url": url, "error_kind": "connection_refused", "status_code": None, "message": "connection refused"}
+            except Exception as exc:
+                logger.exception("system-agent-fanout post_transport_error url=%s", url)
+                return None, None, {"attempted_url": url, "error_kind": "transport_error", "status_code": None, "message": str(exc)}
+    return None, None, {"attempted_url": None, "error_kind": "no_target", "status_code": None, "message": "no target responded"}
+
+
+def _failed_target_label(worker: Any) -> str:
+    return str(getattr(worker, "pod_name", "") or getattr(worker, "worker_id", "") or "unknown")
+
+
+def _failed_target_detail(worker: Any, urls: list[str], error_detail: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "pod_name": getattr(worker, "pod_name", None),
+        "pod_ip": getattr(worker, "pod_ip", None),
+        "http_port": _resolve_worker_http_port(worker),
+        "attempted_urls": urls,
+        "error_kind": (error_detail or {}).get("error_kind"),
+        "status_code": (error_detail or {}).get("status_code"),
+        "message": (error_detail or {}).get("message"),
+        "attempted_url": (error_detail or {}).get("attempted_url"),
+    }
 
 
 async def _get_agent_observability_snapshot_impl(
@@ -608,22 +656,36 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
     partial = False
     fanout_errors = 0
     failed_targets: list[str] = []
+    failed_target_details: list[dict[str, Any]] = []
     seen_process_keys: set[tuple[str, int]] = set()
     seen_task_keys: set[tuple[str, str]] = set()
     seen_pod_keys: set[str] = set()
 
+    work_items: list[tuple[Any, list[str]]] = []
     for worker in workers:
         urls = _aggregate_base_urls(worker)
         if not urls:
             partial = True
             fanout_errors += 1
-            failed_targets.append(str(worker.worker_id or "unknown"))
+            failed_targets.append(_failed_target_label(worker))
+            failed_target_details.append(_failed_target_detail(worker, urls, {"error_kind": "missing_target", "status_code": None, "message": "worker has no reachable aggregate targets", "attempted_url": None}))
             continue
-        snapshot, _ = await _fanout_get_json(urls, path="/agent-observability/snapshot", token=token, params=_snapshot_query_params())
+        work_items.append((worker, urls))
+
+    semaphore = asyncio.Semaphore(AGGREGATE_CONCURRENCY)
+
+    async def _fetch_worker_snapshot(worker: Any, urls: list[str]) -> tuple[Any, list[str], Any | None, dict[str, Any] | None]:
+        async with semaphore:
+            snapshot, _, error_detail = await _fanout_get_json(urls, path="/agent-observability/snapshot", token=token, params=_snapshot_query_params())
+            return worker, urls, snapshot, error_detail
+
+    snapshot_results = await asyncio.gather(*[_fetch_worker_snapshot(worker, urls) for worker, urls in work_items]) if work_items else []
+    for worker, urls, snapshot, error_detail in snapshot_results:
         if snapshot is None:
             partial = True
             fanout_errors += 1
-            failed_targets.append(str(worker.worker_id or "unknown"))
+            failed_targets.append(_failed_target_label(worker))
+            failed_target_details.append(_failed_target_detail(worker, urls, error_detail))
             continue
         sources += 1
         for item in snapshot.get("processes") or []:
@@ -673,6 +735,7 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
         "aggregate_cache_hit": False,
         "aggregate_cache_age_seconds": 0.0,
         "aggregate_failed_targets": failed_targets,
+        "aggregate_failed_target_details": failed_target_details,
         "aggregate_all_sources_failed": all_sources_failed,
         "total_pods": total_target_pods,
         "healthy_pods": total_healthy_pods,
@@ -685,6 +748,7 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
         "cache_hit": False,
         "cache_age_seconds": 0.0,
         "failed_targets": failed_targets,
+        "failed_target_details": failed_target_details,
         "cache_misses": int(_LAST_AGENT_AGGREGATE_META.get("cache_misses") or 0) + 1,
     })
     snapshot = {
@@ -720,6 +784,7 @@ def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
             "aggregate_sources": int(summary.get("aggregate_sources") or 0),
             "aggregate_fanout_errors": int(summary.get("aggregate_fanout_errors") or 0),
             "aggregate_failed_targets": list(summary.get("aggregate_failed_targets") or []),
+            "aggregate_failed_target_details": list(summary.get("aggregate_failed_target_details") or []),
             "aggregate_all_sources_failed": bool(summary.get("aggregate_all_sources_failed")),
             "scanned_at": summary.get("scanned_at"),
         },
@@ -844,6 +909,7 @@ def get_worker_cluster_capacity(
                 host_name=worker.host_name,
                 pod_name=worker.pod_name,
                 pod_ip=worker.pod_ip,
+                http_port=worker.http_port,
                 healthy=worker.healthy,
                 max_concurrent_jobs=worker.max_concurrent_jobs,
                 running_jobs=worker.running_jobs,
@@ -1180,14 +1246,19 @@ async def kill_all_agent_aggregate_suspected_orphans(
         if target_worker is None:
             items.append({"pid": int(row.get("pid") or 0), "pgid": row.get("pgid"), "status": "failed", "reason": "target pod not found in cluster snapshot"})
             continue
-        result, _ = await _fanout_post_json(
+        result, _, error_detail = await _fanout_post_json(
             _aggregate_base_urls(target_worker),
             path=f"/agent-observability/processes/{int(row.get('pid') or 0)}/kill",
             token=token,
             params={},
         )
         if not result:
-            items.append({"pid": int(row.get("pid") or 0), "pgid": row.get("pgid"), "status": "failed", "reason": "fanout kill request failed"})
+            items.append({
+                "pid": int(row.get("pid") or 0),
+                "pgid": row.get("pgid"),
+                "status": "failed",
+                "reason": (error_detail or {}).get("message") or "fanout kill request failed",
+            })
             continue
         for item in result.get("items") or []:
             items.append(item)
