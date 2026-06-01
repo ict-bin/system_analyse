@@ -46,7 +46,7 @@ from .config import (
     build_task_config, get_service_yaml, load_service_config,
 )
 from .logging_utils import configure_container_logging, log_event
-from .metrics import normalize_http_route, observe_http_request as observe_metrics_request, observe_http_request_inflight, render_metrics
+from .metrics import normalize_http_route, observe_http_request as observe_metrics_request, observe_http_request_inflight, render_metrics, render_summary_metrics
 from .metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
@@ -80,7 +80,7 @@ def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
 
 
 def _metrics_rows():
-    return parse_prometheus_metrics(render_metrics())
+    return parse_prometheus_metrics(render_summary_metrics())
 
 
 def _is_api_role() -> bool:
