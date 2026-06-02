@@ -1,4 +1,8 @@
 from types import SimpleNamespace
+import importlib
+import os
+import sys
+import types
 
 from app.api import tasks as tasks_api
 from app.service import agent_observability
@@ -117,3 +121,26 @@ def test_build_agent_runtime_aggregate_exposes_failed_target_details() -> None:
 
     assert runtime["summary"]["aggregate_failed_target_details"][0]["http_port"] == 8080
     assert runtime["summary"]["aggregate_failed_target_details"][0]["error_kind"] == "connection_refused"
+
+
+def test_internal_observability_router_exposes_snapshot_path() -> None:
+    paths = {route.path for route in tasks_api.internal_observability_router.routes}
+    assert "/api/app/system-analyse/agent-observability/snapshot" in paths
+
+
+def test_runner_role_includes_internal_observability_router(monkeypatch) -> None:
+    monkeypatch.setenv("SECFLOW_SYSTEM_ANALYSE_ROLE", "runner")
+    fake_sse = types.ModuleType("sse_starlette")
+    fake_sse_sse = types.ModuleType("sse_starlette.sse")
+    fake_sse_sse.EventSourceResponse = object
+    monkeypatch.setitem(sys.modules, "sse_starlette", fake_sse)
+    monkeypatch.setitem(sys.modules, "sse_starlette.sse", fake_sse_sse)
+    import app.server as server_module
+
+    reloaded = importlib.reload(server_module)
+    try:
+        paths = {route.path for route in reloaded.app.routes}
+        assert "/api/app/system-analyse/agent-observability/snapshot" in paths
+    finally:
+        monkeypatch.delenv("SECFLOW_SYSTEM_ANALYSE_ROLE", raising=False)
+        importlib.reload(reloaded)

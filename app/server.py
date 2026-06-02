@@ -173,6 +173,14 @@ _tasks: dict[str, TaskEntry] = {}
 app = FastAPI(title="system_analyse", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+try:
+    if _is_runner_role():
+        from .api.tasks import internal_observability_router as runner_internal_router
+
+        app.include_router(runner_internal_router)
+except Exception:
+    logger.exception("failed to include runner internal observability router")
+
 
 @app.middleware("http")
 async def collect_request_metrics(request, call_next):
