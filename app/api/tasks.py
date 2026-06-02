@@ -557,6 +557,7 @@ def _agent_cache_key() -> str:
 
 def _invalidate_agent_aggregate_cache() -> None:
     _AGENT_AGGREGATE_CACHE.clear()
+    _AGENT_AGGREGATE_SUMMARY_CACHE.clear()
 
 
 async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None, dict[str, Any] | None]:
@@ -1257,8 +1258,7 @@ async def get_agent_aggregate_observability_summary(
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    snapshot = await _build_agent_aggregate_snapshot(token, db)
-    return snapshot["summary"]
+    return await _build_agent_aggregate_summary(token, db)
 
 
 @router.get("/agent-observability/aggregate/processes", response_model=list[AgentProcessSnapshotResponse])
