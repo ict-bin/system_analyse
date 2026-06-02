@@ -50,6 +50,7 @@ from .metrics import normalize_http_route, observe_http_request as observe_metri
 from .metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
+from .probe_server import ThreadedProbeServer
 from .service.service_role import is_api_role as _is_api_service_role
 from .service.service_role import is_dispatcher_role as _is_dispatcher_service_role
 from .service.service_role import is_runner_role as _is_runner_service_role
@@ -65,6 +66,9 @@ CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 _SUMMARY_CACHE_TTL_SECONDS = 5.0
 _summary_cache: dict[str, tuple[float, Any]] = {}
 _summary_cache_lock = Lock()
+_probe_server: ThreadedProbeServer | None = None
+_probe_shutdown = False
+_probe_started_at = 0.0
 
 
 def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
@@ -146,12 +150,18 @@ def _should_run_db_migrations() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- startup ---
+    global _probe_shutdown, _probe_started_at
+    _probe_shutdown = False
+    _probe_started_at = _time.time()
+    _ensure_probe_server_started()
     await get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
 
     yield
 
     # --- shutdown ---
+    _probe_shutdown = True
     await get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).stop()
+    _stop_probe_server()
 
 
 # ─── Application ──────────────────────────────────────────────────────────────
@@ -214,13 +224,12 @@ def _get_svc_config():
 
 
 def _health_status() -> dict:
-    from .db import ping_db
     from .service.task_service import get_worker_runtime_health
 
     role = _service_role()
     bootstrap = get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).status()
     worker_health = get_worker_runtime_health()
-    db_ok = ping_db()
+    db_ok = bool(bootstrap.get("db_ready"))
     worker_claim_paused = bool(
         worker_health.get("worker_pause_claim_until_ts")
         and float(worker_health["worker_pause_claim_until_ts"]) > _time.time()
@@ -249,6 +258,68 @@ def _health_status() -> dict:
     }
 
 
+def _probe_payload() -> dict[str, object]:
+    base = _health_status()
+    role = str(base.get("role") or _service_role())
+    ready_ok = bool(base.get("status") == "ok")
+    db_ok = bool(base.get("db_ok"))
+    payload = {
+        **base,
+        **build_service_meta(),
+        "service": "secflow-app-system-analyse",
+        "role": role,
+        "started_at": _probe_started_at or None,
+        "updated_at": _time.time(),
+        "shutting_down": _probe_shutdown,
+        "startup_phase": base.get("bootstrap_phase") or "booting",
+        "last_error": base.get("bootstrap_error"),
+        "reason": None if ready_ok else (base.get("bootstrap_error") or ("worker loop stale" if not bool(base.get("worker_ok")) else "bootstrap not ready")),
+        "liveness_ok": not _probe_shutdown,
+        "readiness_ok": ready_ok and not _probe_shutdown,
+        "checks": {
+            "bootstrap": {
+                "db_ready": bool(base.get("bootstrap_db_ready")),
+                "ready": bool(base.get("bootstrap_ready")),
+                "attempts": int(base.get("bootstrap_attempts") or 0),
+            },
+            "database": {
+                "ok": db_ok,
+            },
+            "worker_loop": {
+                "ok": bool(base.get("worker_ok")),
+                "claim_paused": bool(base.get("worker_claim_paused")),
+                "fresh": bool(base.get("worker_loop_fresh", True)),
+            },
+        },
+    }
+    if role == "api":
+        payload["checks"]["worker_loop"]["ok"] = True
+    return payload
+
+
+def _ensure_probe_server_started() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        _probe_server.start()
+        return
+    port = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_PROBE_PORT", "18080"))
+    _probe_server = ThreadedProbeServer(
+        host="0.0.0.0",
+        port=port,
+        payload_provider=_probe_payload,
+        health_paths=("/health", "/livez", "/api/app/system-analyse/health", "/api/app/system-analyse/livez"),
+        ready_paths=("/ready", "/readyz", "/api/app/system-analyse/ready", "/api/app/system-analyse/readyz"),
+    )
+    _probe_server.start()
+
+
+def _stop_probe_server() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        _probe_server.stop()
+        _probe_server = None
+
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 class AnalyseRequest(BaseModel):
@@ -260,13 +331,10 @@ class AnalyseRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/app/system-analyse/health")
 async def health():
-    base = _health_status()
-    return {
-        **base,
-        **build_service_meta(),
-        "active": sum(1 for t in _tasks.values() if t.result is None),
-        "completed": sum(1 for t in _tasks.values() if t.result is not None),
-    }
+    payload = _probe_payload()
+    payload["active"] = sum(1 for t in _tasks.values() if t.result is None)
+    payload["completed"] = sum(1 for t in _tasks.values() if t.result is not None)
+    return payload
 
 
 @app.get("/metrics")
@@ -305,19 +373,20 @@ async def metrics_ai_summary():
 @app.get("/livez")
 @app.get("/api/app/system-analyse/livez")
 async def livez():
-    return {
-        "status": "ok",
-        "role": _service_role(),
-    }
+    payload = _probe_payload()
+    payload["status"] = "ok" if payload["liveness_ok"] else "degraded"
+    return payload
 
 
 @app.get("/readyz")
 @app.get("/api/app/system-analyse/readyz")
+@app.get("/ready")
+@app.get("/api/app/system-analyse/ready")
 async def readyz():
     from fastapi import HTTPException
 
-    payload = _health_status()
-    if payload["status"] != "ok":
+    payload = _probe_payload()
+    if not payload["readiness_ok"]:
         raise HTTPException(status_code=503, detail=payload)
     return payload
 
