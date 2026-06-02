@@ -3,9 +3,11 @@ import importlib
 import os
 import sys
 import types
+from unittest.mock import patch
 
 from app.api import tasks as tasks_api
 from app.service import agent_observability
+from app.service import runner_registry_service
 
 
 def test_build_agent_runtime_aggregate_counts_unknown_and_residual_processes() -> None:
@@ -144,3 +146,53 @@ def test_runner_role_includes_internal_observability_router(monkeypatch) -> None
     finally:
         monkeypatch.delenv("SECFLOW_SYSTEM_ANALYSE_ROLE", raising=False)
         importlib.reload(reloaded)
+
+
+def test_runner_registry_prefers_sa_pod_ip(monkeypatch) -> None:
+    monkeypatch.setattr(runner_registry_service, "POD_NAME", "sa-runner-1")
+    monkeypatch.setattr(runner_registry_service, "POD_IP", "10.0.0.9")
+
+    class _Query:
+        def filter_by(self, **kwargs):
+            del kwargs
+            return self
+
+        def first(self):
+            return None
+
+    class _Db:
+        def __init__(self):
+            self.added = []
+            self.committed = False
+
+        def query(self, model):
+            del model
+            return _Query()
+
+        def add(self, row):
+            self.added.append(row)
+
+        def commit(self):
+            self.committed = True
+
+    db = _Db()
+
+    def _db_gen():
+        yield db
+
+    service = runner_registry_service.RunnerRegistryService(
+        get_db=_db_gen,
+        get_running_tasks_count=lambda: 2,
+    )
+
+    with patch.object(runner_registry_service, "_get_worker_task_concurrency_from_db", return_value=4), patch(
+        "app.service.worker_slot_snapshot.invalidate_worker_slot_summary_cache",
+        return_value=None,
+    ):
+        service._heartbeat_once()
+
+    assert db.committed is True
+    assert len(db.added) == 1
+    payload = db.added[0].config_json
+    assert payload["pod_name"] == "sa-runner-1"
+    assert payload["pod_ip"] == "10.0.0.9"

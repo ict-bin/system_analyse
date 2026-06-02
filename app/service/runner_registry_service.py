@@ -27,6 +27,8 @@ RUNNER_STALE_TIMEOUT_SECONDS = max(
 )
 RUNNER_STATUS_ACTIVE = "active"
 RUNNER_STATUS_DRAINING = "draining"
+POD_NAME = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or ""
+POD_IP = os.environ.get("SA_POD_IP") or os.environ.get("POD_IP") or ""
 
 
 def runner_registry_key(instance_id: str) -> str:
@@ -82,8 +84,8 @@ class RunnerRegistryService:
                 "capacity": capacity,
                 "running_tasks": self._get_running_tasks_count(),
                 "role": "runner",
-                "pod_name": os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "",
-                "pod_ip": os.environ.get("POD_IP") or "",
+                "pod_name": POD_NAME,
+                "pod_ip": POD_IP,
                 "http_port": int(os.environ.get("PORT") or 8080),
                 "heartbeat_ts": now_local().isoformat(),
             }
