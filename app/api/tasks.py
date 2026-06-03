@@ -348,7 +348,7 @@ class TaskListResponse(BaseModel):
     items: list[TaskListItemResponse] = Field(default_factory=list)
     total: int = 0
     page: int = 1
-    per_page: int = 100
+    per_page: int = 50
 
 
 class TaskListStatsResponse(BaseModel):
@@ -1035,7 +1035,7 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
 def list_tasks(
     project_id: str = Query(...),
     page: int = Query(1, ge=1),
-    per_page: int = Query(100, ge=1, le=1000),
+    per_page: int = Query(50, ge=10, le=1000),
     status: Optional[str] = Query(None),
     analysis_mode: Optional[str] = Query(None),
     parent_task_id: Optional[str] = Query(None),

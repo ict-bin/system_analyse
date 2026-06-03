@@ -1112,7 +1112,7 @@ class TaskService:
 
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
-                   per_page: int = 100, status: Optional[str] = None,
+                   per_page: int = 50, status: Optional[str] = None,
                    analysis_mode: Optional[str] = None,
                    parent_task_id: Optional[str] = None,
                    sort_by: str = "created_at",
