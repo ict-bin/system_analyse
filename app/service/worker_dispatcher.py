@@ -154,9 +154,17 @@ class WorkerDispatcher:
         self._get_running_tasks_count = get_running_tasks_count
         self._load_runtime_control = load_runtime_control
         self._task_repository = task_repository
+        self._agent_observability = None
         self._running = False
         self._task: asyncio.Task | None = None
         self._idle_sleep_seconds = WORKER_POLL_INTERVAL_SECONDS
+
+    def _get_agent_observability(self):
+        if self._agent_observability is None:
+            from app.service.agent_observability import AgentObservabilityService
+
+            self._agent_observability = AgentObservabilityService()
+        return self._agent_observability
 
     @staticmethod
     def _resolve_worker_task_concurrency(db: Session | None = None) -> int:
@@ -229,7 +237,16 @@ class WorkerDispatcher:
                 _runtime_state.last_orphan_pi_sweep_ts <= 0.0
                 or (now_ts - _runtime_state.last_orphan_pi_sweep_ts) >= ORPHAN_PI_SWEEP_INTERVAL_SECONDS
             ):
-                cleanup_orphan_pi_processes(logger.warning, label="sa_worker_dispatcher")
+                cleanup_orphan_pi_processes(
+                    logger.warning,
+                    label="sa_worker_dispatcher",
+                    orphan_verifier=lambda pid, ppid, pgid: self._verify_orphan_process_candidate(
+                        db,
+                        pid=pid,
+                        ppid=ppid,
+                        pgid=pgid,
+                    ),
+                )
                 _runtime_state.last_orphan_pi_sweep_ts = now_ts
             available_slots = max(0, current_concurrency - self._get_running_tasks_count())
             if available_slots <= 0:
@@ -291,12 +308,62 @@ class WorkerDispatcher:
             and (now_ts - _runtime_state.last_stale_recovery_ts) < WORKER_STALE_SWEEP_INTERVAL_SECONDS
         ):
             return
+        stale_snapshot = self._get_agent_observability().build_snapshot(db, project_id=None)
+        processes_by_task_id = {
+            str(item.get("task_id") or ""): item
+            for item in stale_snapshot.get("processes", [])
+            if str(item.get("task_id") or "").strip()
+        }
+
+        def _should_recover(stale: AppSaTask) -> bool:
+            linked = processes_by_task_id.get(str(stale.task_id))
+            runtime_evidence = linked.get("runtime_evidence") if isinstance(linked, dict) and isinstance(linked.get("runtime_evidence"), dict) else {}
+            owner_kind = str((linked or {}).get("owner_kind") or "")
+            if owner_kind in {"tracked", "lease_drifted_active"} or bool(runtime_evidence.get("live_runtime_evidence")):
+                if owner_kind == "lease_drifted_active":
+                    repaired = self._task_repository.repair_task_runtime_binding(
+                        db,
+                        task_id=stale.task_id,
+                        worker_instance_id=WORKER_INSTANCE_ID,
+                        lease_deadline=lease_deadline,
+                    )
+                    self._record_timeline_event(
+                        task_id=stale.task_id,
+                        project_id=stale.project_id,
+                        event_type="task_runtime_binding_repaired" if repaired else "task_runtime_binding_repair_requested",
+                        message="检测到租约漂移但运行证据仍在，已尝试修补任务绑定",
+                        level="warning",
+                        payload={
+                            "dispatcher_instance_id": getattr(stale, "dispatcher_instance_id", None),
+                            "repair_target_instance_id": WORKER_INSTANCE_ID,
+                            "lease_epoch": int(getattr(stale, "lease_epoch", 0) or 0),
+                            "owner_kind": owner_kind,
+                            "repaired": repaired,
+                        },
+                    )
+                self._record_timeline_event(
+                    task_id=stale.task_id,
+                    project_id=stale.project_id,
+                    event_type="task_lease_drift_preserved_due_to_runtime_evidence",
+                    message="任务租约漂移，但本地仍检测到智能体运行证据，暂不回收",
+                    level="warning",
+                    payload={
+                        "dispatcher_instance_id": getattr(stale, "dispatcher_instance_id", None),
+                        "lease_epoch": int(getattr(stale, "lease_epoch", 0) or 0),
+                        "owner_kind": owner_kind or "lease_drifted_active",
+                        "runtime_evidence": runtime_evidence,
+                    },
+                )
+                return False
+            return True
+
         recovered_rows = self._task_repository.recover_stale_running_tasks(
             db,
             now=now,
             lease_timeout_seconds=TASK_LEASE_TIMEOUT_SECONDS,
             clear_task_execution_lock=self._clear_task_execution_lock,
             cleanup_resume_files=self._cleanup_resume_files,
+            should_recover=_should_recover,
         )
         for stale in recovered_rows:
             self._record_timeline_event(
@@ -313,6 +380,16 @@ class WorkerDispatcher:
                 },
             )
         _runtime_state.last_stale_recovery_ts = now_ts
+
+    def _verify_orphan_process_candidate(self, db: Session, *, pid: int, ppid: int | None, pgid: int | None) -> tuple[bool, str | None]:
+        del ppid, pgid
+        snapshot = self._get_agent_observability().build_snapshot(db, project_id=None)
+        row = next((item for item in snapshot.get("processes", []) if int(item.get("pid") or 0) == int(pid)), None)
+        if not row:
+            return False, "process_snapshot_missing"
+        if bool(row.get("kill_allowed")) and str(row.get("owner_kind") or "") == "residual":
+            return True, str(row.get("kill_eligibility_reason") or "residual_confirmed")
+        return False, str(row.get("kill_eligibility_reason") or row.get("owner_reason") or "runtime_evidence_present")
 
     def _claim_pending_tasks(self, db: Session, available_slots: int, current_concurrency: int) -> int:
         pending_rows = self._task_repository.list_pending_tasks(db, available_slots)

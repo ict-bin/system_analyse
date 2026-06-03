@@ -299,6 +299,14 @@ def get_worker_runtime_health() -> dict:
     return _get_dispatcher_runtime_health(len(_running_tasks))
 
 
+def get_runtime_tracking_snapshot() -> dict[str, int]:
+    return {
+        str(task_id): int(epoch)
+        for task_id, epoch in list(_running_task_epochs.items())
+        if str(task_id).strip()
+    }
+
+
 def get_worker_runtime_settings() -> dict:
     configured_concurrency = WORKER_TASK_CONCURRENCY
     try:

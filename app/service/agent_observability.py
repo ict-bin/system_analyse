@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 from datetime import datetime
+from datetime import timedelta
+import json
 import os
 import pathlib
 import shlex
@@ -13,13 +15,24 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.db.models import AppSaTask
+from app.service.agent_runtime_registry import build_runtime_registration_key, get_agent_runtime_snapshot
 from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
+from app.service.event_log import events_path, read_events
+from app.service.session_index import build_session_catalog
 
 POD_NAME = (
     os.environ.get("SA_POD_NAME")
     or os.environ.get("POD_NAME")
     or os.environ.get("HOSTNAME")
     or "system-analyse-pod"
+)
+_RUNTIME_ACTIVITY_STALE_SECONDS = max(
+    30,
+    int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_RUNTIME_ACTIVITY_STALE_SECONDS", "120")),
+)
+_ORPHAN_PROTECTION_SECONDS = max(
+    60,
+    int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ORPHAN_PROTECTION_SECONDS", "120")),
 )
 
 _SESSION_ARG_KEYS = {
@@ -59,11 +72,18 @@ class SaAgentProcessSnapshot:
     task_name: str | None
     task_status: str | None
     stage_key: str | None
+    stage_group: str | None
+    family_key: str | None
+    parallel_group: str | None
     role_kind: str | None
     owner_kind: str
     owner_reason: str
+    runtime_evidence: dict[str, Any]
+    lease_state: str | None
+    last_runtime_activity_at: str | None
     kill_allowed: bool
     kill_block_reason: str | None
+    kill_eligibility_reason: str | None
     termination_state: str
 
 
@@ -184,6 +204,7 @@ def _iter_agent_processes() -> list[dict[str, Any]]:
             "runtime_kind": runtime_kind,
             "session_arg_path": _extract_session_arg_path(command),
             "open_paths": _collect_open_paths(proc_dir),
+            "started_at_ts": getattr(proc_dir.stat(), "st_ctime", None),
         })
     return rows
 
@@ -246,6 +267,168 @@ def _task_sort_key(row: AppSaTask) -> tuple[int, float]:
     return status_rank, updated_ts
 
 
+def _path_mtime(path_value: str | None) -> datetime | None:
+    normalized = _normalize_path(path_value)
+    if not normalized:
+        return None
+    try:
+        return datetime.fromtimestamp(pathlib.Path(normalized).stat().st_mtime)
+    except Exception:
+        return None
+
+
+def _read_execution_lock_payload(task_root: str | None) -> dict[str, Any] | None:
+    if not task_root:
+        return None
+    lock_path = pathlib.Path(task_root) / ".task_execution.lock"
+    if not lock_path.exists():
+        return None
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _safe_iso(value: datetime | None) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _session_descriptor_map(task_row: AppSaTask) -> dict[str, dict[str, Any]]:
+    if not task_row.output_path or not task_row.task_id:
+        return {}
+    sessions_root = pathlib.Path(task_row.output_path) / task_row.task_id / "run" / "sessions"
+    run_root = pathlib.Path(task_row.output_path) / task_row.task_id / "run"
+    if not sessions_root.is_dir() or not run_root.is_dir():
+        return {}
+    try:
+        catalog = build_session_catalog(
+            task_id=task_row.task_id,
+            row_status=str(task_row.status or ""),
+            sessions_root=sessions_root,
+            run_root=run_root,
+            parse_session_jsonl_file=lambda path: _parse_session_jsonl_file(path),
+            write_json_atomic=None,
+        )
+    except Exception:
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for node in (catalog.get("index") or {}).get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        relative_path = str(node.get("relative_path") or "").strip()
+        if not relative_path:
+            continue
+        result[str((sessions_root / relative_path).resolve(strict=False))] = node
+    return result
+
+
+def _parse_session_jsonl_file(path: pathlib.Path) -> tuple[dict, list[dict], list[str], int]:
+    warnings: list[str] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as exc:
+        return {}, [], [str(exc)], 0
+    session_meta: dict[str, Any] = {}
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        raw = str(line or "").strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") == "session" and not session_meta:
+            session_meta = dict(payload)
+        events.append(payload)
+    return session_meta, events, warnings, len(lines)
+
+
+def build_agent_runtime_evidence(
+    *,
+    proc: dict[str, Any] | None,
+    task_row: AppSaTask | None,
+    workspace_root: str | None,
+    now: datetime | None = None,
+    running_task_registered: bool = False,
+    running_task_epoch: int | None = None,
+) -> dict[str, Any]:
+    checked_at = now or datetime.now()
+    process_alive = bool(proc)
+    runtime_kind = str((proc or {}).get("runtime_kind") or "").strip() or None
+    session_path = _normalize_path((proc or {}).get("session_arg_path"))
+    runtime_registry = get_agent_runtime_snapshot()
+    runtime_key = build_runtime_registration_key(
+        session_file=session_path,
+        cwd=str((proc or {}).get("cwd") or ""),
+        command=str((proc or {}).get("command") or ""),
+    )
+    runtime_registration = runtime_registry.get(runtime_key or "")
+    session_activity_at = _path_mtime(session_path)
+    events_activity_at = None
+    execution_lock_present = False
+    execution_lock_matches = False
+    task_root = None
+    if task_row is not None and task_row.output_path and task_row.task_id:
+        task_root = str(pathlib.Path(task_row.output_path) / task_row.task_id)
+        events_file = events_path(task_row.output_path, task_row.task_id)
+        if events_file is not None and events_file.exists():
+            events_activity_at = _path_mtime(str(events_file))
+        lock_payload = _read_execution_lock_payload(task_root)
+        if lock_payload:
+            execution_lock_present = True
+            execution_lock_matches = (
+                str(lock_payload.get("worker_instance_id") or "").strip() == str(getattr(task_row, "dispatcher_instance_id", "") or "").strip()
+                and int(lock_payload.get("lease_epoch") or 0) == int(getattr(task_row, "lease_epoch", 0) or 0)
+            )
+    activity_candidates = [item for item in [session_activity_at, events_activity_at] if item is not None]
+    last_runtime_activity_at = max(activity_candidates) if activity_candidates else None
+    recent_runtime_activity = bool(
+        last_runtime_activity_at
+        and (checked_at - last_runtime_activity_at) <= timedelta(seconds=_RUNTIME_ACTIVITY_STALE_SECONDS)
+    )
+    live_runtime_evidence = bool(
+        process_alive
+        and (
+            recent_runtime_activity
+            or execution_lock_matches
+            or running_task_registered
+            or runtime_registration is not None
+        )
+    )
+    no_runtime_evidence = not any(
+        (
+            process_alive,
+            recent_runtime_activity,
+            execution_lock_present,
+            running_task_registered,
+            runtime_registration is not None,
+        )
+    )
+    return {
+        "checked_at": _safe_iso(checked_at),
+        "process_alive": process_alive,
+        "runtime_kind": runtime_kind,
+        "session_activity_at": _safe_iso(session_activity_at),
+        "events_activity_at": _safe_iso(events_activity_at),
+        "last_runtime_activity_at": _safe_iso(last_runtime_activity_at),
+        "recent_runtime_activity": recent_runtime_activity,
+        "execution_lock_present": execution_lock_present,
+        "execution_lock_matches": execution_lock_matches,
+        "running_task_registered": running_task_registered,
+        "running_task_epoch": running_task_epoch,
+        "runtime_registration": dict(runtime_registration) if isinstance(runtime_registration, dict) else None,
+        "workspace_root": workspace_root,
+        "task_root": task_root,
+        "live_runtime_evidence": live_runtime_evidence,
+        "no_runtime_evidence": no_runtime_evidence,
+        "orphan_protection_seconds": _ORPHAN_PROTECTION_SECONDS,
+    }
+
+
 def _match_task(proc: dict[str, Any], task_rows: list[AppSaTask], task_roots_by_id: dict[str, list[str]]) -> tuple[str | None, str | None, str | None]:
     matches: list[tuple[tuple[int, int, int, float], str, str, str]] = []
 
@@ -278,12 +461,19 @@ def _match_task(proc: dict[str, Any], task_rows: list[AppSaTask], task_roots_by_
 
 class AgentObservabilityService:
     def build_snapshot(self, db: Session, *, project_id: str | None = None) -> dict[str, Any]:
+        from app.service.task_service import get_runtime_tracking_snapshot
+
         query = db.query(AppSaTask).filter(AppSaTask.is_deleted.is_(False))
         if project_id:
             query = query.filter(AppSaTask.project_id == project_id)
         task_rows = query.all()
         task_by_id = {row.task_id: row for row in task_rows}
         task_roots_by_id = {row.task_id: _task_roots(row) for row in task_rows}
+        session_descriptors_by_task_id = {
+            row.task_id: _session_descriptor_map(row)
+            for row in task_rows
+        }
+        runtime_tracking = get_runtime_tracking_snapshot()
         cluster_snapshot = build_worker_slot_cluster_snapshot(db, project_id=project_id)
 
         processes: list[dict[str, Any]] = []
@@ -293,21 +483,61 @@ class AgentObservabilityService:
             task_name = task_row.task_name if task_row is not None else None
             task_status = str(task_row.status or "") if task_row is not None else None
             role_kind = _extract_role_kind(str(proc.get("command") or ""))
-            if task_row is not None and str(task_status or "").strip() == "running":
+            runtime_registered = task_id in runtime_tracking
+            runtime_epoch = runtime_tracking.get(task_id)
+            runtime_evidence = build_agent_runtime_evidence(
+                proc=proc,
+                task_row=task_row,
+                workspace_root=workspace_root,
+                now=datetime.now(),
+                running_task_registered=runtime_registered,
+                running_task_epoch=runtime_epoch,
+            )
+            session_descriptor = session_descriptors_by_task_id.get(task_id or "", {}).get(
+                _normalize_path(proc.get("session_arg_path")) or ""
+            )
+            lease_state = None
+            if task_row is not None:
+                if str(task_row.status or "").strip() == "running":
+                    lease_state = "running"
+                elif task_row.lease_expires_at is not None:
+                    lease_state = "expired"
+                else:
+                    lease_state = "released"
+            started_at_ts = proc.get("started_at_ts")
+            process_age_seconds: int | None = None
+            try:
+                if started_at_ts is not None:
+                    process_age_seconds = max(0, int(time.time() - float(started_at_ts)))
+            except Exception:
+                process_age_seconds = None
+            if task_row is not None and str(task_status or "").strip() == "running" and runtime_evidence["live_runtime_evidence"]:
                 owner_kind = "tracked"
-                owner_reason = "running_task_matched"
+                owner_reason = "running_task_with_runtime_evidence"
                 kill_allowed = False
                 kill_block_reason = "进程归属于运行中任务"
+                kill_eligibility_reason = "runtime_evidence_present"
+            elif task_row is not None and runtime_evidence["live_runtime_evidence"]:
+                owner_kind = "lease_drifted_active"
+                owner_reason = "lease_drift_but_runtime_evidence_present"
+                kill_allowed = False
+                kill_block_reason = "任务租约漂移但进程仍有真实运行证据"
+                kill_eligibility_reason = "runtime_evidence_present"
             elif task_row is not None:
                 owner_kind = "residual"
-                owner_reason = "non_running_task_residual"
-                kill_allowed = True
-                kill_block_reason = None
+                owner_reason = "matched_task_without_runtime_evidence"
+                kill_allowed = bool(
+                    process_age_seconds is not None
+                    and process_age_seconds >= _ORPHAN_PROTECTION_SECONDS
+                )
+                kill_block_reason = None if kill_allowed else "残留进程仍在保护窗口内"
+                kill_eligibility_reason = "no_runtime_evidence_confirmed" if kill_allowed else "orphan_protection_window"
             else:
                 owner_kind = "unknown"
-                owner_reason = "unmatched_process"
-                kill_allowed = True
-                kill_block_reason = None
+                owner_reason = "unmatched_process_without_runtime_evidence"
+                kill_allowed = False
+                kill_block_reason = "未匹配任务归属，默认不自动终止"
+                kill_eligibility_reason = "unknown_owner"
             processes.append(
                 SaAgentProcessSnapshot(
                     pod_name=POD_NAME,
@@ -325,12 +555,19 @@ class AgentObservabilityService:
                     task_id=task_id,
                     task_name=task_name,
                     task_status=task_status,
-                    stage_key=None,
-                    role_kind=role_kind,
+                    stage_key=str((session_descriptor or {}).get("stage_key") or "") or None,
+                    stage_group=str((session_descriptor or {}).get("stage_group") or "") or None,
+                    family_key=str((session_descriptor or {}).get("family_key") or "") or None,
+                    parallel_group=str((session_descriptor or {}).get("parallel_group") or "") or None,
+                    role_kind=str((session_descriptor or {}).get("role") or role_kind or "") or None,
                     owner_kind=owner_kind,
                     owner_reason=owner_reason,
+                    runtime_evidence=runtime_evidence,
+                    lease_state=lease_state,
+                    last_runtime_activity_at=runtime_evidence.get("last_runtime_activity_at"),
                     kill_allowed=kill_allowed,
                     kill_block_reason=kill_block_reason,
+                    kill_eligibility_reason=kill_eligibility_reason,
                     termination_state="running",
                 ).__dict__
             )
@@ -349,7 +586,13 @@ class AgentObservabilityService:
                 "process_count": len(linked_processes),
                 "agent_roles": sorted({str(item.get("role_kind") or "") for item in linked_processes if item.get("role_kind")}),
                 "process_pids": [int(item["pid"]) for item in linked_processes],
-                "ownership_status": "tracked" if str(row.status or "").strip() == "running" else "residual",
+                "ownership_status": (
+                    "tracked"
+                    if any(str(item.get("owner_kind") or "") == "tracked" for item in linked_processes)
+                    else "lease_drifted_active"
+                    if any(str(item.get("owner_kind") or "") == "lease_drifted_active" for item in linked_processes)
+                    else "residual"
+                ),
             })
 
         tracked_process_count = len([item for item in processes if item.get("owner_kind") == "tracked"])

@@ -29,6 +29,11 @@ from typing import Callable, Optional
 
 from .agent_process import AgentProcessHandle, find_pi_command
 from .models import TokenUsage
+from .service.agent_runtime_registry import (
+    register_agent_runtime,
+    touch_agent_runtime,
+    unregister_agent_runtime,
+)
 
 logger = logging.getLogger("sa.runner")
 
@@ -837,6 +842,7 @@ async def _run_with_api_retry(
 
     while True:
         result = AgentResult()
+        registered_session_file: str | None = None
 
         # ── 拉起子进程（OSError 由外层 catch）──
         handle = await AgentProcessHandle.spawn(
@@ -850,6 +856,15 @@ async def _run_with_api_retry(
             label="system-agent",
         )
         proc = handle.proc
+        if session_file:
+            register_agent_runtime(
+                session_file=session_file,
+                cwd=cwd,
+                pid=int(proc.pid),
+                command=" ".join(args),
+                runtime_kind="pi",
+            )
+            registered_session_file = session_file
 
         cancel_task = None
         if cancel_event:
@@ -919,6 +934,7 @@ async def _run_with_api_retry(
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
+                    touch_agent_runtime(session_file=session_file, cwd=cwd, command=" ".join(args))
                     ended = _process_line(
                         line.decode("utf-8", errors="replace"), result, on_stream
                     )
@@ -1008,6 +1024,8 @@ async def _run_with_api_retry(
             await handle.terminate_tree(reason=f"read_exception:{type(e).__name__}")
 
         finally:
+            if registered_session_file:
+                unregister_agent_runtime(session_file=registered_session_file, cwd=cwd, command=" ".join(args))
             if cancel_task:
                 cancel_task.cancel()
                 try:

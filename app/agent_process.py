@@ -84,6 +84,7 @@ def cleanup_orphan_pi_processes(
     logger: Callable[[str], None],
     *,
     label: str,
+    orphan_verifier: Callable[[int, int | None, int | None], tuple[bool, str | None]] | None = None,
 ) -> int:
     if not _pid1_is_reaper_process():
         return 0
@@ -120,6 +121,17 @@ def cleanup_orphan_pi_processes(
             )
         except Exception:
             pgid = None
+        if orphan_verifier is not None:
+            try:
+                kill_allowed, reason = orphan_verifier(pid, ppid, pgid)
+            except Exception:
+                kill_allowed, reason = False, "orphan_verifier_failed"
+            if not kill_allowed:
+                logger(
+                    f"skip suspected orphan pi process [{label}] pid={pid} "
+                    f"pgid={pgid if pgid is not None else 'unknown'} reason={reason or 'runtime_evidence_present'}"
+                )
+                continue
         logger(
             f"cleaning orphan pi process [{label}] pid={pid} pgid={pgid if pgid is not None else 'unknown'}"
         )

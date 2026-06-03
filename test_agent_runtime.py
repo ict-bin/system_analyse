@@ -76,9 +76,142 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
     assert len(snapshot["processes"]) == 1
     row = snapshot["processes"][0]
     assert row["owner_kind"] == "unknown"
-    assert row["kill_allowed"] is True
-    assert row["kill_block_reason"] is None
-    assert snapshot["summary"]["killable_unknown_processes"] == 1
+    assert row["kill_allowed"] is False
+    assert row["kill_block_reason"]
+    assert snapshot["summary"]["killable_unknown_processes"] == 0
+
+
+def test_agent_snapshot_marks_non_running_task_with_runtime_evidence_as_lease_drifted_active(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 4321,
+        "ppid": 1,
+        "pgid": 4321,
+        "command": "node /usr/bin/pi --session /tmp/ws/task-1/session.jsonl",
+        "cwd": "/tmp/ws/task-1",
+        "rss_bytes": 2048,
+        "runtime_kind": "pi",
+        "session_arg_path": "/tmp/ws/task-1/session.jsonl",
+        "open_paths": [],
+        "started_at_ts": 1,
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "build_worker_slot_cluster_snapshot",
+        lambda _db, project_id=None: SimpleNamespace(workers=[]),
+    )
+    monkeypatch.setattr(agent_observability, "_path_mtime", lambda _path: agent_observability.datetime.now())
+
+    row = SimpleNamespace(
+        task_id="task-1",
+        task_name="Task 1",
+        status="pending",
+        project_id="p1",
+        output_path="/tmp/ws",
+        input_path="/tmp/ws/task-1",
+        dispatcher_instance_id="sa-worker",
+        lease_epoch=3,
+        lease_expires_at=None,
+        updated_at=None,
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [row]
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    monkeypatch.setattr(
+        sys.modules["app.service.task_service"],
+        "get_runtime_tracking_snapshot",
+        lambda: {"task-1": 3},
+    )
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    process = snapshot["processes"][0]
+    assert process["owner_kind"] == "lease_drifted_active"
+    assert process["kill_allowed"] is False
+    assert process["owner_reason"] == "lease_drift_but_runtime_evidence_present"
+
+
+def test_agent_snapshot_uses_session_descriptor_for_subagent_metadata(monkeypatch) -> None:
+    session_path = "/tmp/ws/task-1/run/sessions/analyse/mod-a.jsonl"
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 4321,
+        "ppid": 1,
+        "pgid": 4321,
+        "command": f"node /usr/bin/pi --session {session_path}",
+        "cwd": "/tmp/ws/task-1/run",
+        "rss_bytes": 2048,
+        "runtime_kind": "pi",
+        "session_arg_path": session_path,
+        "open_paths": [],
+        "started_at_ts": 1,
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "build_worker_slot_cluster_snapshot",
+        lambda _db, project_id=None: SimpleNamespace(workers=[]),
+    )
+    monkeypatch.setattr(agent_observability, "_path_mtime", lambda _path: agent_observability.datetime.now())
+    monkeypatch.setattr(
+        agent_observability,
+        "_session_descriptor_map",
+        lambda _row: {
+            session_path: {
+                "stage_key": "analyse",
+                "stage_group": "analyse",
+                "family_key": "analyse::mod-a",
+                "parallel_group": "analyse::mod-a::a1",
+                "role": "sub_worker",
+            }
+        },
+    )
+
+    row = SimpleNamespace(
+        task_id="task-1",
+        task_name="Task 1",
+        status="running",
+        project_id="p1",
+        output_path="/tmp/ws",
+        input_path="/tmp/ws/task-1",
+        dispatcher_instance_id="sa-worker",
+        lease_epoch=3,
+        lease_expires_at=None,
+        updated_at=None,
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [row]
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    monkeypatch.setattr(
+        sys.modules["app.service.task_service"],
+        "get_runtime_tracking_snapshot",
+        lambda: {"task-1": 3},
+    )
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+    process = snapshot["processes"][0]
+    assert process["owner_kind"] == "tracked"
+    assert process["role_kind"] == "sub_worker"
+    assert process["stage_key"] == "analyse"
+    assert process["stage_group"] == "analyse"
+    assert process["family_key"] == "analyse::mod-a"
+    assert process["parallel_group"] == "analyse::mod-a::a1"
 
 
 def test_resolve_worker_targets_prefers_pod_ip_then_pod_name() -> None:

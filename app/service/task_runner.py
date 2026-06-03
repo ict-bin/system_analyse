@@ -21,6 +21,7 @@ from app.service.task_repository import TaskRepository
 from app.service.worker_dispatcher import WORKER_INSTANCE_ID, lease_deadline
 
 logger = logging.getLogger("sa.task_runner")
+LEASE_HEARTBEAT_FAILURE_TOLERANCE = 3
 
 
 @dataclass
@@ -444,6 +445,7 @@ class TaskRunner:
     async def _supervise_running_task(self, task_id: str, lease_epoch: int, orch: Orchestrator) -> None:
         loop_interval = max(1.0, min(self._settings.task_cancel_poll_interval_seconds, self._settings.task_lease_heartbeat_seconds))
         last_heartbeat_ts = 0.0
+        heartbeat_failures = 0
         while True:
             await asyncio.sleep(loop_interval)
             db_gen = self._deps.get_db()
@@ -466,8 +468,36 @@ class TaskRunner:
                         lease_deadline=lease_deadline,
                     )
                     if not updated:
-                        orch.stop()
-                        return
+                        heartbeat_failures += 1
+                        self._deps.record_timeline_event(
+                            task_id=task_id,
+                            project_id=getattr(row, "project_id", None),
+                            event_type="task_lease_heartbeat_degraded",
+                            message="任务租约续租失败，进入降级观察",
+                            level="warning",
+                            payload={
+                                "lease_epoch": lease_epoch,
+                                "dispatcher_instance_id": WORKER_INSTANCE_ID,
+                                "heartbeat_failures": heartbeat_failures,
+                            },
+                        )
+                        if heartbeat_failures >= LEASE_HEARTBEAT_FAILURE_TOLERANCE:
+                            self._deps.record_timeline_event(
+                                task_id=task_id,
+                                project_id=getattr(row, "project_id", None),
+                                event_type="task_lease_lost_stop_requested",
+                                message="任务租约连续续租失败，停止当前执行",
+                                level="warning",
+                                payload={
+                                    "lease_epoch": lease_epoch,
+                                    "dispatcher_instance_id": WORKER_INSTANCE_ID,
+                                    "heartbeat_failures": heartbeat_failures,
+                                },
+                            )
+                            orch.stop()
+                            return
+                        continue
+                    heartbeat_failures = 0
                     last_heartbeat_ts = now_ts
             finally:
                 try:

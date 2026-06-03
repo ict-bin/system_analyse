@@ -235,6 +235,7 @@ class TaskRepository:
         lease_timeout_seconds: int,
         clear_task_execution_lock: Callable[[str | None, str], None],
         cleanup_resume_files: Callable[[str | None, str], None],
+        should_recover: Callable[[AppSaTask], bool] | None = None,
     ) -> list[AppSaTask]:
         stale_rows = db.query(AppSaTask).filter(
             AppSaTask.is_deleted.is_(False),
@@ -248,7 +249,10 @@ class TaskRepository:
                 ),
             ),
         ).all()
+        recovered_rows: list[AppSaTask] = []
         for stale in stale_rows:
+            if should_recover is not None and not should_recover(stale):
+                continue
             stale.status = "pending"
             stale.error = "任务租约过期，已重新排队"
             stale.dispatcher_instance_id = None
@@ -257,11 +261,12 @@ class TaskRepository:
             stale.finished_at = None
             clear_task_execution_lock(stale.output_path, stale.task_id)
             cleanup_resume_files(stale.output_path, stale.task_id)
-        if stale_rows:
+            recovered_rows.append(stale)
+        if recovered_rows:
             db.commit()
-            for project_id in {str(row.project_id or "").strip() or None for row in stale_rows}:
+            for project_id in {str(row.project_id or "").strip() or None for row in recovered_rows}:
                 _invalidate_slot_summary_for_project(project_id)
-        return stale_rows
+        return recovered_rows
 
     @staticmethod
     def claim_task_lease(
@@ -359,6 +364,31 @@ class TaskRepository:
         row_project_id = db.query(AppSaTask.project_id).filter(AppSaTask.task_id == task_id).scalar()
         _invalidate_slot_summary_for_project(str(row_project_id or "").strip() or None)
         return bool(updated)
+
+    @staticmethod
+    def repair_task_runtime_binding(
+        db: Session,
+        *,
+        task_id: str,
+        worker_instance_id: str,
+        lease_deadline: Callable[[], datetime],
+    ) -> bool:
+        row = db.query(AppSaTask).filter(
+            AppSaTask.task_id == task_id,
+            AppSaTask.is_deleted.is_(False),
+        ).first()
+        if row is None:
+            db.rollback()
+            return False
+        row.status = "running"
+        row.dispatcher_instance_id = worker_instance_id
+        row.dispatch_started_at = now_local()
+        row.lease_expires_at = lease_deadline()
+        if int(row.lease_epoch or 0) <= 0:
+            row.lease_epoch = 1
+        db.commit()
+        _invalidate_slot_summary_for_project(str(row.project_id or "").strip() or None)
+        return True
 
     @staticmethod
     @staticmethod

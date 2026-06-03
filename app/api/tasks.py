@@ -436,11 +436,18 @@ class AgentProcessSnapshotResponse(BaseModel):
     task_name: Optional[str] = None
     task_status: Optional[str] = None
     stage_key: Optional[str] = None
+    stage_group: Optional[str] = None
+    parallel_group: Optional[str] = None
+    family_key: Optional[str] = None
     role_kind: Optional[str] = None
     owner_kind: str
     owner_reason: str
+    runtime_evidence: dict[str, Any] = Field(default_factory=dict)
+    lease_state: Optional[str] = None
+    last_runtime_activity_at: Optional[str] = None
     kill_allowed: bool = False
     kill_block_reason: Optional[str] = None
+    kill_eligibility_reason: Optional[str] = None
     termination_state: str
 
 
@@ -526,6 +533,12 @@ class AgentProcessKillItemResponse(BaseModel):
     pgid: Optional[int] = None
     status: str
     reason: Optional[str] = None
+    task_id: Optional[str] = None
+    owner_kind: Optional[str] = None
+    stage_group: Optional[str] = None
+    parallel_group: Optional[str] = None
+    family_key: Optional[str] = None
+    kill_eligibility_reason: Optional[str] = None
 
 
 class AgentProcessKillResponse(BaseModel):
@@ -1390,7 +1403,18 @@ async def kill_agent_process(
             succeeded=0,
             failed=0,
             skipped=1,
-            items=[AgentProcessKillItemResponse(pid=pid, pgid=row.get("pgid"), status="skipped", reason=row.get("kill_block_reason"))],
+            items=[AgentProcessKillItemResponse(
+                pid=pid,
+                pgid=row.get("pgid"),
+                status="skipped",
+                reason=row.get("kill_block_reason"),
+                task_id=row.get("task_id"),
+                owner_kind=row.get("owner_kind"),
+                stage_group=row.get("stage_group"),
+                parallel_group=row.get("parallel_group"),
+                family_key=row.get("family_key"),
+                kill_eligibility_reason=row.get("kill_eligibility_reason"),
+            )],
         )
     logger.warning(
         "system-agent-manual-kill operator=%s project_id=%s pid=%s pgid=%s task_id=%s workspace_root=%s owner_reason=%s",
@@ -1426,7 +1450,15 @@ async def kill_agent_process(
         succeeded=1 if result.get("status") in {"killed", "gone"} else 0,
         failed=1 if result.get("status") == "failed" else 0,
         skipped=0,
-        items=[AgentProcessKillItemResponse(**result)],
+        items=[AgentProcessKillItemResponse(
+            **result,
+            task_id=row.get("task_id"),
+            owner_kind=row.get("owner_kind"),
+            stage_group=row.get("stage_group"),
+            parallel_group=row.get("parallel_group"),
+            family_key=row.get("family_key"),
+            kill_eligibility_reason=row.get("kill_eligibility_reason"),
+        )],
     )
 
 
@@ -1440,7 +1472,12 @@ async def kill_all_orphan_processes(
     from app.service.agent_observability import get_agent_observability_service
 
     snapshot = get_agent_observability_service().build_snapshot(db, project_id=None)
-    killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "residual" and row.get("kill_allowed")]
+    killable = [
+        row for row in snapshot["processes"]
+        if row.get("owner_kind") == "residual"
+        and row.get("kill_allowed")
+        and str(row.get("kill_eligibility_reason") or "") == "no_runtime_evidence_confirmed"
+    ]
     logger.warning(
         "system-agent-bulk-kill operator=%s project_id=%s count=%s pids=%s",
         user.get("username") or user.get("name") or "unknown",
@@ -1465,7 +1502,18 @@ async def kill_all_orphan_processes(
             },
             task_id=row.get("task_id"),
         )
-    items = [get_agent_observability_service().kill_process(int(row["pid"])) for row in killable]
+    items = [
+        {
+            **get_agent_observability_service().kill_process(int(row["pid"])),
+            "task_id": row.get("task_id"),
+            "owner_kind": row.get("owner_kind"),
+            "stage_group": row.get("stage_group"),
+            "parallel_group": row.get("parallel_group"),
+            "family_key": row.get("family_key"),
+            "kill_eligibility_reason": row.get("kill_eligibility_reason"),
+        }
+        for row in killable
+    ]
     _invalidate_agent_aggregate_cache()
     succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
     failed = sum(1 for item in items if item.get("status") == "failed")
@@ -1483,20 +1531,29 @@ async def kill_all_orphan_processes(
 async def kill_all_agent_aggregate_suspected_orphans(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
+    force: bool = Query(False),
 ):
     user, token = user_and_token
     ensure_admin_user(user)
     snapshot = await _build_agent_aggregate_snapshot(token, db)
-    killable = [row for row in snapshot["processes"] if row.get("owner_kind") == "unknown" and row.get("kill_allowed")]
+    killable = []
+    if force:
+        killable = [
+            row for row in snapshot["processes"]
+            if row.get("owner_kind") == "residual"
+            and row.get("kill_allowed")
+            and str(row.get("kill_eligibility_reason") or "") == "no_runtime_evidence_confirmed"
+        ]
     cluster_snapshot = build_worker_slot_cluster_detail(db, project_id=None)
     worker_by_pod = {str(worker.pod_name or ""): worker for worker in cluster_snapshot.workers}
     items: list[dict[str, Any]] = []
 
     logger.warning(
-        "system-agent-aggregate-bulk-kill-suspected operator=%s project_id=%s count=%s",
+        "system-agent-aggregate-bulk-kill-suspected operator=%s project_id=%s count=%s force=%s",
         user.get("username") or user.get("name") or "unknown",
         None,
         len(killable),
+        force,
     )
     for row in killable:
         _audit_agent_kill_event(
@@ -1532,6 +1589,12 @@ async def kill_all_agent_aggregate_suspected_orphans(
                 "pgid": row.get("pgid"),
                 "status": "failed",
                 "reason": (error_detail or {}).get("message") or "fanout kill request failed",
+                "task_id": row.get("task_id"),
+                "owner_kind": row.get("owner_kind"),
+                "stage_group": row.get("stage_group"),
+                "parallel_group": row.get("parallel_group"),
+                "family_key": row.get("family_key"),
+                "kill_eligibility_reason": row.get("kill_eligibility_reason"),
             })
             continue
         for item in result.get("items") or []:
