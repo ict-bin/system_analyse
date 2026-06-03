@@ -34,6 +34,7 @@ _ORPHAN_PROTECTION_SECONDS = max(
     60,
     int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ORPHAN_PROTECTION_SECONDS", "120")),
 )
+_RUNNING_TASK_STATUSES = {"running", "pending", "queued", "dispatching"}
 
 _SESSION_ARG_KEYS = {
     "--session",
@@ -514,11 +515,11 @@ class AgentObservabilityService:
                     process_age_seconds = max(0, int(time.time() - float(started_at_ts)))
             except Exception:
                 process_age_seconds = None
-            if task_row is not None and str(task_status or "").strip() == "running" and runtime_evidence["live_runtime_evidence"]:
+            if task_row is not None and str(task_status or "").strip() in _RUNNING_TASK_STATUSES and runtime_evidence["live_runtime_evidence"]:
                 owner_kind = "tracked"
-                owner_reason = "running_task_with_runtime_evidence"
+                owner_reason = "active_task_with_runtime_evidence"
                 kill_allowed = False
-                kill_block_reason = "进程归属于运行中任务"
+                kill_block_reason = "进程归属于活动任务"
                 kill_eligibility_reason = "runtime_evidence_present"
             elif task_row is not None and runtime_evidence["live_runtime_evidence"]:
                 owner_kind = "lease_drifted_active"
