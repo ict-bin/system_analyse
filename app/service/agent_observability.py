@@ -474,7 +474,10 @@ class AgentObservabilityService:
             for row in task_rows
         }
         runtime_tracking = get_runtime_tracking_snapshot()
-        cluster_snapshot = build_worker_slot_cluster_snapshot(db, project_id=project_id)
+        try:
+            build_worker_slot_cluster_snapshot(db, project_id=project_id)
+        except Exception:
+            pass
 
         processes: list[dict[str, Any]] = []
         for proc in _iter_agent_processes():
