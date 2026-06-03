@@ -11,6 +11,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -46,6 +47,29 @@ _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
     "cache_misses": 0,
 }
 AGGREGATE_CONCURRENCY = max(1, int(os.environ.get("SA_AGENT_AGGREGATE_CONCURRENCY", "8")))
+
+
+def _log_list_api_failure(
+    *,
+    endpoint: str,
+    project_id: str | None,
+    started: float,
+    exc: Exception,
+) -> None:
+    duration_seconds = time.perf_counter() - started
+    is_db_pool_timeout = isinstance(exc, SATimeoutError)
+    logger.warning(
+        "system-analysis list api failed",
+        extra={
+            "endpoint": endpoint,
+            "project_id": project_id,
+            "exception_type": type(exc).__name__,
+            "is_db_pool_timeout": is_db_pool_timeout,
+            "error_code": "db_pool_timeout" if is_db_pool_timeout else "unhandled_list_api_error",
+            "duration_seconds": round(duration_seconds, 3),
+        },
+        exc_info=exc,
+    )
 
 
 def _summary_with_meta(summary: dict[str, Any], *, cache_hit: bool, cache_age_seconds: float = 0.0) -> dict[str, Any]:
@@ -1019,17 +1043,22 @@ def list_tasks(
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
 ):
-    return get_task_service().list_tasks(
-        db,
-        project_id=project_id,
-        page=page,
-        per_page=per_page,
-        status=status,
-        analysis_mode=analysis_mode,
-        parent_task_id=parent_task_id,
-        sort_by=sort_by,
-        sort_order=sort_order,
-    )
+    started = time.perf_counter()
+    try:
+        return get_task_service().list_tasks(
+            db,
+            project_id=project_id,
+            page=page,
+            per_page=per_page,
+            status=status,
+            analysis_mode=analysis_mode,
+            parent_task_id=parent_task_id,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+    except Exception as exc:
+        _log_list_api_failure(endpoint="/tasks", project_id=project_id, started=started, exc=exc)
+        raise
 
 
 @router.get("/tasks/stats", response_model=TaskListStatsResponse)
@@ -1040,13 +1069,18 @@ def get_task_stats(
     parent_task_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    return get_task_service().get_task_stats(
-        db,
-        project_id=project_id,
-        status=status,
-        analysis_mode=analysis_mode,
-        parent_task_id=parent_task_id,
-    )
+    started = time.perf_counter()
+    try:
+        return get_task_service().get_task_stats(
+            db,
+            project_id=project_id,
+            status=status,
+            analysis_mode=analysis_mode,
+            parent_task_id=parent_task_id,
+        )
+    except Exception as exc:
+        _log_list_api_failure(endpoint="/tasks/stats", project_id=project_id, started=started, exc=exc)
+        raise
 
 
 @router.get("/workers/cluster-capacity/summary", response_model=WorkerClusterCapacitySummaryResponse)
@@ -1054,17 +1088,27 @@ def get_worker_cluster_capacity_summary(
     project_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    snapshot = build_worker_slot_cluster_summary(db, project_id=project_id)
-    return WorkerClusterCapacitySummaryResponse(
-        worker_count=snapshot.worker_count,
-        healthy_workers=snapshot.healthy_workers,
-        stale_workers=snapshot.stale_workers,
-        total_capacity=snapshot.total_capacity,
-        busy_slots=snapshot.busy_slots,
-        available_slots=snapshot.available_slots,
-        queued_jobs=snapshot.queued_jobs,
-        updated_at=isoformat_local(snapshot.updated_at),
-    )
+    started = time.perf_counter()
+    try:
+        snapshot = build_worker_slot_cluster_summary(db, project_id=project_id)
+        return WorkerClusterCapacitySummaryResponse(
+            worker_count=snapshot.worker_count,
+            healthy_workers=snapshot.healthy_workers,
+            stale_workers=snapshot.stale_workers,
+            total_capacity=snapshot.total_capacity,
+            busy_slots=snapshot.busy_slots,
+            available_slots=snapshot.available_slots,
+            queued_jobs=snapshot.queued_jobs,
+            updated_at=isoformat_local(snapshot.updated_at),
+        )
+    except Exception as exc:
+        _log_list_api_failure(
+            endpoint="/workers/cluster-capacity/summary",
+            project_id=project_id,
+            started=started,
+            exc=exc,
+        )
+        raise
 
 
 @router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
