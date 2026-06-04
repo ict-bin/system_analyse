@@ -461,7 +461,29 @@ def _match_task(proc: dict[str, Any], task_rows: list[AppSaTask], task_roots_by_
 
 
 class AgentObservabilityService:
+    def build_snapshot_for_processes(self, processes_source: list[dict[str, Any]]) -> dict[str, Any]:
+        from app.db import get_db
+
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            return self._build_snapshot_from_processes(db, processes_source)
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
     def build_snapshot(self, db: Session, *, project_id: str | None = None) -> dict[str, Any]:
+        return self._build_snapshot_from_processes(db, list(_iter_agent_processes()), project_id=project_id)
+
+    def _build_snapshot_from_processes(
+        self,
+        db: Session,
+        processes_source: list[dict[str, Any]],
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
         from app.service.task_service import get_runtime_tracking_snapshot
 
         query = db.query(AppSaTask).filter(AppSaTask.is_deleted.is_(False))
@@ -481,7 +503,7 @@ class AgentObservabilityService:
             pass
 
         processes: list[dict[str, Any]] = []
-        for proc in _iter_agent_processes():
+        for proc in processes_source:
             task_id, match_source, workspace_root = _match_task(proc, task_rows, task_roots_by_id)
             task_row = task_by_id.get(task_id or "")
             task_name = task_row.task_name if task_row is not None else None

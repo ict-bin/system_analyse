@@ -17,6 +17,7 @@ from app.logging_utils import log_event
 from app.models import SwarmEvent
 from app.orchestrator import Orchestrator
 from app.service.event_log import append_events, write_final, events_path
+from app.service.agent_cleanup import AgentCleanupService
 from app.service.task_repository import TaskRepository
 from app.service.worker_dispatcher import WORKER_INSTANCE_ID, lease_deadline
 
@@ -39,6 +40,7 @@ class TaskRunnerDependencies:
     remove_running_task: Callable[[str], None]
     record_timeline_event: Callable[..., None]
     task_repository: TaskRepository
+    merge_result_json: Callable[[dict | None, dict | None], dict | None]
 
 
 @dataclass
@@ -54,6 +56,7 @@ class TaskRunner:
     def __init__(self, *, deps: TaskRunnerDependencies, settings: TaskRunnerSettings) -> None:
         self._deps = deps
         self._settings = settings
+        self._agent_cleanup = AgentCleanupService()
 
     async def execute_task(self, task_id: str, lease_epoch: int) -> None:
         event_buffer: list[dict] = []
@@ -62,6 +65,7 @@ class TaskRunner:
         last_stage_flush_count = 0
         emitted_stage_states: set[tuple[str, str]] = set()
         task_snapshot = None
+        pre_cleanup_report: dict | None = None
         # events_file 在 _prepare_task_execution 返回后才可知，先用 None
         events_file: Path | None = None
 
@@ -173,7 +177,10 @@ class TaskRunner:
                 last_stage_flush_count = len(event_buffer)
 
         try:
+            pre_cleanup_report = self._run_agent_cleanup(task_id=task_id, project_id=None, phase="pre_task")
             task_snapshot, cfg = self._prepare_task_execution(task_id, lease_epoch, on_event)
+            if pre_cleanup_report is not None:
+                pre_cleanup_report["project_id"] = task_snapshot.project_id
             output_path_for_lock = task_snapshot.output_path
             self._deps.record_timeline_event(
                 task_id=task_id,
@@ -225,10 +232,67 @@ class TaskRunner:
                 task_id=task_id,
                 error=str(exc),
             )
-            self._persist_task_error(task_id, lease_epoch, event_buffer, exc, events_file)
+            self._persist_task_error(task_id, lease_epoch, event_buffer, exc, events_file, pre_cleanup_report=pre_cleanup_report)
         finally:
+            post_project_id = getattr(task_snapshot, "project_id", None) if task_snapshot is not None else None
+            post_cleanup_report = self._run_agent_cleanup(task_id=task_id, project_id=post_project_id, phase="post_task")
+            self._attach_cleanup_report(task_id=task_id, pre_cleanup_report=pre_cleanup_report, post_cleanup_report=post_cleanup_report)
             self._deps.remove_running_task(task_id)
             self._deps.clear_task_execution_lock(output_path_for_lock, task_id)
+
+    def _run_agent_cleanup(self, *, task_id: str, project_id: str | None, phase: str) -> dict[str, object]:
+        self._deps.record_timeline_event(
+            task_id=task_id,
+            project_id=project_id,
+            event_type="agent_cleanup_started",
+            message="任务启动前智能体清理开始" if phase == "pre_task" else "任务结束后智能体清理开始",
+            level="info",
+            payload={"cleanup_phase": phase, "runner_instance_id": WORKER_INSTANCE_ID},
+        )
+        report = self._agent_cleanup.run_cleanup(phase=phase)
+        event_type = "agent_cleanup_failed" if bool(report.get("cleanup_failed")) else "agent_cleanup_completed"
+        self._deps.record_timeline_event(
+            task_id=task_id,
+            project_id=project_id,
+            event_type=event_type,
+            message=(
+                "任务启动前智能体清理失败，任务继续执行"
+                if phase == "pre_task" and bool(report.get("cleanup_failed"))
+                else "任务启动前智能体清理完成"
+                if phase == "pre_task"
+                else "任务结束后智能体清理失败"
+                if bool(report.get("cleanup_failed"))
+                else "任务结束后智能体清理完成"
+            ),
+            level=str(report.get("level") or "info"),
+            payload=report,
+        )
+        return report
+
+    def _attach_cleanup_report(
+        self,
+        *,
+        task_id: str,
+        pre_cleanup_report: dict | None,
+        post_cleanup_report: dict | None,
+    ) -> None:
+        db_gen = self._deps.get_db()
+        db: Session = next(db_gen)
+        try:
+            row = self._deps.task_repository.get_task(db, task_id)
+            if row is None:
+                return
+            cleanup_payload = {
+                "pre": pre_cleanup_report,
+                "post": post_cleanup_report,
+            }
+            row.result_json = self._deps.merge_result_json(row.result_json, {"agent_cleanup": cleanup_payload})
+            db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
 
     def _prepare_task_execution(self, task_id: str, lease_epoch: int, on_event: Callable[[SwarmEvent], None]) -> tuple[SimpleNamespace, object]:
         db_gen = self._deps.get_db()
@@ -405,6 +469,7 @@ class TaskRunner:
         self, task_id: str, lease_epoch: int,
         event_buffer: list[dict], exc: Exception,
         events_file: Path | None = None,
+        pre_cleanup_report: dict | None = None,
     ) -> None:
         # 先写文件（包含 __final__ 标记）
         if not write_final(events_file, event_buffer):
@@ -434,6 +499,9 @@ class TaskRunner:
                         "events_file": str(events_file) if events_file is not None else None,
                     },
                 )
+                if row is not None:
+                    row.result_json = self._deps.merge_result_json(row.result_json, {"agent_cleanup": {"pre": pre_cleanup_report}})
+                    db.commit()
             finally:
                 try:
                     next(db_gen)

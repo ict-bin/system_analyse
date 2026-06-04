@@ -88,6 +88,9 @@ class WorkerDispatcherGlobalLimitTests(unittest.TestCase):
         self.assertEqual(repo.lock_calls, 1)
         self.assertEqual(repo.release_calls, 1)
 
+    def test_resolve_worker_task_concurrency_is_pinned_to_one(self):
+        self.assertEqual(wd.WorkerDispatcher._resolve_worker_task_concurrency(None), 1)
+
     def test_dispatch_skips_when_global_claim_lock_is_busy(self):
         repo = FakeRepository(
             pending_rows=[SimpleNamespace(task_id="task-1")],

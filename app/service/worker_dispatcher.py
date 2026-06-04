@@ -12,7 +12,6 @@ from typing import Callable
 
 from sqlalchemy.orm import Session
 
-from app.agent_process import cleanup_orphan_pi_processes
 from app.db.models import AppSaTask
 from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
 from app.service.task_repository import TaskRepository
@@ -32,10 +31,6 @@ WORKER_IDLE_BACKOFF_MAX_SECONDS = max(
 WORKER_STALE_SWEEP_INTERVAL_SECONDS = max(
     5.0,
     float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_STALE_SWEEP_INTERVAL", "30")),
-)
-ORPHAN_PI_SWEEP_INTERVAL_SECONDS = max(
-    10.0,
-    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ORPHAN_PI_SWEEP_INTERVAL", "30")),
 )
 MAX_RUNNING_TASKS_GLOBAL = max(0, int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_MAX_RUNNING_TASKS_GLOBAL", "0")))
 GLOBAL_CLAIM_LOCK_KEY = str(
@@ -83,7 +78,6 @@ class WorkerRuntimeState:
     control_reason: str | None = None
     control_updated_at: str | None = None
     current_worker_task_concurrency: int = WORKER_TASK_CONCURRENCY
-    last_orphan_pi_sweep_ts: float = 0.0
 
     def snapshot(self, running_tasks_count: int) -> dict:
         now_ts = _time.time()
@@ -112,7 +106,6 @@ class WorkerRuntimeState:
             "worker_control_pause_claim_until_ts": self.control_pause_claim_until_ts or None,
             "worker_control_reason": self.control_reason,
             "worker_control_updated_at": self.control_updated_at,
-            "worker_last_orphan_pi_sweep_ts": self.last_orphan_pi_sweep_ts or None,
             "worker_poll_interval_seconds": WORKER_POLL_INTERVAL_SECONDS,
             "worker_poll_jitter_seconds": WORKER_POLL_JITTER_SECONDS,
             "worker_task_concurrency": self.current_worker_task_concurrency,
@@ -168,12 +161,7 @@ class WorkerDispatcher:
 
     @staticmethod
     def _resolve_worker_task_concurrency(db: Session | None = None) -> int:
-        if db is None:
-            return WORKER_TASK_CONCURRENCY
-        try:
-            return max(1, int(_get_worker_task_concurrency_from_db(db)))
-        except Exception:
-            return WORKER_TASK_CONCURRENCY
+        return 1
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -233,21 +221,6 @@ class WorkerDispatcher:
         try:
             current_concurrency = self._resolve_worker_task_concurrency(db)
             _runtime_state.current_worker_task_concurrency = current_concurrency
-            if (
-                _runtime_state.last_orphan_pi_sweep_ts <= 0.0
-                or (now_ts - _runtime_state.last_orphan_pi_sweep_ts) >= ORPHAN_PI_SWEEP_INTERVAL_SECONDS
-            ):
-                cleanup_orphan_pi_processes(
-                    logger.warning,
-                    label="sa_worker_dispatcher",
-                    orphan_verifier=lambda pid, ppid, pgid: self._verify_orphan_process_candidate(
-                        db,
-                        pid=pid,
-                        ppid=ppid,
-                        pgid=pgid,
-                    ),
-                )
-                _runtime_state.last_orphan_pi_sweep_ts = now_ts
             available_slots = max(0, current_concurrency - self._get_running_tasks_count())
             if available_slots <= 0:
                 return 0
@@ -380,16 +353,6 @@ class WorkerDispatcher:
                 },
             )
         _runtime_state.last_stale_recovery_ts = now_ts
-
-    def _verify_orphan_process_candidate(self, db: Session, *, pid: int, ppid: int | None, pgid: int | None) -> tuple[bool, str | None]:
-        del ppid, pgid
-        snapshot = self._get_agent_observability().build_snapshot(db, project_id=None)
-        row = next((item for item in snapshot.get("processes", []) if int(item.get("pid") or 0) == int(pid)), None)
-        if not row:
-            return False, "process_snapshot_missing"
-        if bool(row.get("kill_allowed")) and str(row.get("owner_kind") or "") == "residual":
-            return True, str(row.get("kill_eligibility_reason") or "residual_confirmed")
-        return False, str(row.get("kill_eligibility_reason") or row.get("owner_reason") or "runtime_evidence_present")
 
     def _claim_pending_tasks(self, db: Session, available_slots: int, current_concurrency: int) -> int:
         pending_rows = self._task_repository.list_pending_tasks(db, available_slots)

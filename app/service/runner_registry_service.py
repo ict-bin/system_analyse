@@ -77,7 +77,7 @@ class RunnerRegistryService:
         db: Session = next(db_gen)
         try:
             key = runner_registry_key(WORKER_INSTANCE_ID)
-            capacity = max(1, int(_get_worker_task_concurrency_from_db(db)))
+            capacity = 1
             payload = {
                 "instance_id": WORKER_INSTANCE_ID,
                 "status": RUNNER_STATUS_ACTIVE,

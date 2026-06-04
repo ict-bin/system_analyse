@@ -308,24 +308,9 @@ def get_runtime_tracking_snapshot() -> dict[str, int]:
 
 
 def get_worker_runtime_settings() -> dict:
-    configured_concurrency = WORKER_TASK_CONCURRENCY
-    try:
-        from app.db import get_db as _get_db
-
-        _db_gen = _get_db()
-        _db = next(_db_gen)
-        try:
-            configured_concurrency = max(1, int(_get_worker_task_concurrency_from_db(_db)))
-        finally:
-            try:
-                next(_db_gen)
-            except StopIteration:
-                pass
-    except Exception:
-        configured_concurrency = WORKER_TASK_CONCURRENCY
     return {
         "worker_instance_id": WORKER_INSTANCE_ID,
-        "worker_task_concurrency": configured_concurrency,
+        "worker_task_concurrency": 1,
         "worker_poll_interval_seconds": WORKER_POLL_INTERVAL_SECONDS,
         "worker_poll_jitter_seconds": WORKER_POLL_JITTER_SECONDS,
         "worker_idle_backoff_max_seconds": WORKER_IDLE_BACKOFF_MAX_SECONDS,
@@ -1057,6 +1042,18 @@ def _write_models_json_from_db(db: "Session") -> None:
         logger.warning("_write_models_json_from_db failed: %s", _exc, exc_info=True)
 
 
+def _merge_result_json(existing: dict | None, patch: dict | None) -> dict | None:
+    base = dict(existing or {}) if isinstance(existing, dict) else {}
+    if not isinstance(patch, dict):
+        return base or None
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = _merge_result_json(base.get(key), value)
+        else:
+            base[key] = value
+    return base or None
+
+
 class TaskService:
     def __init__(self) -> None:
         from app.db import get_db
@@ -1081,6 +1078,7 @@ class TaskService:
                 remove_running_task=self._remove_running_task,
                 record_timeline_event=self._record_timeline_event,
                 task_repository=self._task_repository,
+                merge_result_json=_merge_result_json,
             ),
             settings=TaskRunnerSettings(
                 source_mode_default_analyse_targets=list(SOURCE_MODE_DEFAULT_ANALYSE_TARGETS),
@@ -1813,7 +1811,7 @@ class TaskService:
         db_gen = self._runner._deps.get_db()
         db: Session = next(db_gen)
         try:
-            current_concurrency = max(1, int(_get_worker_task_concurrency_from_db(db)))
+            current_concurrency = 1
             available_slots = max(0, current_concurrency - len(_running_tasks))
             if available_slots <= 0:
                 return

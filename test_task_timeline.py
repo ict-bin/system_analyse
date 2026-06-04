@@ -382,6 +382,7 @@ async def test_task_runner_records_task_and_stage_timeline(monkeypatch):
         remove_running_task=lambda task_id: None,
         record_timeline_event=lambda **kwargs: recorded.append(kwargs),
         task_repository=repo,
+        merge_result_json=lambda existing, patch: {**(existing or {}), **(patch or {})},
     )
     settings = TaskRunnerSettings(
         source_mode_default_analyse_targets=["source"],
@@ -414,6 +415,8 @@ async def test_task_runner_records_task_and_stage_timeline(monkeypatch):
     assert "task_finished" in event_types
     assert event_types.count("stage_started") == 1
     assert event_types.count("stage_finished") == 1
+    assert "agent_cleanup_started" in event_types
+    assert "agent_cleanup_completed" in event_types
 
 
 @pytest.mark.asyncio
@@ -435,6 +438,7 @@ async def test_task_runner_records_task_error(monkeypatch):
         remove_running_task=lambda task_id: None,
         record_timeline_event=lambda **kwargs: recorded.append(kwargs),
         task_repository=repo,
+        merge_result_json=lambda existing, patch: {**(existing or {}), **(patch or {})},
     )
     settings = TaskRunnerSettings(
         source_mode_default_analyse_targets=["source"],
@@ -472,3 +476,69 @@ async def test_task_runner_records_task_error(monkeypatch):
 
     assert any(item["event_type"] == "task_error" for item in recorded)
     assert repo.finalize_error_calls
+
+
+@pytest.mark.asyncio
+async def test_task_runner_continues_when_pre_cleanup_fails(monkeypatch):
+    recorded = []
+    repo = _FakeRepo()
+
+    deps = TaskRunnerDependencies(
+        get_db=_fake_get_db,
+        acquire_execution_lock=lambda db, output_path, task_id, lease_epoch: None,
+        clear_task_execution_lock=lambda output_path, task_id: None,
+        flush_stages=lambda task_id, events: None,
+        load_svc_config_from_db=lambda db, project_id: SimpleNamespace(),
+        infer_analysis_mode=lambda row: "binary",
+        security_filter_log_payload_resolved=lambda payload: {},
+        write_models_json_from_db=lambda db: None,
+        write_task_result_json=lambda snapshot, payload: "/tmp/result.json",
+        lightweight_result_json=lambda snapshot, payload, result_file: {"path": result_file},
+        remove_running_task=lambda task_id: None,
+        record_timeline_event=lambda **kwargs: recorded.append(kwargs),
+        task_repository=repo,
+        merge_result_json=lambda existing, patch: {**(existing or {}), **(patch or {})},
+    )
+    settings = TaskRunnerSettings(
+        source_mode_default_analyse_targets=["source"],
+        task_stage_flush_batch_size=10,
+        task_stage_flush_min_interval_seconds=60,
+        task_cancel_poll_interval_seconds=1,
+        task_lease_heartbeat_seconds=30,
+    )
+    runner = TaskRunner(deps=deps, settings=settings)
+
+    monkeypatch.setattr("app.service.task_runner.build_task_config", lambda svc, prompt, cwd: SimpleNamespace(model_dump=lambda mode="json": {}))
+    monkeypatch.setattr("app.service.task_runner.Orchestrator", _FakeOrchestrator)
+    monkeypatch.setattr("app.service.task_runner.append_events", lambda path, events: True)
+    monkeypatch.setattr("app.service.task_runner.write_final", lambda path, events: True)
+    monkeypatch.setattr("app.service.task_runner.events_path", lambda output_path, task_id: Path("/tmp/events.jsonl"))
+    monkeypatch.setattr("app.service.task_runner.WORKER_INSTANCE_ID", "runner-1")
+
+    async def _fake_supervise(self, task_id, lease_epoch, orch):
+        del task_id, lease_epoch, orch
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(TaskRunner, "_supervise_running_task", _fake_supervise)
+    monkeypatch.setattr(
+        runner._agent_cleanup,
+        "run_cleanup",
+        lambda phase: {
+            "cleanup_phase": phase,
+            "runner_instance_id": "runner-1",
+            "scanned_process_count": 1,
+            "killed_process_count": 0 if phase == "pre_task" else 1,
+            "failed_process_count": 1 if phase == "pre_task" else 0,
+            "surviving_process_count": 1 if phase == "pre_task" else 0,
+            "cleanup_failed": phase == "pre_task",
+            "level": "critical" if phase == "pre_task" else "info",
+            "task_continued": phase == "pre_task",
+            "items": [],
+        },
+    )
+
+    await runner.execute_task("sat_runner_3", 2)
+
+    event_types = [item["event_type"] for item in recorded]
+    assert "agent_cleanup_failed" in event_types
+    assert "task_started" in event_types
