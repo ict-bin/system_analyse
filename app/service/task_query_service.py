@@ -226,6 +226,8 @@ class TaskQueryService:
         final_report_path = output_root / "final_report.md" if output_root else None
         modules_list_path = output_root / "modules.list" if output_root else None
         modules_root = output_root / "modules" if output_root else None
+        dependency_graph_path = output_root / "module_dependency_graph.json" if output_root else None
+        dependency_db_path = output_root / "module_dependency_graph.sqlite" if output_root else None
         warnings: list[str] = []
 
         final_report_markdown: str | None = None
@@ -241,6 +243,18 @@ class TaskQueryService:
                 warnings.append(err)
             elif modules_list_markdown:
                 modules_order = [line.strip() for line in modules_list_markdown.splitlines() if line.strip()]
+
+        module_dependency_graph: dict | None = None
+        module_dependency_by_name: dict[str, dict] = {}
+        if dependency_graph_path and dependency_graph_path.exists():
+            try:
+                module_dependency_graph = json.loads(dependency_graph_path.read_text("utf-8", errors="replace"))
+                for node in module_dependency_graph.get("nodes", []) or []:
+                    name = str(node.get("module_name") or node.get("id") or "")
+                    if name:
+                        module_dependency_by_name[name] = node
+            except Exception as exc:
+                warnings.append(f"依赖关系图读取失败: {exc}")
 
         available = bool(final_report_markdown or (modules_root and modules_root.exists()))
         if row.status not in ("passed", "failed", "error", "cancelled"):
@@ -286,6 +300,7 @@ class TaskQueryService:
                 if risk_level == "高":
                     high_risk_modules_counted += 1
                 report_lines = [line for line in (module_report_markdown or "").splitlines() if line.strip()]
+                dep_node = module_dependency_by_name.get(module_name, {})
                 modules.append({
                     "module_name": module_name,
                     "rank": rank,
@@ -297,6 +312,11 @@ class TaskQueryService:
                     "file_count": file_count,
                     "risk_level": risk_level,
                     "risk_score": risk_score,
+                    "dependency_count": dep_node.get("dependency_count"),
+                    "reverse_dependency_count": dep_node.get("reverse_dependency_count"),
+                    "dependency_weight": dep_node.get("dependency_weight"),
+                    "dependency_risk_bonus": dep_node.get("dependency_risk_bonus"),
+                    "outer_layer_score": dep_node.get("outer_layer_score"),
                     "report_sections": self._parse_report_sections(module_report_markdown),
                     "report_preview": "\n".join(report_lines[:12]) if report_lines else None,
                 })
@@ -329,9 +349,12 @@ class TaskQueryService:
             "output_root": str(output_root) if output_root else None,
             "final_report_path": str(final_report_path) if final_report_path else None,
             "modules_list_path": str(modules_list_path) if modules_list_path else None,
+            "module_dependency_graph_path": str(dependency_graph_path) if dependency_graph_path and dependency_graph_path.exists() else None,
+            "module_dependency_db_path": str(dependency_db_path) if dependency_db_path and dependency_db_path.exists() else None,
             "report_generation_type": report_generation_type,
             "report_generation_label": report_generation_label,
             "final_report_markdown": final_report_markdown,
+            "module_dependency_graph": module_dependency_graph,
             "modules": modules,
             "summary": summary,
             "warnings": warnings,

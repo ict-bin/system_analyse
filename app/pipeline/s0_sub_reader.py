@@ -445,6 +445,64 @@ class SubReaderStage(BaseStage):
             "",
         ]
 
+        # 目录结构先验：粗分类必须优先参考真实目录边界。
+        path_tree: dict[str, int] = defaultdict(int)
+        top_tree: dict[str, int] = defaultdict(int)
+        for rel in files:
+            parts = [p for p in rel.replace("\\", "/").split("/") if p]
+            if len(parts) >= 2:
+                top_tree[parts[0]] += 1
+            if len(parts) >= 3:
+                path_tree["/".join(parts[:2])] += 1
+            elif len(parts) >= 2:
+                path_tree[parts[0]] += 1
+            else:
+                path_tree["__root__"] += 1
+        if path_tree:
+            lines.extend([
+                "## 目录结构先验（粗分类优先参考）",
+                "",
+                "> 大多数固件/源码树的目录边界就是最可靠的初始模块边界；除非 details/ 符号和依赖关系明确证明跨目录属于同一功能，否则 Stage1 应优先按目录聚合。",
+                "",
+                "### 一级目录",
+            ])
+            for path, count in sorted(top_tree.items(), key=lambda x: (-x[1], x[0]))[:80]:
+                lines.append(f"- `{path}`：{count} 个文件")
+            lines.extend(["", "### 二级目录/根分组"])
+            for path, count in sorted(path_tree.items(), key=lambda x: (-x[1], x[0]))[:120]:
+                lines.append(f"- `{path}`：{count} 个文件")
+            lines.append("")
+
+        # 导入导出/NEEDED 先验：为 Stage1/S2 的模块边界提供二进制依赖依据。
+        lib_exports: dict[str, int] = defaultdict(int)
+        lib_imports: dict[str, int] = defaultdict(int)
+        lib_needed: dict[str, set[str]] = defaultdict(set)
+        for rel in files:
+            d = load_detail_json(details_dir, rel) or {}
+            exports = d.get("exports") or d.get("symbols") or []
+            imports = d.get("imports") or []
+            needed = d.get("needed") or []
+            if exports or imports or needed:
+                base = Path(rel.replace("\\", "/")).name
+                lib_exports[base] += len(exports)
+                lib_imports[base] += len(imports)
+                for item in needed[:20]:
+                    lib_needed[base].add(str(item))
+        if lib_exports or lib_imports or lib_needed:
+            lines.extend([
+                "## ELF/SO 导入导出依赖先验（模块划分必须参考）",
+                "",
+                "> `导入多、导出少` 的文件通常是上层业务/入口模块；`导出多、被 NEEDED/符号引用多` 的文件通常是底层库/公共能力。Stage1/S2 不应只看文件名，应结合这些关系决定模块边界。",
+                "",
+                "| 文件 | 导出符号数 | 导入符号数 | NEEDED 示例 |",
+                "|---|---:|---:|---|",
+            ])
+            all_libs = sorted(set(lib_exports) | set(lib_imports) | set(lib_needed), key=lambda k: (-(lib_exports[k] + lib_imports[k] + len(lib_needed[k])), k))[:120]
+            for base in all_libs:
+                needed_sample = ", ".join(sorted(lib_needed.get(base, set()))[:8])
+                lines.append(f"| `{base}` | {lib_exports.get(base, 0)} | {lib_imports.get(base, 0)} | {needed_sample or '-'} |")
+            lines.append("")
+
         # 按类型分组展示（最多展示每组前10个文件）
         MAX_SHOW = 10
         for ftype, entries in sorted(type_groups.items(), key=lambda x: -len(x[1])):

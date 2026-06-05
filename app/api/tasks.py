@@ -169,6 +169,11 @@ class TaskResultModuleResponse(BaseModel):
     file_count: int = 0
     risk_level: Optional[str] = None
     risk_score: Optional[int] = None
+    dependency_count: Optional[int] = None
+    reverse_dependency_count: Optional[int] = None
+    dependency_weight: Optional[int] = None
+    dependency_risk_bonus: Optional[int] = None
+    outer_layer_score: Optional[int] = None
     report_sections: list[TaskResultModuleSectionResponse] = Field(default_factory=list)
     report_preview: Optional[str] = None
 
@@ -180,9 +185,12 @@ class TaskResultResponse(BaseModel):
     output_root: Optional[str] = None
     final_report_path: Optional[str] = None
     modules_list_path: Optional[str] = None
+    module_dependency_graph_path: Optional[str] = None
+    module_dependency_db_path: Optional[str] = None
     final_report_markdown: Optional[str] = None
     report_generation_type: Optional[str] = None
     report_generation_label: Optional[str] = None
+    module_dependency_graph: Optional[dict[str, Any]] = None
     modules: list[TaskResultModuleResponse] = Field(default_factory=list)
     summary: TaskResultSummaryResponse
     warnings: list[str] = Field(default_factory=list)

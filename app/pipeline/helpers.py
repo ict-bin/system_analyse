@@ -1675,9 +1675,30 @@ def write_failure_report(
 
 
 def generate_modules_list(modules_dir: Path, output_path: Path) -> None:
-    """生成 modules.list：按风险等级排序，每行一个模块名。"""
+    """生成 modules.list：按风险等级 + 依赖外层性排序，每行一个模块名。
+
+    依赖图方向为 A -> B 表示 A 依赖 B。A 的 dependency_count 越少，越可能是
+    系统外层/入口模块；同等风险分数下应更靠前。
+    """
     RISK_ORDER = {"严重": 0, "高": 1, "中": 2, "低": 3, "信息": 4, "未知": 5}
-    entries: list[tuple[str, int, str]] = []
+    dep_bonus: dict[str, int] = {}
+    dep_count: dict[str, int] = {}
+    graph_path = output_path.parent / "module_dependency_graph.json"
+    if graph_path.exists():
+        try:
+            import json as _json
+            graph = _json.loads(graph_path.read_text("utf-8", errors="replace"))
+            for node in graph.get("nodes", []) or []:
+                name = str(node.get("module_name") or node.get("id") or "")
+                if not name:
+                    continue
+                dep_bonus[name] = int(node.get("dependency_risk_bonus") or 0)
+                dep_count[name] = int(node.get("dependency_count") or 0)
+        except Exception:
+            dep_bonus = {}
+            dep_count = {}
+
+    entries: list[tuple[str, int, int, int, str]] = []
 
     for mod_dir in sorted(modules_dir.iterdir()):
         if not mod_dir.is_dir():
@@ -1694,11 +1715,11 @@ def generate_modules_list(modules_dir: Path, output_path: Path) -> None:
             m = re.search(r'RISK_SCORE:\s*(\d+)', text)
             if m:
                 risk_score = min(int(m.group(1)), 100)
-        entries.append((risk_level, risk_score, mod_name))
+        entries.append((risk_level, risk_score, dep_bonus.get(mod_name, 0), dep_count.get(mod_name, 999999), mod_name))
 
-    entries.sort(key=lambda e: (RISK_ORDER.get(e[0], 5), -e[1]))
+    entries.sort(key=lambda e: (RISK_ORDER.get(e[0], 5), -(e[1] + e[2]), e[3], e[4]))
     output_path.write_text(
-        "\n".join(name for _, _, name in entries) + "\n", encoding="utf-8")
+        "\n".join(name for _, _, _, _, name in entries) + "\n", encoding="utf-8")
 
 
 def strip_target_prefix(output_dir: Path, target_dir: str) -> None:

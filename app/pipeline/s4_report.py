@@ -35,6 +35,7 @@ from .helpers import (
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
 )
+from .module_dependency import build_module_dependency_graph
 
 
 def _extract_first(pattern: str, text: str, default: str = "") -> str:
@@ -435,236 +436,24 @@ class FinalReportStage(BaseStage):
                     # 不 return，需要继续进行论文归档等后处理
                     return
 
-            s_cfg = cfg.stages.final_check
-            granularity = getattr(cfg, "module_granularity", "fine") or "fine"
-            report_sys_prompt = load_prompt(cfg, "step4_final_report", "workers")
-            j_report_prompt = load_prompt(cfg, "step4_check_report", "judges")
-            reflect_report = load_prompt(cfg, "reflect_report", "workers")
-            report_session = ctx.session_path("final_report.jsonl")
-            w_base = ctx.make_w_base()
-            j_base = ctx.make_j_base()
-
-            feedback = ""
-            for attempt in range(max_iter(s_cfg)):
-                round_started = utc_now_iso()
-                round_start_ts = time.time()
-                ctx.emit_event("stage", stage="4b", attempt=attempt + 1)
-
-                _cur_mods = discover_modules(str(workspace))
-                if not _cur_mods:
-                    raise StageError("Stage 4b: modules/ 为空，无法生成报告（不应到达此处）")
-                prompt_parts = [
-                    "读取所有模块的 module_report.md，生成最终分析总报告 final_report.md。\n"
-                    "提示：先用 `ls modules/` 获取模块名称列表，再逐个读取 `modules/<模块名>/module_report.md`。"
-                ]
-                if feedback:
-                    prompt_parts.append(f"\n\n{feedback}")
-
-                ar = await run_agent_with_stage_guard(
-                    ctx=ctx,
-                    stage="4b",
-                    context=f"s4b-report-a{attempt+1}",
-                    heartbeat_payload_factory=lambda beat, attempt_no=attempt + 1, session=report_session: {
-                        "attempt": attempt_no,
-                        "heartbeat": beat,
-                        "session_file": session,
-                    },
-                    model=ctx.wm("report"),
-                    prompt="\n".join(prompt_parts),
-                    system_prompt=report_sys_prompt,
-                    session_file=report_session,
-                    **w_base,
+            # ── 程序化最终报告合并 ─────────────────────────────────────────────
+            # 最终报告不再由 LLM 生成/评审驱动，避免全局 Judge 失败导致所有模块集体重做。
+            # 模块级质量问题应在 S3 的 per-module Judge 中解决；这里仅确定性合并
+            # 已存在的 module_report.md。
+            report_modules = discover_modules(str(workspace))
+            if not report_modules:
+                raise StageError("Stage 4b: modules/ 为空，无法生成报告（不应到达此处）")
+            if _write_fallback_final_report(workspace, report_modules):
+                ctx.emit_event(
+                    "log",
+                    level="info",
+                    msg="[S4b] 已由程序根据各模块 module_report.md 合并生成最终报告，跳过最终报告 LLM/Judge",
                 )
-                ctx.tokens += ar.token_usage
-
-                if not (workspace / "final_report.md").exists():
-                    fallback_modules = discover_modules(str(workspace))
-                    if _write_fallback_final_report(workspace, fallback_modules):
-                        ctx.emit_event(
-                            "log",
-                            level="warn",
-                            msg="[S4b] final_report.md 未由智能体生成，已根据模块报告生成兜底最终报告",
-                        )
-
-                has_report = (workspace / "final_report.md").exists()
-                ctx.emit_event("stage_result", stage="4b", has_report=has_report)
-
-                # ── 并行 per-module 验收 judge ─────────────────────────────────────
-                if has_report and ctx.j_cfgs:
-                    _final_mods = discover_modules(str(workspace))
-                    _j_sys = load_granularity_prompt(cfg, "step3_check_analyse", granularity, "judges")
-                    _sem_pm = asyncio.Semaphore(cfg.parallel_modules)
-                    _pm_failed: list[str] = []
-                    _pm_lock = asyncio.Lock()
-
-                    async def _check_one_module_pm(mod_name_pm: str) -> None:
-                        async with _sem_pm:
-                            jpm_sess = ctx.session_path(
-                                "judges", "final_check", mod_name_pm,
-                                f"final-check-a{attempt + 1}-j0.jsonl",
-                            )
-                            try:
-                                jpm_ar = await run_agent_with_stage_guard(
-                                    ctx=ctx, stage="4b-check",
-                                    context=f"s4b-check-{mod_name_pm}",
-                                    heartbeat_payload_factory=lambda beat, m=mod_name_pm: {
-                                        "module": m, "heartbeat": beat},
-                                    prompt=f"最终验收：评审模块 `{mod_name_pm}` 的分析报告完整性。",
-                                    model=ctx.jm("analyse", ctx.j_cfgs[0]),
-                                    system_prompt=_j_sys,
-                                    tools=cfg.judges.default_tools,
-                                    cwd=str(workspace),
-                                    session_file=jpm_sess,
-                                    cancel_event=ctx.cancel_event,
-                                    max_retries=cfg.agent_max_retries,
-                                    retry_delay=cfg.agent_retry_delay,
-                                    pi_max_retries=cfg.pi_max_retries,
-                                    pi_retry_delay=cfg.pi_retry_delay,
-                                )
-                                ctx.tokens += jpm_ar.token_usage
-                                _pm_parsed = parse_eval_md(jpm_ar.output or "")
-                                if not _pm_parsed["pass"]:
-                                    async with _pm_lock:
-                                        _pm_failed.append(mod_name_pm)
-                                    write_judge_feedback(
-                                        workspace, "s4_completeness", mod_name_pm,
-                                        attempt + 1, [_pm_parsed])
-                            except Exception as _exc_pm:
-                                ctx.emit_event("log", level="warn",
-                                               msg=f"[S4b-check] {mod_name_pm} 异常: {_exc_pm}")
-
-                    await asyncio.gather(*[_check_one_module_pm(m) for m in _final_mods])
-
-                    if _pm_failed:
-                        _sum = workspace / "judge_output" / "s4_completeness" / "module_check_summary.md"
-                        _sum.parent.mkdir(parents=True, exist_ok=True)
-                        _sum.write_text(
-                            f"# 最终验收失败模块（第 {attempt + 1} 轮）\n\n"
-                            + "\n".join(f"- {m}" for m in _pm_failed),
-                            encoding="utf-8",
-                        )
-                        ctx.emit_event("log", level="warn",
-                                       msg=f"[S4b-check] {len(_pm_failed)} 个模块未通过，详见 judge_output/s4_completeness/")
-
-                # ── 全局 Judge ───────────────────────────────────────────────────────
-                judge_results = []
-                judge_records = []
-                for j_idx, j_item in enumerate(ctx.j_cfgs):
-                    j_model = ctx.jm("report", j_item)
-                    judge_session = ctx.session_path(
-                        "judges",
-                        "final_report",
-                        f"final-report-a{attempt + 1}-j{j_idx}.jsonl",
-                    )
-                    j_ar = await run_agent_with_stage_guard(
-                        ctx=ctx,
-                        stage="4b",
-                        context=f"s4b-judge-j{j_idx}-a{attempt+1}",
-                        heartbeat_payload_factory=lambda beat, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
-                            "attempt": attempt_no,
-                            "heartbeat": beat,
-                            "judge_id": f"judge-{judge_id}",
-                            "session_file": session,
-                        },
-                        prompt="评审 final_report.md 的质量和完整性。",
-                        model=j_model,
-                        system_prompt=j_report_prompt,
-                        tools=cfg.judges.default_tools,
-                        cwd=str(workspace),
-                        session_file=judge_session,
-                        **j_base,
-                    )
-                    ctx.tokens += j_ar.token_usage
-                    parsed = parse_eval_md(j_ar.output or "")
-                    judge_results.append(parsed)
-                    judge_records.append({
-                        "judge_id": f"judge-{j_idx}",
-                        "model": j_model,
-                        "score": parsed["score"],
-                        "passed": parsed["pass"],
-                        "feedback": parsed["feedback"],
-                        "session_file": judge_session,
-                        "token_usage": j_ar.token_usage,
-                    })
-                    ctx.emit_event("judge_eval", stage="4b", judge_id=f"judge-{j_idx}",
-                                   passed=parsed["pass"], score=parsed["score"])
-                    archive_file(
-                        ctx.output_dir,
-                        f"s4b-a{attempt+1}-j{j_idx}.md",
-                        f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
-                        f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{j_ar.output[:3000]}",
-                    )
-
-                voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
-                final_pass = has_report and voted_pass and attempt + 1 >= s_cfg.min_rounds
-                max_reached = attempt + 1 >= max_iter(s_cfg)
-                forced_pass = max_reached and has_report and max_rounds_exceeded_treated_as_passed(cfg)
-                ctx.record_evaluation_round(
-                    module_name="__task__",
-                    stage="final_report",
-                    stage_round=attempt + 1,
-                    status="passed" if (final_pass or forced_pass) else "failed" if max_reached else "running",
-                    started_at=round_started,
-                    ended_at=utc_now_iso(),
-                    duration_ms=(time.time() - round_start_ts) * 1000,
-                    worker={
-                        "model": ctx.wm("report"),
-                        "session_file": report_session,
-                        "token_usage": ar.token_usage,
-                        "error": ar.error,
-                    },
-                    judges=judge_records,
-                    passed_by_vote=voted_pass,
-                    module_completed=(final_pass or forced_pass) and has_report,
-                    completion_reason=(
-                        "passed"
-                        if final_pass and has_report
-                        else "max_rounds_exceeded_treated_as_passed"
-                        if forced_pass
-                        else "max_rounds_exceeded"
-                        if max_reached
-                        else ""
-                    ),
-                    needed_reflection=not final_pass,
-                    artifact_paths=[str(workspace / "final_report.md")],
-                    extra={"has_report": has_report},
-                )
-                if voted_pass and has_report:
-                    if attempt + 1 >= s_cfg.min_rounds:
-                        break
-                    else:
-                        ctx.emit_event("reflect", stage="4b", round=attempt + 1,
-                                       min_rounds=s_cfg.min_rounds)
-                        feedback = (
-                            f"# 自查要求（第 {attempt+1} 轮，需至少 {s_cfg.min_rounds} 轮）\n\n"
-                            + reflect_report
-                        )
-                elif not has_report:
-                    ctx.emit_event("log", level="warn",
-                                   msg="[S4b] final_report.md 未生成，本轮不能通过，进入下一轮修正")
-                    feedback = (
-                        "上一轮没有生成 final_report.md。必须直接写入该文件；"
-                        "不要只输出说明文字。请先用已有 modules/*/module_report.md 汇总，"
-                        "然后使用 write 工具或 shell 重定向创建 final_report.md。"
-                    )
-                else:
-                    fb4 = write_judge_feedback(
-                        workspace, "s4_report", None, attempt + 1, judge_results)
-                    ctx.emit_event("log", level="info",
-                                   msg=f"[S4b] judge意见已写入 {fb4}")
-                    feedback = f"评审未通过，完整意见请 read {fb4} ，阅后修正 final_report.md"
-                if forced_pass:
-                    break
-            else:
-                raise StageError(f"Stage 4b 最终报告未通过，已达最大轮数 {s_cfg.max_rounds}")
-
-            # ── 写 checkpoint（在归档前确认报告已生成） ─────────────────────────────
             if not (workspace / "final_report.md").exists():
-                raise StageError("Stage 4b 最终报告阶段结束但 final_report.md 未生成")
-            _ensure_report_generation_marker(workspace / "final_report.md", "ai")
-
-            if cp and (workspace / "final_report.md").exists():
-                cp.mark_done("s4_report")
+                raise StageError("Stage 4b 程序化最终报告合并失败，final_report.md 未生成")
+            _ensure_report_generation_marker(workspace / "final_report.md", "program")
+            if cp:
+                cp.mark_done("s4_report", generation="program", module_count=len(report_modules))
 
         # ── 组装输出目录 ──────────────────────────────────────────────────────
         final_mods = discover_modules(str(workspace))
@@ -679,6 +468,23 @@ class FinalReportStage(BaseStage):
             dst = modules_out / mod
             if src.is_dir():
                 shutil.copytree(str(src), str(dst))
+
+        # module dependency graph — 依赖图持久化为 SQLite + JSON，供后端查询和前端渲染
+        try:
+            graph = build_module_dependency_graph(
+                workspace=workspace,
+                details_dir=ctx.details_dir,
+                sqlite_path=final_out_dir / "module_dependency_graph.sqlite",
+                json_path=final_out_dir / "module_dependency_graph.json",
+            )
+            ctx.emit_event(
+                "stage_result",
+                stage="module_dependency_graph",
+                module_count=graph.get("summary", {}).get("module_count", 0),
+                edge_count=graph.get("summary", {}).get("edge_count", 0),
+            )
+        except Exception as exc:
+            ctx.emit_event("log", level="warn", msg=f"[依赖图] 生成失败: {exc}")
 
         # final_report.md
         report_src = workspace / "final_report.md"

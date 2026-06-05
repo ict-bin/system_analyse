@@ -31,6 +31,7 @@ from .s1_security_filter import SecurityFocusFilterStage
 from .s2_refine import RefineStage
 from .s3_analyse import AnalyseStage
 from .s4_report import CompletenessCheckStage, FinalReportStage
+from .module_dependency import build_module_dependency_graph
 from .evaluation import EvaluationRecorder
 
 __all__ = [
@@ -60,5 +61,5 @@ __all__ = [
     "SecurityFocusFilterStage",
     "RefineStage",
     "AnalyseStage",
-    "CompletenessCheckStage", "FinalReportStage",
+    "CompletenessCheckStage", "FinalReportStage", "build_module_dependency_graph",
 ]
