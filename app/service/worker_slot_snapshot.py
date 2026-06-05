@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AppSaTask
 from app.service.runner_registry_service import get_runner_registry_service
-from app.service.task_service import get_worker_runtime_settings
 from app.time_utils import now_local
 
 _TERMINAL_STATUSES = {"passed", "failed", "error", "cancelled"}
@@ -148,6 +147,8 @@ def _build_base_worker_snapshot(
             grouped_rows[worker_id].append(row)
 
     all_worker_ids = set(runner_map) | set(grouped_rows)
+    from app.service.task_service import get_worker_runtime_settings
+
     default_capacity = max(1, int(get_worker_runtime_settings().get("worker_task_concurrency") or 1))
     worker_snapshots: list[SaWorkerSnapshot] = []
 
