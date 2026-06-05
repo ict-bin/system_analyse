@@ -97,9 +97,12 @@ rmdir modules/$MOD/recover 2>/dev/null || true
 - 若建议子模块有明显的功能边界（如 bras_dhcp vs bras_auth vs bras_l2tp）→ 必须拆分
 - **不要根据文件数量决定是否拆分**；只根据功能边界、职责内聚性、建议子模块稳定性判断
 
-**必须同时参考 ELF/SO 依赖关系**：
+**必须同时参考 ELF/SO 与源码依赖关系**：
 - 对边界不清的二进制文件，可 `read details/<path>.json` 查看 `symbols`/`imports`/`needed`。
-- `needed` 指向同一功能库、且 imports/exports 形成强调用关系的一组文件，通常应保持在同一模块或明确拆为“上层业务模块 → 下层库模块”。
+- 对 C/C++/Python 等源码文件，也要查看 `details/<path>.json` 中的 `symbols/functions`、`imports`、`needed`、`source_imports`。
+- C/C++：`symbols/functions` 表示本文件定义，`imports` 表示函数调用，`needed` 表示 `#include`/头文件依赖。
+- Python：`symbols/functions` 表示函数/类定义，`imports`/`needed` 表示 import/from import/调用关系。
+- `needed` 指向同一功能库/头文件/模块，且 imports/exports 形成强调用关系的一组文件，通常应保持在同一模块或明确拆为“上层业务模块 → 下层库模块”。
 - 若两个候选子模块之间无共享 NEEDED、无导入导出匹配、目录也不同，则更适合拆分。
 - 导入依赖更少、被底层库支撑的可执行/业务模块通常更接近系统外层入口；公共库/底层库通常不应抢占业务模块命名。
 

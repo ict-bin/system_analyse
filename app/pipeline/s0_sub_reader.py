@@ -18,6 +18,7 @@ checkpoint: s0_sub_reader（整体），per-file 靠 JSON 文件存在性做幂�
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import concurrent.futures
 import json
@@ -37,6 +38,12 @@ _C_FUNC_RE = re.compile(
     r"[\w\s\*<>:,]+\s+(\w+)\s*\([^;{]*\)\s*(?:const\s*)?\{",
     re.MULTILINE,
 )
+_C_INCLUDE_RE = re.compile(r"^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]", re.MULTILINE)
+_C_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_C_CALL_EXCLUDE = frozenset({
+    "if", "for", "while", "switch", "return", "sizeof", "typeof", "alignof",
+    "case", "do", "else", "static_assert", "offsetof", "container_of",
+})
 
 # 文本类型集合（需要读取内容）
 _TEXT_EXTS = frozenset({
@@ -125,33 +132,109 @@ def _extract_python_info(full_path: str, rel_path: str, ftype: str) -> dict:
         except OSError:
             return result
 
-        # C/C++ 源码：提取函数名
+        # C/C++ 源码：提取函数定义、函数调用、include 依赖
         if ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"):
-            fns = list(dict.fromkeys(_C_FUNC_RE.findall(content)))[:30]
+            fns = list(dict.fromkeys(_C_FUNC_RE.findall(content)))[:80]
+            includes = list(dict.fromkeys(_C_INCLUDE_RE.findall(content)))[:80]
+            include_keys = [Path(item).stem for item in includes if Path(item).stem]
+            calls_raw = _C_CALL_RE.findall(content)
+            defined = set(fns)
+            calls = []
+            for name in calls_raw:
+                if name in defined or name in _C_CALL_EXCLUDE:
+                    continue
+                if name.startswith("__") and name.endswith("__"):
+                    continue
+                calls.append(name)
+            calls = list(dict.fromkeys(calls))[:150]
             result["functions"] = fns if fns else []
+            result["symbols"] = fns if fns else []
+            result["imports"] = calls
+            result["needed"] = include_keys[:80]
+            result["source_imports"] = {
+                "language": "c_cpp",
+                "includes": includes[:80],
+                "include_keys": include_keys[:80],
+                "calls": calls[:150],
+            }
             result["type"] = "C_SOURCE" if ext == ".c" else (
                 "HEADER" if ext in (".h", ".hpp", ".hh", ".hxx") else "CPP_SOURCE"
             )
-            if fns:
-                result["keywords"] = fns[:5]
-                result["summary"] = f"C/C++ 源文件，包含函数: {', '.join(fns[:5])}"
+            if fns or includes or calls:
+                result["keywords"] = list(dict.fromkeys(fns[:5] + include_keys[:5] + calls[:5]))[:8]
+                parts = []
+                if fns:
+                    parts.append(f"定义函数: {', '.join(fns[:5])}")
+                if includes:
+                    parts.append(f"包含头文件: {', '.join(includes[:5])}")
+                if calls:
+                    parts.append(f"调用外部符号: {', '.join(calls[:5])}")
+                result["summary"] = "C/C++ 源文件，" + "；".join(parts)
                 result["confidence"] = "medium"
             else:
-                result["summary"] = f"C/C++ 源文件，未提取到函数名（可能为纯声明文件）"
+                result["summary"] = f"C/C++ 源文件，未提取到函数/依赖关系"
                 result["confidence"] = "low"
 
-        # Python 脚本：提取函数和类名
+        # Python 脚本：提取函数/类定义、import/from import、调用名
         elif ext == ".py":
             result["type"] = "SCRIPT_PYTHON"
             fns = re.findall(r"^(?:def|class)\s+(\w+)", content, re.MULTILINE)
-            fns = list(dict.fromkeys(fns))[:20]
+            import_modules: list[str] = []
+            imported_names: list[str] = []
+            call_names: list[str] = []
+            try:
+                tree = ast.parse(content)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        fns.append(node.name)
+                    elif isinstance(node, ast.Import):
+                        for alias in node.names:
+                            import_modules.append(alias.name)
+                            imported_names.append(alias.asname or alias.name.split(".")[-1])
+                    elif isinstance(node, ast.ImportFrom):
+                        if node.module:
+                            import_modules.append(node.module)
+                        for alias in node.names:
+                            imported_names.append(alias.asname or alias.name)
+                            if node.module:
+                                import_modules.append(f"{node.module}.{alias.name}")
+                    elif isinstance(node, ast.Call):
+                        fn = node.func
+                        if isinstance(fn, ast.Name):
+                            call_names.append(fn.id)
+                        elif isinstance(fn, ast.Attribute):
+                            call_names.append(fn.attr)
+            except SyntaxError:
+                # fallback regex already populated fns
+                import_modules.extend(re.findall(r"^\s*import\s+([\w\.]+)", content, re.MULTILINE))
+                import_modules.extend(re.findall(r"^\s*from\s+([\w\.]+)\s+import\s+", content, re.MULTILINE))
+            fns = list(dict.fromkeys(fns))[:80]
+            import_modules = list(dict.fromkeys(m for m in import_modules if m))[:120]
+            imported_names = list(dict.fromkeys(n for n in imported_names if n))[:120]
+            call_names = list(dict.fromkeys(n for n in call_names if n and n not in set(fns)))[:150]
             result["functions"] = fns
-            result["keywords"] = fns[:5]
-            if fns:
-                result["summary"] = f"Python 脚本，定义: {', '.join(fns[:5])}"
+            result["symbols"] = fns
+            result["imports"] = list(dict.fromkeys(imported_names + call_names))[:150]
+            result["needed"] = import_modules
+            result["source_imports"] = {
+                "language": "python",
+                "modules": import_modules,
+                "imported_names": imported_names,
+                "calls": call_names,
+            }
+            result["keywords"] = list(dict.fromkeys(fns[:5] + imported_names[:5] + import_modules[:5]))[:8]
+            if fns or import_modules:
+                parts = []
+                if fns:
+                    parts.append(f"定义: {', '.join(fns[:5])}")
+                if import_modules:
+                    parts.append(f"导入模块: {', '.join(import_modules[:5])}")
+                if call_names:
+                    parts.append(f"调用: {', '.join(call_names[:5])}")
+                result["summary"] = "Python 脚本，" + "；".join(parts)
                 result["confidence"] = "medium"
             else:
-                result["summary"] = "Python 脚本，未提取到函数定义"
+                result["summary"] = "Python 脚本，未提取到函数定义或导入关系"
                 result["confidence"] = "low"
 
         # Shell 脚本：提取函数名
@@ -501,6 +584,31 @@ class SubReaderStage(BaseStage):
             for base in all_libs:
                 needed_sample = ", ".join(sorted(lib_needed.get(base, set()))[:8])
                 lines.append(f"| `{base}` | {lib_exports.get(base, 0)} | {lib_imports.get(base, 0)} | {needed_sample or '-'} |")
+            lines.append("")
+
+        # 源码导入导出关系先验：C/C++/Python 等源码项目也能参与模块构图。
+        source_rows: list[tuple[str, int, int, str]] = []
+        for rel in files:
+            d = load_detail_json(details_dir, rel) or {}
+            source_imports = d.get("source_imports") or {}
+            if not source_imports:
+                continue
+            exports = d.get("symbols") or d.get("functions") or []
+            imports = d.get("imports") or []
+            needed = d.get("needed") or []
+            lang = source_imports.get("language") or d.get("type") or "source"
+            source_rows.append((rel, len(exports), len(imports) + len(needed), str(lang)))
+        if source_rows:
+            lines.extend([
+                "## 源码导入导出依赖先验（C/C++/Python 等）",
+                "",
+                "> 源码文件也会提取定义函数/类、函数调用、#include、Python import/from import，并参与后续模块依赖图构建。",
+                "",
+                "| 文件 | 语言/类型 | 导出定义数 | 导入/调用/包含数 |",
+                "|---|---|---:|---:|",
+            ])
+            for rel, export_count, import_count, lang in sorted(source_rows, key=lambda x: (-(x[1] + x[2]), x[0]))[:120]:
+                lines.append(f"| `{rel}` | {lang} | {export_count} | {import_count} |")
             lines.append("")
 
         # 按类型分组展示（最多展示每组前10个文件）
