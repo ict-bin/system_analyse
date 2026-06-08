@@ -166,6 +166,12 @@ def init_runner_registry_service(
 
 
 def get_runner_registry_service() -> RunnerRegistryService:
+    global _runner_registry_service
     if _runner_registry_service is None:
-        raise RuntimeError("RunnerRegistryService not initialized")
+        from app.db import get_db
+
+        _runner_registry_service = RunnerRegistryService(
+            get_db=get_db,
+            get_running_tasks_count=lambda: 0,
+        )
     return _runner_registry_service
