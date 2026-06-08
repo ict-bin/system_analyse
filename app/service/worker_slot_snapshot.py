@@ -8,6 +8,7 @@ import time
 from sqlalchemy.orm import Session
 
 from app.db.models import AppSaTask
+from app.service.pod_metrics import fetch_pod_resource_map
 from app.service.runner_registry_service import get_runner_registry_service
 from app.time_utils import now_local
 
@@ -47,6 +48,15 @@ class SaWorkerSnapshot:
     available_slots: int
     source: str
     last_heartbeat_at: datetime | None
+    pod_created_at: str | None = None
+    pod_started_at: str | None = None
+    pod_metrics_at: str | None = None
+    pod_cpu_usage_millicores: int | None = None
+    pod_memory_usage_bytes: int | None = None
+    pod_cpu_request_millicores: int | None = None
+    pod_memory_request_bytes: int | None = None
+    pod_cpu_limit_millicores: int | None = None
+    pod_memory_limit_bytes: int | None = None
     active_jobs: list[SaWorkerActiveJobSnapshot] = field(default_factory=list)
     error: str | None = None
 
@@ -66,6 +76,11 @@ class SaClusterCapacitySnapshot:
 
 _SUMMARY_CACHE_TTL_SECONDS = 5.0
 _summary_cache: dict[tuple[str | None, str], tuple[float, SaClusterCapacitySnapshot]] = {}
+
+
+def get_worker_runtime_settings() -> dict[str, object]:
+    from app.service.task_service import get_worker_runtime_settings as _impl
+    return _impl()
 
 
 def invalidate_worker_slot_summary_cache(*, project_id: str | None = None) -> None:
@@ -147,10 +162,15 @@ def _build_base_worker_snapshot(
             grouped_rows[worker_id].append(row)
 
     all_worker_ids = set(runner_map) | set(grouped_rows)
-    from app.service.task_service import get_worker_runtime_settings
-
     default_capacity = max(1, int(get_worker_runtime_settings().get("worker_task_concurrency") or 1))
     worker_snapshots: list[SaWorkerSnapshot] = []
+    pod_resource_map = fetch_pod_resource_map(
+        pod_names=[
+            str(item.get("pod_name") or "").strip()
+            for item in active_runner_rows
+            if str(item.get("pod_name") or "").strip()
+        ],
+    )
 
     for worker_id in all_worker_ids:
         owner_rows = grouped_rows.get(worker_id, [])
@@ -198,12 +218,14 @@ def _build_base_worker_snapshot(
             error = "stale lease and stale runner registry"
         elif not runner_live and latest_lease is not None:
             error = "runner registry missing; using task lease fallback"
+        pod_name = str((runner or {}).get("pod_name") or "").strip() or None
+        pod_metrics = pod_resource_map.get(pod_name or "", {})
 
         worker_snapshots.append(
             SaWorkerSnapshot(
                 worker_id=worker_id,
                 host_name=_parse_host_name(worker_id),
-                pod_name=str((runner or {}).get("pod_name") or "").strip() or None,
+                pod_name=pod_name,
                 pod_ip=str((runner or {}).get("pod_ip") or "").strip() or None,
                 http_port=int((runner or {}).get("http_port") or 8080) if (runner or {}).get("http_port") or runner else 8080,
                 healthy=healthy,
@@ -212,6 +234,15 @@ def _build_base_worker_snapshot(
                 available_slots=max(0, max_concurrent_jobs - occupied_slots) if healthy else 0,
                 source=source,
                 last_heartbeat_at=latest_heartbeat,
+                pod_created_at=pod_metrics.get("pod_created_at"),
+                pod_started_at=pod_metrics.get("pod_started_at"),
+                pod_metrics_at=pod_metrics.get("pod_metrics_at"),
+                pod_cpu_usage_millicores=pod_metrics.get("pod_cpu_usage_millicores"),
+                pod_memory_usage_bytes=pod_metrics.get("pod_memory_usage_bytes"),
+                pod_cpu_request_millicores=pod_metrics.get("pod_cpu_request_millicores"),
+                pod_memory_request_bytes=pod_metrics.get("pod_memory_request_bytes"),
+                pod_cpu_limit_millicores=pod_metrics.get("pod_cpu_limit_millicores"),
+                pod_memory_limit_bytes=pod_metrics.get("pod_memory_limit_bytes"),
                 active_jobs=active_jobs,
                 error=error,
             )
