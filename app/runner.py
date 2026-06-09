@@ -587,14 +587,14 @@ async def run_agent(
                     model_stuck_timeout=model_stuck_timeout,
                     model_stuck_max_activations=model_stuck_max_activations,
                 )
-                return await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
+                return await coro
             except asyncio.TimeoutError:
                 timeout_failures += 1
                 result = AgentResult()
                 result.error = (
-                    f"agent run timed out after {timeout_seconds:.0f}s"
+                    f"agent run idle timed out after {timeout_seconds:.0f}s"
                     if timeout_seconds else
-                    "agent run timed out"
+                    "agent run idle timed out"
                 )
                 result.exit_code = -1
                 can_retry = timeout_retry_enabled and (
@@ -604,12 +604,12 @@ async def run_agent(
                     return result
                 delay = _backoff(retry_delay, timeout_failures)
                 _log_warn(
-                    f"agent 单次输入超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
+                    f"agent 单次输入空闲超时 [{timeout_failures}/{_fmt_max(timeout_max_retries)}], "
                     f"{delay:.0f}s 后重试: {result.error}"
                 )
                 if on_stream:
                     on_stream(
-                        f"\n⏱️ 智能体执行超时，{delay:.0f}s 后重试 "
+                        f"\n⏱️ 智能体空闲超时，{delay:.0f}s 后重试 "
                         f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
                     )
                 await asyncio.sleep(delay)
@@ -892,12 +892,17 @@ async def _run_with_api_retry(
             # ── per-pi-process stuck 监测：记录 session mtime 基线 ──
             _pi_last_mtime: float = 0.0
             _pi_last_active: float = time.monotonic()
+            last_activity_at: float = time.monotonic()
             if _stuck_timeout > 0 and session_file:
                 try:
                     _pi_last_mtime = os.path.getmtime(session_file)
                 except OSError:
                     _pi_last_mtime = 0.0
             _pi_stuck_triggered: bool = False
+
+            def _mark_activity() -> None:
+                nonlocal last_activity_at
+                last_activity_at = time.monotonic()
 
             buffer = b""
             while True:
@@ -918,6 +923,7 @@ async def _run_with_api_retry(
                     if _cur_mtime != _pi_last_mtime:
                         _pi_last_mtime = _cur_mtime
                         _pi_last_active = time.monotonic()
+                        _mark_activity()
 
                 # ── stuck 检测 ──
                 if _stuck_timeout > 0:
@@ -928,15 +934,20 @@ async def _run_with_api_retry(
 
                 # timeout 不是 EOF，继续等待；只有真正的 pipe EOF（chunk=b"" 且非 timeout）才退出
                 if _is_timeout:
+                    if timeout_seconds and (time.monotonic() - last_activity_at) >= timeout_seconds:
+                        raise asyncio.TimeoutError
                     continue
                 if not chunk:
+                    if timeout_seconds and (time.monotonic() - last_activity_at) >= timeout_seconds:
+                        raise asyncio.TimeoutError
                     break
+                _mark_activity()
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
                     touch_agent_runtime(session_file=session_file, cwd=cwd, command=" ".join(args))
                     ended = _process_line(
-                        line.decode("utf-8", errors="replace"), result, on_stream
+                        line.decode("utf-8", errors="replace"), result, on_stream, _mark_activity
                     )
                     if ended:
                         agent_ended = True
@@ -973,7 +984,7 @@ async def _run_with_api_retry(
                 continue
             if buffer.strip():
                 _process_line(
-                    buffer.decode("utf-8", errors="replace"), result, on_stream
+                    buffer.decode("utf-8", errors="replace"), result, on_stream, _mark_activity
                 )
 
             # agent_ended 后必须继续 drain stdout 直到 EOF，
@@ -1159,11 +1170,14 @@ def _process_line(
     line: str,
     result: AgentResult,
     on_stream: Callable[[str], None] | None,
+    on_activity: Callable[[], None] | None = None,
 ) -> bool:
     """解析一行 JSONL。返回 True 表示收到 agent_end（调用方应停止读取）。"""
     line = line.strip()
     if not line:
         return False
+    if on_activity:
+        on_activity()
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
