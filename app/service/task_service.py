@@ -634,9 +634,29 @@ def _task_workspace_root(row: AppSaTask) -> Path | None:
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        last_exc: OSError | None = None
+        for attempt in range(20):
+            try:
+                tmp.replace(path)
+                return
+            except FileNotFoundError as exc:
+                last_exc = exc
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except PermissionError as exc:
+                last_exc = exc
+                _time.sleep(0.05 * (attempt + 1))
+        if last_exc is not None:
+            raise last_exc
+        tmp.replace(path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def _load_task_result_json(row: AppSaTask) -> dict | None:
