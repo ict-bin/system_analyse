@@ -659,6 +659,41 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
             pass
 
 
+def _remove_task_root_for_restart(output_path: str | None, task_id: str) -> dict[str, object]:
+    """Move the old task directory out of the canonical path before restart.
+
+    Renaming is fast and prevents the next run from seeing stale checkpoint/workspace
+    files even if background deletion on NFS takes longer than expected.
+    """
+    result: dict[str, object] = {"task_root": None, "renamed_to": None, "removed": False, "existed": False}
+    if not output_path:
+        return result
+    task_root = Path(output_path) / task_id
+    result["task_root"] = str(task_root)
+    if not task_root.exists():
+        return result
+    result["existed"] = True
+    tombstone = task_root.with_name(f".{task_root.name}.restart-delete-{uuid.uuid4().hex}")
+    try:
+        task_root.rename(tombstone)
+        result["renamed_to"] = str(tombstone)
+    except FileNotFoundError:
+        return result
+    except OSError:
+        import shutil as _shutil
+        _shutil.rmtree(task_root)
+        result["removed"] = True
+        return result
+
+    import shutil as _shutil
+    try:
+        _shutil.rmtree(tombstone)
+        result["removed"] = True
+    except OSError as exc:
+        logger.warning("restart cleanup tombstone failed path=%s: %s", tombstone, exc)
+    return result
+
+
 def _load_task_result_json(row: AppSaTask) -> dict | None:
     path = _task_result_path(row)
     if path and path.is_file():
@@ -1585,21 +1620,34 @@ class TaskService:
                 },
             )
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
+        cleanup_result = _remove_task_root_for_restart(row.output_path, task_id)
+        if row.output_path:
+            task_root = Path(row.output_path) / task_id
+            if task_root.exists():
+                from fastapi import HTTPException
+                self._record_task_operation_event(
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    operation="restart_task",
+                    event_type="task_operation_rejected",
+                    message="任务重启被拒绝：旧运行目录未清理干净",
+                    level="error",
+                    payload={
+                        "reason": "task_root_cleanup_failed",
+                        "task_root": str(task_root),
+                        "cleanup": cleanup_result,
+                        "before_status": previous_status,
+                        "after_status": previous_status,
+                        "changed": False,
+                    },
+                )
+                raise HTTPException(500, f"重启前清理任务目录失败: {task_root}")
+        _clear_task_execution_lock(row.output_path, task_id)
         row = self._task_repository.restart_task_in_place(db, row)
         row.latest_abnormal_reason_json = None
         flag_modified(row, "latest_abnormal_reason_json")
         db.commit()
         db.refresh(row)
-        # 清除上次运行目录（含 .checkpoint/），当次从零开始
-        if row.output_path:
-            import shutil as _shutil
-            task_root = os.path.join(row.output_path, task_id)
-            if os.path.isdir(task_root):
-                try:
-                    _shutil.rmtree(task_root)
-                except Exception as _e:
-                    logger.warning("Failed to clean task dir %s: %s", task_root, _e)
-        _clear_task_execution_lock(row.output_path, task_id)
         self._record_task_operation_event(
             task_id=task_id,
             project_id=row.project_id,
@@ -1611,6 +1659,7 @@ class TaskService:
                 "after_status": str(row.status or ""),
                 "changed": previous_status != str(row.status or ""),
                 "analysis_mode": _infer_analysis_mode(row),
+                "cleanup": cleanup_result,
             },
         )
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
