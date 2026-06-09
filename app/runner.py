@@ -427,6 +427,7 @@ async def _run_with_context_overflow_recovery(
     retry_delay: float,
     pi_max_retries: int,
     pi_retry_delay: float,
+    timeout_seconds: float | None = None,
     model_stuck_timeout: float | None = None,
     model_stuck_max_activations: int | None = None,
 ) -> AgentResult:
@@ -441,6 +442,7 @@ async def _run_with_context_overflow_recovery(
         retry_delay=retry_delay,
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
+        timeout_seconds=timeout_seconds,
         session_file=session_file,
         model_stuck_timeout=model_stuck_timeout,
         model_stuck_max_activations=model_stuck_max_activations,
