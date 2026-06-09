@@ -475,6 +475,7 @@ async def _run_with_context_overflow_recovery(
             retry_delay=retry_delay,
             pi_max_retries=pi_max_retries,
             pi_retry_delay=pi_retry_delay,
+            timeout_seconds=None,
         )
 
     if single_input_tokens > single_input_limit:
@@ -501,6 +502,7 @@ async def _run_with_context_overflow_recovery(
         retry_delay=retry_delay,
         pi_max_retries=pi_max_retries,
         pi_retry_delay=pi_retry_delay,
+        timeout_seconds=None,
     )
     return retry_result
 
@@ -584,6 +586,7 @@ async def run_agent(
                     retry_delay=retry_delay,
                     pi_max_retries=pi_max_retries,
                     pi_retry_delay=pi_retry_delay,
+                    timeout_seconds=timeout_seconds,
                     model_stuck_timeout=model_stuck_timeout,
                     model_stuck_max_activations=model_stuck_max_activations,
                 )
@@ -646,6 +649,7 @@ async def _run_with_pi_retry(
     retry_delay: float,
     pi_max_retries: int,
     pi_retry_delay: float,
+    timeout_seconds: float | None = None,
     session_file: str | None = None,
     model_stuck_timeout: float | None = None,
     model_stuck_max_activations: int | None = None,
@@ -685,6 +689,7 @@ async def _run_with_pi_retry(
                 max_retries=max_retries,
                 retry_delay=retry_delay,
                 session_file=session_file,
+                timeout_seconds=timeout_seconds,
                 model_stuck_timeout=model_stuck_timeout,
                 model_stuck_max_activations=model_stuck_max_activations,
             )
@@ -815,6 +820,7 @@ async def _run_with_api_retry(
     max_retries: int,
     retry_delay: float,
     session_file: str | None = None,
+    timeout_seconds: float | None = None,
     model_stuck_timeout: float | None = None,
     model_stuck_max_activations: int | None = None,
 ) -> AgentResult:
