@@ -33,6 +33,7 @@
 
 ⚠️ **约束（严格遵守）**：
 1. **必须使用 write 工具**将完整报告写入 `modules/{{MODULE_NAME}}/module_report.md`
+2. **报告较长时可分块写入**：先用 `write` 写入第一部分，再用 `bash echo '...content...' >> modules/{{MODULE_NAME}}/module_report.md` 追加后续部分
 2. 使用相对路径，不要使用 `/data/output/...` 绝对路径
 3. **写完即结束，不要再做任何其他操作**
 4. **严禁访问 `prescan/` 目录**：prescan 是关键词预扫描的中间产物，不是模块的文件清单；

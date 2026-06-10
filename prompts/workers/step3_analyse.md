@@ -19,7 +19,8 @@
   ⚠️ **不要**用 `iSulad-master/src/...` 这样的路径（会 ENOENT）
   ⚠️ **不要**用容器绝对路径 `/data/files/...` 或 `/workspace/...`
   ⚠️ `target/` 是相对 workspace 的符号链接，永远从这里访问源码
-- **严禁** 调用 `bash` 运行 nm / readelf / strings / file 命令
+- **严禁** 调用 `bash` 运行 nm / readelf / strings / file 等二进制分析命令（这些信息已在 details/ 中）
+- **允许** 用 `bash echo >>` 追加报告内容（分块写入）
 
 ---
 
@@ -29,9 +30,10 @@
 
 ⚠️ **约束（严格遵守）**：
 1. **必须使用 write 工具**将完整报告写入 `modules/{{MODULE_NAME}}/module_report.md`
-2. 使用相对路径，不要使用 `/data/output/...` 绝对路径
-3. **写完即结束，不要再做任何其他操作**
-4. **严禁访问 `prescan/` 目录**：prescan 是关键词预扫描的中间产物，不是模块的文件清单；
+2. **报告较长时可分块写入**：先用 `write` 写入第一部分，再用 `bash echo '...content...' >> modules/{{MODULE_NAME}}/module_report.md` 追加后续部分
+3. 使用相对路径，不要使用 `/data/output/...` 绝对路径
+4. **写完即结束，不要再做任何其他操作**
+5. **严禁访问 `prescan/` 目录**：prescan 是关键词预扫描的中间产物，不是模块的文件清单；
    模块包含的文件以 `modules/{{MODULE_NAME}}/files.list` 为唯一标准
 
 # module_report.md 必须包含
