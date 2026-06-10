@@ -30,6 +30,7 @@ from app.service.task_query_service import TaskQueryService
 from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
 from app.service.task_repository import TaskRepository
 from app.service.event_log import append_events, write_final, read_events, events_path as _events_path
+from app.service.agent_cleanup import AgentCleanupService
 from app.service.runtime_control_service import get_runtime_control_service
 from app.service.runner_registry_service import (
     RUNNER_STATUS_ACTIVE,
@@ -55,6 +56,7 @@ from app.service.worker_dispatcher import (
 from app.time_utils import isoformat_local, now_local
 
 logger = logging.getLogger("sa.task_service")
+_local_agent_cleanup = AgentCleanupService()
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 TASK_CANCEL_POLL_INTERVAL_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_CANCEL_POLL_INTERVAL", "2"))
@@ -336,6 +338,19 @@ def _clear_task_execution_lock(output_path: str | None, task_id: str) -> None:
         lock_path.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _cleanup_local_agents_for_operation(*, task_id: str, project_id: str | None, operation: str) -> dict[str, object]:
+    report = _local_agent_cleanup.run_cleanup(phase=operation)
+    TaskQueryService._record_timeline_event(
+        task_id=task_id,
+        project_id=project_id,
+        event_type="agent_cleanup_completed" if not report.get("cleanup_failed") else "agent_cleanup_failed",
+        message=f"{operation} 清理 Pod 内 pi/python 进程完成",
+        level=str(report.get("level") or "info"),
+        payload=report,
+    )
+    return report
 
 
 def _read_task_execution_lock_payload(lock_path: Path | None) -> dict[str, object] | None:
@@ -1620,6 +1635,11 @@ class TaskService:
                 },
             )
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
+        cleanup_report = _cleanup_local_agents_for_operation(
+            task_id=row.task_id,
+            project_id=row.project_id,
+            operation="restart_pre_task",
+        )
         cleanup_result = _remove_task_root_for_restart(row.output_path, task_id)
         if row.output_path:
             task_root = Path(row.output_path) / task_id
@@ -1660,6 +1680,7 @@ class TaskService:
                 "changed": previous_status != str(row.status or ""),
                 "analysis_mode": _infer_analysis_mode(row),
                 "cleanup": cleanup_result,
+                "agent_cleanup": cleanup_report,
             },
         )
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
@@ -1689,6 +1710,11 @@ class TaskService:
             )
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
         health = _inspect_resume_health(row)
+        cleanup_report = _cleanup_local_agents_for_operation(
+            task_id=row.task_id,
+            project_id=row.project_id,
+            operation="resume_pre_task",
+        )
         if not health["can_resume"]:
             missing = health.get("missing_artifacts") or []
             hint = f" 缺失产物: {', '.join(missing[:6])}" if missing else ""
@@ -1727,6 +1753,7 @@ class TaskService:
                 "after_status": str(row.status or ""),
                 "changed": previous_status != str(row.status or ""),
                 "analysis_mode": _infer_analysis_mode(row),
+                "agent_cleanup": cleanup_report,
             },
         )
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
@@ -1760,6 +1787,11 @@ class TaskService:
         at = _running_tasks.get(task_id)
         if at and not at.done():
             at.cancel()
+        cleanup_report = _cleanup_local_agents_for_operation(
+            task_id=row.task_id,
+            project_id=row.project_id,
+            operation="cancel_task",
+        )
         row = self._task_repository.cancel_task_in_place(db, row)
         reason, changed = _sync_task_abnormal_reason(row)
         _record_abnormal_reason(row, reason, changed=changed)
@@ -1778,6 +1810,7 @@ class TaskService:
                 "after_status": str(row.status or ""),
                 "changed": previous_status != str(row.status or ""),
                 "status": row.status,
+                "agent_cleanup": cleanup_report,
             },
         )
         return self._row_to_dict(row)

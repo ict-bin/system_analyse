@@ -283,10 +283,7 @@ def get_config_service() -> ConfigService:
 
 
 def get_worker_task_concurrency(db: Session) -> int:
-    try:
-        return int(get_config_service().get_runtime_settings(db).get("worker_task_concurrency") or 4)
-    except Exception:
-        return 4
+    return 1
 
 
 _DEFAULT_MODELS_CONFIG: Dict[str, Any] = {

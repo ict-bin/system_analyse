@@ -677,6 +677,17 @@ def _failed_target_detail(worker: Any, urls: list[str], error_detail: dict[str, 
     }
 
 
+def _kill_local_agent_processes(phase: str = "manual") -> dict[str, object]:
+    from app.service.agent_cleanup import AgentCleanupService
+
+    return AgentCleanupService().run_cleanup(phase=phase)
+
+
+@internal_observability_router.post("/agent-observability/cleanup", response_model=dict[str, Any], include_in_schema=False)
+def cleanup_local_agent_processes(phase: str = Query("manual")):
+    return _kill_local_agent_processes(phase=phase)
+
+
 async def _get_agent_observability_snapshot_impl(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
@@ -685,6 +696,38 @@ async def _get_agent_observability_snapshot_impl(
     from app.service.agent_observability import get_agent_observability_service
 
     return get_agent_observability_service().build_snapshot(db, project_id=None)
+
+
+async def _cleanup_all_runner_agent_processes(*, db: Session, token: str, phase: str) -> dict[str, Any]:
+    cluster_snapshot = build_worker_slot_cluster_detail(db, project_id=None)
+    workers = [worker for worker in cluster_snapshot.workers if worker.healthy]
+    items: list[dict[str, Any]] = []
+    for worker in workers:
+        result, _, error_detail = await _fanout_post_json(
+            _aggregate_base_urls(worker),
+            path="/agent-observability/cleanup",
+            token=token,
+            params={"phase": phase},
+        )
+        if result:
+            row = dict(result)
+            row["pod_name"] = worker.pod_name
+            row["worker_id"] = worker.worker_id
+            items.append(row)
+        else:
+            items.append({
+                "pod_name": worker.pod_name,
+                "worker_id": worker.worker_id,
+                "cleanup_failed": True,
+                "error": error_detail,
+            })
+    _invalidate_agent_aggregate_cache()
+    return {
+        "phase": phase,
+        "requested": len(workers),
+        "items": items,
+        "failed": sum(1 for item in items if item.get("cleanup_failed")),
+    }
 
 
 @router.get("/agent-observability/snapshot")
@@ -1011,7 +1054,13 @@ def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.post("/tasks", status_code=201)
-def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
+async def create_task(
+    body: TaskCreateRequest,
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    await _cleanup_all_runner_agent_processes(db=db, token=token, phase="create_task_pre_task")
     analysis_mode = body.analysis_mode or body.parent_task_type
     prompt = body.prompt_content
     if not prompt or not prompt.strip():
@@ -1469,6 +1518,7 @@ async def kill_agent_process(
         task_id=row.get("task_id"),
     )
     result = get_agent_observability_service().kill_process(pid)
+    _kill_local_agent_processes(phase="manual_kill_sweep")
     _invalidate_agent_aggregate_cache()
     return AgentProcessKillResponse(
         requested=1,
@@ -1540,6 +1590,7 @@ async def kill_all_orphan_processes(
         }
         for row in killable
     ]
+    _kill_local_agent_processes(phase="manual_bulk_kill_sweep")
     _invalidate_agent_aggregate_cache()
     succeeded = sum(1 for item in items if item.get("status") in {"killed", "gone"})
     failed = sum(1 for item in items if item.get("status") == "failed")
@@ -1695,19 +1746,50 @@ def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/tasks/{task_id}/cancel")
-def cancel_task(task_id: str, db: Session = Depends(get_db)):
-    return get_task_service().cancel_task(db, task_id)
+async def cancel_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    _, token = user_and_token
+    result = get_task_service().cancel_task(db, task_id)
+    cleanup = await _cleanup_all_runner_agent_processes(db=db, token=token, phase="cancel_task")
+    try:
+        get_task_service()._record_task_operation_event(
+            task_id=task_id,
+            project_id=result.get("project_id") if isinstance(result, dict) else None,
+            operation="cancel_task",
+            event_type="agent_cleanup_completed" if cleanup.get("failed") == 0 else "agent_cleanup_failed",
+            message="取消任务后已清理所有 runner Pod 内 pi/python 进程",
+            level="info" if cleanup.get("failed") == 0 else "error",
+            payload={"aggregate_cleanup": cleanup},
+        )
+    except Exception:
+        logger.exception("failed to record aggregate cleanup event for cancelled task")
+    return result
 
 
 @router.post("/tasks/{task_id}/restart", status_code=201)
-def restart_task(task_id: str, db: Session = Depends(get_db)):
+async def restart_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
     """Reset and restart an existing task in-place, reusing the same task ID."""
+    _, token = user_and_token
+    await _cleanup_all_runner_agent_processes(db=db, token=token, phase="restart_pre_task")
     return get_task_service().restart_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/resume", status_code=201)
-def resume_task(task_id: str, db: Session = Depends(get_db)):
+async def resume_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
     """Resume a task from Stage 3 (断点续跑), reusing the same task ID."""
+    _, token = user_and_token
+    await _cleanup_all_runner_agent_processes(db=db, token=token, phase="resume_pre_task")
     return get_task_service().resume_task(db, task_id)
 
 

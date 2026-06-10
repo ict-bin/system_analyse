@@ -35,12 +35,16 @@ def _read_status_value(proc_dir: pathlib.Path, key: str) -> int | None:
 def _iter_agent_processes_for_cleanup() -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     proc_root = pathlib.Path("/proc")
+    current_pid = os.getpid()
+    current_pgid = os.getpgrp()
     for proc_dir in proc_root.iterdir():
         if not proc_dir.name.isdigit():
             continue
         try:
             pid = int(proc_dir.name)
         except ValueError:
+            continue
+        if pid in {1, current_pid}:
             continue
         try:
             comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
@@ -54,8 +58,13 @@ def _iter_agent_processes_for_cleanup() -> list[dict[str, Any]]:
             pgid = int(stat) if stat else None
         except Exception:
             continue
-        if comm != "pi" and exe != "node":
+        is_pi_runtime = comm == "pi" or exe == "node"
+        is_python_runtime = comm.lower() in {"python", "python3"} or exe.lower().startswith("python")
+        if not is_pi_runtime and not is_python_runtime:
             continue
+        # Never signal the service's own process group. Python helpers sharing that
+        # group are killed by PID; pi-created sessions retain group cleanup.
+        safe_pgid = pgid if pgid is not None and pgid != current_pgid else None
         session_arg_path = None
         if "--session" in cmdline:
             try:
@@ -68,7 +77,7 @@ def _iter_agent_processes_for_cleanup() -> list[dict[str, Any]]:
         items.append(
             {
                 "pid": pid,
-                "pgid": pgid,
+                "pgid": safe_pgid,
                 "ppid": _read_status_value(proc_dir, "PPid"),
                 "command": cmdline,
                 "cwd": cwd,
@@ -145,11 +154,19 @@ class AgentCleanupService:
 
     def run_cleanup(self, *, phase: str) -> dict[str, Any]:
         items = self._scan()
+        terminated_groups: set[int] = set()
         for item in items:
+            pgid = item.get("pgid")
+            if pgid is not None and int(pgid) in terminated_groups:
+                item["termination_status"] = "gone"
+                item["termination_signal"] = "group_already_terminated"
+                continue
             status, term_signal, error = self._terminate_process_group(
                 int(item.get("pid") or 0),
-                item.get("pgid"),
+                pgid,
             )
+            if pgid is not None:
+                terminated_groups.add(int(pgid))
             item["termination_status"] = status
             item["termination_signal"] = term_signal
             item["termination_error"] = error
