@@ -240,60 +240,6 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
     }, merge_targets_in_progress)
 
 
-def _cross_module_dep_hint(mod_name: str, files_list: list[str], details_dir: "Path", workspace_path: "Path") -> str:
-    """生成跨模块依赖提示（S2 Worker 做 split/merge 参考）。"""
-    import json
-    mods_root = workspace_path / "modules"
-    # 符号 → 模块 索引
-    sym_to_mod: dict[str, set[str]] = {}
-    for mod_dir in mods_root.iterdir():
-        if not mod_dir.is_dir(): continue
-        fl = mod_dir / "files.list"
-        if not fl.exists(): continue
-        for rel in fl.read_text(encoding="utf-8").splitlines():
-            rel = rel.strip()
-            if not rel: continue
-            dp = details_dir / f"{rel}.json"
-            if not dp.exists(): continue
-            try:
-                d = json.loads(dp.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            for sym in (d.get("symbols") or d.get("functions") or []):
-                sym_to_mod.setdefault(str(sym).strip().lower(), set()).add(mod_dir.name)
-
-    # 本模块文件导入其他模块符号
-    rows: list[tuple[str, str, str]] = []
-    for rel in files_list:
-        dp = details_dir / f"{rel}.json"
-        if not dp.exists(): continue
-        try:
-            d = json.loads(dp.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        for imp in (d.get("imports") or [])[:10]:
-            imp_l = str(imp).strip().lower()
-            targets = sym_to_mod.get(imp_l, set()) - {mod_name}
-            for t in sorted(targets)[:2]:
-                rows.append((rel, imp, t))
-                if len(rows) >= 20: break
-            if len(rows) >= 20: break
-        if len(rows) >= 20: break
-
-    if not rows:
-        return ""
-
-    lines = [
-        "\n\n## 跨模块依赖关系（本模块文件导入了其他模块的符号）",
-        "| 本模块文件 | 导入符号 | 符号所在模块 |",
-        "|---|---|---|",
-    ]
-    for rel, imp, target in rows:
-        lines.append(f"| `{rel}` | `{imp}` | `{target}` |")
-    lines.append("\n> 如果同一目标模块被 3+ 个文件依赖 → 考虑 merge 到该模块。")
-    return "\n".join(lines)
-
-
 # ── Stage ────────────────────────────────────────────────────────────────────
 
 class RefineStage(BaseStage):
@@ -567,9 +513,6 @@ class RefineStage(BaseStage):
             ]
             if file_summary:
                 prompt_parts.append("\n\n## 文件摘要\n\n" + file_summary)
-            dep_hint = _cross_module_dep_hint(mod_name, files_list, details_dir, workspace)
-            if dep_hint:
-                prompt_parts.append(dep_hint)
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
