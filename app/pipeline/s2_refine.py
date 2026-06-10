@@ -1,20 +1,17 @@
 """
-pipeline/s2_refine.py — Stage 2: 细分类
+pipeline/s2_refine.py — Stage 2: 模块细分 v3
 
-入: ctx.classified_modules
-    workspace/modules/*/files.list
-出: ctx.refined_modules
-    workspace/modules/*/files.list（可能重组）
-    workspace/.s2_snapshots/*.snapshot
+架构变更:
+  - 快照位置: modules/<mod>/.snapshot（每模块自包含）
+  - LLM 并行处理，Python 串行提交（commit_queue）
+  - merge 到 LLM 处理中的模块时，直接追加 .snapshot + files.list
+  - 重试不回滚 Worker 产物，Worker 自己根据 Judge 反馈修改
+  - Python _validate_module() 替代 check_module.sh
 
-核心流程:
-  对每个模块并行运行（asyncio.Queue + parallel_modules 个 worker）:
-    (文件数>阈值时) 子Worker批量预读文件摘要
-    → Worker(step2_refine.md) → Judge(step2_check_refine.md) 多轮
-  Stage 2 后全局检查: filtered_files.txt vs 所有 files.list
-  遗漏文件用补分类(step2_reclassify.md)
-
-并发控制: asyncio.Queue + parallel_modules 个 worker
+入: workspace/modules/*/files.list
+出: workspace/modules/*/ (拆分/合并后)
+    workspace/deleted.list
+    ctx.refined_modules
 """
 from __future__ import annotations
 
@@ -34,51 +31,215 @@ from .helpers import (
     load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
     enforce_filter_constraint,
-    archive_module_deletions, get_module_deleted_files, restore_module_for_retry,
-    fix_orphan_dirs_before_judge, build_s2_diagnose_report,
-    module_has_nonempty_files, commit_split_plan, split_plan_exists, list_split_candidate_modules,
-    process_module_recover,
+    module_has_nonempty_files, split_plan_exists, list_split_candidate_modules,
+    get_module_deleted_files, process_module_recover,
+    read_module_files, read_split_merge_targets,
 )
 
 
-class RefineStage(BaseStage):
-    """Stage 2: 细分类（含子Worker摘要生成 + 全局补分类）"""
+# ── Python 侧校验 ──────────────────────────────────────────────────────────
 
+def _read_lines(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {ln.strip() for ln in path.read_text("utf-8", errors="replace").splitlines() if ln.strip()}
+
+
+def _write_lines(path: Path, lines: set[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8")
+
+
+def _validate_module(mod_dir: Path) -> dict:
+    """
+    校验单模块:
+      .snapshot 文件集合 == files.list ∪ split/*/files.list ∪ split/_merge_to/*/files.list ∪ deleted/files.list
+    返回 {pass: bool, missing: [...], extra: [...]} 供 Judge 参考，不抛异常。
+    """
+    mod_name = mod_dir.name
+    snapshot = _read_lines(mod_dir / ".snapshot")
+
+    if not snapshot:
+        return {"pass": False, "missing": ["NO_SNAPSHOT"], "extra": [],
+                "snap_count": 0, "covered_count": 0, "mod_name": mod_name}
+
+    kept = _read_lines(mod_dir / "files.list")
+    deleted = _read_lines(mod_dir / "deleted" / "files.list")
+    split_files: set[str] = set()
+    for child_dir in sorted((mod_dir / "split").iterdir()) if (mod_dir / "split").exists() else []:
+        if child_dir.name.startswith("_"):
+            for sub in (child_dir / "files.list" for _ in [1]):
+                continue
+        fl = child_dir / "files.list" if child_dir.is_dir() else None
+        if fl and fl.exists():
+            split_files |= _read_lines(fl)
+
+    merge_root = mod_dir / "split" / "_merge_to"
+    if merge_root.exists():
+        for d in sorted(merge_root.iterdir()):
+            if d.is_dir():
+                fl = d / "files.list"
+                if fl.exists():
+                    split_files |= _read_lines(fl)
+
+    covered = kept | split_files | deleted
+    missing = sorted(snapshot - covered)
+    extra = sorted(covered - snapshot)
+
+    return {
+        "pass": len(missing) == 0 and len(extra) == 0,
+        "missing": missing[:30],
+        "extra": extra[:30],
+        "snap_count": len(snapshot),
+        "covered_count": len(covered),
+        "mod_name": mod_name,
+    }
+
+
+# ── 提交逻辑 ────────────────────────────────────────────────────────────────
+
+def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) -> dict:
+    """
+    提交单个模块的 split/merge/deleted。
+    返回 {"applied": bool, "new_modules": [...], "merged_targets": [...], "retained_parent": bool}
+
+    处理三种 split 情况:
+      1. 全拆: mod → child1, child2 (原模块消失)
+      2. 部分拆: mod → child + mod' (原模块保留部分文件)
+      3. 合并: mod 部分文件 → _merge_to/target
+    """
+    mods_root = workspace / "modules"
+    mod_name = mod_dir.name
+    snapshot = _read_lines(mod_dir / ".snapshot")
+    deleted_set = _read_lines(mod_dir / "deleted" / "files.list")
+
+    # ── 读取 Worker 产物 ──
+    child_map: dict[str, set[str]] = {}
+    retained_parent = False
+    for child in list_split_candidate_modules(mod_dir):
+        files = _read_lines(mod_dir / "split" / child / "files.list")
+        if files:
+            child_map[child] = files
+            if child == mod_name:
+                retained_parent = True
+
+    merge_map: dict[str, set[str]] = {}
+    merge_root = mod_dir / "split" / "_merge_to"
+    if merge_root.exists():
+        for d in sorted(merge_root.iterdir()):
+            if d.is_dir():
+                files = _read_lines(d / "files.list")
+                if files:
+                    merge_map[d.name] = files
+
+    kept = _read_lines(mod_dir / "files.list")
+
+    # ── 完整性校验 ──
+    covered = set().union(*child_map.values()) if child_map else set()
+    covered |= set().union(*merge_map.values()) if merge_map else set()
+    covered |= deleted_set
+    covered |= kept
+    if snapshot and covered != snapshot:
+        missing = snapshot - covered
+        extra = covered - snapshot
+        raise StageError(
+            f"提交前校验失败: {mod_name} missing={len(missing)} extra={len(extra)}"
+            + (f" missing示例={sorted(missing)[:5]}" if missing else "")
+            + (f" extra示例={sorted(extra)[:5]}" if extra else "")
+        )
+
+    # ── 执行提交 ──
+    new_modules: list[str] = []
+    merged_targets: list[str] = []
+
+    for child, files in child_map.items():
+        if child == mod_name:
+            _write_lines(mod_dir / "files.list", files)
+        else:
+            target_dir = mods_root / child
+            existing = _read_lines(target_dir / "files.list")
+            _write_lines(target_dir / "files.list", existing | files)
+            new_modules.append(child)
+            # 如果目标在 LLM 处理中，追加到其 .snapshot
+            if child in in_progress:
+                snap = target_dir / ".snapshot"
+                if snap.exists():
+                    snap_set = _read_lines(snap)
+                    _write_lines(snap, snap_set | files)
+
+    for target, files in merge_map.items():
+        target_dir = mods_root / target
+        existing = _read_lines(target_dir / "files.list")
+        _write_lines(target_dir / "files.list", existing | files)
+        merged_targets.append(target)
+        # 如果目标在 LLM 处理中，追加到其 .snapshot
+        if target in in_progress:
+            snap = target_dir / ".snapshot"
+            if snap.exists():
+                snap_set = _read_lines(snap)
+                _write_lines(snap, snap_set | files)
+
+    # 处理原模块
+    kept_parent_files = False
+    if mod_name not in child_map:
+        kept_lines = _read_lines(mod_dir / "files.list")
+        if kept_lines:
+            # 父模块保留了一部分文件，不删
+            kept_parent_files = True
+        elif deleted_set:
+            (mod_dir / "files.list").unlink(missing_ok=True)
+        else:
+            shutil.rmtree(str(mod_dir), ignore_errors=True)
+    else:
+        _write_lines(mod_dir / "files.list", child_map[mod_name])
+
+    # 追加 deleted
+    if deleted_set:
+        with open(str(workspace / "deleted.list"), "a", encoding="utf-8") as f:
+            for fp in sorted(deleted_set):
+                f.write(fp + "\n")
+
+    # 清理
+    for p in [".snapshot", "split", "deleted"]:
+        path = mod_dir / p
+        if path.exists():
+            shutil.rmtree(str(path), ignore_errors=True)
+
+    return {
+        "applied": True,
+        "new_modules": sorted(set(new_modules)),
+        "merged_targets": sorted(set(merged_targets)),
+        "retained_parent": retained_parent or kept_parent_files,
+    }
+
+
+# ── Stage ────────────────────────────────────────────────────────────────────
+
+class RefineStage(BaseStage):
     stage_num = 2
     stage_name = "细分"
 
-    @staticmethod
-    def _module_refine_artifacts_valid(workspace: Path, mod_name: str) -> bool:
-        mod_dir = get_modules_root(str(workspace)) / mod_name
-        files_list = mod_dir / "files.list"
-        if not files_list.exists() or not files_list.is_file():
-            return False
-        try:
-            if not any(line.strip() for line in files_list.read_text("utf-8", errors="replace").splitlines()):
-                return False
-        except Exception:
-            return False
-        if (mod_dir / "deleted").exists() or (mod_dir / "recover").exists():
-            return False
-        return True
-
-    @classmethod
-    def _stage_refine_artifacts_valid(cls, workspace: Path) -> bool:
-        modules = discover_modules(str(workspace))
-        if not modules:
-            return False
-        return all(cls._module_refine_artifacts_valid(workspace, mod_name) for mod_name in modules)
-
     def _reset(self) -> None:
-        """每次 execute 前重置并发状态。"""
         self._refined: set[str] = set()
         self._in_progress: set[str] = set()
         self._errors: list[BaseException] = []
         self._queue: asyncio.Queue = asyncio.Queue()
+        self._commit_queue: asyncio.Queue = asyncio.Queue()
         self._ctx: PipelineContext | None = None
-        self._deleted_lock: asyncio.Lock = asyncio.Lock()  # 保护 workspace/deleted.list 写入
 
-    # ── 主入口 ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _module_refine_artifacts_valid(workspace: Path, mod_name: str) -> bool:
+        mod_dir = get_modules_root(str(workspace)) / mod_name
+        fl = mod_dir / "files.list"
+        if not fl.exists():
+            return False
+        try:
+            if not any(ln.strip() for ln in fl.read_text("utf-8", errors="replace").splitlines()):
+                return False
+        except Exception:
+            return False
+        return not (mod_dir / ".snapshot").exists()
+
     async def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         self._reset()
@@ -86,49 +247,38 @@ class RefineStage(BaseStage):
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        # ── checkpoint: 整体已完成 ────────────────────────────────────────────
         if cp and cp.is_done("s2_refine"):
-            if self._stage_refine_artifacts_valid(workspace):
-                ctx.refined_modules = discover_modules(str(workspace))
-                ctx.emit_event("log", level="info",
-                               msg=f"[S2] 整体 checkpoint 已完成，跳过({len(ctx.refined_modules)}个模块)")
-                return
-            cp.clear("s2_refine")
-            cp.clear("s2_global_check")
-            ctx.emit_event("log", level="warn",
-                           msg="[S2] 检测到整体 checkpoint 与模块产物不一致，已清理脏 checkpoint 并重建")
-
-        # ── 从 checkpoint 恢复已完成模块，增量续跑 ─────────────────────────────
-        done_modules: set[str] = cp.list_done_modules("s2") if cp else set()
-        if done_modules:
-            valid_done_modules = {mod_name for mod_name in done_modules if self._module_refine_artifacts_valid(workspace, mod_name)}
-            stale_done_modules = sorted(done_modules - valid_done_modules)
-            for mod_name in stale_done_modules:
-                cp.clear(f"s2_modules/{mod_name}")
-            self._refined = set(valid_done_modules)
+            ctx.refined_modules = discover_modules(str(workspace))
             ctx.emit_event("log", level="info",
-                           msg=f"[S2] 从 checkpoint 恢复 {len(valid_done_modules)} 个已完成模块")
-            if stale_done_modules:
-                ctx.emit_event("log", level="warn",
-                               msg=f"[S2] 发现 {len(stale_done_modules)} 个脏模块 checkpoint，已清理并重新细分")
+                           msg=f"[S2] checkpoint 已完成，跳过({len(ctx.refined_modules)}个模块)")
+            return
 
         all_modules = discover_modules(str(workspace))
-        skipped = 0
         for mod in all_modules:
             if mod not in self._refined:
                 await self._queue.put(mod)
-            else:
-                skipped += 1
-        if skipped:
-            ctx.emit_event("log", level="info",
-                           msg=f"[S2] 跳过 {skipped} 个已完成模块，待处理 {self._queue.qsize()} 个")
 
         parallel = max(1, cfg.parallel_modules)
-        workers = [asyncio.create_task(self._worker()) for _ in range(parallel)]
+
+        # 启动 LLM workers (并行)
+        llm_workers = [asyncio.create_task(self._llm_worker()) for _ in range(parallel)]
+
+        # 启动 commit worker (串行)
+        commit_task = asyncio.create_task(self._commit_worker())
+
+        # 等待 LLM 全部完成
         await self._queue.join()
-        for w in workers:
+
+        # 停止 LLM workers
+        for w in llm_workers:
             w.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.gather(*llm_workers, return_exceptions=True)
+
+        # 标记 commit 队列结束
+        await self._commit_queue.put(None)
+
+        # 等待 commit 完成
+        await commit_task
 
         if self._errors:
             for e in self._errors:
@@ -136,46 +286,42 @@ class RefineStage(BaseStage):
                     raise e
             raise self._errors[0]
 
-        # ── 全局完整性检查（有独立 checkpoint，避免重复运行）─────────────────
+        # 全局完整性检查
         if not (cp and cp.is_done("s2_global_check")):
             await self._global_completeness_check()
             if cp:
                 cp.mark_done("s2_global_check")
         else:
-            ctx.emit_event("log", level="info",
-                           msg="[S2] 全局完整性检查 checkpoint 已完成，跳过")
+            ctx.emit_event("log", level="info", msg="[S2] 全局检查 checkpoint 已完成，跳过")
 
         ctx.refined_modules = discover_modules(str(workspace))
         if cp:
             cp.mark_done("s2_refine", module_count=len(ctx.refined_modules))
 
-    # ── Queue worker ───────────────────────────────────────────────────────
-    async def _worker(self) -> None:
+    # ── LLM Worker (并行) ──────────────────────────────────────────────────
+    async def _llm_worker(self) -> None:
         while True:
             mod_name = await self._queue.get()
+            self._in_progress.add(mod_name)
             try:
                 if mod_name not in self._refined:
                     await self._refine_one(mod_name)
             except PiFatalError as e:
                 self._errors.append(e)
             except StageError as e:
-                if ctx := self._ctx:
-                    if ctx.continue_on_module_failure:
-                        ctx.record_soft_module_failure(
-                            stage="refine",
-                            module_name=mod_name,
-                            error=str(e),
-                            artifact_paths=[str(ctx.module_dir(mod_name) / "files.list")],
-                            extra={"soft_failed": True},
-                            record_round="已达最大轮数" not in str(e),
-                        )
-                    else:
-                        self._errors.append(e)
+                ctx = self._ctx
+                if ctx and ctx.continue_on_module_failure:
+                    ctx.record_soft_module_failure(
+                        stage="refine",
+                        module_name=mod_name,
+                        error=str(e),
+                        artifact_paths=[str(ctx.module_dir(mod_name) / "files.list")],
+                        extra={"soft_failed": True},
+                        record_round="已达最大轮数" not in str(e),
+                    )
                 else:
                     self._errors.append(e)
             except Exception as e:
-                # 任何未预期的运行时异常（含程序性 bug）都必须中止流水线，
-                # 让上层以 task_error 落地并停止重试，避免 S2 卡住。
                 ctx = self._ctx
                 if ctx is not None:
                     try:
@@ -189,15 +335,53 @@ class RefineStage(BaseStage):
                         )
                     except Exception:
                         pass
-                fatal = PiFatalError(
-                    f"S2 refine 模块 {mod_name} 未捕获异常: {type(e).__name__}: {e}"
-                )
+                fatal = PiFatalError(f"S2 refine {mod_name}: {type(e).__name__}: {e}")
                 fatal.fatal = True
                 self._errors.append(fatal)
             finally:
+                self._in_progress.discard(mod_name)
                 self._queue.task_done()
 
-    # ── 单模块细分 ─────────────────────────────────────────────────────────
+    # ── Commit Worker (串行) ───────────────────────────────────────────────
+    async def _commit_worker(self) -> None:
+        while True:
+            item = await self._commit_queue.get()
+            if item is None:
+                self._commit_queue.task_done()
+                break
+            mod_dir, was_split, new_ones = item
+            mod_name = mod_dir.name
+            ctx = self._ctx
+            workspace = ctx.workspace
+            try:
+                commit_info = {"applied": False, "new_modules": [], "merged_targets": [], "retained_parent": False}
+                if was_split or (mod_dir / "split").exists():
+                    commit_info = _commit_one_module(mod_dir, workspace, self._in_progress)
+                    new_ones = list(commit_info.get("new_modules") or [])
+
+                # 检查原模块是否还存在
+                if mod_dir.exists() and not (mod_dir / "files.list").exists():
+                    shutil.rmtree(str(mod_dir), ignore_errors=True)
+
+                # 新子模块入队（LLM workers 可能还在跑，可以追加到 queue）
+                for nm in new_ones:
+                    if nm not in self._refined and nm not in self._in_progress:
+                        self._in_progress.add(nm)
+                        await self._queue.put(nm)
+
+                self._refined.add(mod_name)
+                cp = ctx.checkpoint if ctx else None
+                if cp:
+                    cp.mark_done(f"s2_modules/{mod_name}",
+                                 split=was_split, new_modules=new_ones)
+            except Exception as exc:
+                ctx.emit_event("log", level="error",
+                               msg=f"[S2] 提交失败 {mod_name}: {exc}")
+                self._errors.append(exc)
+            finally:
+                self._commit_queue.task_done()
+
+    # ── 单模块 LLM 处理 ────────────────────────────────────────────────────
     async def _refine_one(self, mod_name: str) -> None:
         ctx = self._ctx
         cp = ctx.checkpoint
@@ -207,86 +391,51 @@ class RefineStage(BaseStage):
         w_base = ctx.make_w_base()
         j_base = ctx.make_j_base()
 
-        # ── 模块级 checkpoint 跳过（并发断点续跑） ────────────────────────────
-        if cp and cp.is_done(f"s2_modules/{mod_name}"):
-            if not self._module_refine_artifacts_valid(workspace, mod_name):
-                cp.clear(f"s2_modules/{mod_name}")
-                ctx.emit_event("log", level="warn",
-                               msg=f"[S2] {mod_name} checkpoint 存在但产物不完整，已清理并重新执行")
-            else:
-                self._refined.add(mod_name)
-                ctx.emit_event("log", level="info",
-                               msg=f"[S2] {mod_name} 模块 checkpoint 已完成，跳过")
-                return
-
         mod_dir = get_modules_root(str(workspace)) / mod_name
         if not (mod_dir / "files.list").exists():
             return
 
-        fc = sum(1 for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip())
+        fc = sum(1 for _ in (mod_dir / "files.list").read_text("utf-8", errors="replace").splitlines() if _.strip())
         if fc == 0:
-            ctx.emit_event("log", level="warn",
-                           msg=f"[跳过] {mod_name} 过滤后 0 个文件，自动移除空模块")
+            ctx.emit_event("log", level="warn", msg=f"[跳过] {mod_name} 0 文件，移除空模块")
             shutil.rmtree(str(mod_dir), ignore_errors=True)
             return
 
+        # checkpoint skip
+        if cp and cp.is_done(f"s2_modules/{mod_name}"):
+            if not self._module_refine_artifacts_valid(workspace, mod_name):
+                cp.clear(f"s2_modules/{mod_name}")
+            else:
+                self._refined.add(mod_name)
+                return
+
         refine_session = ctx.session_path("refine", f"{mod_name}.jsonl")
 
-        # 快照（拆分前保存，重试时不覆盖）
-        snapshots_dir = workspace / ".s2_snapshots"
-        snapshots_dir.mkdir(exist_ok=True)
-        snapshot_path = snapshots_dir / f"{mod_name}.snapshot"
-        if not snapshot_path.exists():
-            shutil.copy2(str(mod_dir / "files.list"), str(snapshot_path))
-
-        # 文件数超过阈值时，先用子 Worker 收集文件摘要
-        # ── 文件摘要获取：三层降级逻辑 ────────────────────────────────────
-        # 层1: details/ 存在 → 直接读 JSON（零 LLM，任意文件数均适用）
-        # 层2: 有不清晰文件  → 只对这些文件调用 LLM sub_reader（最小 token）
-        # 层3: details/ 不存在 → 原有逻辑（fc > SUB_WORKER_THRESHOLD 时调用）
-        files_list = [l.strip() for l in (mod_dir / "files.list").read_text("utf-8").splitlines() if l.strip()]
+        # ── 文件摘要 ──
+        files_list = [l.strip() for l in (mod_dir / "files.list").read_text("utf-8", errors="replace").splitlines() if l.strip()]
         sub_prompt = load_prompt(cfg, "step2_sub_read", "workers")
         file_summary = ""
-        # ctx.details_dir 已由 orchestrator 初始化为 workspace/details/，直接使用
         details_dir = ctx.details_dir
 
         if details_dir.exists():
-            # 层1+2：优先从 details/ 读取
-            summary_from_details, unclear_files = load_details_for_module(
-                details_dir, files_list, cfg.target_dir
-            )
-            no_llm_note = " (跳过LLM)" if not unclear_files else ""
+            summary_from_details, unclear_files = load_details_for_module(details_dir, files_list, cfg.target_dir)
             ctx.emit_event("log", level="info",
-                           msg=(f"[S2] {mod_name}: {fc}个文件，"
-                                f"{len(unclear_files)}个需LLM补充{no_llm_note}"))
+                           msg=f"[S2] {mod_name}: {fc}个文件, {len(unclear_files)}个需LLM补充")
             if unclear_files and sub_prompt:
-                # 层2：只对不清晰文件调用 LLM
                 supplement = await collect_file_summaries(
-                    ctx=ctx,
-                    mod_name=mod_name,
-                    mod_dir=mod_dir,
-                    sub_prompt_template=sub_prompt,
-                    parallel=cfg.parallel_sub_workers,
-                    sub_model=cfg.workers.model_for("sub_read"),
-                    target_dir=cfg.target_dir,
+                    ctx=ctx, mod_name=mod_name, mod_dir=mod_dir,
+                    sub_prompt_template=sub_prompt, parallel=cfg.parallel_sub_workers,
+                    sub_model=cfg.workers.model_for("sub_read"), target_dir=cfg.target_dir,
                     files_override=unclear_files,
                 )
-                file_summary = (
-                    (summary_from_details + "\n" + supplement)
-                    if summary_from_details else supplement
-                )
+                file_summary = (summary_from_details + "\n" + supplement) if summary_from_details else supplement
             else:
                 file_summary = summary_from_details
         elif sub_prompt and fc > SUB_WORKER_THRESHOLD:
-            # 层3 fallback：details/ 不存在，走原有逻辑
             file_summary = await collect_file_summaries(
-                ctx=ctx,
-                mod_name=mod_name,
-                mod_dir=mod_dir,
-                sub_prompt_template=sub_prompt,
-                parallel=cfg.parallel_sub_workers,
-                sub_model=cfg.workers.model_for("sub_read"),
-                target_dir=cfg.target_dir,
+                ctx=ctx, mod_name=mod_name, mod_dir=mod_dir,
+                sub_prompt_template=sub_prompt, parallel=cfg.parallel_sub_workers,
+                sub_model=cfg.workers.model_for("sub_read"), target_dir=cfg.target_dir,
             )
 
         granularity = getattr(cfg, "module_granularity", "fine") or "fine"
@@ -294,356 +443,210 @@ class RefineStage(BaseStage):
         j_sys_prompt = load_granularity_prompt(cfg, "step2_check_refine", granularity, "judges")
         reflect_prompt = load_granularity_prompt(cfg, "reflect_refine", granularity, "workers")
 
-        # 兼容旧 prompt：若粒度专用提示词未完全内嵌，再追加统一提示
         _gran_hint = build_granularity_hint(granularity)
         if _gran_hint and _gran_hint not in w_sys_prompt:
             w_sys_prompt += _gran_hint
         if _gran_hint and _gran_hint not in j_sys_prompt:
             j_sys_prompt += _gran_hint
 
+        # ── 初始化 .snapshot ──
+        snapshot_path = mod_dir / ".snapshot"
+        if not snapshot_path.exists():
+            shutil.copy2(str(mod_dir / "files.list"), str(snapshot_path))
+
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
             round_started = utc_now_iso()
             round_start_ts = time.time()
 
-            # 重试前由 Python 恢复状态（不靠 Worker bash 自清理）
-            if attempt > 0:
-                restore_module_for_retry(
-                    mod_name, mod_dir, workspace, self._refined
-                )
+            # ★ 不再 restore_module_for_retry — Worker 自己改 split/deleted
 
             ctx.emit_event("stage", stage=2, module=mod_name, attempt=attempt + 1)
 
             prompt_parts = [
-                f"当前正式已存在模块（禁止直接修改它们，只能通过 split/_merge_to 提交候选合并）：{', '.join(sorted(discover_modules(str(workspace))))}",
+                f"当前正式已存在模块: {', '.join(sorted(discover_modules(str(workspace))))}",
                 f"检查模块 `{mod_name}` 是否需要细分。",
-                f"如需拆分，只能在 `modules/{mod_name}/split/` 下创建候选子模块，禁止直接创建/修改正式 `modules/<其他模块>` 目录。",
-                f"若某些文件应并入已有模块，请写入 `modules/{mod_name}/split/_merge_to/<目标模块>/files.list` 作为候选迁移清单。",
-                f"Judge 通过后，Python 会依据 split 草稿正式提交拆分与合并。",
+                f"如需拆分 → `modules/{mod_name}/split/<child>/files.list`",
+                f"如需合并 → `modules/{mod_name}/split/_merge_to/<target>/files.list`",
+                f"如需排除 → `modules/{mod_name}/deleted/files.list`",
+                f"Judge 通过后 Python 自动提交。",
             ]
             if file_summary:
-                prompt_parts.append("\n\n## 文件摘要（子 Worker 已分析）\n\n" + file_summary)
+                prompt_parts.append("\n\n## 文件摘要\n\n" + file_summary)
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
             ar = await run_agent_with_stage_guard(
-                ctx=ctx,
-                stage="refine",
+                ctx=ctx, stage="refine",
                 context=f"s2-refine-{mod_name}-a{attempt+1}",
                 heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=refine_session: {
-                    "module": module,
-                    "attempt": attempt_no,
-                    "heartbeat": beat,
-                    "session_file": session,
+                    "module": module, "attempt": attempt_no, "heartbeat": beat, "session_file": session,
                 },
                 prompt="\n".join(prompt_parts),
-                model=ctx.wm("refine"),
-                system_prompt=w_sys_prompt,
-                session_file=refine_session,
-                **w_base,
+                model=ctx.wm("refine"), system_prompt=w_sys_prompt,
+                session_file=refine_session, **w_base,
             )
             ctx.tokens += ar.token_usage
 
             split_new_modules = list_split_candidate_modules(mod_dir)
             new_ones = [nm for nm in split_new_modules if nm != mod_name]
             was_split = split_plan_exists(mod_dir)
-            ctx.emit_event("stage_result", stage=2, module=mod_name,
-                           split=was_split, new_modules=new_ones)
+            ctx.emit_event("stage_result", stage=2, module=mod_name, split=was_split, new_modules=new_ones)
 
-            # ── Judge 前自动修复孤儿目录（问题2/3：路径写错导致MISSING）──────
-            orphan_fixed = fix_orphan_dirs_before_judge(
-                workspace, mod_name, self._refined
-            )
-            if orphan_fixed:
-                ctx.emit_event(
-                    "log",
-                    level="warn",
-                    msg=f"[S2孤儿修复] {mod_name}: 自动移入modules/ {orphan_fixed}",
-                )
+            # ── Python 校验（替代 check_module.sh）──
+            py_validation = _validate_module(mod_dir)
 
-            # ── Judge ──────────────────────────────────────────────────
-            # 生成 deleted/ 摘要注入 Judge prompt
+            # ── Judge ──
             del_files = get_module_deleted_files(mod_dir)
             deleted_summary = ""
             if del_files:
                 preview = sorted(del_files)[:30]
                 more = f"\n  ...(共 {len(del_files)} 个)" if len(del_files) > 30 else ""
                 deleted_summary = (
-                    f"\n\n## \u26a0\ufe0f 本轮提议排除文件\uff08modules/{mod_name}/deleted/files.list\uff09"
-                    f"\n共 {len(del_files)} 个，请审查是否确实不属于任何安全维度相关模块："
-                    + "".join(f"\n  - {f}" for f in preview) + more
+                    f"\n\n## 本轮提议排除文件（modules/{mod_name}/deleted/files.list）"
+                    f"\n共 {len(del_files)} 个" + "".join(f"\n  - {f}" for f in preview) + more
                 )
+
             judge_results = []
             judge_records = []
             for j_idx, j_item in enumerate(ctx.j_cfgs):
                 j_model = ctx.jm("refine", j_item)
-                judge_session = ctx.session_path(
-                    "judges",
-                    "refine",
-                    mod_name,
-                    f"refine-a{attempt + 1}-j{j_idx}.jsonl",
+                judge_session = ctx.session_path("judges", "refine", mod_name,
+                                                 f"refine-a{attempt + 1}-j{j_idx}.jsonl")
+                # 注入 Python 校验结果
+                judge_prompt = (
+                    f"评审 Worker 对模块 `{mod_name}` 的细分判断。"
+                    f"{deleted_summary}\n\n"
+                    f"## Python 侧校验结果\n"
+                    f"  snapshot={py_validation['snap_count']} files, "
+                    f"covered={py_validation['covered_count']}, "
+                    f"missing={len(py_validation.get('missing',[]))}, "
+                    f"extra={len(py_validation.get('extra',[]))}\n"
                 )
+                if py_validation.get("missing"):
+                    judge_prompt += f"  MISSING: {py_validation['missing'][:10]}\n"
+                if py_validation.get("extra"):
+                    judge_prompt += f"  EXTRA: {py_validation['extra'][:10]}\n"
+
                 j_ar = await run_agent_with_stage_guard(
-                    ctx=ctx,
-                    stage="refine",
+                    ctx=ctx, stage="refine",
                     context=f"s2-judge-{mod_name}-j{j_idx}-a{attempt+1}",
                     heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
-                        "module": module,
-                        "attempt": attempt_no,
-                        "heartbeat": beat,
-                        "judge_id": f"judge-{judge_id}",
-                        "session_file": session,
+                        "module": module, "attempt": attempt_no, "heartbeat": beat,
+                        "judge_id": f"judge-{judge_id}", "session_file": session,
                     },
-                    prompt=(
-                        f"评审 Worker 对模块 `{mod_name}` 的细分判断。"
-                        f"{deleted_summary}\n\n"
-                        f"**必须执行的校验命令（直接复制执行，无需修改）：**\n"
-                        f"```bash\nbash /app/scripts/check_module.sh {cfg.target_dir} modules {mod_name}\n```"
-                    ),
-                    model=j_model,
-                    system_prompt=j_sys_prompt,
-                    tools=cfg.judges.default_tools,
-                    cwd=str(workspace),
-                    session_file=judge_session,
-                    **j_base,
+                    prompt=judge_prompt, model=j_model,
+                    system_prompt=j_sys_prompt, tools=cfg.judges.default_tools,
+                    cwd=str(workspace), session_file=judge_session, **j_base,
                 )
                 ctx.tokens += j_ar.token_usage
                 parsed = parse_eval_md(j_ar.output or "")
                 judge_results.append(parsed)
                 judge_records.append({
-                    "judge_id": f"judge-{j_idx}",
-                    "model": j_model,
-                    "score": parsed["score"],
-                    "passed": parsed["pass"],
-                    "feedback": parsed["feedback"],
-                    "session_file": judge_session,
+                    "judge_id": f"judge-{j_idx}", "model": j_model,
+                    "score": parsed["score"], "passed": parsed["pass"],
+                    "feedback": parsed["feedback"], "session_file": judge_session,
                     "token_usage": j_ar.token_usage,
                 })
                 ctx.emit_event("judge_eval", stage=2, judge_id=f"judge-{j_idx}",
                                module=mod_name, passed=parsed["pass"], score=parsed["score"])
-                archive_file(
-                    ctx.output_dir,
-                    f"s2-{mod_name}-a{attempt+1}-j{j_idx}.md",
-                    f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
-                    f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{j_ar.output[:3000]}",
-                )
+                archive_file(ctx.output_dir, f"s2-{mod_name}-a{attempt+1}-j{j_idx}.md",
+                             f"Score: {parsed['score']}\nPass: {parsed['pass']}\n\n"
+                             f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{j_ar.output[:3000]}")
 
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
             max_reached = attempt + 1 >= max_iter(s_cfg)
             forced_pass = max_reached and max_rounds_exceeded_treated_as_passed(cfg)
+
             ctx.record_evaluation_round(
-                module_name=mod_name,
-                stage="refine",
-                stage_round=attempt + 1,
-                status=(
-                    "passed"
-                    if (final_pass or forced_pass)
-                    else "failed"
-                    if max_reached
-                    else "needs_reflection"
-                    if voted_pass
-                    else "needs_retry"
-                ),
-                started_at=round_started,
-                ended_at=utc_now_iso(),
+                module_name=mod_name, stage="refine", stage_round=attempt + 1,
+                status=("passed" if (final_pass or forced_pass)
+                        else "failed" if max_reached
+                        else "needs_reflection" if voted_pass
+                        else "needs_retry"),
+                started_at=round_started, ended_at=utc_now_iso(),
                 duration_ms=(time.time() - round_start_ts) * 1000,
-                worker={
-                    "model": ctx.wm("refine"),
-                    "session_file": refine_session,
-                    "token_usage": ar.token_usage,
-                    "error": ar.error,
-                },
-                judges=judge_records,
-                passed_by_vote=voted_pass,
+                worker={"model": ctx.wm("refine"), "session_file": refine_session,
+                        "token_usage": ar.token_usage, "error": ar.error},
+                judges=judge_records, passed_by_vote=voted_pass,
                 module_completed=False,
-                completion_reason=(
-                    "passed"
-                    if final_pass
-                    else "max_rounds_exceeded_treated_as_passed"
-                    if forced_pass
-                    else "max_rounds_exceeded"
-                    if max_reached
-                    else ""
-                ),
+                completion_reason=("passed" if final_pass
+                                   else "max_rounds_exceeded_treated_as_passed" if forced_pass
+                                   else "max_rounds_exceeded" if max_reached else ""),
                 needed_reflection=not final_pass,
                 artifact_paths=[str(mod_dir / "files.list")],
-                extra={
-                    "file_count": fc,
-                    "split": was_split,
-                    "new_modules": new_ones,
-                },
+                extra={"file_count": fc, "split": was_split, "new_modules": new_ones},
             )
 
-            if voted_pass:
-                if attempt + 1 >= s_cfg.min_rounds:
-                    commit_info = {"applied": False, "new_modules": [], "merged_targets": [], "retained_parent": False}
-                    if was_split:
-                        commit_info = commit_split_plan(workspace, mod_name)
-                        new_ones = list(commit_info.get("new_modules") or [])
-                    await archive_module_deletions(
-                        workspace, mod_name, mod_dir, self._deleted_lock, ctx
-                    )
-                    if mod_dir.exists() and not (mod_dir / "files.list").exists():
-                        import shutil as _shutil
-                        _shutil.rmtree(str(mod_dir), ignore_errors=True)
-                    if was_split and new_ones:
-                        for nm in new_ones:
-                            if nm not in self._refined and nm not in self._in_progress:
-                                self._in_progress.add(nm)
-                                await self._queue.put(nm)
-                    self._refined.add(mod_name)
-                    # ── 写模块级 checkpoint（judge通过后原子写入）────────────
-                    _cp = self._ctx.checkpoint if self._ctx else None
-                    if _cp:
-                        _cp.mark_done(f"s2_modules/{mod_name}",
-                                      split=was_split,
-                                      new_modules=new_ones)
-                    return
-                else:
-                    ctx.emit_event("reflect", stage=2, module=mod_name, round=attempt + 1)
-                    feedback = (
-                        f"# 自查要求（第 {attempt+1} 轮，需至少 {s_cfg.min_rounds} 轮）\n\n"
-                        + reflect_prompt
-                    )
-                    jfb = "\n".join(
-                        f"judge-{i}: {r['feedback']}"
-                        for i, r in enumerate(judge_results))
-                    feedback += "\n\n## Judge 上轮意见\n\n" + jfb
-            else:
-                # Process recover/ (Judge marked wrong-deleted files)
-                recovered = process_module_recover(mod_dir)
-                if recovered:
-                    has_missing = any(
-                        "missing" in r["feedback"].lower() or "遗漏" in r["feedback"]
-                        or "丢失" in r["feedback"]
-                        for r in judge_results if not r["pass"]
-                    )
-                    if not has_missing:
-                        skip_restore = True
-                    ctx.emit_event("log", level="info",
-                                   msg=(f"[S2] {mod_name}: recovered {len(recovered)} files "
-                                        f"(skip_restore={skip_restore})"))
-                fb_rel = write_judge_feedback(
-                    workspace, "s2_refine", mod_name, attempt + 1, judge_results)
-                ctx.emit_event("log", level="info",
-                               msg=f"[S2] judge 意见已写入 {fb_rel}")
-                fail_fb = str(fb_rel)
-                if "missing" in fail_fb.lower() or "丢失" in fail_fb or "遗漏" in fail_fb:
-                    guidance = (
-                        "\n\n⚠️ **文件丢失！** "
-                        "请先阅读下方诊断报告，**不要盲目重写脚本**，"
-                        "按报告指引针对性修复。"
-                    )
-                    # 问题1/4: 构建磁盘诊断文件，Worker 通过 read 工具获取完整原始诊断
-                    missing_files = [
-                        line.split("MISSING: ")[1].strip()
-                        for r in judge_results if not r["pass"]
-                        for line in r["feedback"].splitlines()
-                        if line.startswith("MISSING: ")
-                    ]
-                    diagnose_path = build_s2_diagnose_report(
-                        workspace, mod_name, missing_files
-                    )
-                    ctx.emit_event(
-                        "log",
-                        level="info",
-                        msg=f"[S2诊断] {mod_name}: 诊断报告已写入 {diagnose_path}",
-                    )
-                    guidance += (
-                        f"\n\n🔍 **请先执行诊断**（这一步必须做）：\n"
-                        f"```\nread {diagnose_path}\n```\n"
-                        f"报告会告诉你每个 MISSING 文件当前在哪里，应该怎么修复。"
-                    )
-                else:
-                    guidance = "\n\n请根据评审意见调整拆分策略。"
-                feedback = (
-                    "请先阅读 judge 完整意见：\n"
-                    + f"```\nread {fail_fb}\n```\n"
-                    + guidance
-                )
-                if recovered:
-                    rec_list = chr(10).join(f"  - {f}" for f in recovered[:30])
-                    feedback += (
-                        chr(10) + chr(10)
-                        + "## ⚠️ 已从 deleted/ 恢复的文件（禁止再次删除）"
-                        + chr(10) + chr(10) + rec_list
-                    )
-
-            if forced_pass:
-                if was_split:
-                    commit_info = commit_split_plan(workspace, mod_name)
-                    new_ones = list(commit_info.get("new_modules") or [])
-                await archive_module_deletions(
-                    workspace, mod_name, mod_dir, self._deleted_lock, ctx
-                )
-                if mod_dir.exists() and not (mod_dir / "files.list").exists():
-                    import shutil as _shutil2
-                    _shutil2.rmtree(str(mod_dir), ignore_errors=True)
-                if was_split and new_ones:
-                    for nm in new_ones:
-                        if nm not in self._refined and nm not in self._in_progress:
-                            self._in_progress.add(nm)
-                            await self._queue.put(nm)
-                self._refined.add(mod_name)
-                # ── forced_pass 也写 checkpoint ────────────────────────────
-                _cp2 = self._ctx.checkpoint if self._ctx else None
-                if _cp2:
-                    _cp2.mark_done(f"s2_modules/{mod_name}",
-                                   split=was_split,
-                                   new_modules=new_ones,
-                                   forced=True)
+            if final_pass or forced_pass:
+                # ★ 入 commit 队列，不在这里提交
+                await self._commit_queue.put((mod_dir, was_split, new_ones))
                 return
 
-        raise StageError(f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
+            if voted_pass:
+                ctx.emit_event("reflect", stage=2, module=mod_name, round=attempt + 1)
+                feedback = (f"# 自查要求（第 {attempt+1} 轮，需至少 {s_cfg.min_rounds} 轮）\n\n"
+                            + reflect_prompt)
+                jfb = "\n".join(f"judge-{i}: {r['feedback']}"
+                                for i, r in enumerate(judge_results))
+                feedback += "\n\n## Judge 上轮意见\n\n" + jfb
+            else:
+                # Judge 不通过 — 不恢复 Worker 产物，让 Worker 自己改
+                recovered = process_module_recover(mod_dir)
+                if recovered:
+                    ctx.emit_event("log", level="info",
+                                   msg=f"[S2] {mod_name}: recovered {len(recovered)} files from deleted/")
+                fb_rel = write_judge_feedback(workspace, "s2_refine", mod_name, attempt + 1, judge_results)
+                ctx.emit_event("log", level="info", msg=f"[S2] judge 意见 → {fb_rel}")
+                guidance = "\n\n请根据评审意见调整 split/merge/deleted 内容。"
+                feedback = "请先阅读 judge 完整意见：\n" + f"```\nread {fb_rel}\n```\n" + guidance
 
-    # ── Stage 2 后：全局完整性检查 + 遗漏文件补分类 ───────────────────────
+            if forced_pass and not final_pass:
+                await self._commit_queue.put((mod_dir, was_split, new_ones))
+                return
+
+        raise StageError(f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数")
+
+    # ── 全局完整性检查（保持不变）──────────────────────────────────────────
     async def _global_completeness_check(self) -> None:
         ctx = self._ctx
         cfg = ctx.cfg
         workspace = ctx.workspace
-        w_base = ctx.make_w_base()
 
         filtered_txt = workspace / "filtered_files.txt"
         if not filtered_txt.exists():
             return
 
-        all_target = set(
-            l.strip() for l in filtered_txt.read_text("utf-8").splitlines() if l.strip()
-        )
-        # 工作集 = filtered_files − 已确认排除文件
+        all_target = set(l.strip() for l in filtered_txt.read_text("utf-8").splitlines() if l.strip())
         confirmed_deleted = ctx.load_confirmed_deleted()
         if confirmed_deleted:
             all_target -= confirmed_deleted
             ctx.emit_event("log", level="info",
-                           msg=f"[S2全局检查] 工作集: {len(all_target)} 个 "
-                               f"(已排除 {len(confirmed_deleted)} 个已确认排除文件)")
+                           msg=f"[S2全局检查] 工作集: {len(all_target)} (已排除 {len(confirmed_deleted)} 个已确认排除)")
+
         mods_root = get_modules_root(str(workspace))
         all_classified: set[str] = set()
         for flist in mods_root.glob("*/files.list"):
             if flist.name == "files.list.snapshot":
                 continue
             for l in flist.read_text("utf-8").splitlines():
-                l = l.strip()
-                if l:
-                    all_classified.add(l)
+                if l.strip():
+                    all_classified.add(l.strip())
         missing_files = sorted(all_target - all_classified)
 
         if not missing_files:
             ctx.emit_event("log", level="info",
-                           msg=f"Stage2 全局检查: 全部 {len(all_target)} 个文件已归类 ✅")
+                           msg=f"Stage2 全局检查: 全部 {len(all_target)} 个文件已归类")
             return
 
         ctx.emit_event("log", level="warn",
                        msg=f"Stage2 全局检查: {len(missing_files)} 个文件未归类，启动补分类")
 
-        mod_summary_lines = ["## 已有模块（名称 | 示例文件）"]
+        mod_summary_lines = ["## 已有模块"]
         for flist in sorted(mods_root.glob("*/files.list")):
             mod_name = flist.parent.name
-            sample = next(
-                (l.strip() for l in flist.read_text("utf-8").splitlines() if l.strip()),
-                "(空)"
-            )
+            sample = next((l.strip() for l in flist.read_text("utf-8").splitlines() if l.strip()), "(空)")
             mod_summary_lines.append(f"- {mod_name} | {Path(sample).name}")
         mod_summary = "\n".join(mod_summary_lines)
 
@@ -652,76 +655,56 @@ class RefineStage(BaseStage):
         reclassify_sessions_dir = ctx.sess_dir / "reclassify"
         reclassify_sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        reclass_prompt = (
-            f"## 待归类文件（{len(missing_files)} 个）\n\n"
-            + "\n".join(missing_files)
-            + f"\n\n{mod_summary}"
-        )
+        w_base = ctx.make_w_base()
+        reclass_prompt = f"## 待归类文件（{len(missing_files)} 个）\n\n" + "\n".join(missing_files) + f"\n\n{mod_summary}"
 
         for rc_attempt in range(max_rc):
             session_file = str(reclassify_sessions_dir / f"reclassify-a{rc_attempt + 1}.jsonl")
-            ctx.emit_event(
-                "stage",
-                stage="2-reclassify",
-                attempt=rc_attempt + 1,
-                missing_count=len(missing_files),
-                session_file=session_file,
-            )
-            ctx.emit_event("model", stage="2-reclassify", model=ctx.wm("classify"))
+            ctx.emit_event("stage", stage="2-reclassify", attempt=rc_attempt + 1,
+                           missing_count=len(missing_files), session_file=session_file)
+
             rc_ar = await run_agent_with_stage_guard(
-                ctx=ctx,
-                stage="2-reclassify",
+                ctx=ctx, stage="2-reclassify",
                 heartbeat_payload_factory=lambda beat, attempt=rc_attempt + 1, count=len(missing_files): {
-                    "attempt": attempt,
-                    "heartbeat": beat,
-                    "missing_count": count,
-                    "session_file": session_file,
+                    "attempt": attempt, "heartbeat": beat, "missing_count": count, "session_file": session_file,
                 },
                 context=f"s2-reclassify-a{rc_attempt+1}",
-                prompt=reclass_prompt,
-                model=ctx.wm("classify"),
-                tools=w_base["tools"],
-                system_prompt=reclass_prompt_tmpl,
-                cwd=str(workspace),
-                thinking_level=w_base.get("thinking_level", "off"),
-                session_file=session_file,
-                cancel_event=w_base.get("cancel_event"),
-                max_retries=w_base.get("max_retries", 3),
-                retry_delay=w_base.get("retry_delay", 10),
-                pi_max_retries=w_base.get("pi_max_retries", -1),
-                pi_retry_delay=w_base.get("pi_retry_delay", 10),
+                prompt=reclass_prompt, model=ctx.wm("classify"),
+                tools=w_base["tools"], system_prompt=reclass_prompt_tmpl,
+                cwd=str(workspace), thinking_level=w_base.get("thinking_level", "off"),
+                session_file=session_file, cancel_event=w_base.get("cancel_event"),
+                max_retries=w_base.get("max_retries", 3), retry_delay=w_base.get("retry_delay", 10),
+                pi_max_retries=w_base.get("pi_max_retries", -1), pi_retry_delay=w_base.get("pi_retry_delay", 10),
             )
             ctx.tokens += rc_ar.token_usage
 
             all_classified2: set[str] = set()
             for flist in mods_root.glob("*/files.list"):
                 for l in flist.read_text("utf-8").splitlines():
-                    l = l.strip()
-                    if l:
-                        all_classified2.add(l)
+                    if l.strip():
+                        all_classified2.add(l.strip())
             still_missing = sorted(all_target - all_classified2 - ctx.load_confirmed_deleted())
-            ctx.emit_event(
-                "stage_result",
-                stage="2-reclassify",
-                attempt=rc_attempt + 1,
-                status="completed",
-                missing_count=len(still_missing),
-                session_file=session_file,
-            )
-            ctx.emit_event("log", level="info",
-                           msg=f"补分类第{rc_attempt+1}轮: 剩余 {len(still_missing)} 个未归类")
+            ctx.emit_event("stage_result", stage="2-reclassify", attempt=rc_attempt + 1,
+                           status="completed", missing_count=len(still_missing))
             if not still_missing:
                 break
             missing_files = still_missing
-            reclass_prompt = (
-                f"## 仍未归类文件（{len(missing_files)} 个）\n\n"
-                + "\n".join(missing_files)
-                + f"\n\n{mod_summary}"
-            )
+            reclass_prompt = f"## 仍未归类文件（{len(missing_files)} 个）\n\n" + "\n".join(missing_files) + f"\n\n{mod_summary}"
 
-        # 全局过滤约束：删除各 files.list 中不属于 filtered_files.txt 的越界条目
         if ctx.filtered_files:
             removed = enforce_filter_constraint(workspace, set(ctx.filtered_files))
             if removed:
                 ctx.emit_event("log", level="warn",
-                               msg=f"[S2过滤约束] 删除 {removed} 个超出 filtered_files.txt 范围的文件条目")
+                               msg=f"[S2过滤约束] 删除 {removed} 个超出 filtered_files.txt 的文件条目")
+
+        # 补快照
+        snap_dir = workspace / ".s2_snapshots"
+        snap_dir.mkdir(exist_ok=True)
+        snap_created = 0
+        for flist in mods_root.glob("*/files.list"):
+            mod_name = flist.parent.name
+            if flist.stat().st_size > 0 and not (snap_dir / f"{mod_name}.snapshot").exists():
+                shutil.copy2(str(flist), str(snap_dir / f"{mod_name}.snapshot"))
+                snap_created += 1
+        if snap_created:
+            ctx.emit_event("log", level="info", msg=f"[S2全局检查] 补创建 {snap_created} 个模块快照")
