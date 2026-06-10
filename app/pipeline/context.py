@@ -95,6 +95,17 @@ class PipelineContext:
     path_group_map: dict[str, str] = field(default_factory=dict)
     # PathGroupStage v2 产出: 文件路径 → 路径推断模块名 的映射
 
+    # ── S2↔S3 redo 回溯 ──────────────────────────────────────────────
+    redo_modules: list[str] = field(default_factory=list)
+    # S3 触发重分类的模块名列表
+
+    redo_feedback: dict[str, str] = field(default_factory=dict)
+    # 模块名 → S3 Judge 重分类意见
+
+    redo_s3_modules: list[str] = field(default_factory=list)
+    # redo 完成后需要重新跑 S3 的模块（原模块+新子模块+merge目标），
+    # 为空时 S3 跑全部模块
+
     invalid_detail_files: list[str] = field(default_factory=list)
     # ValidateDetailsStage 发现的无效 details JSON 列表
 

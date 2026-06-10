@@ -73,7 +73,11 @@ class AnalyseStage(BaseStage):
             j_sys_prompt += _gran_hint
 
         final_modules = discover_modules(str(workspace))
-        ctx.modules_needing_reclassify = []
+        # ── redo 模式：只处理变动模块 ──
+        if ctx.redo_s3_modules:
+            final_modules = [m for m in ctx.redo_s3_modules if m in final_modules]
+        ctx.redo_modules = []
+        ctx.redo_feedback = {}
         s3_errors: list[BaseException] = []
         s3_sem = asyncio.Semaphore(max(1, cfg.parallel_modules))
 
@@ -118,24 +122,14 @@ class AnalyseStage(BaseStage):
                     raise e
             raise s3_errors[0]
 
-        # ── Stage 2 → Stage 3 重分类回溯 ──────────────────────────────────────
-        if ctx.modules_needing_reclassify:
-            # redo 前清除相关模块的 S3 checkpoint（分类已改变，旧报告无效）
-            if cp:
-                cp.clear_stage_modules("s3", ctx.modules_needing_reclassify)
-            await self._redo_s2_s3(
-                ctx, final_modules,
-                w_sys_prompt, j_sys_prompt, reflect_prompt,
-            )
-
         ctx.analysed_modules = [
             d.name for d in ctx.modules_root().iterdir()
             if d.is_dir() and (d / "module_report.md").exists() and module_has_nonempty_files(d)
         ]
 
-        # ── 写整体 checkpoint ────────────────────────────────────────────────
         if cp:
             cp.mark_done("s3_analyse", module_count=len(ctx.analysed_modules))
+    
 
     # ── 单模块分析（W+J 多轮）────────────────────────────────────────────────
     async def _analyse_module(
@@ -356,7 +350,7 @@ class AnalyseStage(BaseStage):
                     f"{parsed['feedback']}\n\n---\n## Raw Output\n\n{j_ar.output[:3000]}",
                 )
 
-            # 重分类检测
+            # 重分类检测 — 保存 S3 Judge 反馈，交由 Orchestrator 循环 S2
             reclass_votes = sum(
                 1 for r in judge_results if "[需要重新分类]" in r.get("feedback", "")
             )
@@ -387,8 +381,13 @@ class AnalyseStage(BaseStage):
                     artifact_paths=[str(mod_dir / "module_report.md")],
                 )
                 ctx.emit_event("reclassify", module=mod_name)
-                ctx.modules_needing_reclassify.append(mod_name)
-                return  # 交给 _redo_s2_s3 处理
+                # ★ 保存 S3 Judge 的具体反馈（非通用描述）
+                ctx.redo_feedback[mod_name] = "\n\n".join(
+                    f"## Judge {r['judge_id']} 重分类意见\n\n{r['feedback']}"
+                    for r in judge_records if "[需要重新分类]" in (r.get("feedback") or "")
+                )
+                ctx.redo_modules.append(mod_name)
+                return
 
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
             final_pass = voted_pass and attempt + 1 >= s_cfg.min_rounds
@@ -469,220 +468,5 @@ class AnalyseStage(BaseStage):
                     cp.mark_done(f"s3_modules/{mod_name}", forced=True)
                 return
 
-        if mod_name not in ctx.modules_needing_reclassify:
             raise StageError(f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")
-
-    # ── Stage 2/3 重分类回溯 ─────────────────────────────────────────────────
-    async def _redo_s2_s3(
-        self,
-        ctx: PipelineContext,
-        original_modules: list[str],
-        w_sys_analyse: str,
-        j_sys_analyse: str,
-        reflect_analyse: str,
-    ) -> None:
-        cfg = ctx.cfg
-        workspace = ctx.workspace
-        mods_root = get_modules_root(str(workspace))
-
-        to_reclassify = ctx.modules_needing_reclassify[:]
-        ctx.emit_event("stage", stage="2-redo", modules=to_reclassify)
-
-        s_cfg_refine = cfg.stages.refine
-        granularity = getattr(cfg, "module_granularity", "fine") or "fine"
-        w_sys_refine = load_granularity_prompt(cfg, "step2_refine", granularity, "workers")
-        j_sys_refine = load_granularity_prompt(cfg, "step2_check_refine", granularity, "judges")
-        reflect_refine = load_granularity_prompt(cfg, "reflect_refine", granularity, "workers")
-        # 2-redo 中注入安全维度约束，防止重分类超出过滤范围
-        from .s1_classify import _build_security_focus_section  # noqa: PLC0415
-        _sec_cats = getattr(cfg, "security_focus_categories", ["all"])
-        _sec_focus_hint = _build_security_focus_section(_sec_cats)
-        # 2-redo 中同样注入粒度约束，与 S2 保持一致
-        _gran_hint = build_granularity_hint(granularity)
-        if _gran_hint and _gran_hint not in w_sys_refine:
-            w_sys_refine += _gran_hint
-        if _gran_hint and _gran_hint not in j_sys_refine:
-            j_sys_refine += _gran_hint
-        w_base = ctx.make_w_base()
-        j_base = ctx.make_j_base()
-        _redo_deleted_lock: asyncio.Lock = asyncio.Lock()  # 保护 deleted.list 并发写入
-        all_merged_targets: list[str] = []  # 收集所有 2-redo 中通过 _merge_to 接收了新文件的已有模块
-
-        for mod_name in to_reclassify:
-            mod_dir = mods_root / mod_name
-            if not mod_dir.exists():
-                continue
-
-            refine_session = ctx.session_path("refine-redo", f"{mod_name}.jsonl")
-            feedback = "# 重分类要求\n\nStage 3 分析发现该模块分类不合理，需要重新细分。"
-            if _sec_focus_hint:
-                feedback += _sec_focus_hint  # 注入安全维度约束
-
-            # ── 为 redo 的 refine Worker 预加载 details/ 摘要（节省 token）─────────────
-            _details_dir = ctx.details_dir  # 由 orchestrator 初始化，永不为 None
-            if _details_dir.exists() and mod_dir.exists():
-                _flist = [l.strip() for l in (mod_dir / "files.list").read_text("utf-8",errors="replace").splitlines() if l.strip()] if (mod_dir / "files.list").exists() else []
-                if _flist:
-                    _det_summary, _unclear = load_details_for_module(_details_dir, _flist, cfg.target_dir)
-                    if _det_summary:
-                        feedback += (
-                            "\n\n## 模块文件摘要（来自 details/ 预处理）\n\n"
-                            + _det_summary[:3000]
-                            + ("\n（…摘要已截断）" if len(_det_summary) > 3000 else "")
-                        )
-                        ctx.emit_event("log", level="info",
-                                       msg=(f"[S3-2redo] {mod_name}: 注入 details 摘要"
-                                            f"（{len(_flist)}个文件，{len(_unclear)}个需补充）"))
-
-            for attempt in range(max_iter(s_cfg_refine)):
-                # 重试前恢复干净状态：从快照还原 files.list，清除上轮 split/ 和 deleted/
-                if attempt > 0:
-                    restore_module_for_retry(mod_name, mod_dir, workspace, set())
-
-                ctx.emit_event("stage", stage="2-redo", module=mod_name, attempt=attempt + 1)
-
-                ar = await run_agent_with_stage_guard(
-                    ctx=ctx,
-                    stage="2-redo",
-                    context=f"s2-redo-{mod_name}-a{attempt+1}",
-                    heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=refine_session: {
-                        "module": module,
-                        "attempt": attempt_no,
-                        "heartbeat": beat,
-                        "session_file": session,
-                    },
-                    model=ctx.wm("refine"),
-                    prompt=f"重新检查模块 `{mod_name}` 并细分。\n\n{feedback}",
-                    system_prompt=w_sys_refine,
-                    session_file=refine_session,
-                    **w_base,
-                )
-                ctx.tokens += ar.token_usage
-
-                # enforce 在 Judge 前运行，Judge 看到清洁数据
-                if ctx.filtered_files:
-                    _rm = enforce_filter_constraint(workspace, set(ctx.filtered_files))
-                    if _rm:
-                        ctx.emit_event("log", level="warn",
-                                       msg=f"[S3-2redo过滤] 补先移除 {_rm} 个越界条目")
-
-                # 孤儿目录修复（Worker bash 路径拼写错误导致 MISSING）
-                orphan_fixed = fix_orphan_dirs_before_judge(workspace, mod_name, set())
-                if orphan_fixed:
-                    ctx.emit_event("log", level="warn",
-                                   msg=f"[S3-2redo孤儿修复] {mod_name}: 自动移入modules/ {orphan_fixed}")
-
-                judge_results = []
-                eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
-                for j_idx, j_item in enumerate(ctx.j_cfgs):
-                    judge_session = ctx.session_path(
-                        "judges",
-                        "refine-redo",
-                        mod_name,
-                        f"refine-redo-a{attempt + 1}-j{j_idx}.jsonl",
-                    )
-                    j_ar = await run_agent_with_stage_guard(
-                        ctx=ctx,
-                        stage="2-redo",
-                        context=f"s2-redo-judge-{mod_name}-j{j_idx}-a{attempt+1}",
-                        heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
-                            "module": module,
-                            "attempt": attempt_no,
-                            "heartbeat": beat,
-                            "judge_id": f"judge-{judge_id}",
-                            "session_file": session,
-                        },
-                        prompt=f"评审模块 `{mod_name}` 的重新细分。",
-                        model=ctx.jm("refine", j_item),
-                        system_prompt=j_sys_refine,
-                        tools=cfg.judges.default_tools,
-                        cwd=eval_cwd,
-                        session_file=judge_session,
-                        **j_base,
-                    )
-                    ctx.tokens += j_ar.token_usage
-                    parsed = parse_eval_md(j_ar.output or "")
-                    judge_results.append(parsed)
-                    ctx.emit_event("judge_eval", stage="2-redo", judge_id=f"judge-{j_idx}",
-                                   module=mod_name, passed=parsed["pass"], score=parsed["score"])
-
-                voted_pass = check_voting(judge_results, s_cfg_refine.pass_mode, ctx.j_count)
-                if voted_pass:
-                    if attempt + 1 >= s_cfg_refine.min_rounds:
-                        # 提交 split 草稿（若 Worker 创建了拆分计划）
-                        if split_plan_exists(mod_dir):
-                            _commit_info = commit_split_plan(workspace, mod_name)
-                            # 收集 _merge_to 涉及的已有模块（它们的 S3 报告已过时）
-                            _mt = _commit_info.get("merged_targets") or []
-                            for _m in _mt:
-                                if _m not in all_merged_targets:
-                                    all_merged_targets.append(_m)
-                                    ctx.emit_event("log", level="info",
-                                                   msg=(f"[S3-2redo] {mod_name} 拆分将 {len(_mt)} 个文件并入已有模块"
-                                                        f"，将对 {_mt} 重新运行 S3 分析"))
-                        # 归档 deleted/ → workspace/deleted.list
-                        await archive_module_deletions(
-                            workspace, mod_name, mod_dir, _redo_deleted_lock, ctx
-                        )
-                        break
-                    feedback = "# 自查要求\n\n" + reflect_refine
-                    jfb = "\n".join(
-                        f"judge-{i}: {r['feedback']}"
-                        for i, r in enumerate(judge_results))
-                    feedback += "\n\n## Judge 上轮意见\n\n" + jfb
-                else:
-                    _fb_redo = write_judge_feedback(
-                        workspace, "s2_refine", mod_name, attempt + 1, judge_results)
-                    feedback = f"评审未通过，完整意见请 read {{_fb_redo}}"
-                    feedback = f"评审未通过，完整意见请 read {_fb_redo}"
-            else:
-                raise StageError(f"Stage 2-redo 模块 {mod_name} 重分类未通过")
-
-        # Stage 3-redo: 分三类收集需要重新分析的模块
-        #
-        # 1. 新子模块（split 产生，不在 original_modules 里）
-        # 2. 被重分类的模块本身（to_reclassify，若 files.list 非空）
-        # 3. 通过 _merge_to 接收了新文件的已有模块（merged_targets）
-        #    ——这类模块的 S3 报告是在合并前写的，文件数已过时，必须重新分析
-        new_mods = discover_modules(str(workspace))
-        redo_analyse: list[str] = []
-        seen: set[str] = set()
-
-        def _add_redo(m: str) -> None:
-            if m not in seen:
-                seen.add(m)
-                redo_analyse.append(m)
-
-        for m in new_mods:
-            if m not in original_modules:
-                # 类型1：split 产生的全新子模块
-                _add_redo(m)
-            elif m in to_reclassify:
-                # 类型2：被重分类的模块自身（保留了部分文件）
-                flist = mods_root / m / "files.list"
-                if flist.exists() and flist.stat().st_size > 0:
-                    _add_redo(m)
-
-        # 类型3：通过 _merge_to 接收了新文件的已有模块
-        # all_merged_targets 在上面的 2-redo commit 循环里收集
-        for m in all_merged_targets:
-            flist = mods_root / m / "files.list"
-            if flist.exists() and flist.stat().st_size > 0:
-                _add_redo(m)
-
-        # 清除 merged_targets 的旧 S3 checkpoint，使 _analyse_module 真正重跑
-        if redo_analyse and ctx.checkpoint:
-            for m in all_merged_targets:
-                if m in seen:
-                    ctx.checkpoint.clear(f"s3_modules/{m}")
-                    ctx.emit_event("log", level="info",
-                                   msg=f"[S3-redo] 清除 {m} 旧 S3 checkpoint（merge 后文件数已变）")
-
-        if redo_analyse:
-            ctx.emit_event("stage", stage="3-redo", modules=redo_analyse)
-            for mod_name in redo_analyse:
-                await self._analyse_module(
-                    ctx, mod_name,
-                    w_sys_analyse, j_sys_analyse, reflect_analyse,
-                    session_suffix="-redo",
-                )
+            raise StageError(f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")

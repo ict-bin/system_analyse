@@ -225,10 +225,17 @@ class RefineStage(BaseStage):
     stage_num = 2
     stage_name = "细分"
 
+    def __init__(self):
+        super().__init__()
+        self._redo_modules: list[str] = []
+        self._redo_feedback: dict[str, str] = {}
+        self._commit_children: set[str] = set()  # commit 产生的新子模块名
+
     def _reset(self) -> None:
         self._refined: set[str] = set()
         self._in_progress: set[str] = set()
-        self._pending_merge_targets: set[str] = set()  # 在LLM中被merge的模块，LLM完成后才入commit队列
+        self._pending_merge_targets: set[str] = set()
+        self._commit_children: set[str] = set()  # commit 产生的新子模块
         self._errors: list[BaseException] = []
         self._queue: asyncio.Queue = asyncio.Queue()
         self._commit_queue: asyncio.Queue = asyncio.Queue()
@@ -261,6 +268,9 @@ class RefineStage(BaseStage):
             return
 
         all_modules = discover_modules(str(workspace))
+        # ── redo 模式：只处理指定模块 ──
+        if self._redo_modules:
+            all_modules = [m for m in self._redo_modules if m in all_modules]
         for mod in all_modules:
             if mod not in self._refined:
                 await self._queue.put(mod)
@@ -368,7 +378,8 @@ class RefineStage(BaseStage):
             try:
                 commit_info, merge_in_progress = _commit_one_module(mod_dir, workspace, self._in_progress)
                 new_ones = list(commit_info.get("new_modules") or [])
-
+                for nm in new_ones:
+                    self._commit_children.add(nm)  # ★ 记录给 Orchestrator
                 # 记录被 merge 的 LLM 处理中模块（等 LLM 结束后入队列）
                 for target in merge_in_progress:
                     self._pending_merge_targets.add(target)
@@ -462,7 +473,7 @@ class RefineStage(BaseStage):
         if _gran_hint and _gran_hint not in j_sys_prompt:
             j_sys_prompt += _gran_hint
 
-        # ── 初始化 .snapshot ──
+        # ── 初始化 .snapshot（W+J 需要参考原始文件清单）──
         snapshot_path = mod_dir / ".snapshot"
         if not snapshot_path.exists():
             shutil.copy2(str(mod_dir / "files.list"), str(snapshot_path))
@@ -476,6 +487,16 @@ class RefineStage(BaseStage):
 
             ctx.emit_event("stage", stage=2, module=mod_name, attempt=attempt + 1)
 
+            # ── S3 redo 反馈注入 ──
+            redo_fb = self._redo_feedback.get(mod_name, "")
+            if redo_fb:
+                redo_intro = (
+                    "\n\n# Stage 3 重分类反馈（必须按以下意见调整模块归属）\n\n"
+                    + redo_fb
+                )
+            else:
+                redo_intro = ""
+
             prompt_parts = [
                 f"当前正式已存在模块: {', '.join(sorted(discover_modules(str(workspace))))}",
                 f"检查模块 `{mod_name}` 是否需要细分。",
@@ -486,6 +507,8 @@ class RefineStage(BaseStage):
             ]
             if file_summary:
                 prompt_parts.append("\n\n## 文件摘要\n\n" + file_summary)
+            if redo_intro:
+                prompt_parts.append(redo_intro)
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
