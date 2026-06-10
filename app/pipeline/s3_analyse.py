@@ -32,10 +32,6 @@ from .helpers import (
     module_has_nonempty_files,
     load_details_for_module,
     StageError, PiFatalError, max_rounds_exceeded_treated_as_passed,
-    enforce_filter_constraint,
-    commit_split_plan, split_plan_exists,
-    archive_module_deletions, restore_module_for_retry,
-    fix_orphan_dirs_before_judge,
 )
 
 
@@ -458,11 +454,7 @@ class AnalyseStage(BaseStage):
                 ctx.emit_event("log", level="info",
                                msg=f"[S3] judge意见已写入 {fb_rel}")
                 feedback = f"评审未通过，完整意见请 read {fb_rel} ，阅后修正 modules/{mod_name}/module_report.md"
-                if report_path.exists():
-                    try:
-                        report_path.unlink()
-                    except OSError:
-                        pass
+                # ★ 不删除报告 — Worker 基于 Judge 反馈直接修改
             if forced_pass:
                 if cp:
                     cp.mark_done(f"s3_modules/{mod_name}", forced=True)
