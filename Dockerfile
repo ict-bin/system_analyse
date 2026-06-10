@@ -35,10 +35,10 @@ ENV SESSION_DIR=/data/sessions
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health || exit 1
+    CMD curl -f http://localhost:18080/healthz || exit 1
 
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
-CMD ["python3", "main.py"]
+CMD ["./scripts/start-with-probe.sh", "python3", "main.py"]

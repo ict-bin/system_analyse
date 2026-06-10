@@ -71,6 +71,10 @@ _probe_shutdown = False
 _probe_started_at = 0.0
 
 
+def _external_probe_process_enabled() -> bool:
+    return str(os.environ.get("SECFLOW_EXTERNAL_PROBE_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
     now = _time.monotonic()
     with _summary_cache_lock:
@@ -153,7 +157,8 @@ async def lifespan(app: FastAPI):
     global _probe_shutdown, _probe_started_at
     _probe_shutdown = False
     _probe_started_at = _time.time()
-    _ensure_probe_server_started()
+    if not _external_probe_process_enabled():
+        _ensure_probe_server_started()
     await get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
 
     yield
@@ -161,7 +166,8 @@ async def lifespan(app: FastAPI):
     # --- shutdown ---
     _probe_shutdown = True
     await get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).stop()
-    _stop_probe_server()
+    if not _external_probe_process_enabled():
+        _stop_probe_server()
 
 
 # ─── Application ──────────────────────────────────────────────────────────────
