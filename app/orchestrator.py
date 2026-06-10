@@ -273,59 +273,6 @@ class Orchestrator:
 
         try:
             await pipeline.run(ctx)
-
-            # ── S2↔S3 redo 循环 ──────────────────────────────────────
-            # S3 检测到分类不合理 → ctx.redo_modules 非空 → 重新 S2+S3
-            max_redo = 3
-            redo_cycles = 0
-            while ctx.redo_modules and redo_cycles < max_redo:
-                redo_cycles += 1
-                _log.info("[redo] 第 %s 次重分类: %s 个模块", redo_cycles, len(ctx.redo_modules))
-
-                # 清除 checkpoint（S2+S3 需要重新处理）
-                for mod_name in ctx.redo_modules:
-                    cp.clear(f"s2_modules/{mod_name}")
-                    cp.clear(f"s3_modules/{mod_name}")
-                cp.clear("s2_refine")
-                cp.clear("s3_analyse")
-
-                # 重建 snapshot（模块内容可能已变动）
-                for mod_name in ctx.redo_modules:
-                    mod_dir = workspace / "modules" / mod_name
-                    if mod_dir.exists() and (mod_dir / "files.list").exists():
-                        snap = mod_dir / ".snapshot"
-                        snap.unlink(missing_ok=True)
-                        shutil.copy2(str(mod_dir / "files.list"), str(snap))
-
-                redo_modules_snapshot = list(ctx.redo_modules)
-                redo_feedback_snapshot = dict(ctx.redo_feedback)
-                ctx.redo_modules = []
-                ctx.redo_feedback = {}
-
-                # 重跑 S2（只处理 redo 模块 + 新子模块）
-                refine = RefineStage()
-                refine._redo_modules = redo_modules_snapshot
-                refine._redo_feedback = redo_feedback_snapshot
-                await refine.execute(ctx)
-
-                # 收集变动模块：原 redo 模块 + commit 产生的新子模块
-                s3_redo_set = set(redo_modules_snapshot)
-                s3_redo_set |= refine._commit_children  # 新子模块
-
-                ctx.redo_s3_modules = list(s3_redo_set)
-
-                # 重跑 S3（只跑变动模块）
-                analyse = AnalyseStage()
-                await analyse.execute(ctx)
-
-                # 更新最终报告
-                complete_s4 = Pipeline([CompletenessCheckStage(), FinalReportStage()])
-                await complete_s4.run(ctx)
-
-                ctx.redo_s3_modules = []
-
-            if redo_cycles >= max_redo and ctx.redo_modules:
-                _log.warning("[redo] 已达最大重分类次数 %s，剩余 %s 个模块未处理", max_redo, len(ctx.redo_modules))
             result.status = TaskStatus.PASSED
             result.total_tokens = ctx.tokens
             # S0 过滤结果为 0 文件：流水线已正常终止，写说明报告

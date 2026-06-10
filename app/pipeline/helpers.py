@@ -588,6 +588,16 @@ def commit_split_plan(workspace: "Path", mod_name: str) -> dict[str, list[str] |
         _write_unique_files(mod_dir / "files.list", sorted(child_map[mod_name]))
 
     shutil.rmtree(str(split_dir), ignore_errors=True)
+    # ── 为新创建/合并的子模块立即创建快照 ──────────────────────────────
+    # 防止子模块在队列中等待时因缺少快照导致 check_module.sh 误判
+    snapshots_dir = workspace / ".s2_snapshots"
+    snapshots_dir.mkdir(exist_ok=True)
+    for child in sorted({*new_modules, *merged_targets}):
+        child_snapshot = snapshots_dir / f"{child}.snapshot"
+        if not child_snapshot.exists():
+            child_flist = mods_root / child / "files.list"
+            if child_flist.exists():
+                shutil.copy2(str(child_flist), str(child_snapshot))
     return {
         "applied": True,
         "new_modules": sorted(set(new_modules)),

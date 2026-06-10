@@ -248,8 +248,6 @@ class RefineStage(BaseStage):
 
     def __init__(self):
         super().__init__()
-        self._redo_modules: list[str] = []
-        self._redo_feedback: dict[str, str] = {}
         self._commit_children: set[str] = set()  # commit 产生的新子模块名
 
     def _reset(self) -> None:
@@ -289,9 +287,6 @@ class RefineStage(BaseStage):
             return
 
         all_modules = discover_modules(str(workspace))
-        # ── redo 模式：只处理指定模块 ──
-        if self._redo_modules:
-            all_modules = [m for m in self._redo_modules if m in all_modules]
         for mod in all_modules:
             if mod not in self._refined:
                 await self._queue.put(mod)
@@ -508,16 +503,6 @@ class RefineStage(BaseStage):
 
             ctx.emit_event("stage", stage=2, module=mod_name, attempt=attempt + 1)
 
-            # ── S3 redo 反馈注入 ──
-            redo_fb = self._redo_feedback.get(mod_name, "")
-            if redo_fb:
-                redo_intro = (
-                    "\n\n# Stage 3 重分类反馈（必须按以下意见调整模块归属）\n\n"
-                    + redo_fb
-                )
-            else:
-                redo_intro = ""
-
             prompt_parts = [
                 f"当前正式已存在模块: {', '.join(sorted(discover_modules(str(workspace))))}",
                 f"检查模块 `{mod_name}` 是否需要细分。",
@@ -528,8 +513,6 @@ class RefineStage(BaseStage):
             ]
             if file_summary:
                 prompt_parts.append("\n\n## 文件摘要\n\n" + file_summary)
-            if redo_intro:
-                prompt_parts.append(redo_intro)
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 

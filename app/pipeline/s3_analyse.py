@@ -69,9 +69,11 @@ class AnalyseStage(BaseStage):
             j_sys_prompt += _gran_hint
 
         final_modules = discover_modules(str(workspace))
-        # ── redo 模式：只处理变动模块 ──
-        if ctx.redo_s3_modules:
-            final_modules = [m for m in ctx.redo_s3_modules if m in final_modules]
+
+        # ── 构建模块依赖图（S3 风险排序用）──
+        if ctx.module_dependency_graph is None:
+            ctx.module_dependency_graph = _build_module_dep_graph(workspace)
+
         ctx.redo_modules = []
         ctx.redo_feedback = {}
         s3_errors: list[BaseException] = []
@@ -377,12 +379,10 @@ class AnalyseStage(BaseStage):
                     artifact_paths=[str(mod_dir / "module_report.md")],
                 )
                 ctx.emit_event("reclassify", module=mod_name)
-                # ★ 保存 S3 Judge 的具体反馈（非通用描述）
-                ctx.redo_feedback[mod_name] = "\n\n".join(
-                    f"## Judge {r['judge_id']} 重分类意见\n\n{r['feedback']}"
-                    for r in judge_records if "[需要重新分类]" in (r.get("feedback") or "")
-                )
-                ctx.redo_modules.append(mod_name)
+                # ★ 不做 S2 redo — 模块边界由 S2 Judge 最终裁定
+                # 重分类意见记录到 timeline，但不触发重分类循环
+                ctx.emit_event("log", level="warn",
+                               msg=f"[S3] {mod_name} Judge 建议重分类，但不触发 S2 redo")
                 return
 
             voted_pass = check_voting(judge_results, s_cfg.pass_mode, ctx.j_count)
@@ -460,5 +460,7 @@ class AnalyseStage(BaseStage):
                     cp.mark_done(f"s3_modules/{mod_name}", forced=True)
                 return
 
-            raise StageError(f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")
-            raise StageError(f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")
+        raise StageError(f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")
+
+
+# ── 模块依赖图构建 ──────────────────────────────────────────────────────
