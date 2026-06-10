@@ -613,6 +613,37 @@ class SubReaderStage(BaseStage):
 
         # 按类型分组展示（最多展示每组前10个文件）
         MAX_SHOW = 10
+
+        # ── 路径推断模块名对照（使用 PathGroupStage v2 算法）─────────
+        from .s0_path_group import _build_path_groups_v2  # noqa: PLC0415
+        _path_normal, _path_special = _build_path_groups_v2(files)
+        _path_module: dict[str, str] = {}
+        _path_module_counts: dict[str, int] = defaultdict(int)
+        for _mod, _flist in _path_normal.items():
+            for _f in _flist:
+                _path_module[_f] = _mod
+                _path_module_counts[_mod] += 1
+        for _mod, _flist in _path_special.items():
+            for _f in _flist:
+                _path_module[_f] = f"[特殊]{_mod}"
+                _path_module_counts[f"[特殊]{_mod}"] = _path_module_counts.get(f"[特殊]{_mod}", 0) + 1
+
+        # ── 路径推断摘要表 ─────────────────────────────────────────
+        lines.extend([
+            "",
+            "## 路径推断模块 vs LLM推断模块 对照",
+            "",
+            "> 路径推断由 PathGroupStage v2 基于目录边界生成，",
+            "> LLM 推断由 SubReader 基于文件内容分析生成。",
+            "> 两种建议均可参考；通常路径推断更贴近项目既有目录结构。",
+            "",
+            "| 路径推断模块 | 文件数 | LLM推断匹配度 |",
+            "|---|---:|---|",
+        ])
+        for _pm in sorted(_path_module_counts.keys(), key=lambda k: -_path_module_counts[k]):
+            lines.append(f"| `{_pm}` | {_path_module_counts[_pm]} | - |")
+        lines.append("")
+        lines.append(f"> 共 {len(_path_module_counts)} 个路径模块，{sum(_path_module_counts.values())} 个文件")
         for ftype, entries in sorted(type_groups.items(), key=lambda x: -len(x[1])):
             lines.append(f"## {ftype}（{len(entries)} 个文件）")
             lines.append("")
