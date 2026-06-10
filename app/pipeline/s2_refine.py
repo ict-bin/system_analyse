@@ -206,7 +206,9 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
     # 清理
     for p in [".snapshot", "split", "deleted"]:
         path = mod_dir / p
-        if path.exists():
+        if path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
             shutil.rmtree(str(path), ignore_errors=True)
 
     return ({
