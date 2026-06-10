@@ -187,8 +187,13 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
     kept_parent_files = False
     if mod_name not in child_map:
         kept_lines = _read_lines(mod_dir / "files.list")
+        # ★ 从 kept 中移除已拆出到子模块的文件 + 已合并到其他模块的文件
+        split_out = set().union(*child_map.values()) if child_map else set()
+        merge_out = set().union(*merge_map.values()) if merge_map else set()
+        kept_lines -= split_out
+        kept_lines -= merge_out
         if kept_lines:
-            # 父模块保留了一部分文件，不删
+            _write_lines(mod_dir / "files.list", kept_lines)
             kept_parent_files = True
         elif deleted_set:
             (mod_dir / "files.list").unlink(missing_ok=True)
