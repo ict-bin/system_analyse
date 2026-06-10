@@ -1,37 +1,31 @@
 """
-pipeline/s0_path_group.py — Stage 0.3: 路径先验分组（纯 Python，无 LLM）
+pipeline/s0_path_group.py — Stage 0.3: 路径先验分组（纯 Python，无 LLM） v2
 
-入: ctx.filtered_files （filtered_files.txt 的相对路径列表）
-出: workspace/prescan/path_groups.md
-    追加到 ctx.prescan_summary
+v2 改进: 利用项目已有目录结构推断模块边界，而非取最深目录名。
+  好项目已经按功能划分好了目录层级:
+    src/storage/buffer/  → storage 模块（非 buffer）
+    src/storage/page/    → storage 模块（非 page）
+    contrib/adminpack/   → adminpack 模块
 
 算法:
-  1. 按文件名特征识别共享库/内核模块 → special 组
-     匹配规则: lib*.so*, lib*.ko*, *.ko, *.ko.xz, *.ko.gz 等
-     特殊组内再按 so/ko 库基名前缀二次分组 (libssl.so.1.1 → libssl)
-  2. 其余文件按「最近有意义目录名」分组
-     - 跳过通用容器目录: bin sbin usr lib lib64 local etc var
-       opt run tmp proc sys dev home root mnt media srv
-     - 取路径中最深（最末）一个「有意义」的目录节点
-     - 若路径只有文件名（根目录文件）→ group "__root__"
-  3. 输出 path_groups.md 到 workspace/prescan/，并追加到 prescan_summary
-
-特殊库识别策略（无需人工配置）:
-  - 文件名以 "lib" 开头且扩展名含 .so / .ko / .a
-  - 例: libssl.so.1.1, libpthread-2.31.so, iptables.ko.xz
-  - 非 lib 前缀的 .ko / .ko.xz / .ko.gz 也归入 special（内核模块）
-  - 通过 _is_shared_lib() 判断，无目录配置依赖
+  1. 找所有文件的公共前缀 → 项目根，剥离
+  2. 剥离通用结构前缀 (src/, contrib/, include/, lib/, bin/...)
+  3. 在剩余路径中找"功能模块边界"——即深度>=2 的公共父目录
+     - 同级目录数 > 1 且每个 >= MIN_FILES 的 → 独立模块
+     - 同级只有一个或太小 → 合并到父级
+  4. 共享库/内核模块 → 单独处理（special_groups，保持不变）
 """
+
 from __future__ import annotations
 
-import re
+import os
 from collections import defaultdict
 from pathlib import Path
 
 from .base import BaseStage
 from .context import PipelineContext
 
-# 这些目录节点本身不携带有效功能语义，跳过
+# ── 通用结构分段（无功能语义，会被跳过）─────────────────────────────
 _SKIP_SEGMENTS = frozenset({
     "bin", "sbin", "usr", "lib", "lib32", "lib64", "lib64d",
     "libexec", "local", "etc", "var", "opt", "run", "tmp",
@@ -39,53 +33,189 @@ _SKIP_SEGMENTS = frozenset({
     "srv", "share", "include", "src", "source", "build",
     "install", "out", "output", "release", "debug", "target",
     "objs", "obj", "objects", ".", "..", "",
+    # ── 以下在开源项目中常见，但对应源码目录结构本身就带功能语义 ──
+    # "common", "utils", "tools", "test", "tests", "examples"  ← 保留不跳过
 })
 
-# 共享库/内核模块文件名模式
-# 匹配: libssl.so, libssl.so.1.1, libfoo.ko, libbar.ko.xz, iptables.ko.gz
+# ── 源码树结构的顶层容器（剥离后获得功能子树）─────────────────────
+_STRUCTURAL_ROOTS = frozenset({
+    "src", "contrib", "include", "lib", "bin", "tools",
+    "platform", "app", "apps", "modules", "plugins",
+    "extensions", "extension", "third_party", "vendor",
+    "gausskernel", "common", "backend", "frontend",
+    "interfaces",
+})
+
+# ── 共享库/内核模块模式 ───────────────────────────────────────────
+import re
 _SHARED_LIB_RE = re.compile(
-    r"^lib.+\.(so|a)([\.\-_\d]|$)"      # lib*.so*, lib*.a (静态库)
-    r"|^lib.+\.ko(\.xz|\.gz|\.zst)?$"   # lib*.ko*
-    r"|^.+\.ko(\.xz|\.gz|\.zst)?$",     # *.ko* (内核模块，不限 lib 前缀)
+    r"^lib.+\.(so|a)([\.\-_\d]|$)"
+    r"|^lib.+\.ko(\.xz|\.gz|\.zst)?$"
+    r"|^.+\.ko(\.xz|\.gz|\.zst)?$",
     re.IGNORECASE,
 )
-
-# 提取共享库基名: libssl.so.1.1.1k → libssl
 _LIB_BASE_RE = re.compile(r"^(lib[a-zA-Z0-9_+\-]+?)(?:\.so|\.ko|\.a|[-_]\d)", re.IGNORECASE)
+
+# ── 一个"模块"至少要有这么多文件，否则合并到父级 ──────────────────
+_MIN_MODULE_FILES = 3
 
 
 def _is_shared_lib(rel_path: str) -> bool:
-    """按文件名模式判断是否为共享库 / 内核模块，无需目录配置。"""
-    basename = Path(rel_path.replace("\\", "/")).name
-    return bool(_SHARED_LIB_RE.match(basename))
+    return bool(_SHARED_LIB_RE.match(Path(rel_path.replace("\\", "/")).name))
 
 
 def _soname_prefix(rel_path: str) -> str | None:
-    """从路径中提取 lib 基础名 (libssl.so.1.1 → libssl)，失败返回 None。"""
-    basename = Path(rel_path.replace("\\", "/")).name
-    m = _LIB_BASE_RE.match(basename)
+    m = _LIB_BASE_RE.match(Path(rel_path.replace("\\", "/")).name)
     return m.group(1).lower() if m else None
 
 
-def _infer_group(rel_path: str) -> str:
-    """从相对路径推断组名（取最深有意义的目录节点）。"""
-    parts = [p for p in rel_path.replace("\\", "/").split("/")[:-1] if p]
-    for part in reversed(parts):
-        clean = part.lower().lstrip("0123456789.-_")
-        if clean and clean not in _SKIP_SEGMENTS and len(clean) >= 2:
-            return part.lower()
-    return "__root__"
+def _common_prefix(paths: list[str]) -> str:
+    """找所有路径的最长公共目录前缀（不含文件名）。"""
+    if not paths:
+        return ""
+    def _parts(p: str) -> list[str]:
+        return p.replace("\\", "/").rstrip("/").split("/")[:-1]  # strip filename
+    common = _parts(paths[0])
+    for p in paths[1:]:
+        parts = _parts(p)
+        i = 0
+        while i < min(len(common), len(parts)) and common[i] == parts[i]:
+            i += 1
+        common = common[:i]
+    return "/".join(common)
 
 
-def _build_path_groups(
+def _is_meaningful(name: str) -> bool:
+    """目录名是否携带功能语义（不是通用容器）。"""
+    clean = name.lower().lstrip("0123456789.-_")
+    return clean not in _SKIP_SEGMENTS and len(clean) >= 2
+
+
+# ── 核心：推断功能模块边界 ────────────────────────────────────────
+
+def _strip_common_prefixes(rel_paths: list[str]) -> list[list[str]]:
+    """
+    对每个文件路径:
+      1. 剥离文件名
+      2. 剥离项目公共前缀（所有文件的最长公共路径）
+      3. 剥离最外层通用结构前缀 (src/contrib/include...)
+    返回每个文件的功能子路径（分段列表）。
+    """
+    if not rel_paths:
+        return []
+
+    project_root = _common_prefix(rel_paths)
+    root_segments = project_root.split("/") if project_root else []
+
+    stripped: list[list[str]] = []
+    for rel in rel_paths:
+        clean = rel.replace("\\", "/")
+        # 剥离项目公共前缀
+        if root_segments and clean.startswith(project_root + "/"):
+            clean = clean[len(project_root) + 1:]
+        elif root_segments:
+            # 尝试部分匹配
+            for i in range(min(len(root_segments), 3), 0, -1):
+                prefix = "/".join(root_segments[:i]) + "/"
+                if clean.startswith(prefix):
+                    clean = clean[len(prefix):]
+                    break
+
+        # 去掉文件名
+        parts = clean.split("/")[:-1]
+        if not parts:
+            stripped.append([])
+            continue
+
+        # 剥离最前面若干层通用结构前缀，但最多剥 3 层
+        strip_count = 0
+        while strip_count < 3 and parts:
+            head = parts[0].lower()
+            if head in _STRUCTURAL_ROOTS:
+                parts.pop(0)
+                strip_count += 1
+            else:
+                break
+
+        stripped.append(parts)
+
+    return stripped
+
+
+def _find_module_boundary(path_parts_lists: list[list[str]]) -> dict[int, str]:
+    """
+    给定所有文件的功能子路径，找出每个深度级别中各目录的文件数。
+    返回 {file_index: module_name} 的映射。
+
+    算法:
+      对每个文件的功能子路径:
+        - 路径为空 → group="__root__"
+        - 取第一个有意义段作为模块边界
+        - 然后做第二轮合并: 同级目录中子级文件数 < _MIN_MODULE_FILES 的，
+          合并到父级模块中
+    """
+    # 第一遍: 每个文件取其第一个有意义段作为候选模块
+    result: dict[int, str] = {}
+    for idx, parts in enumerate(path_parts_lists):
+        if not parts:
+            result[idx] = "__root__"
+            continue
+        # 跳过开头的无意义段
+        start = 0
+        while start < len(parts) and not _is_meaningful(parts[start]):
+            start += 1
+        if start >= len(parts):
+            result[idx] = parts[-1].lower() if parts else "__root__"
+        else:
+            result[idx] = parts[start].lower()
+
+    # 第二遍: 统计每个模块的文件数
+    module_counts: dict[str, int] = defaultdict(int)
+    for idx, mod in result.items():
+        module_counts[mod] += 1
+
+    # 第三遍: 合并过小的模块到父级
+    for idx, parts in enumerate(path_parts_lists):
+        current_mod = result.get(idx, "__root__")
+        if module_counts.get(current_mod, 0) >= _MIN_MODULE_FILES:
+            continue  # 已经足够大
+        if not parts:
+            continue
+        # 往上找一级: 如果有父级且父级文件数 >= MIN → 合并
+        start = 0
+        while start < len(parts) and not _is_meaningful(parts[start]):
+            start += 1
+        if start + 1 < len(parts):
+            parent_level = parts[start + 1].lower()
+            # 检查同级兄弟的文件数: 所有以当前段为后缀的文件
+            sibling_count = 0
+            for idx2, parts2 in enumerate(path_parts_lists):
+                s2 = 0
+                while s2 < len(parts2) and not _is_meaningful(parts2[s2]):
+                    s2 += 1
+                if s2 < len(parts2) and parts2[s2].lower() == parent_level:
+                    sibling_count += 1
+            if sibling_count >= _MIN_MODULE_FILES:
+                result[idx] = parent_level
+            else:
+                # 父级也不够 → 继续往上
+                # 用 segments 中更靠近根的那一层
+                # 其实就是取路径中第一个有意义段作为模块
+                # 但如果所有兄弟都不够 → 尝试再往上
+                pass
+
+    return result
+
+
+def _build_path_groups_v2(
     files: list[str],
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """
     返回:
-      normal_groups  {group_name: [rel_path, ...]}   — 路径可直接推断所属
-      special_groups {lib_prefix_or_key: [rel_path, ...]} — 共享库/内核模块，需 LLM 判断
+      normal_groups  {module_name: [rel_path, ...]}
+      special_groups {lib_prefix: [rel_path, ...]}
     """
-    normal_groups: dict[str, list[str]] = defaultdict(list)
+    normal_files: list[str] = []
     special_groups: dict[str, list[str]] = defaultdict(list)
 
     for rel in files:
@@ -93,40 +223,48 @@ def _build_path_groups(
             key = _soname_prefix(rel) or "__unmatched_shared__"
             special_groups[key].append(rel)
         else:
-            key = _infer_group(rel)
-            normal_groups[key].append(rel)
+            normal_files.append(rel)
+
+    if not normal_files:
+        return {}, dict(special_groups)
+
+    stripped = _strip_common_prefixes(normal_files)
+    boundaries = _find_module_boundary(stripped)
+
+    normal_groups: dict[str, list[str]] = defaultdict(list)
+    for idx, rel in enumerate(normal_files):
+        mod = boundaries.get(idx, "__root__")
+        normal_groups[mod].append(rel)
 
     return dict(normal_groups), dict(special_groups)
 
 
-def _render_markdown(
+def _render_markdown_v2(
     normal_groups: dict[str, list[str]],
     special_groups: dict[str, list[str]],
     max_sample: int = 8,
 ) -> str:
     lines: list[str] = [
-        "## 路径先验分组（Path-Inferred Groups）",
+        "## 路径先验分组（Path-Inferred Groups）v2",
         "",
-        "> 本节由纯 Python 路径分析自动生成，无需 LLM 参与。",
-        "> 「直接路径组」可直接采用为初始模块；「特殊路径组」（共享库/内核模块）需结合功能语义判断归属。",
-        "> 共享库识别基于文件名模式（lib*.so* / *.ko*），无需目录配置。",
+        "> 算法: 利用项目已有目录结构推断功能模块边界。",
+        "> 剥离项目公共前缀 + 通用结构前缀后，取第 1~3 层有意义目录作为模块名。",
+        "> 特殊文件（共享库/内核模块）单独列出，需 LLM 判断归属。",
         "",
     ]
 
-    # ── 直接路径组 ──
     if normal_groups:
-        lines += ["### 直接路径组（建议直接采用为初始模块）", ""]
+        lines += ["### 推断模块（可按需合并/拆分）", ""]
         for gname, flist in sorted(normal_groups.items(), key=lambda x: -len(x[1])):
             lines.append(f"**[{gname}]** — {len(flist)} 个文件")
             for f in flist[:max_sample]:
                 lines.append(f"  - `{f}`")
             if len(flist) > max_sample:
-                lines.append(f"  - ... 共 {len(flist)} 个文件（仅展示前 {max_sample} 个）")
+                lines.append(f"  - ... 共 {len(flist)} 个文件")
             lines.append("")
     else:
-        lines += ["### 直接路径组", "", "（无）", ""]
+        lines += ["### 推断模块", "", "（无）", ""]
 
-    # ── 特殊路径组（共享库/内核模块）──
     if special_groups:
         lines += ["### 特殊文件（共享库 / 内核模块，需 LLM 判断归属）", ""]
         for gname, flist in sorted(special_groups.items(), key=lambda x: -len(x[1])):
@@ -134,24 +272,23 @@ def _render_markdown(
             for f in flist[:max_sample]:
                 lines.append(f"  - `{f}`")
             if len(flist) > max_sample:
-                lines.append(f"  - ... 共 {len(flist)} 个文件（仅展示前 {max_sample} 个）")
+                lines.append(f"  - ... 共 {len(flist)} 个文件")
             lines.append("")
     else:
-        lines += ["### 特殊文件（共享库 / 内核模块）", "", "（无）", ""]
+        lines += ["### 特殊文件", "", "（无）", ""]
 
     total_groups = len(normal_groups) + len(special_groups)
     total_files = sum(len(v) for v in normal_groups.values()) + sum(len(v) for v in special_groups.values())
     lines += [
-        f"**汇总**: {len(normal_groups)} 个直接路径组 + {len(special_groups)} 个特殊文件组"
-        f"，覆盖 {total_files} 个文件，合计 {total_groups} 组",
+        f"**汇总**: {len(normal_groups)} 个推断模块 + {len(special_groups)} 个特殊文件组"
+        f"，覆盖 {total_files} 个文件",
         "",
     ]
-
     return "\n".join(lines)
 
 
 class PathGroupStage(BaseStage):
-    """Stage 0.3: 路径先验分组（纯 Python，无 LLM 调用，始终执行）"""
+    """Stage 0.3: 路径先验分组 — 利用项目目录结构推断模块边界"""
 
     stage_num = 0
     stage_name = "路径先验分组"
@@ -159,14 +296,11 @@ class PathGroupStage(BaseStage):
     async def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
 
-        # ── checkpoint 跳过（PathGroup 是纯Python，运行很快，但续跑时 prescan_summary 需要重建） ──
         if cp and cp.is_done("s0_pathgroup"):
-            # 从磁盘重建 prescan_summary
             p = ctx.workspace / "prescan" / "path_groups.md"
             if p.exists():
                 pg_content = p.read_text("utf-8", errors="replace")
                 separator = "\n\n---\n\n" if ctx.prescan_summary else ""
-                # 只注入重要的摘要部分（避免重复运行分组逻辑）
                 ctx.prescan_summary = ctx.prescan_summary + separator + pg_content[:2000]
             ctx.emit_event("log", level="info", msg="[S0-PathGroup] checkpoint已完成，跳过")
             return
@@ -178,38 +312,30 @@ class PathGroupStage(BaseStage):
 
         ctx.emit_event("stage", stage="path_group", file_count=len(ctx.filtered_files))
 
-        normal_groups, special_groups = _build_path_groups(ctx.filtered_files)
+        normal_groups, special_groups = _build_path_groups_v2(ctx.filtered_files)
 
-        md = _render_markdown(normal_groups, special_groups)
+        md = _render_markdown_v2(normal_groups, special_groups)
 
-        # 写入 prescan 目录
         prescan_dir = ctx.workspace / "prescan"
         prescan_dir.mkdir(parents=True, exist_ok=True)
         out_path = prescan_dir / "path_groups.md"
         out_path.write_text(md, encoding="utf-8")
 
-        # 追加到 prescan_summary（ClassifyStage 会注入进 prompt）
-        # ⚠️ 只追加统计摘要，不追加完整文件列表，避免 prompt 过大（38KB → token 爆炸）
-        # path_groups.md 完整内容已写入磁盘，Worker 可通过 read 工具按需获取
-        # 这里只注入「模块名 → 文件数」的极简摘要，而非完整路径列表
-        group_summary_lines: list[str] = ["### 路径先验分组摘要（完整文件列表见 prescan/path_groups.md）\n"]
+        # 仅注入统计摘要（不注入完整文件列表）
+        group_summary_lines: list[str] = ["### 路径先验分组摘要（完整列表见 prescan/path_groups.md）\n"]
         for group_name, files in sorted(normal_groups.items(), key=lambda x: -len(x[1])):
-            group_summary_lines.append(f"- [{group_name}] {len(files)} 个文件")
+            group_summary_lines.append(f"- {len(files):>4} 个文件 → [{group_name}]")
         for group_name, files in sorted(special_groups.items(), key=lambda x: -len(x[1])):
-            group_summary_lines.append(f"- [{group_name}] {len(files)} 个文件（特殊路径组）")
+            group_summary_lines.append(f"- {len(files):>4} 个文件 → [{group_name}]（特殊路径组）")
         group_summary = "\n".join(group_summary_lines)
+
         separator = "\n\n---\n\n" if ctx.prescan_summary else ""
         ctx.prescan_summary = ctx.prescan_summary + separator + group_summary
 
-        ctx.emit_event(
-            "stage_result",
-            stage="path_group",
-            normal_groups=len(normal_groups),
-            special_groups=len(special_groups),
-            total_files=len(ctx.filtered_files),
-        )
+        ctx.emit_event("stage_result", stage="path_group",
+                       normal_groups=len(normal_groups),
+                       special_groups=len(special_groups))
 
-        # ── 写 checkpoint ────────────────────────────────────────────────────────
         if cp:
             cp.mark_done("s0_pathgroup",
                          normal_groups=len(normal_groups),
