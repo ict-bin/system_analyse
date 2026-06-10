@@ -614,19 +614,11 @@ class SubReaderStage(BaseStage):
         # 按类型分组展示（最多展示每组前10个文件）
         MAX_SHOW = 10
 
-        # ── 路径推断模块名对照（使用 PathGroupStage v2 算法）─────────
-        from .s0_path_group import _build_path_groups_v2  # noqa: PLC0415
-        _path_normal, _path_special = _build_path_groups_v2(files)
-        _path_module: dict[str, str] = {}
+        # ── 路径推断模块名对照（复用 PathGroupStage v2 已算好的结果）───
+        _path_module = ctx.path_group_map  # {file_path: module_name}
         _path_module_counts: dict[str, int] = defaultdict(int)
-        for _mod, _flist in _path_normal.items():
-            for _f in _flist:
-                _path_module[_f] = _mod
-                _path_module_counts[_mod] += 1
-        for _mod, _flist in _path_special.items():
-            for _f in _flist:
-                _path_module[_f] = f"[特殊]{_mod}"
-                _path_module_counts[f"[特殊]{_mod}"] = _path_module_counts.get(f"[特殊]{_mod}", 0) + 1
+        for _mod in _path_module.values():
+            _path_module_counts[_mod] += 1
 
         # ── 路径推断摘要表 ─────────────────────────────────────────
         lines.extend([

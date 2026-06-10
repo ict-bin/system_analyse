@@ -92,6 +92,9 @@ class PipelineContext:
     classify_context_path: Path | None = None
     # workspace/classify_context.md，SubReaderStage 生成，ClassifyStage 注入 prompt
 
+    path_group_map: dict[str, str] = field(default_factory=dict)
+    # PathGroupStage v2 产出: 文件路径 → 路径推断模块名 的映射
+
     invalid_detail_files: list[str] = field(default_factory=list)
     # ValidateDetailsStage 发现的无效 details JSON 列表
 

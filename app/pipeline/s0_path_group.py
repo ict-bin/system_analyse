@@ -314,6 +314,15 @@ class PathGroupStage(BaseStage):
 
         normal_groups, special_groups = _build_path_groups_v2(ctx.filtered_files)
 
+        # ── 存入 ctx 供 SubReader classify_context.md 使用 ─────────────
+        ctx.path_group_map.clear()
+        for _mod, _flist in normal_groups.items():
+            for _f in _flist:
+                ctx.path_group_map[_f] = _mod
+        for _mod, _flist in special_groups.items():
+            for _f in _flist:
+                ctx.path_group_map[_f] = f"[特殊]{_mod}"
+
         md = _render_markdown_v2(normal_groups, special_groups)
 
         prescan_dir = ctx.workspace / "prescan"
