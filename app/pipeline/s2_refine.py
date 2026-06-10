@@ -143,12 +143,28 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
     covered |= kept
     if snapshot and covered != snapshot:
         missing = snapshot - covered
+        # ★ 允许已在其他模块中的文件隐式通过（redo 时子模块来源于上轮拆分）
+        mods_root = workspace / "modules"
+        truly_missing: set[str] = set()
+        for f in missing:
+            found = False
+            for other_fl in mods_root.glob("*/files.list"):
+                if other_fl.parent.name == mod_name:
+                    continue
+                if f in (other_fl.read_text("utf-8", errors="replace") or ""):
+                    found = True
+                    break
+            if not found and f in (workspace / "deleted.list").read_text(encoding="utf-8", errors="replace"):
+                found = True
+            if not found:
+                truly_missing.add(f)
         extra = covered - snapshot
-        raise StageError(
-            f"提交前校验失败: {mod_name} missing={len(missing)} extra={len(extra)}"
-            + (f" missing示例={sorted(missing)[:5]}" if missing else "")
-            + (f" extra示例={sorted(extra)[:5]}" if extra else "")
-        )
+        if truly_missing or extra:
+            raise StageError(
+                f"提交前校验失败: {mod_name} missing={len(truly_missing)} extra={len(extra)}"
+                + (f" missing示例={sorted(truly_missing)[:5]}" if truly_missing else "")
+                + (f" extra示例={sorted(extra)[:5]}" if extra else "")
+            )
 
     # ── 执行提交 ──
     new_modules: list[str] = []
