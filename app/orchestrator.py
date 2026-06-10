@@ -198,11 +198,12 @@ class Orchestrator:
             pi_settings_dir.mkdir(exist_ok=True)
             import json as _json
             pi_settings = {
+                "defaultThinkingLevel": "off",
                 "compaction": {
                     "enabled": True,
                     "reserveTokens": 16384,
                     "keepRecentTokens": 40000,
-                }
+                },
             }
             (pi_settings_dir / "settings.json").write_text(
                 _json.dumps(pi_settings, indent=2), encoding="utf-8"
