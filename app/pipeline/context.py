@@ -119,6 +119,9 @@ class PipelineContext:
     soft_failed_modules: list[dict] = field(default_factory=list)
     """记录被允许跳过的模块级失败，供汇总与日志使用"""
 
+    program_error_modules: list[dict] = field(default_factory=list)
+    """记录触发了 fatal 异常的程序性错误，供前端展示和数据库存证"""
+
     # ══════════════════════════════════════════════════════════
     # Stage 4 输出
     # ══════════════════════════════════════════════════════════
@@ -303,6 +306,31 @@ class PipelineContext:
                 artifact_paths=artifact_paths or [],
                 extra=extra,
             )
+
+    def record_module_program_error(
+        self,
+        *,
+        stage: str,
+        module_name: str,
+        error_type: str,
+        error_message: str,
+        traceback_text: str = "",
+        artifact_paths: list[str] | None = None,
+    ) -> None:
+        payload = {
+            "stage": stage,
+            "module_name": module_name,
+            "error_type": error_type,
+            "error_message": error_message,
+            "traceback": traceback_text,
+            "artifact_paths": artifact_paths or [],
+        }
+        self.program_error_modules.append(payload)
+        self.emit_event(
+            "log",
+            level="error",
+            msg=f"[{stage}] 模块 {module_name} 程序性错误 ({error_type}): {error_message}",
+        )
 
     # ── Worker / Judge 参数构建 ────────────────────────────────
 

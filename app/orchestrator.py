@@ -374,4 +374,7 @@ class Orchestrator:
                    modules=str(modules_out),
                    archive=f"{archive_path}.zip")
 
+        result_payload = result.model_dump(mode="json")
+        result_payload["program_error_modules"] = list(getattr(ctx, "program_error_modules", []) or [])
+        result_payload["soft_failed_modules"] = list(getattr(ctx, "soft_failed_modules", []) or [])
         return result

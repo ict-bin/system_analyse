@@ -37,6 +37,7 @@ from .helpers import (
     archive_module_deletions, get_module_deleted_files, restore_module_for_retry,
     fix_orphan_dirs_before_judge, build_s2_diagnose_report,
     module_has_nonempty_files, commit_split_plan, split_plan_exists, list_split_candidate_modules,
+    process_module_recover,
 )
 
 
@@ -172,6 +173,27 @@ class RefineStage(BaseStage):
                         self._errors.append(e)
                 else:
                     self._errors.append(e)
+            except Exception as e:
+                # 任何未预期的运行时异常（含程序性 bug）都必须中止流水线，
+                # 让上层以 task_error 落地并停止重试，避免 S2 卡住。
+                ctx = self._ctx
+                if ctx is not None:
+                    try:
+                        import traceback as _tb
+                        ctx.record_module_program_error(
+                            stage="refine",
+                            module_name=mod_name,
+                            error_type=type(e).__name__,
+                            error_message=f"{e}",
+                            traceback_text=_tb.format_exc(),
+                        )
+                    except Exception:
+                        pass
+                fatal = PiFatalError(
+                    f"S2 refine 模块 {mod_name} 未捕获异常: {type(e).__name__}: {e}"
+                )
+                fatal.fatal = True
+                self._errors.append(fatal)
             finally:
                 self._queue.task_done()
 

@@ -421,12 +421,23 @@ class TaskRunner:
                 return
             result_json = None
             result_error = None
+            program_errors: list[dict] = []
+            soft_failed_modules: list[dict] = []
             if result:
                 result_payload = result.model_dump(mode="json")
                 result_file = self._deps.write_task_result_json(task_snapshot, result_payload)
                 result_json = self._deps.lightweight_result_json(task_snapshot, result_payload, result_file)
                 if result.error:
                     result_error = result.error
+            program_errors = list(getattr(task_snapshot, "program_error_modules", []) or [])
+            soft_failed_modules = list(getattr(task_snapshot, "soft_failed_modules", []) or [])
+            if program_errors:
+                if not result_error:
+                    first = program_errors[0]
+                    result_error = (
+                        f"程序性错误 ({first.get('error_type')}) in {first.get('stage')} "
+                        f"{first.get('module_name')}: {first.get('error_message')}"
+                    )
             updated = self._deps.task_repository.finalize_task_result(
                 db,
                 task_id=task_id,
