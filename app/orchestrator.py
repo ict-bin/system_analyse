@@ -316,6 +316,17 @@ class Orchestrator:
             self._emit("error", task_id, error=str(e))
 
         result.total_duration_ms = (time.time() - start) * 1000
+
+        # ── 写模块依赖图 ─────────────────────────────────────────────────
+        try:
+            if ctx.module_dependency_graph:
+                import json as _json
+                (final_out_dir / "module_dependency_graph.json").write_text(
+                    _json.dumps(ctx.module_dependency_graph, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception as _dep_err:
+            _log.warning("module dependency graph write failed: %s", _dep_err)
         try:
             evaluator.write_summary(
                 task_status=result.status.value,

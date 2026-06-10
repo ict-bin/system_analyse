@@ -464,3 +464,76 @@ class AnalyseStage(BaseStage):
 
 
 # ── 模块依赖图构建 ──────────────────────────────────────────────────────
+
+def _build_module_dep_graph(workspace: Path) -> dict:
+    """
+    从 details/*.json 构建模块级依赖图（nodes+edges 格式，前端渲染）。
+    """
+    import json
+    from collections import defaultdict
+
+    mods_root = workspace / "modules"
+    details_dir = workspace / "details"
+
+    # 模块 → 文件集合
+    mod_files: dict[str, set[str]] = {}
+    for d in mods_root.iterdir():
+        if not d.is_dir(): continue
+        fl = d / "files.list"
+        if not fl.exists(): continue
+        mod_files[d.name] = {l.strip() for l in fl.read_text(encoding="utf-8").splitlines() if l.strip()}
+
+    # 文件 → (exports, imports) 从 details/
+    file_exports: dict[str, set[str]] = defaultdict(set)
+    file_imports: dict[str, set[str]] = defaultdict(set)
+
+    for mod_name, files in mod_files.items():
+        for rel in files:
+            dp = details_dir / f"{rel}.json"
+            if not dp.exists(): continue
+            try:
+                d = json.loads(dp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(d, dict): continue
+            for sym in (d.get("symbols") or d.get("exports") or d.get("functions") or []):
+                file_exports[rel].add(str(sym).strip().lower())
+            for imp in (d.get("imports") or []):
+                file_imports[rel].add(str(imp).strip().lower())
+
+    # 符号 → 模块
+    sym_to_mod: dict[str, set[str]] = defaultdict(set)
+    for mod_name, files in mod_files.items():
+        for rel in files:
+            for sym in file_exports.get(rel, set()):
+                sym_to_mod[sym].add(mod_name)
+
+    # 模块间依赖: A imports sym → sym 在 B 中 → A depends_on B
+    depends_on: dict[str, set[str]] = defaultdict(set)
+    for mod_a, files in mod_files.items():
+        for rel in files:
+            for imp in file_imports.get(rel, set()):
+                for mod_b in sym_to_mod.get(imp, set()):
+                    if mod_b != mod_a:
+                        depends_on[mod_a].add(mod_b)
+
+    # 构建 nodes + edges
+    nodes = []
+    edges = []
+    for mod_name in sorted(mod_files.keys()):
+        deps = sorted(depends_on.get(mod_name, set()))
+        rev = sorted({m for m, ds in depends_on.items() if mod_name in ds})
+        nodes.append({
+            "module_name": mod_name,
+            "file_count": len(mod_files[mod_name]),
+            "depends_on": deps,
+            "depended_by": rev,
+        })
+        for target in deps:
+            edges.append({"source": mod_name, "target": target})
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "summary": {"module_count": len(nodes), "edge_count": len(edges)},
+    }
