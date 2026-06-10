@@ -653,6 +653,34 @@ class SubReaderStage(BaseStage):
                 lines.append("")
 
         # ctx.classify_context_path 已由 orchestrator 初始化，直接写入
+        # ── 跨文件导入导出依赖摘要 ────────────────────────────────
+        _dep_rows: list[tuple[str, str, str]] = []
+        for rel in files:
+            d = load_detail_json(details_dir, rel) or {}
+            for imp in (d.get("imports") or [])[:5]:
+                imp = str(imp).strip().lower()
+                for other_rel in files:
+                    if other_rel == rel: continue
+                    od = load_detail_json(details_dir, other_rel) or {}
+                    other_syms = {str(s).strip().lower() for s in (od.get("symbols") or od.get("functions") or [])}
+                    if imp in other_syms:
+                        _dep_rows.append((rel, imp, other_rel))
+                        break
+                if len(_dep_rows) >= 50: break
+            if len(_dep_rows) >= 50: break
+        if _dep_rows:
+            lines.extend([
+                "",
+                "## 文件间导入导出关系（跨文件，建议归入同一模块）",
+                "",
+                "| 导入方 | 导入符号 | 被导入方（符号提供者）|",
+                "|---|---|---|",
+            ])
+            for _a, _sym, _b in _dep_rows[:30]:
+                lines.append(f"| `{_a}` | `{_sym}` | `{_b}` |")
+            lines.append("")
+            lines.append("> 同一行中的两个文件应优先归入同一模块。")
+
         ctx.classify_context_path.write_text("\n".join(lines), encoding="utf-8")
         ctx.emit_event("log", level="info",
                        msg=f"[S0-SubReader] classify_context.md 已生成 ({len(lines)} 行)")
