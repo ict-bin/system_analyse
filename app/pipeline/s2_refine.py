@@ -98,10 +98,12 @@ def _validate_module(mod_dir: Path) -> dict:
 
 # ── 提交逻辑 ────────────────────────────────────────────────────────────────
 
-def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) -> dict:
+def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) -> tuple[dict, set[str]]:
     """
     提交单个模块的 split/merge/deleted。
-    返回 {"applied": bool, "new_modules": [...], "merged_targets": [...], "retained_parent": bool}
+    返回 (commit_info, merge_targets_in_progress):
+      commit_info: {"applied", "new_modules", "merged_targets", "retained_parent"}
+      merge_targets_in_progress: 在 LLM 处理中被合并到的目标模块名集合
 
     处理三种 split 情况:
       1. 全拆: mod → child1, child2 (原模块消失)
@@ -151,6 +153,7 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
     # ── 执行提交 ──
     new_modules: list[str] = []
     merged_targets: list[str] = []
+    merge_targets_in_progress: set[str] = set()
 
     for child, files in child_map.items():
         if child == mod_name:
@@ -172,12 +175,13 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
         existing = _read_lines(target_dir / "files.list")
         _write_lines(target_dir / "files.list", existing | files)
         merged_targets.append(target)
-        # 如果目标在 LLM 处理中，追加到其 .snapshot
+        # 如果目标在 LLM 处理中，追加到其 .snapshot + 记录待处理
         if target in in_progress:
             snap = target_dir / ".snapshot"
             if snap.exists():
                 snap_set = _read_lines(snap)
                 _write_lines(snap, snap_set | files)
+            merge_targets_in_progress.add(target)
 
     # 处理原模块
     kept_parent_files = False
@@ -205,12 +209,12 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
         if path.exists():
             shutil.rmtree(str(path), ignore_errors=True)
 
-    return {
+    return ({
         "applied": True,
         "new_modules": sorted(set(new_modules)),
         "merged_targets": sorted(set(merged_targets)),
         "retained_parent": retained_parent or kept_parent_files,
-    }
+    }, merge_targets_in_progress)
 
 
 # ── Stage ────────────────────────────────────────────────────────────────────
@@ -222,6 +226,7 @@ class RefineStage(BaseStage):
     def _reset(self) -> None:
         self._refined: set[str] = set()
         self._in_progress: set[str] = set()
+        self._pending_merge_targets: set[str] = set()  # 在LLM中被merge的模块，LLM完成后才入commit队列
         self._errors: list[BaseException] = []
         self._queue: asyncio.Queue = asyncio.Queue()
         self._commit_queue: asyncio.Queue = asyncio.Queue()
@@ -339,6 +344,11 @@ class RefineStage(BaseStage):
                 fatal.fatal = True
                 self._errors.append(fatal)
             finally:
+                # LLM 完成后，如果被 merge 过 → 也要入 commit 队列
+                if mod_name in self._pending_merge_targets:
+                    mod_dir = get_modules_root(str(self._ctx.workspace)) / mod_name
+                    await self._commit_queue.put((mod_dir, False, []))
+                    self._pending_merge_targets.discard(mod_name)
                 self._in_progress.discard(mod_name)
                 self._queue.task_done()
 
@@ -354,16 +364,17 @@ class RefineStage(BaseStage):
             ctx = self._ctx
             workspace = ctx.workspace
             try:
-                commit_info = {"applied": False, "new_modules": [], "merged_targets": [], "retained_parent": False}
-                if was_split or (mod_dir / "split").exists():
-                    commit_info = _commit_one_module(mod_dir, workspace, self._in_progress)
-                    new_ones = list(commit_info.get("new_modules") or [])
+                commit_info, merge_in_progress = _commit_one_module(mod_dir, workspace, self._in_progress)
+                new_ones = list(commit_info.get("new_modules") or [])
 
-                # 检查原模块是否还存在
+                # 记录被 merge 的 LLM 处理中模块（等 LLM 结束后入队列）
+                for target in merge_in_progress:
+                    self._pending_merge_targets.add(target)
+
                 if mod_dir.exists() and not (mod_dir / "files.list").exists():
                     shutil.rmtree(str(mod_dir), ignore_errors=True)
 
-                # 新子模块入队（LLM workers 可能还在跑，可以追加到 queue）
+                # 新子模块入 LLM 队列（去重）
                 for nm in new_ones:
                     if nm not in self._refined and nm not in self._in_progress:
                         self._in_progress.add(nm)
@@ -580,8 +591,17 @@ class RefineStage(BaseStage):
             )
 
             if final_pass or forced_pass:
-                # ★ 入 commit 队列，不在这里提交
-                await self._commit_queue.put((mod_dir, was_split, new_ones))
+                # ★ 有变动才入 commit 队列；无变动直接通过
+                has_split = (mod_dir / "split").exists() and any((mod_dir / "split").iterdir())
+                has_deleted = (mod_dir / "deleted").exists()
+                if has_split or has_deleted:
+                    await self._commit_queue.put((mod_dir, was_split, new_ones))
+                else:
+                    # 无变动 — 但如果被其他模块 merge 过，仍需走 commit
+                    # 已在 _llm_worker finally 中处理
+                    self._refined.add(mod_name)
+                    if cp:
+                        cp.mark_done(f"s2_modules/{mod_name}", split=False, new_modules=[])
                 return
 
             if voted_pass:
@@ -603,7 +623,15 @@ class RefineStage(BaseStage):
                 feedback = "请先阅读 judge 完整意见：\n" + f"```\nread {fb_rel}\n```\n" + guidance
 
             if forced_pass and not final_pass:
-                await self._commit_queue.put((mod_dir, was_split, new_ones))
+                has_split = (mod_dir / "split").exists() and any((mod_dir / "split").iterdir())
+                has_deleted = (mod_dir / "deleted").exists()
+                if has_split or has_deleted:
+                    self._pending_merge_targets.discard(mod_name)
+                    await self._commit_queue.put((mod_dir, was_split, new_ones))
+                else:
+                    self._refined.add(mod_name)
+                    if cp:
+                        cp.mark_done(f"s2_modules/{mod_name}", split=False, new_modules=[])
                 return
 
         raise StageError(f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数")
