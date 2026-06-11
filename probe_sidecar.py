@@ -71,6 +71,9 @@ class Handler(BaseHTTPRequestHandler):
             elif is_readyz:
                 ready = bool(payload.get("readiness_ok")) and not _shutting_down
                 code = HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE
+            elif self.path in ("/startupz",):
+                # Some K8s deployments use /startupz as startup probe path
+                code = HTTPStatus.OK
             else:
                 code = HTTPStatus.NOT_FOUND
                 payload = {"status": "not_found"}
