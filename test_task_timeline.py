@@ -399,6 +399,22 @@ async def test_task_runner_records_task_and_stage_timeline(monkeypatch):
     monkeypatch.setattr("app.service.task_runner.write_final", lambda path, events: True)
     monkeypatch.setattr("app.service.task_runner.events_path", lambda output_path, task_id: Path("/tmp/events.jsonl"))
     monkeypatch.setattr("app.service.task_runner.WORKER_INSTANCE_ID", "runner-1")
+    monkeypatch.setattr(
+        runner._agent_cleanup,
+        "run_cleanup",
+        lambda phase: {
+            "cleanup_phase": phase,
+            "runner_instance_id": "runner-1",
+            "scanned_process_count": 0,
+            "killed_process_count": 0,
+            "failed_process_count": 0,
+            "surviving_process_count": 0,
+            "cleanup_failed": False,
+            "level": "info",
+            "task_continued": True,
+            "items": [],
+        },
+    )
 
     async def _fake_supervise(self, task_id, lease_epoch, orch):
         del task_id, lease_epoch, orch

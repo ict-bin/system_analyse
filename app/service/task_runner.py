@@ -18,6 +18,7 @@ from app.models import SwarmEvent
 from app.orchestrator import Orchestrator
 from app.service.event_log import append_events, write_final, events_path
 from app.service.agent_cleanup import AgentCleanupService
+from app.service.task_execution_lock import TaskExecutionLockConflict, RUNNER_PROCESS_TOKEN
 from app.service.task_repository import TaskRepository
 from app.service.worker_dispatcher import WORKER_INSTANCE_ID, lease_deadline
 
@@ -249,7 +250,22 @@ class TaskRunner:
             level="info",
             payload={"cleanup_phase": phase, "runner_instance_id": WORKER_INSTANCE_ID},
         )
-        report = self._agent_cleanup.run_cleanup(phase=phase)
+        try:
+            report = self._agent_cleanup.run_cleanup(phase=phase)
+        except Exception as exc:
+            report = {
+                "cleanup_phase": phase,
+                "runner_instance_id": WORKER_INSTANCE_ID,
+                "scanned_process_count": 0,
+                "killed_process_count": 0,
+                "failed_process_count": 0,
+                "surviving_process_count": 0,
+                "cleanup_failed": True,
+                "level": "warning" if phase == "pre_task" else "error",
+                "task_continued": phase == "pre_task",
+                "error": str(exc),
+                "items": [],
+            }
         event_type = "agent_cleanup_failed" if bool(report.get("cleanup_failed")) else "agent_cleanup_completed"
         self._deps.record_timeline_event(
             task_id=task_id,
@@ -287,7 +303,8 @@ class TaskRunner:
                 "post": post_cleanup_report,
             }
             row.result_json = self._deps.merge_result_json(row.result_json, {"agent_cleanup": cleanup_payload})
-            db.commit()
+            if hasattr(db, "commit"):
+                db.commit()
         finally:
             try:
                 next(db_gen)
@@ -309,7 +326,37 @@ class TaskRunner:
                     row.lease_epoch,
                 )
                 raise RuntimeError("task lease lost before execute")
-            self._deps.acquire_execution_lock(db, row.output_path, task_id, lease_epoch)
+
+            def _lock_observer(event_type: str, payload: dict[str, object]) -> None:
+                message_map = {
+                    "task_execution_lock_stale_detected": "检测到旧执行锁，准备自动清理",
+                    "task_execution_lock_cleared": "旧执行锁已清理，准备重试获取",
+                    "task_execution_lock_reacquired": "任务执行锁已重新获取",
+                    "task_execution_lock_conflict": "任务执行锁冲突，当前已有活跃执行实例",
+                    "task_execution_lock_reentry_blocked": "检测到同实例重复进入执行路径",
+                    "task_execution_lock_acquired": "任务执行锁已获取",
+                }
+                level = (
+                    "warning"
+                    if event_type in {"task_execution_lock_stale_detected", "task_execution_lock_cleared"}
+                    else "error"
+                    if event_type in {"task_execution_lock_conflict", "task_execution_lock_reentry_blocked"}
+                    else "info"
+                )
+                self._deps.record_timeline_event(
+                    task_id=task_id,
+                    project_id=getattr(row, "project_id", None),
+                    event_type=event_type,
+                    message=message_map.get(event_type, "任务执行锁状态更新"),
+                    level=level,
+                    payload=payload,
+                )
+
+            acquire_params = inspect.signature(self._deps.acquire_execution_lock).parameters
+            if "observer" in acquire_params:
+                self._deps.acquire_execution_lock(db, row.output_path, task_id, lease_epoch, observer=_lock_observer)
+            else:
+                self._deps.acquire_execution_lock(db, row.output_path, task_id, lease_epoch)
             svc = self._deps.load_svc_config_from_db(db, row.project_id)
             tcfg = dict(row.task_config_json or {})
             if tcfg.get("analyse_targets"):
@@ -500,13 +547,16 @@ class TaskRunner:
                 self._deps.record_timeline_event(
                     task_id=task_id,
                     project_id=project_id,
-                    event_type="task_error",
-                    message="任务执行异常结束",
+                    event_type="task_execution_lock_conflict" if isinstance(exc, TaskExecutionLockConflict) else "task_error",
+                    message="任务执行锁冲突，任务执行异常结束" if isinstance(exc, TaskExecutionLockConflict) else "任务执行异常结束",
                     level="error",
                     payload={
                         "runner_instance_id": WORKER_INSTANCE_ID,
+                        "runner_process_token": RUNNER_PROCESS_TOKEN,
                         "lease_epoch": lease_epoch,
                         "error": str(exc),
+                        "error_kind": getattr(exc, "conflict_kind", None),
+                        "error_payload": getattr(exc, "payload", None),
                         "events_file": str(events_file) if events_file is not None else None,
                     },
                 )

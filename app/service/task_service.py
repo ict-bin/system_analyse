@@ -15,7 +15,7 @@ import time as _time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy import or_
 from sqlalchemy import func
@@ -26,6 +26,14 @@ from app.config import load_service_config
 from app.db.models import AppSaTask, AppSaTaskEvent
 from app.logging_utils import log_event
 from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
+from app.service.task_execution_lock import (
+    RUNNER_BOOT_ID,
+    RUNNER_MAIN_PID,
+    RUNNER_PROCESS_STARTED_AT,
+    RUNNER_PROCESS_TOKEN,
+    TaskExecutionLockConflict,
+    current_runner_lock_identity,
+)
 from app.service.task_query_service import TaskQueryService
 from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
 from app.service.task_repository import TaskRepository
@@ -164,6 +172,15 @@ def _task_abnormal_reason(row: AppSaTask) -> dict | None:
         code = "user_cancelled"
         category = "cancel"
         title = "任务已取消"
+    elif "task execution lock already exists" in message.lower():
+        if "lock_runner_process_token" in message.lower():
+            code = "execution_lock_conflict"
+            category = "runtime"
+            title = "任务执行锁冲突"
+        else:
+            code = "execution_lock_conflict"
+            category = "runtime"
+            title = "任务执行锁冲突"
     elif "lease" in message.lower() or "租约" in message:
         code = "lease_lost"
         category = "runtime"
@@ -354,6 +371,10 @@ def _coerce_lock_epoch(value: object) -> int | None:
     except Exception:
         return None
     return epoch if epoch >= 0 else None
+
+
+def _coerce_lock_text(value: object) -> str:
+    return str(value or "").strip()
 
 
 def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) -> None:
@@ -1908,16 +1929,23 @@ class TaskService:
         _running_task_epochs.pop(task_id, None)
 
     @staticmethod
-    def _acquire_execution_lock(db: Session, output_path: str | None, task_id: str, lease_epoch: int) -> Path | None:
+    def _acquire_execution_lock(
+        db: Session,
+        output_path: str | None,
+        task_id: str,
+        lease_epoch: int,
+        observer: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> Path | None:
         lock_path = _task_execution_lock_path(output_path, task_id)
         if not lock_path:
             return None
         lock_path.parent.mkdir(parents=True, exist_ok=True)
+        runner_identity = current_runner_lock_identity()
         payload = {
             "task_id": task_id,
-            "worker_instance_id": WORKER_INSTANCE_ID,
             "lease_epoch": lease_epoch,
             "acquired_at": isoformat_local(now_local()),
+            **runner_identity,
         }
         for attempt in range(2):
             try:
@@ -1925,27 +1953,88 @@ class TaskService:
             except FileExistsError:
                 row = db.query(AppSaTask).filter_by(task_id=task_id).first()
                 lock_payload = _read_task_execution_lock_payload(lock_path)
-                lock_worker = str((lock_payload or {}).get("worker_instance_id") or "").strip()
+                lock_worker = _coerce_lock_text((lock_payload or {}).get("worker_instance_id"))
                 lock_epoch = _coerce_lock_epoch((lock_payload or {}).get("lease_epoch"))
+                lock_boot_id = _coerce_lock_text((lock_payload or {}).get("runner_boot_id"))
+                lock_process_token = _coerce_lock_text((lock_payload or {}).get("runner_process_token"))
+                lock_process_started_at = _coerce_lock_text((lock_payload or {}).get("runner_process_started_at"))
+                lock_main_pid = (lock_payload or {}).get("runner_main_pid")
                 row_worker = str(getattr(row, "dispatcher_instance_id", "") or "").strip()
                 row_epoch = int(getattr(row, "lease_epoch", 0) or 0)
                 row_status = str(getattr(row, "status", "") or "").strip()
                 row_lease_expires_at = getattr(row, "lease_expires_at", None)
+                requested_epoch = int(lease_epoch or 0)
+                current_worker = str(runner_identity["worker_instance_id"])
+                current_boot_id = str(runner_identity["runner_boot_id"])
+                current_process_token = str(runner_identity["runner_process_token"])
+                same_process_instance = (
+                    lock_worker == current_worker
+                    and bool(lock_process_token)
+                    and lock_process_token == current_process_token
+                )
+                stale_reasons: list[str] = []
+                if row is None:
+                    stale_reasons.append("task_row_missing")
+                if row_status != "running":
+                    stale_reasons.append("row_not_running")
+                if row_lease_expires_at is not None and row_lease_expires_at < now_local():
+                    stale_reasons.append("lease_expired")
+                if lock_epoch is None:
+                    stale_reasons.append("lock_epoch_missing")
+                elif lock_epoch != row_epoch:
+                    stale_reasons.append("lock_epoch_mismatch_row")
+                if row_epoch != requested_epoch:
+                    stale_reasons.append("requested_epoch_mismatch_row")
+                if row_worker != current_worker:
+                    stale_reasons.append("row_worker_mismatch_current")
+                if lock_worker and row_worker and lock_worker != row_worker:
+                    stale_reasons.append("lock_worker_mismatch_row")
+                if not lock_process_token:
+                    stale_reasons.append("legacy_lock_missing_process_token")
+                elif lock_process_token != current_process_token:
+                    stale_reasons.append("runner_process_token_mismatch")
+                if not lock_boot_id:
+                    stale_reasons.append("legacy_lock_missing_boot_id")
+                elif lock_boot_id != current_boot_id:
+                    stale_reasons.append("runner_boot_id_mismatch")
                 lock_is_stale = (
                     row is None
-                    or row_status != "running"
-                    or (row_lease_expires_at is not None and row_lease_expires_at < now_local())
-                    or lock_epoch is None
-                    or lock_epoch != row_epoch
-                    or (lock_worker and row_worker and lock_worker != row_worker)
-                    or row_epoch != int(lease_epoch or 0)
-                    or row_worker != WORKER_INSTANCE_ID
+                    or bool(stale_reasons)
                 )
+                debug_payload = {
+                    "task_id": task_id,
+                    "lock_path": str(lock_path),
+                    "requested_worker_instance_id": current_worker,
+                    "requested_lease_epoch": requested_epoch,
+                    "requested_runner_boot_id": current_boot_id,
+                    "requested_runner_process_token": current_process_token,
+                    "lock_worker_instance_id": lock_worker or None,
+                    "lock_lease_epoch": lock_epoch,
+                    "lock_runner_boot_id": lock_boot_id or None,
+                    "lock_runner_process_token": lock_process_token or None,
+                    "lock_runner_process_started_at": lock_process_started_at or None,
+                    "lock_runner_main_pid": lock_main_pid,
+                    "row_status": row_status or None,
+                    "row_worker_instance_id": row_worker or None,
+                    "row_lease_epoch": row_epoch,
+                    "row_lease_expires_at": isoformat_local(row_lease_expires_at) if row_lease_expires_at else None,
+                }
                 if lock_is_stale and attempt == 0:
+                    if callable(observer):
+                        observer(
+                            "task_execution_lock_stale_detected",
+                            {
+                                **debug_payload,
+                                "decision": "stale_detected",
+                                "stale_reasons": list(stale_reasons),
+                            },
+                        )
                     logger.warning(
                         "detected stale task execution lock; clearing and retrying: task_id=%s lock_path=%s "
                         "lock_worker_instance_id=%s lock_lease_epoch=%s row_status=%s row_worker_instance_id=%s "
-                        "row_lease_epoch=%s row_lease_expires_at=%s requested_lease_epoch=%s requested_worker_instance_id=%s",
+                        "row_lease_epoch=%s row_lease_expires_at=%s requested_lease_epoch=%s requested_worker_instance_id=%s "
+                        "lock_runner_boot_id=%s lock_runner_process_token=%s requested_runner_boot_id=%s "
+                        "requested_runner_process_token=%s stale_reasons=%s",
                         task_id,
                         lock_path,
                         lock_worker or "-",
@@ -1955,24 +2044,65 @@ class TaskService:
                         row_epoch,
                         isoformat_local(row_lease_expires_at) if row_lease_expires_at else "-",
                         lease_epoch,
-                        WORKER_INSTANCE_ID,
+                        current_worker,
+                        lock_boot_id or "-",
+                        lock_process_token or "-",
+                        current_boot_id,
+                        current_process_token,
+                        ",".join(stale_reasons) or "-",
                     )
                     _clear_task_execution_lock(output_path, task_id)
+                    if callable(observer):
+                        observer(
+                            "task_execution_lock_cleared",
+                            {
+                                **debug_payload,
+                                "decision": "stale_cleared",
+                                "stale_reasons": list(stale_reasons),
+                            },
+                        )
                     continue
-                raise RuntimeError(
+                conflict_kind = "execution_lock_reentry" if same_process_instance else "execution_lock_conflict"
+                conflict_payload = {
+                    **debug_payload,
+                    "decision": "reentry" if same_process_instance else "active_conflict",
+                }
+                if callable(observer):
+                    observer(
+                        "task_execution_lock_reentry_blocked" if same_process_instance else "task_execution_lock_conflict",
+                        conflict_payload,
+                    )
+                raise TaskExecutionLockConflict(
                     "task execution lock already exists: "
                     f"{lock_path} "
                     f"(lock_worker_instance_id={lock_worker or '-'}, "
                     f"lock_lease_epoch={lock_epoch if lock_epoch is not None else '-'}, "
+                    f"lock_runner_boot_id={lock_boot_id or '-'}, "
+                    f"lock_runner_process_token={lock_process_token or '-'}, "
                     f"row_status={row_status or '-'}, "
                     f"row_worker_instance_id={row_worker or '-'}, "
                     f"row_lease_epoch={row_epoch}, "
-                    f"row_lease_expires_at={isoformat_local(row_lease_expires_at) if row_lease_expires_at else '-'})"
+                    f"row_lease_expires_at={isoformat_local(row_lease_expires_at) if row_lease_expires_at else '-'})",
+                    conflict_kind=conflict_kind,
+                    payload=conflict_payload,
                 )
             try:
                 os.write(fd, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
             finally:
                 os.close(fd)
+            if callable(observer):
+                observer(
+                    "task_execution_lock_acquired" if attempt == 0 else "task_execution_lock_reacquired",
+                    {
+                        "task_id": task_id,
+                        "lock_path": str(lock_path),
+                        "requested_worker_instance_id": str(runner_identity["worker_instance_id"]),
+                        "requested_lease_epoch": int(lease_epoch or 0),
+                        "requested_runner_boot_id": str(runner_identity["runner_boot_id"]),
+                        "requested_runner_process_token": str(runner_identity["runner_process_token"]),
+                        "decision": "acquired" if attempt == 0 else "continued",
+                    },
+                )
             return lock_path
         raise RuntimeError(f"failed to acquire task execution lock after stale-lock cleanup retry: {lock_path}")
 
