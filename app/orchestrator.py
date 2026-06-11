@@ -201,8 +201,8 @@ class Orchestrator:
                 "defaultThinkingLevel": "off",
                 "compaction": {
                     "enabled": True,
-                    "reserveTokens": 16384,
-                    "keepRecentTokens": 40000,
+                    "reserveTokens": 8192,
+                    "keepRecentTokens": 50000,
                 },
             }
             (pi_settings_dir / "settings.json").write_text(
