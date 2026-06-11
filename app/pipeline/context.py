@@ -380,6 +380,7 @@ class PipelineContext:
             "retry_delay": self.cfg.agent_retry_delay,
             "pi_max_retries": self.cfg.pi_max_retries,
             "pi_retry_delay": self.cfg.pi_retry_delay,
+            "task_pi_dir": getattr(self.cfg, "task_pi_dir", ""),
             "model_stuck_timeout": getattr(self.cfg, "model_stuck_timeout", 1800.0),
             "model_stuck_max_activations": getattr(self.cfg, "model_stuck_max_activations", 5),
         }
@@ -393,6 +394,7 @@ class PipelineContext:
             "retry_delay": self.cfg.agent_retry_delay,
             "pi_max_retries": self.cfg.pi_max_retries,
             "pi_retry_delay": self.cfg.pi_retry_delay,
+            "task_pi_dir": getattr(self.cfg, "task_pi_dir", ""),
             "model_stuck_timeout": getattr(self.cfg, "model_stuck_timeout", 1800.0),
             "model_stuck_max_activations": getattr(self.cfg, "model_stuck_max_activations", 5),
         }

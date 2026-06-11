@@ -148,6 +148,7 @@ class SecurityFocusFilterStage(BaseStage):
             retry_delay=cfg.agent_retry_delay,
             pi_max_retries=cfg.pi_max_retries,
             pi_retry_delay=cfg.pi_retry_delay,
+            task_pi_dir=getattr(cfg, "task_pi_dir", ""),
         )
 
         # judge_corrections: 由 Judge 输出的结构化修正指令，注入下轮 Worker prompt
@@ -286,6 +287,7 @@ class SecurityFocusFilterStage(BaseStage):
                     retry_delay=cfg.agent_retry_delay,
                     pi_max_retries=cfg.pi_max_retries,
                     pi_retry_delay=cfg.pi_retry_delay,
+                    task_pi_dir=getattr(cfg, "task_pi_dir", ""),
                 )
                 ctx.tokens += j_ar.token_usage
                 parsed = parse_eval_md(j_ar.output or "")

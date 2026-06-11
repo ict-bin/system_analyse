@@ -55,6 +55,18 @@ def _resolve_enable_final_check(row: AppSaTask) -> bool | None:
     return None
 
 
+def _agent_runtime_payload(row: AppSaTask) -> dict[str, object]:
+    task_config = row.task_config_json if isinstance(row.task_config_json, dict) else {}
+    agent_task_key = task_config.get("agent_task_key") if isinstance(task_config.get("agent_task_key"), dict) else {}
+    secret = str(agent_task_key.get("secret") or "").strip()
+    return {
+        "has_agent_task_key": bool(secret),
+        "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
+        "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
+        "agent_runtime_mode": "task_scoped" if secret else "global",
+    }
+
+
 def _compute_missing_files(workspace_root: Path) -> tuple[list[str], list[str]]:
     warnings: list[str] = []
     filtered_files_path = workspace_root / "filtered_files.txt"

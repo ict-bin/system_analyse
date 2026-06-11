@@ -187,6 +187,19 @@ def _single_input_token_limit(context_window: int) -> int:
     return max(1, int(context_window * _SINGLE_INPUT_CONTEXT_RATIO))
 
 
+def _build_agent_env(
+    base_env: dict[str, str] | None,
+    *,
+    task_pi_dir: str | None = None,
+) -> dict[str, str] | None:
+    payload = dict(base_env or {})
+    normalized_pi_dir = str(task_pi_dir or "").strip()
+    if normalized_pi_dir:
+        payload["PI_CODING_AGENT_DIR"] = normalized_pi_dir
+        payload["PI_MODELS_JSON"] = str(Path(normalized_pi_dir) / "models.json")
+    return payload or None
+
+
 def _parse_context_overflow_details(error_text: str | None) -> dict[str, int]:
     text = str(error_text or "")
     lowered = text.lower()
@@ -522,6 +535,7 @@ async def run_agent(
     system_prompt: str = "",
     cwd: str = ".",
     env: dict[str, str] | None = None,
+    task_pi_dir: str | None = None,
     thinking_level: str = "off",
     session_file: str | None = None,
     on_stream: Callable[[str], None] | None = None,
@@ -555,6 +569,7 @@ async def run_agent(
         return r
 
     args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+    env = _build_agent_env(env, task_pi_dir=task_pi_dir)
 
     # System/User Prompt → 临时文件，避免超长 argv 导致 Argument list too long
     tmp_dir: str | None = None

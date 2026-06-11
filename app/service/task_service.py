@@ -2451,6 +2451,7 @@ class TaskService:
             "abnormal_reason_title": (abnormal_reason or {}).get("title"),
             "abnormal_reason_code": (abnormal_reason or {}).get("code"),
             "abnormal_reason_category": (abnormal_reason or {}).get("category"),
+            **_agent_runtime_payload(row),
         }
 
 

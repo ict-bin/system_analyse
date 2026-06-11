@@ -517,6 +517,7 @@ class TaskConfig(BaseModel):
     source_file: str = Field(default="", description="兼容字段：用于归档命名")
     function_name: str = Field(default="", description="兼容字段：用于归档命名")
     cwd: str = Field(default="/data/target")
+    task_pi_dir: str = Field(default="", description="任务级 PI runtime 目录")
 
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")
     continue_on_module_failure: bool = Field(

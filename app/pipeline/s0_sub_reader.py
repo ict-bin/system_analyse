@@ -463,6 +463,7 @@ class SubReaderStage(BaseStage):
                     tools=[],
                     cwd=str(ctx.workspace),
                     thinking_level="off",
+                    task_pi_dir=getattr(cfg, "task_pi_dir", ""),
                     session_file=str(ctx.sess_dir / f"sub-reader-llm-{i // batch_size + 1}.jsonl"),
                     cancel_event=ctx.cancel_event,
                     max_retries=cfg.agent_max_retries,

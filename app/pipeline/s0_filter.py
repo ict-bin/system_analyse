@@ -260,6 +260,7 @@ class ExploreStage(BaseStage):
             cwd=str(workspace),
             tools=cfg.workers.default_tools,
             env={**os.environ, "TMPDIR": str(ctx.task_tmp), "HOME": str(workspace)},
+            task_pi_dir=getattr(cfg, "task_pi_dir", ""),
             thinking_level="off",
             cancel_event=ctx.cancel_event,
             max_retries=cfg.agent_max_retries,
