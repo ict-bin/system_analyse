@@ -26,6 +26,7 @@ from app.config import load_service_config
 from app.db.models import AppSaTask, AppSaTaskEvent
 from app.logging_utils import log_event
 from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
+from app.service.task_query_service import _agent_runtime_payload
 from app.service.task_execution_lock import (
     RUNNER_BOOT_ID,
     RUNNER_MAIN_PID,
