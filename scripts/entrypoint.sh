@@ -26,6 +26,7 @@ except Exception:
     data = {}
 data.setdefault("theme", "dark")
 data["defaultThinkingLevel"] = "off"
+data["compaction"] = {"enabled": True, "reserveTokens": 16384, "keepRecentTokens": 40000}
 p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 print(f"[entrypoint] settings.json updated → {p}")
 PY
