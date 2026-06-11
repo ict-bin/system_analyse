@@ -304,6 +304,10 @@ def _probe_payload() -> dict[str, object]:
 
 
 def _ensure_probe_server_started() -> None:
+    # 独立 sidecar 进程 probe_sidecar.py 替代线程内探针
+    # 环境变量 SECFLOW_SYSTEM_ANALYSE_PROBE_STANDALONE=1 启用旧探针（兼容）
+    if os.environ.get("SECFLOW_SYSTEM_ANALYSE_PROBE_STANDALONE") != "1":
+        return
     global _probe_server
     if _probe_server is not None:
         _probe_server.start()

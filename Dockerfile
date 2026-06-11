@@ -11,7 +11,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -q
 
 COPY app/ ./app/
-COPY cli.py main.py ./
+COPY cli.py main.py probe_sidecar.py ./
 COPY prompts/ ./prompts/
 COPY scripts/ ./scripts/
 COPY config.example.json .env.example ./

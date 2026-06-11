@@ -34,4 +34,9 @@ if [ -d /data/config/prompts ]; then
     echo "[entrypoint] custom prompts found at /data/config/prompts/"
 fi
 
+# 启动独立探针 sidecar 进程（不受主服务 GIL/CPU 影响）
+PROBE_PORT="${PROBE_PORT:-18080}"
+echo "[entrypoint] starting probe sidecar on port $PROBE_PORT ..."
+python3 /app/probe_sidecar.py &
+
 exec "$@"
