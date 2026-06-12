@@ -304,16 +304,17 @@ class Orchestrator:
             result.error = str(e)
             result.total_tokens = ctx.tokens
             self._emit("stage_fail", task_id, error=str(e))
-        except Exception:
-            result.status = TaskStatus.FAILED
-            result.error = "任务被取消"
-            result.total_tokens = ctx.tokens
-            self._emit("stage_fail", task_id, error="cancelled")
         except Exception as e:
-            result.status = TaskStatus.ERROR
-            result.error = str(e)
-            result.total_tokens = ctx.tokens
-            self._emit("error", task_id, error=str(e))
+            if getattr(e, '__class__', None) and e.__class__.__name__ == 'CancelledError':
+                result.status = TaskStatus.FAILED
+                result.error = "任务被取消"
+                result.total_tokens = ctx.tokens
+                self._emit("stage_fail", task_id, error="cancelled")
+            else:
+                result.status = TaskStatus.ERROR
+                result.error = str(e)
+                result.total_tokens = ctx.tokens
+                self._emit("error", task_id, error=str(e))
 
         result.total_duration_ms = (time.time() - start) * 1000
 
