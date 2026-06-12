@@ -381,9 +381,19 @@ class _StdoutReader:
 
     def _read_loop(self):
         try:
+            import select
+            fd = self.stdout.fileno()
             buf = b""
             while True:
-                chunk = self.stdout.read(4096)
+                # Use select with 1s timeout to detect EOF without blocking forever
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    # No data available; keep waiting
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
                 if not chunk:
                     break
                 buf += chunk
@@ -435,7 +445,21 @@ class _StderrReader:
 
     def _read_loop(self):
         try:
-            self.data = self.stderr.read()
+            import select
+            fd = self.stderr.fileno()
+            chunks = []
+            while True:
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            self.data = b"".join(chunks)
         except Exception:
             pass
         finally:
