@@ -44,10 +44,11 @@ class RunnerRegistryService:
         self._task: object | None = None
 
     def start(self) -> None:
-        if not is_runner_role() or (self._task and not self._task.done()):
+        if not is_runner_role() or (self._task and self._task.is_alive()):
             return
         self._running = True
-        self._task = threading.Thread(target=self._heartbeat_loop(), name="sa_runner_registry_heartbeat")
+        self._task = threading.Thread(target=self._heartbeat_loop, name="sa_runner_registry_heartbeat", daemon=True)
+        self._task.start()
         logger.info(
             "runner registry heartbeat started (instance_id=%s interval=%ss)",
             WORKER_INSTANCE_ID,
@@ -57,8 +58,8 @@ class RunnerRegistryService:
     def stop(self) -> None:
         self._running = False
         task = self._task
-        if task and not task.done():
-            task.cancel()
+        if task and task.is_alive():
+            self._stop_event.set()
             try:
                 task
             except Exception:

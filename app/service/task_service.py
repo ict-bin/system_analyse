@@ -1822,8 +1822,8 @@ class TaskService:
             )
             return self._row_to_dict(row)
         at = _running_tasks.get(task_id)
-        if at and not at.done():
-            at.cancel()
+        if at and at.is_alive():
+            pass  # thread cannot be cancelled
         row = self._task_repository.cancel_task_in_place(db, row)
         reason, changed = _sync_task_abnormal_reason(row)
         _record_abnormal_reason(row, reason, changed=changed)
@@ -1904,14 +1904,15 @@ class TaskService:
         return str(best_runner["instance_id"]) if best_runner else None
 
     def _run_task_locally(self, task_id: str, lease_epoch: int) -> None:
-        if task_id in _running_tasks and not _running_tasks[task_id].done():
+        if task_id in _running_tasks and _running_tasks[task_id].is_alive():
             return
-        asyncio_task = threading.Thread(target=self._runner.execute_task(task_id, lease_epoch), name=f"sa_task_{task_id}")
+        task_thread = threading.Thread(target=self._runner.execute_task, args=(task_id, lease_epoch), name=f"sa_task_{task_id}", daemon=True)
+        task_thread.start()
         _running_tasks[task_id] = asyncio_task
         _running_task_epochs[task_id] = lease_epoch
 
     def _start_runner_assignment_loop(self) -> None:
-        if self._runner_assignment_task and not self._runner_assignment_task.done():
+        if self._runner_assignment_task and self._runner_assignment_task.is_alive():
             return
         self._runner_assignment_loop_running = True
         self._runner_assignment_task = threading.Thread(target=
@@ -1922,8 +1923,8 @@ class TaskService:
     def _stop_runner_assignment_loop(self) -> None:
         self._runner_assignment_loop_running = False
         task = self._runner_assignment_task
-        if task and not task.done():
-            task.cancel()
+        if task and task.is_alive():
+            pass  # thread cannot be cancelled
             try:
                 task
             except Exception:

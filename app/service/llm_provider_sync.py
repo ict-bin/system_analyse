@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 
-import aiohttp
+import httpx
 
 logger = logging.getLogger("sa.llm_sync")
 
@@ -230,16 +230,15 @@ def sync_providers_to_pi(
         headers["Authorization"] = f"Bearer {token}"
 
     try:
-        with aiohttp.ClientSession() as session:
-            with session.get(
+        with httpx.Client(timeout=httpx.Timeout(timeout)) as client:
+            resp = client.get(
                 url,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning("配置中心返回 HTTP %s，跳过 Provider 同步", resp.status)
-                    return False
-                data = resp.json()
+            )
+            if resp.status_code != 200:
+                logger.warning("配置中心返回 HTTP %s，跳过 Provider 同步", resp.status_code)
+                return False
+            data = resp.json()
 
         items: list[dict] = data.get("items", [])
         if not items:
@@ -250,7 +249,7 @@ def sync_providers_to_pi(
         write_pi_models_file(models_json, source="configcenter")
         return True
 
-    except aiohttp.ClientError as e:
+    except httpx.HTTPError as e:
         logger.error("连接配置中心失败，跳过同步: %s", e)
     except Exception as e:
         logger.exception("同步 LLM Provider 时发生未知错误: %s", e)

@@ -46,16 +46,13 @@ class RuntimeBootstrap:
             return
         self._stop_event = threading.Event()
         self._status = RuntimeBootstrapStatus()
-        self._task = threading.Thread(target=self._bootstrap_loop(app), name="sa_runtime_bootstrap")
+        self._task = threading.Thread(target=self._bootstrap_loop, args=(app,), name="sa_runtime_bootstrap", daemon=True)
+        self._task.start()
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                self._task
-            except Exception:
-                pass
+        if self._task and self._task.is_alive():
+            self._task.join(timeout=5.0)
         self._task = None
         try:
             if is_dispatcher_role() or is_runner_role():

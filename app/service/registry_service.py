@@ -82,13 +82,14 @@ class RegistryService:
         if not self._cfg.enabled:
             return
         self._running = True
-        self._task = threading.Thread(target=self._loop(), name="registry_heartbeat")
+        self._task = threading.Thread(target=self._loop, name="registry_heartbeat", daemon=True)
+        self._task.start()
         logger.info("Registry heartbeat started (interval=%ds)", self._cfg.heartbeat_interval_seconds)
 
     def stop(self) -> None:
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
+        if self._task and self._task.is_alive():
+            self._stop_event.set()
 
 
 _registry_service: RegistryService | None = None

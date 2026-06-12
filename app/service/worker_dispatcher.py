@@ -164,11 +164,12 @@ class WorkerDispatcher:
         return 1
 
     def start(self) -> None:
-        if self._task and not self._task.done():
+        if self._task and self._task.is_alive():
             return
         self._running = True
         self._idle_sleep_seconds = WORKER_POLL_INTERVAL_SECONDS
-        self._task = threading.Thread(target=self._run_forever(), name="sa_worker_dispatcher")
+        self._task = threading.Thread(target=self._run_forever, name="sa_worker_dispatcher", daemon=True)
+        self._task.start()
         logger.info(
             "worker dispatcher started (poll_interval=%ss concurrency=%s stale_sweep_interval=%ss)",
             WORKER_POLL_INTERVAL_SECONDS,
@@ -179,8 +180,8 @@ class WorkerDispatcher:
     def stop(self) -> None:
         self._running = False
         task = self._task
-        if task and not task.done():
-            task.cancel()
+        if task and task.is_alive():
+            self._stop_event.set()
             try:
                 task
             except Exception:
