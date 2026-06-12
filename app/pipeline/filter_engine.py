@@ -278,7 +278,7 @@ def _parse_json_output(raw: str, context: str) -> dict:
         raise StageError(f"{context} json parse failed")
 
 
-async def run_agent_filter_engine(ctx) -> FilterEngineStats:
+def run_agent_filter_engine(ctx) -> FilterEngineStats:
     cfg = ctx.cfg
     workspace = ctx.workspace
     selected_engine = normalize_filter_engine(getattr(cfg, "filter_engine", "script"))
@@ -318,7 +318,7 @@ async def run_agent_filter_engine(ctx) -> FilterEngineStats:
             "session_file": session_file,
         }
         ctx.emit_event("stage", stage="filter-tree-batch", **payload)
-        ar = await run_agent_with_stage_guard(
+        ar = run_agent_with_stage_guard(
             ctx=ctx,
             stage="filter-tree-batch",
             context=f"filter-tree-batch-{idx}",
@@ -365,7 +365,7 @@ async def run_agent_filter_engine(ctx) -> FilterEngineStats:
 
     merge_session = ctx.session_path("filter-engine", "merge.jsonl")
     ctx.emit_event("stage", stage="filter-merge", session_file=merge_session, batch_count=len(batch_outputs))
-    merge_result = await run_agent_with_stage_guard(
+    merge_result = run_agent_with_stage_guard(
         ctx=ctx,
         stage="filter-merge",
         context="filter-merge",

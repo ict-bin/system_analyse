@@ -18,7 +18,7 @@ pipeline/s4_report.py — Stage 4: 最终报告
 """
 from __future__ import annotations
 
-import asyncio
+import subprocess
 import re
 import shutil
 import time
@@ -160,7 +160,7 @@ class CompletenessCheckStage(BaseStage):
     stage_num = 4
     stage_name = "完整性检查"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
@@ -187,7 +187,7 @@ class CompletenessCheckStage(BaseStage):
                 "report-completeness",
                 f"s4a-j{j_idx}.jsonl",
             )
-            j_ar = await run_agent_with_stage_guard(
+            j_ar = run_agent_with_stage_guard(
                 ctx=ctx,
                 stage="4a",
                 context=f"s4a-judge-j{j_idx}",
@@ -223,14 +223,14 @@ class CompletenessCheckStage(BaseStage):
         s4a_pass = check_voting(judge_results, "all", ctx.j_count)
 
         if not s4a_pass and missing_modules:
-            await self._redo_missing(ctx, missing_modules)
+            self._redo_missing(ctx, missing_modules)
 
         # ── 写 checkpoint ────────────────────────────────────────────────────────
         if cp := ctx.checkpoint:
             cp.mark_done("s4_completeness")
 
     # ── 补做缺失模块的 Stage 2+3 ──────────────────────────────────────────
-    async def _redo_missing(self, ctx: PipelineContext, missing_modules: list[str]) -> None:
+    def _redo_missing(self, ctx: PipelineContext, missing_modules: list[str]) -> None:
         cfg = ctx.cfg
         workspace = ctx.workspace
         mods_root = get_modules_root(str(workspace))
@@ -253,7 +253,7 @@ class CompletenessCheckStage(BaseStage):
             try:
                 # Stage 2 补做
                 refine_session = ctx.session_path("refine-s4", f"{mod_name}.jsonl")
-                ar = await run_agent_with_stage_guard(
+                ar = run_agent_with_stage_guard(
                     ctx=ctx,
                     stage="2-redo-s4",
                     context=f"s4-s2-redo-{mod_name}",
@@ -273,7 +273,7 @@ class CompletenessCheckStage(BaseStage):
                 # Stage 3 补做（预读内容，优先复用 details/ JSON）
                 loop = __import__("asyncio").get_event_loop()
                 _details_dir_opt = ctx.details_dir if ctx.details_dir.exists() else None
-                pre_content = await loop.run_in_executor(
+                pre_content = loop.run_in_executor(
                     None, pre_read_module_with_details,
                     cfg.target_dir, mod_dir, _details_dir_opt
                 )
@@ -289,7 +289,7 @@ class CompletenessCheckStage(BaseStage):
                     ]
                     if feedback:
                         prompt_parts.append(f"\n\n{feedback}")
-                    ar = await run_agent_with_stage_guard(
+                    ar = run_agent_with_stage_guard(
                         ctx=ctx,
                         stage="3-redo-s4",
                         context=f"s4-s3-redo-{mod_name}-a{attempt+1}",
@@ -327,7 +327,7 @@ class CompletenessCheckStage(BaseStage):
                             mod_name,
                             f"analyse-s4-a{attempt + 1}-j{j_idx}.jsonl",
                         )
-                        j_ar = await run_agent_with_stage_guard(
+                        j_ar = run_agent_with_stage_guard(
                             ctx=ctx,
                             stage="3-redo-s4",
                             context=f"s4-s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",
@@ -381,7 +381,7 @@ class FinalReportStage(BaseStage):
     stage_num = 5
     stage_name = "生成报告"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace

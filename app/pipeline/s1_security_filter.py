@@ -63,7 +63,7 @@ class SecurityFocusFilterStage(BaseStage):
     stage_num = 1       # 与 ClassifyStage 相同；Pipeline stable-sort 保证本阶段在其之后
     stage_name = "安全维度过滤"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         cfg = ctx.cfg
         sec_cats: list[str] = getattr(cfg, "security_focus_categories", ["all"])
@@ -211,7 +211,7 @@ class SecurityFocusFilterStage(BaseStage):
                     f"完成后输出 `<result>` 摘要（执行了哪些恢复/删除操作）。"
                 ]
 
-            ar = await run_agent_with_stage_guard(
+            ar = run_agent_with_stage_guard(
                 ctx=ctx,
                 stage="security_filter",
                 context=f"s1-security-filter-a{attempt+1}",
@@ -265,7 +265,7 @@ class SecurityFocusFilterStage(BaseStage):
                     f"- <模块名>  # 原因说明\n"
                     f"```"
                 )
-                j_ar = await run_agent_with_stage_guard(
+                j_ar = run_agent_with_stage_guard(
                     ctx=ctx,
                     stage="security_filter_judge",
                     context=f"s1-security-filter-judge{j_idx}-a{attempt+1}",

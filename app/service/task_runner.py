@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import threading
 import inspect
 import json
 import logging
@@ -104,7 +104,7 @@ class TaskRunner:
         self._settings = settings
         self._agent_cleanup = AgentCleanupService()
 
-    async def execute_task(self, task_id: str, lease_epoch: int) -> None:
+    def execute_task(self, task_id: str, lease_epoch: int) -> None:
         event_buffer: list[dict] = []
         output_path_for_lock: str | None = None
         last_stage_flush_ts = 0.0
@@ -247,17 +247,17 @@ class TaskRunner:
                     self._deps.flush_stages(task_id, event_buffer)
                 last_stage_flush_count = len(event_buffer)
             orch = Orchestrator(config=cfg, on_event=on_event)
-            task_supervisor = asyncio.create_task(
+            task_supervisor = threading.Thread(target=
                 self._supervise_running_task(task_id, lease_epoch, orch),
                 name=f"sa_supervise_{task_id}",
             )
             try:
-                result = await orch.execute(task_id)
+                result = orch.execute(task_id)
             finally:
                 task_supervisor.cancel()
                 try:
-                    await task_supervisor
-                except asyncio.CancelledError:
+                    task_supervisor
+                except Exception:
                     pass
             # 最终增量刷新剩余 events
             if events_file is not None:
@@ -267,7 +267,7 @@ class TaskRunner:
             else:
                 self._deps.flush_stages(task_id, event_buffer)
             self._persist_task_result(task_id, lease_epoch, task_snapshot, result, event_buffer, events_file)
-        except asyncio.CancelledError:
+        except Exception:
             pass
         except Exception as exc:
             log_event(
@@ -644,12 +644,12 @@ class TaskRunner:
         except Exception:
             pass
 
-    async def _supervise_running_task(self, task_id: str, lease_epoch: int, orch: Orchestrator) -> None:
+    def _supervise_running_task(self, task_id: str, lease_epoch: int, orch: Orchestrator) -> None:
         loop_interval = max(1.0, min(self._settings.task_cancel_poll_interval_seconds, self._settings.task_lease_heartbeat_seconds))
         last_heartbeat_ts = 0.0
         heartbeat_failures = 0
         while True:
-            await asyncio.sleep(loop_interval)
+            time.sleep(loop_interval)
             db_gen = self._deps.get_db()
             db: Session = next(db_gen)
             try:

@@ -13,7 +13,7 @@ pipeline/s1_classify.py — Stage 1: 粗分类
 """
 from __future__ import annotations
 
-import asyncio
+import subprocess
 import time
 from pathlib import Path
 
@@ -213,7 +213,7 @@ class ClassifyStage(BaseStage):
     stage_num = 1
     stage_name = "分类"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cfg = ctx.cfg
         workspace = ctx.workspace
         task_id = ctx.task_id
@@ -402,7 +402,7 @@ class ClassifyStage(BaseStage):
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
-            ar = await run_agent_with_stage_guard(
+            ar = run_agent_with_stage_guard(
                 ctx=ctx,
                 stage="classify",
                 context=f"s1-classify-a{attempt+1}",
@@ -449,7 +449,7 @@ class ClassifyStage(BaseStage):
                         "3. 所有 filtered_files.txt 中的文件"
                         "是否已全部分类（覆盖率 100%）"
                     )
-                j_ar = await run_agent_with_stage_guard(
+                j_ar = run_agent_with_stage_guard(
                     ctx=ctx,
                     stage="classify",
                     context=f"s1-classify-judge{j_idx}",

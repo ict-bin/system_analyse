@@ -22,7 +22,8 @@ system_analyse — REST API 服务器
 
 from __future__ import annotations
 
-import asyncio
+import threading
+import queue
 import json
 import logging
 import os
@@ -36,9 +37,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
 
 from .build_info import build_service_meta
 from .config import (
@@ -159,13 +159,13 @@ async def lifespan(app: FastAPI):
     _probe_started_at = _time.time()
     if not _external_probe_process_enabled():
         _ensure_probe_server_started()
-    await get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
+    get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
 
     yield
 
     # --- shutdown ---
     _probe_shutdown = True
-    await get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).stop()
+    get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).stop()
     if not _external_probe_process_enabled():
         _stop_probe_server()
 
@@ -179,8 +179,8 @@ class TaskEntry:
         self.prompt = prompt
         self.result: TaskResult | None = None
         self.events: list[dict] = []
-        self.queues: list[asyncio.Queue] = []
-        self.done = asyncio.Event()
+        self.queues: list[queue.Queue] = []
+        self.done = threading.Event()
         self.callback_url: str | None = None
 
 
@@ -199,7 +199,7 @@ except Exception:
 
 
 @app.middleware("http")
-async def collect_request_metrics(request, call_next):
+def collect_request_metrics(request, call_next):
     started = _time.perf_counter()
     response = None
     route = request.scope.get("route")
@@ -207,7 +207,7 @@ async def collect_request_metrics(request, call_next):
     normalized_route = normalize_http_route(str(path))
     observe_http_request_inflight(request.method, normalized_route, 1)
     try:
-        response = await call_next(request)
+        response = call_next(request)
         return response
     finally:
         status_code = response.status_code if response is not None else 500
@@ -340,7 +340,7 @@ class AnalyseRequest(BaseModel):
 
 @app.get("/health")
 @app.get("/api/app/system-analyse/health")
-async def health():
+def health():
     payload = _probe_payload()
     payload["active"] = sum(1 for t in _tasks.values() if t.result is None)
     payload["completed"] = sum(1 for t in _tasks.values() if t.result is not None)
@@ -349,13 +349,13 @@ async def health():
 
 @app.get("/metrics")
 @app.get("/api/app/system-analyse/metrics", include_in_schema=False)
-async def metrics():
+def metrics():
     return PlainTextResponse(render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/api/app/system-analyse/metrics/summary", include_in_schema=False)
-async def metrics_summary():
-    return await run_in_threadpool(
+def metrics_summary():
+    return run_in_threadpool(
         _cached_summary,
         "summary",
         lambda: build_generic_observability_summary(_metrics_rows(), title="系统分析"),
@@ -363,8 +363,8 @@ async def metrics_summary():
 
 
 @app.get("/api/app/system-analyse/metrics/rest-api-summary", include_in_schema=False)
-async def metrics_rest_api_summary():
-    return await run_in_threadpool(
+def metrics_rest_api_summary():
+    return run_in_threadpool(
         _cached_summary,
         "rest-api-summary",
         lambda: build_rest_api_summary(_metrics_rows()),
@@ -372,8 +372,8 @@ async def metrics_rest_api_summary():
 
 
 @app.get("/api/app/system-analyse/metrics/ai-summary", include_in_schema=False)
-async def metrics_ai_summary():
-    return await run_in_threadpool(
+def metrics_ai_summary():
+    return run_in_threadpool(
         _cached_summary,
         "ai-summary",
         lambda: build_ai_summary(_metrics_rows(), coverage_text="系统分析 AI 指标覆盖 worker / judge / review 等调用。"),
@@ -382,7 +382,7 @@ async def metrics_ai_summary():
 
 @app.get("/livez")
 @app.get("/api/app/system-analyse/livez")
-async def livez():
+def livez():
     payload = _probe_payload()
     payload["status"] = "ok" if payload["liveness_ok"] else "degraded"
     return payload
@@ -392,7 +392,7 @@ async def livez():
 @app.get("/api/app/system-analyse/readyz")
 @app.get("/ready")
 @app.get("/api/app/system-analyse/ready")
-async def readyz():
+def readyz():
     from fastapi import HTTPException
 
     payload = _probe_payload()
@@ -402,7 +402,7 @@ async def readyz():
 
 
 @app.post("/analyse", status_code=202)
-async def submit_analyse(body: AnalyseRequest):
+def submit_analyse(body: AnalyseRequest):
     """直接提交分析任务（CLI 兼容路由）。"""
     _require_api_role()
     svc = _get_svc_config()
@@ -419,7 +419,7 @@ async def submit_analyse(body: AnalyseRequest):
         for q in entry.queues:
             try:
                 q.put_nowait(d)
-            except asyncio.QueueFull:
+            except queue.QueueFull:
                 pass
 
     orch = Orchestrator(config=cfg, on_event=on_event)
@@ -430,9 +430,9 @@ async def submit_analyse(body: AnalyseRequest):
               event="task_submitted", task_id=task_id, cwd=cwd,
               callback_url=entry.callback_url or "")
 
-    async def _run():
+    def _run():
         try:
-            entry.result = await orch.execute(task_id)
+            entry.result = orch.execute(task_id)
         except Exception as e:
             log_event(logger, logging.ERROR, "analysis task failed",
                       event="task_failed", task_id=task_id, error=str(e))
@@ -447,18 +447,19 @@ async def submit_analyse(body: AnalyseRequest):
             for q in entry.queues:
                 try:
                     q.put_nowait(done_data)
-                except asyncio.QueueFull:
+                except queue.QueueFull:
                     pass
             entry.done.set()
             if entry.result:
                 log_event(logger, logging.INFO, "analysis task finished",
                           event="task_finished", task_id=task_id, status=entry.result.status.value)
             if entry.callback_url and entry.result:
-                await _notify(entry)
-            await asyncio.sleep(CLEANUP_DELAY)
+                _notify(entry)
+            time.sleep(CLEANUP_DELAY)
             _tasks.pop(task_id, None)
 
-    asyncio.create_task(_run())
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
     return {
         "task_id": task_id,
         "source_file": cfg.source_file,
@@ -469,12 +470,12 @@ async def submit_analyse(body: AnalyseRequest):
     }
 
 
-async def _notify(entry: TaskEntry):
+def _notify(entry: TaskEntry):
     if not entry.callback_url or not entry.result:
         return
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            await client.post(entry.callback_url, json={
+        with httpx.Client(timeout=30) as client:
+            client.post(entry.callback_url, json={
                 "task_id": entry.task_id,
                 "status": entry.result.status.value,
                 "duration_ms": entry.result.total_duration_ms,
@@ -487,7 +488,7 @@ async def _notify(entry: TaskEntry):
 
 
 @app.get("/task/{task_id}")
-async def get_task(task_id: str):
+def get_task(task_id: str):
     _require_api_role()
     entry = _tasks.get(task_id)
     if not entry:
@@ -498,15 +499,15 @@ async def get_task(task_id: str):
 
 
 @app.get("/task/{task_id}/stream")
-async def stream_task(task_id: str):
+def stream_task(task_id: str):
     _require_api_role()
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404, "Task not found")
-    queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+    queue: queue.Queue = queue.Queue(maxsize=1000)
     entry.queues.append(queue)
 
-    async def gen():
+    def gen():
         for evt in entry.events:
             yield {"data": json.dumps(evt, ensure_ascii=False)}
         if entry.result:
@@ -515,22 +516,22 @@ async def stream_task(task_id: str):
         try:
             while True:
                 try:
-                    evt = await asyncio.wait_for(queue.get(), timeout=30)
+                    evt = queue.get(timeout=30)
                     yield {"data": json.dumps(evt, ensure_ascii=False)}
                     if evt.get("type") == "done":
                         return
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield {"comment": "keepalive"}
         finally:
             if queue in entry.queues:
                 entry.queues.remove(queue)
 
-    return EventSourceResponse(gen())
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.post("/task/{task_id}/stop")
 @app.post("/task/{task_id}/abort")  # alias kept for compatibility
-async def stop_task(task_id: str):
+def stop_task(task_id: str):
     _require_api_role()
     entry = _tasks.get(task_id)
     if not entry:
@@ -542,7 +543,7 @@ async def stop_task(task_id: str):
 
 
 @app.get("/tasks")
-async def list_engine_tasks():
+def list_engine_tasks():
     _require_api_role()
     return {"tasks": [
         {"task_id": tid, "prompt": e.prompt[:100],

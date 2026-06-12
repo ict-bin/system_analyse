@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-import asyncio
+import threading
+import concurrent.futures
 from typing import Any, Optional
 
 import httpx
@@ -619,13 +620,13 @@ def _invalidate_agent_aggregate_cache() -> None:
     _AGENT_AGGREGATE_SUMMARY_CACHE.clear()
 
 
-async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None, dict[str, Any] | None]:
+def _fanout_get_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None, dict[str, Any] | None]:
     headers = _auth_headers_from_token(token)
-    async with httpx.AsyncClient(timeout=AGGREGATE_HTTP_TIMEOUT_SECONDS) as client:
+    with httpx.Client(timeout=AGGREGATE_HTTP_TIMEOUT_SECONDS) as client:
         for base_url in urls:
             url = f"{base_url}{path}"
             try:
-                response = await client.get(url, headers=headers, params=params)
+                response = client.get(url, headers=headers, params=params)
                 if response.status_code == 200:
                     return response.json(), base_url, None
                 logger.warning("system-agent-fanout http_error url=%s status=%s body=%s", url, response.status_code, response.text[:200])
@@ -642,13 +643,13 @@ async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: di
     return None, None, {"attempted_url": None, "error_kind": "no_target", "status_code": None, "message": "no target responded"}
 
 
-async def _fanout_post_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None, dict[str, Any] | None]:
+def _fanout_post_json(urls: list[str], *, path: str, token: str, params: dict[str, Any]) -> tuple[Any | None, str | None, dict[str, Any] | None]:
     headers = _auth_headers_from_token(token)
-    async with httpx.AsyncClient(timeout=AGGREGATE_HTTP_TIMEOUT_SECONDS) as client:
+    with httpx.Client(timeout=AGGREGATE_HTTP_TIMEOUT_SECONDS) as client:
         for base_url in urls:
             url = f"{base_url}{path}"
             try:
-                response = await client.post(url, headers=headers, params=params)
+                response = client.post(url, headers=headers, params=params)
                 if response.status_code == 200:
                     return response.json(), base_url, None
                 logger.warning("system-agent-fanout post_http_error url=%s status=%s body=%s", url, response.status_code, response.text[:200])
@@ -693,7 +694,7 @@ def cleanup_local_agent_processes(phase: str = Query("manual")):
     return _kill_local_agent_processes(phase=phase)
 
 
-async def _get_agent_observability_snapshot_impl(
+def _get_agent_observability_snapshot_impl(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
@@ -703,7 +704,7 @@ async def _get_agent_observability_snapshot_impl(
     return get_agent_observability_service().build_snapshot(db, project_id=None)
 
 
-async def _cleanup_task_owner_runner_agent_processes(*, db: Session, token: str, task_id: str, phase: str) -> dict[str, Any]:
+def _cleanup_task_owner_runner_agent_processes(*, db: Session, token: str, task_id: str, phase: str) -> dict[str, Any]:
     row = db.query(AppSaTask).filter(AppSaTask.task_id == task_id, AppSaTask.is_deleted.is_(False)).first()
     if row is None:
         return {"phase": phase, "task_id": task_id, "skipped": True, "reason": "task_not_found"}
@@ -714,7 +715,7 @@ async def _cleanup_task_owner_runner_agent_processes(*, db: Session, token: str,
     target_worker = next((worker for worker in cluster_snapshot.workers if worker.worker_id == owner_id or worker.pod_name == owner_id), None)
     if target_worker is None:
         return {"phase": phase, "task_id": task_id, "owner_id": owner_id, "skipped": True, "reason": "owner_runner_not_found"}
-    result, _, error_detail = await _fanout_post_json(
+    result, _, error_detail = _fanout_post_json(
         _aggregate_base_urls(target_worker),
         path="/agent-observability/cleanup",
         token=token,
@@ -734,22 +735,22 @@ async def _cleanup_task_owner_runner_agent_processes(*, db: Session, token: str,
 
 
 @router.get("/agent-observability/snapshot")
-async def get_agent_observability_snapshot(
+def get_agent_observability_snapshot(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
-    return await _get_agent_observability_snapshot_impl(db=db, user_and_token=user_and_token)
+    return _get_agent_observability_snapshot_impl(db=db, user_and_token=user_and_token)
 
 
 @internal_observability_router.get("/agent-observability/snapshot", response_model=dict[str, Any], include_in_schema=False)
-async def get_internal_agent_observability_snapshot(
+def get_internal_agent_observability_snapshot(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
-    return await _get_agent_observability_snapshot_impl(db=db, user_and_token=user_and_token)
+    return _get_agent_observability_snapshot_impl(db=db, user_and_token=user_and_token)
 
 
-async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, Any]:
+def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, Any]:
     from app.service.agent_observability import get_agent_observability_service
     from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
 
@@ -801,14 +802,21 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
             continue
         work_items.append((worker, urls))
 
-    semaphore = asyncio.Semaphore(AGGREGATE_CONCURRENCY)
+    semaphore = threading.BoundedSemaphore(AGGREGATE_CONCURRENCY)
 
-    async def _fetch_worker_snapshot(worker: Any, urls: list[str]) -> tuple[Any, list[str], Any | None, dict[str, Any] | None]:
-        async with semaphore:
-            snapshot, _, error_detail = await _fanout_get_json(urls, path="/agent-observability/snapshot", token=token, params=_snapshot_query_params())
+    def _fetch_worker_snapshot(worker: Any, urls: list[str]) -> tuple[Any, list[str], Any | None, dict[str, Any] | None]:
+        with semaphore:
+            snapshot, _, error_detail = _fanout_get_json(urls, path="/agent-observability/snapshot", token=token, params=_snapshot_query_params())
             return worker, urls, snapshot, error_detail
 
-    snapshot_results = await asyncio.gather(*[_fetch_worker_snapshot(worker, urls) for worker, urls in work_items]) if work_items else []
+    snapshot_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=AGGREGATE_CONCURRENCY) as executor:
+        futures = {executor.submit(_fetch_worker_snapshot, worker, urls): (worker, urls) for worker, urls in work_items}
+        for f in futures:
+            try:
+                snapshot_results.append(f.result())
+            except Exception:
+                pass
     for worker, urls, snapshot, error_detail in snapshot_results:
         if snapshot is None:
             partial = True
@@ -894,7 +902,7 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
     return snapshot
 
 
-async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, Any]:
+def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, Any]:
     now_ts = time.time()
     cache_key = _agent_cache_key()
     cached = _AGENT_AGGREGATE_SUMMARY_CACHE.get(cache_key)
@@ -952,11 +960,11 @@ async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, A
             continue
         work_items.append((worker, urls))
 
-    semaphore = asyncio.Semaphore(AGGREGATE_CONCURRENCY)
+    semaphore = threading.BoundedSemaphore(AGGREGATE_CONCURRENCY)
 
-    async def _fetch_worker_summary(worker: Any, urls: list[str]) -> tuple[Any, list[str], Any | None, dict[str, Any] | None]:
-        async with semaphore:
-            worker_summary, _, error_detail = await _fanout_get_json(
+    def _fetch_worker_summary(worker: Any, urls: list[str]) -> tuple[Any, list[str], Any | None, dict[str, Any] | None]:
+        with semaphore:
+            worker_summary, _, error_detail = _fanout_get_json(
                 urls,
                 path="/agent-observability/summary",
                 token=token,
@@ -964,7 +972,14 @@ async def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, A
             )
             return worker, urls, worker_summary, error_detail
 
-    summary_results = await asyncio.gather(*[_fetch_worker_summary(worker, urls) for worker, urls in work_items]) if work_items else []
+    summary_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=AGGREGATE_CONCURRENCY) as executor:
+        futures = {executor.submit(_fetch_worker_summary, worker, urls): (worker, urls) for worker, urls in work_items}
+        for f in futures:
+            try:
+                summary_results.append(f.result())
+            except Exception:
+                pass
     for worker, urls, worker_summary, error_detail in summary_results:
         if worker_summary is None:
             partial = True
@@ -1271,7 +1286,7 @@ def get_worker_cluster_capacity(
 
 
 @router.get("/agent-observability/summary", response_model=AgentObservabilitySummaryResponse)
-async def get_agent_observability_summary(
+def get_agent_observability_summary(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
@@ -1282,7 +1297,7 @@ async def get_agent_observability_summary(
 
 
 @internal_observability_router.get("/agent-observability/summary", response_model=AgentObservabilitySummaryResponse, include_in_schema=False)
-async def get_internal_agent_observability_summary(
+def get_internal_agent_observability_summary(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
@@ -1293,7 +1308,7 @@ async def get_internal_agent_observability_summary(
 
 
 @router.get("/agent-observability/processes", response_model=list[AgentProcessSnapshotResponse])
-async def list_agent_processes(
+def list_agent_processes(
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
     stage_key: Optional[str] = Query(None),
@@ -1326,7 +1341,7 @@ async def list_agent_processes(
 
 
 @internal_observability_router.get("/agent-observability/processes", response_model=list[AgentProcessSnapshotResponse], include_in_schema=False)
-async def list_internal_agent_processes(
+def list_internal_agent_processes(
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
     stage_key: Optional[str] = Query(None),
@@ -1337,7 +1352,7 @@ async def list_internal_agent_processes(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
-    return await list_agent_processes(
+    return list_agent_processes(
         pod=pod,
         task_id=task_id,
         stage_key=stage_key,
@@ -1351,7 +1366,7 @@ async def list_internal_agent_processes(
 
 
 @router.get("/agent-observability/sessions/content")
-async def get_agent_session_content(
+def get_agent_session_content(
     task_id: str = Query(...),
     session_file: str = Query(...),
     db: Session = Depends(get_db),
@@ -1362,7 +1377,7 @@ async def get_agent_session_content(
 
 
 @router.get("/agent-observability/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
-async def list_agent_tasks(
+def list_agent_tasks(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
@@ -1373,15 +1388,15 @@ async def list_agent_tasks(
 
 
 @internal_observability_router.get("/agent-observability/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse], include_in_schema=False)
-async def list_internal_agent_tasks(
+def list_internal_agent_tasks(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
-    return await list_agent_tasks(db=db, user_and_token=user_and_token)
+    return list_agent_tasks(db=db, user_and_token=user_and_token)
 
 
 @router.get("/agent-observability/pods", response_model=list[AgentPodSnapshotResponse])
-async def list_agent_pods(
+def list_agent_pods(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
@@ -1392,24 +1407,24 @@ async def list_agent_pods(
 
 
 @internal_observability_router.get("/agent-observability/pods", response_model=list[AgentPodSnapshotResponse], include_in_schema=False)
-async def list_internal_agent_pods(
+def list_internal_agent_pods(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
-    return await list_agent_pods(db=db, user_and_token=user_and_token)
+    return list_agent_pods(db=db, user_and_token=user_and_token)
 
 
 @router.get("/agent-observability/aggregate/summary", response_model=AgentObservabilitySummaryResponse)
-async def get_agent_aggregate_observability_summary(
+def get_agent_aggregate_observability_summary(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    return await _build_agent_aggregate_summary(token, db)
+    return _build_agent_aggregate_summary(token, db)
 
 
 @router.get("/agent-observability/aggregate/processes", response_model=list[AgentProcessSnapshotResponse])
-async def list_agent_aggregate_processes(
+def list_agent_aggregate_processes(
     pod: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
     stage_key: Optional[str] = Query(None),
@@ -1421,7 +1436,7 @@ async def list_agent_aggregate_processes(
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    rows = list((await _build_agent_aggregate_snapshot(token, db))["processes"])
+    rows = list((_build_agent_aggregate_snapshot(token, db))["processes"])
     if pod:
         rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
     if task_id:
@@ -1440,39 +1455,39 @@ async def list_agent_aggregate_processes(
 
 
 @router.get("/agent-observability/aggregate/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
-async def list_agent_aggregate_tasks(
+def list_agent_aggregate_tasks(
     pod: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    rows = list((await _build_agent_aggregate_snapshot(token, db))["tasks"])
+    rows = list((_build_agent_aggregate_snapshot(token, db))["tasks"])
     if pod:
         rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
     return rows
 
 
 @router.get("/agent-observability/aggregate/pods", response_model=list[AgentPodSnapshotResponse])
-async def list_agent_aggregate_pods(
+def list_agent_aggregate_pods(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    return (await _build_agent_aggregate_snapshot(token, db))["pods"]
+    return (_build_agent_aggregate_snapshot(token, db))["pods"]
 
 
 @router.get("/agent-observability/aggregate/runtime", response_model=AgentRuntimeAggregateResponse)
-async def get_agent_aggregate_runtime(
+def get_agent_aggregate_runtime(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    snapshot = await _build_agent_aggregate_snapshot(token, db)
+    snapshot = _build_agent_aggregate_snapshot(token, db)
     return _build_agent_runtime_aggregate(snapshot)
 
 
 @router.post("/agent-observability/processes/{pid}/kill", response_model=AgentProcessKillResponse)
-async def kill_agent_process(
+def kill_agent_process(
     pid: int,
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
@@ -1554,7 +1569,7 @@ async def kill_agent_process(
 
 
 @router.post("/agent-observability/processes/kill-all-orphans", response_model=AgentProcessKillResponse)
-async def kill_all_orphan_processes(
+def kill_all_orphan_processes(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
@@ -1620,14 +1635,14 @@ async def kill_all_orphan_processes(
 
 
 @router.post("/agent-observability/aggregate/processes/kill-all-suspected-orphans", response_model=AgentProcessKillResponse)
-async def kill_all_agent_aggregate_suspected_orphans(
+def kill_all_agent_aggregate_suspected_orphans(
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
     force: bool = Query(False),
 ):
     user, token = user_and_token
     ensure_admin_user(user)
-    snapshot = await _build_agent_aggregate_snapshot(token, db)
+    snapshot = _build_agent_aggregate_snapshot(token, db)
     killable = []
     if force:
         killable = [
@@ -1669,7 +1684,7 @@ async def kill_all_agent_aggregate_suspected_orphans(
         if target_worker is None:
             items.append({"pid": int(row.get("pid") or 0), "pgid": row.get("pgid"), "status": "failed", "reason": "target pod not found in cluster snapshot"})
             continue
-        result, _, error_detail = await _fanout_post_json(
+        result, _, error_detail = _fanout_post_json(
             _aggregate_base_urls(target_worker),
             path=f"/agent-observability/processes/{int(row.get('pid') or 0)}/kill",
             token=token,
@@ -1761,13 +1776,13 @@ def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/tasks/{task_id}/cancel")
-async def cancel_task(
+def cancel_task(
     task_id: str,
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    cleanup = await _cleanup_task_owner_runner_agent_processes(db=db, token=token, task_id=task_id, phase="cancel_task")
+    cleanup = _cleanup_task_owner_runner_agent_processes(db=db, token=token, task_id=task_id, phase="cancel_task")
     result = get_task_service().cancel_task(db, task_id)
     try:
         get_task_service()._record_task_operation_event(
@@ -1785,26 +1800,26 @@ async def cancel_task(
 
 
 @router.post("/tasks/{task_id}/restart", status_code=201)
-async def restart_task(
+def restart_task(
     task_id: str,
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     """Reset and restart an existing task in-place, reusing the same task ID."""
     _, token = user_and_token
-    await _cleanup_task_owner_runner_agent_processes(db=db, token=token, task_id=task_id, phase="restart_pre_task")
+    _cleanup_task_owner_runner_agent_processes(db=db, token=token, task_id=task_id, phase="restart_pre_task")
     return get_task_service().restart_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/resume", status_code=201)
-async def resume_task(
+def resume_task(
     task_id: str,
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     """Resume a task from Stage 3 (断点续跑), reusing the same task ID."""
     _, token = user_and_token
-    await _cleanup_task_owner_runner_agent_processes(db=db, token=token, task_id=task_id, phase="resume_pre_task")
+    _cleanup_task_owner_runner_agent_processes(db=db, token=token, task_id=task_id, phase="resume_pre_task")
     return get_task_service().resume_task(db, task_id)
 
 

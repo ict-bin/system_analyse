@@ -15,7 +15,7 @@ pipeline/s2_refine.py — Stage 2: 模块细分 v3
 """
 from __future__ import annotations
 
-import asyncio
+import subprocess
 import shutil
 import time
 from pathlib import Path
@@ -256,8 +256,8 @@ class RefineStage(BaseStage):
         self._pending_merge_targets: set[str] = set()
         self._commit_children: set[str] = set()  # commit 产生的新子模块
         self._errors: list[BaseException] = []
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._commit_queue: asyncio.Queue = asyncio.Queue()
+        self._queue: queue.Queue = queue.Queue()
+        self._commit_queue: queue.Queue = queue.Queue()
         self._ctx: PipelineContext | None = None
 
     @staticmethod
@@ -273,7 +273,7 @@ class RefineStage(BaseStage):
             return False
         return not (mod_dir / ".snapshot").exists()
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         self._reset()
         self._ctx = ctx
@@ -289,29 +289,32 @@ class RefineStage(BaseStage):
         all_modules = discover_modules(str(workspace))
         for mod in all_modules:
             if mod not in self._refined:
-                await self._queue.put(mod)
+                self._queue.put(mod)
 
         parallel = max(1, cfg.parallel_modules)
 
         # 启动 LLM workers (并行)
-        llm_workers = [asyncio.create_task(self._llm_worker()) for _ in range(parallel)]
+        llm_workers = [threading.Thread(target=self._llm_worker, daemon=True) for _ in range(parallel)]
+        for w in llm_workers:
+            w.start()
 
         # 启动 commit worker (串行)
-        commit_task = asyncio.create_task(self._commit_worker())
+        commit_thread = threading.Thread(target=self._commit_worker, daemon=True)
+        commit_thread.start()
 
         # 等待 LLM 全部完成
-        await self._queue.join()
+        self._queue.join()
 
         # 停止 LLM workers
         for w in llm_workers:
             w.cancel()
-        await asyncio.gather(*llm_workers, return_exceptions=True)
+        # [THREAD] replaced: # GATHER   # *llm_workers, return_exceptions=True)
 
         # 标记 commit 队列结束
-        await self._commit_queue.put(None)
+        self._commit_queue.put(None)
 
         # 等待 commit 完成
-        await commit_task
+        commit_task
 
         if self._errors:
             for e in self._errors:
@@ -321,7 +324,7 @@ class RefineStage(BaseStage):
 
         # 全局完整性检查
         if not (cp and cp.is_done("s2_global_check")):
-            await self._global_completeness_check()
+            self._global_completeness_check()
             if cp:
                 cp.mark_done("s2_global_check")
         else:
@@ -332,13 +335,13 @@ class RefineStage(BaseStage):
             cp.mark_done("s2_refine", module_count=len(ctx.refined_modules))
 
     # ── LLM Worker (并行) ──────────────────────────────────────────────────
-    async def _llm_worker(self) -> None:
+    def _llm_worker(self) -> None:
         while True:
-            mod_name = await self._queue.get()
+            mod_name = self._queue.get()
             self._in_progress.add(mod_name)
             try:
                 if mod_name not in self._refined:
-                    await self._refine_one(mod_name)
+                    self._refine_one(mod_name)
             except PiFatalError as e:
                 self._errors.append(e)
             except StageError as e:
@@ -375,15 +378,15 @@ class RefineStage(BaseStage):
                 # LLM 完成后，如果被 merge 过 → 也要入 commit 队列
                 if mod_name in self._pending_merge_targets:
                     mod_dir = get_modules_root(str(self._ctx.workspace)) / mod_name
-                    await self._commit_queue.put((mod_dir, False, []))
+                    self._commit_queue.put((mod_dir, False, []))
                     self._pending_merge_targets.discard(mod_name)
                 self._in_progress.discard(mod_name)
                 self._queue.task_done()
 
     # ── Commit Worker (串行) ───────────────────────────────────────────────
-    async def _commit_worker(self) -> None:
+    def _commit_worker(self) -> None:
         while True:
-            item = await self._commit_queue.get()
+            item = self._commit_queue.get()
             if item is None:
                 self._commit_queue.task_done()
                 break
@@ -407,7 +410,7 @@ class RefineStage(BaseStage):
                 for nm in new_ones:
                     if nm not in self._refined and nm not in self._in_progress:
                         self._in_progress.add(nm)
-                        await self._queue.put(nm)
+                        self._queue.put(nm)
 
                 self._refined.add(mod_name)
                 cp = ctx.checkpoint if ctx else None
@@ -422,7 +425,7 @@ class RefineStage(BaseStage):
                 self._commit_queue.task_done()
 
     # ── 单模块 LLM 处理 ────────────────────────────────────────────────────
-    async def _refine_one(self, mod_name: str) -> None:
+    def _refine_one(self, mod_name: str) -> None:
         ctx = self._ctx
         cp = ctx.checkpoint
         cfg = ctx.cfg
@@ -462,7 +465,7 @@ class RefineStage(BaseStage):
             ctx.emit_event("log", level="info",
                            msg=f"[S2] {mod_name}: {fc}个文件, {len(unclear_files)}个需LLM补充")
             if unclear_files and sub_prompt:
-                supplement = await collect_file_summaries(
+                supplement = collect_file_summaries(
                     ctx=ctx, mod_name=mod_name, mod_dir=mod_dir,
                     sub_prompt_template=sub_prompt, parallel=cfg.parallel_sub_workers,
                     sub_model=cfg.workers.model_for("sub_read"), target_dir=cfg.target_dir,
@@ -472,7 +475,7 @@ class RefineStage(BaseStage):
             else:
                 file_summary = summary_from_details
         elif sub_prompt and fc > SUB_WORKER_THRESHOLD:
-            file_summary = await collect_file_summaries(
+            file_summary = collect_file_summaries(
                 ctx=ctx, mod_name=mod_name, mod_dir=mod_dir,
                 sub_prompt_template=sub_prompt, parallel=cfg.parallel_sub_workers,
                 sub_model=cfg.workers.model_for("sub_read"), target_dir=cfg.target_dir,
@@ -516,7 +519,7 @@ class RefineStage(BaseStage):
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
-            ar = await run_agent_with_stage_guard(
+            ar = run_agent_with_stage_guard(
                 ctx=ctx, stage="refine",
                 context=f"s2-refine-{mod_name}-a{attempt+1}",
                 heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, session=refine_session: {
@@ -568,7 +571,7 @@ class RefineStage(BaseStage):
                 if py_validation.get("extra"):
                     judge_prompt += f"  EXTRA: {py_validation['extra'][:10]}\n"
 
-                j_ar = await run_agent_with_stage_guard(
+                j_ar = run_agent_with_stage_guard(
                     ctx=ctx, stage="refine",
                     context=f"s2-judge-{mod_name}-j{j_idx}-a{attempt+1}",
                     heartbeat_payload_factory=lambda beat, module=mod_name, attempt_no=attempt + 1, judge_id=j_idx, session=judge_session: {
@@ -624,7 +627,7 @@ class RefineStage(BaseStage):
                 has_split = (mod_dir / "split").exists() and any((mod_dir / "split").iterdir())
                 has_deleted = (mod_dir / "deleted").exists()
                 if has_split or has_deleted:
-                    await self._commit_queue.put((mod_dir, was_split, new_ones))
+                    self._commit_queue.put((mod_dir, was_split, new_ones))
                 else:
                     # 无变动 — 但如果被其他模块 merge 过，仍需走 commit
                     # 已在 _llm_worker finally 中处理
@@ -656,7 +659,7 @@ class RefineStage(BaseStage):
                 has_deleted = (mod_dir / "deleted").exists()
                 if has_split or has_deleted:
                     self._pending_merge_targets.discard(mod_name)
-                    await self._commit_queue.put((mod_dir, was_split, new_ones))
+                    self._commit_queue.put((mod_dir, was_split, new_ones))
                 else:
                     self._refined.add(mod_name)
                     if cp:
@@ -666,7 +669,7 @@ class RefineStage(BaseStage):
         raise StageError(f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数")
 
     # ── 全局完整性检查（保持不变）──────────────────────────────────────────
-    async def _global_completeness_check(self) -> None:
+    def _global_completeness_check(self) -> None:
         ctx = self._ctx
         cfg = ctx.cfg
         workspace = ctx.workspace
@@ -720,7 +723,7 @@ class RefineStage(BaseStage):
             ctx.emit_event("stage", stage="2-reclassify", attempt=rc_attempt + 1,
                            missing_count=len(missing_files), session_file=session_file)
 
-            rc_ar = await run_agent_with_stage_guard(
+            rc_ar = run_agent_with_stage_guard(
                 ctx=ctx, stage="2-reclassify",
                 heartbeat_payload_factory=lambda beat, attempt=rc_attempt + 1, count=len(missing_files): {
                     "attempt": attempt, "heartbeat": beat, "missing_count": count, "session_file": session_file,

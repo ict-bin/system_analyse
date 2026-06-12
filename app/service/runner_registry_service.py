@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import asyncio
+import threading
+import time
 import logging
 import os
 from typing import Callable
@@ -40,37 +41,37 @@ class RunnerRegistryService:
         self._get_db = get_db
         self._get_running_tasks_count = get_running_tasks_count
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._task: object | None = None
 
-    async def start(self) -> None:
+    def start(self) -> None:
         if not is_runner_role() or (self._task and not self._task.done()):
             return
         self._running = True
-        self._task = asyncio.create_task(self._heartbeat_loop(), name="sa_runner_registry_heartbeat")
+        self._task = threading.Thread(target=self._heartbeat_loop(), name="sa_runner_registry_heartbeat")
         logger.info(
             "runner registry heartbeat started (instance_id=%s interval=%ss)",
             WORKER_INSTANCE_ID,
             RUNNER_HEARTBEAT_INTERVAL_SECONDS,
         )
 
-    async def stop(self) -> None:
+    def stop(self) -> None:
         self._running = False
         task = self._task
         if task and not task.done():
             task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
+                task
+            except Exception:
                 pass
         self._task = None
 
-    async def _heartbeat_loop(self) -> None:
+    def _heartbeat_loop(self) -> None:
         while self._running:
             try:
                 self._heartbeat_once()
             except Exception as exc:
                 logger.warning("runner registry heartbeat failed: %s", exc)
-            await asyncio.sleep(RUNNER_HEARTBEAT_INTERVAL_SECONDS)
+            time.sleep(RUNNER_HEARTBEAT_INTERVAL_SECONDS)
 
     def _heartbeat_once(self) -> None:
         db_gen = self._get_db()

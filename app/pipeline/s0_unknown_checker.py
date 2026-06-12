@@ -27,7 +27,7 @@ class UnknownCheckerStage(BaseStage):
     stage_num = 0
     stage_name = "未知文件类型识别"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
@@ -92,7 +92,7 @@ class UnknownCheckerStage(BaseStage):
                 f"对每个文件运行 `file` 命令并分析结果，然后输出 JSON 数组。"
             )
             session = str(ctx.sess_dir / f"unknown-checker-batch{batch_start // BATCH + 1}.jsonl")
-            ar = await run_agent_with_stage_guard(
+            ar = run_agent_with_stage_guard(
                 ctx=ctx,
                 stage="unknown_checker",
                 context=f"s0-unknown-checker-batch{batch_start // BATCH + 1}",

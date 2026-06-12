@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
+import threading
 import logging
 import os
 from dataclasses import asdict, dataclass
@@ -34,34 +34,34 @@ class RuntimeBootstrapStatus:
 
 class RuntimeBootstrap:
     def __init__(self, pool_overrides, should_run_migrations) -> None:
-        self._task: Optional[asyncio.Task] = None
-        self._stop_event = asyncio.Event()
+        self._task: Optional[object] = None
+        self._stop_event = threading.Event()
         self._status = RuntimeBootstrapStatus()
         self._router_installed = False
         self._pool_overrides = pool_overrides
         self._should_run_migrations = should_run_migrations
 
-    async def start(self, app: FastAPI) -> None:
+    def start(self, app: FastAPI) -> None:
         if self._task and not self._task.done():
             return
-        self._stop_event = asyncio.Event()
+        self._stop_event = threading.Event()
         self._status = RuntimeBootstrapStatus()
-        self._task = asyncio.create_task(self._bootstrap_loop(app), name="sa_runtime_bootstrap")
+        self._task = threading.Thread(target=self._bootstrap_loop(app), name="sa_runtime_bootstrap")
 
-    async def stop(self) -> None:
+    def stop(self) -> None:
         self._stop_event.set()
         if self._task and not self._task.done():
             self._task.cancel()
             try:
-                await self._task
-            except asyncio.CancelledError:
+                self._task
+            except Exception:
                 pass
         self._task = None
         try:
             if is_dispatcher_role() or is_runner_role():
                 from app.service.task_service import get_task_service
 
-                await get_task_service().stop_worker_loop()
+                get_task_service().stop_worker_loop()
             if is_api_role():
                 from app.service.registry_service import get_registry_service
 
@@ -75,15 +75,15 @@ class RuntimeBootstrap:
     def ready(self) -> bool:
         return self._status.ready
 
-    async def _bootstrap_loop(self, app: FastAPI) -> None:
+    def _bootstrap_loop(self, app: FastAPI) -> None:
         svc_yaml = get_service_yaml()
-        await self._sync_providers_once(svc_yaml)
+        self._sync_providers_once(svc_yaml)
 
         while not self._stop_event.is_set():
             made_progress = False
 
             if not self._status.db_ready:
-                made_progress = await self._init_db(svc_yaml)
+                made_progress = self._init_db(svc_yaml)
 
             if self._status.db_ready:
                 if is_api_role() and not self._router_installed:
@@ -93,13 +93,13 @@ class RuntimeBootstrap:
                     ) or made_progress
 
                 if is_api_role() and not self._status.registry_ready:
-                    made_progress = await self._attempt_async_component_start(
+                    made_progress = self._attempt_async_component_start(
                         "registry_register",
                         self._start_registry,
                     ) or made_progress
 
                 if (is_dispatcher_role() or is_runner_role()) and not self._status.worker_loop_ready:
-                    made_progress = await self._attempt_async_component_start(
+                    made_progress = self._attempt_async_component_start(
                         "worker_loop_start",
                         self._start_worker_loop,
                     ) or made_progress
@@ -114,16 +114,16 @@ class RuntimeBootstrap:
                 continue
 
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=DB_INIT_RETRY_SECONDS)
-            except asyncio.TimeoutError:
+                self._stop_event.wait(timeout=DB_INIT_RETRY_SECONDS)
+            except Exception:
                 pass
 
-    async def _sync_providers_once(self, svc_yaml) -> None:
+    def _sync_providers_once(self, svc_yaml) -> None:
         if self._status.provider_sync_done:
             return
         self._status.phase = "provider_sync"
         try:
-            sync_ok = await sync_providers_to_pi(
+            sync_ok = sync_providers_to_pi(
                 base_url=svc_yaml.configcenter.base_url,
                 token=svc_yaml.auth_service.service_machine_token,
                 timeout=svc_yaml.configcenter.timeout,
@@ -143,7 +143,7 @@ class RuntimeBootstrap:
         finally:
             self._status.provider_sync_done = True
 
-    async def _init_db(self, svc_yaml) -> bool:
+    def _init_db(self, svc_yaml) -> bool:
         from app.db import init_db
 
         self._status.phase = "db_init"
@@ -195,10 +195,10 @@ class RuntimeBootstrap:
             logger.warning("%s failed on role=%s (retry in %ss): %s", phase, service_role(), DB_INIT_RETRY_SECONDS, exc, exc_info=True)
             return False
 
-    async def _attempt_async_component_start(self, phase: str, starter) -> bool:
+    def _attempt_async_component_start(self, phase: str, starter) -> bool:
         self._status.phase = phase
         try:
-            await starter()
+            starter()
             self._status.error = None
             return True
         except Exception as exc:
@@ -213,18 +213,18 @@ class RuntimeBootstrap:
         self._router_installed = True
         self._status.management_api_ready = True
 
-    async def _start_registry(self) -> None:
+    def _start_registry(self) -> None:
         from app.service.registry_service import get_registry_service
 
         registry = get_registry_service()
-        await registry.register()
+        registry.register()
         registry.start()
         self._status.registry_ready = True
 
-    async def _start_worker_loop(self) -> None:
+    def _start_worker_loop(self) -> None:
         from app.service.task_service import get_task_service
 
-        await get_task_service().start_worker_loop()
+        get_task_service().start_worker_loop()
         self._status.worker_loop_ready = True
 
     def _all_required_components_ready(self) -> bool:

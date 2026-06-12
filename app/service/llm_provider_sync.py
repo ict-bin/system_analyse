@@ -212,7 +212,7 @@ def validate_pi_models_file(
     }
 
 
-async def sync_providers_to_pi(
+def sync_providers_to_pi(
     base_url: str,
     token: str = "",
     timeout: int = 30,
@@ -230,8 +230,8 @@ async def sync_providers_to_pi(
         headers["Authorization"] = f"Bearer {token}"
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
+        with aiohttp.ClientSession() as session:
+            with session.get(
                 url,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
@@ -239,7 +239,7 @@ async def sync_providers_to_pi(
                 if resp.status != 200:
                     logger.warning("配置中心返回 HTTP %s，跳过 Provider 同步", resp.status)
                     return False
-                data = await resp.json()
+                data = resp.json()
 
         items: list[dict] = data.get("items", [])
         if not items:

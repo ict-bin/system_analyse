@@ -6,7 +6,7 @@ Each task is persisted in MySQL and executed asynchronously.
 
 from __future__ import annotations
 
-import asyncio
+import threading
 import json
 import logging
 import os
@@ -79,7 +79,7 @@ RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS = max(
 )
 
 # Running asyncio tasks keyed by task_id so we can cancel them
-_running_tasks: dict[str, asyncio.Task] = {}
+_running_tasks: dict[str, object] = {}
 _running_task_epochs: dict[str, int] = {}
 
 
@@ -1219,7 +1219,7 @@ class TaskService:
             load_runtime_control=self._load_runtime_control,
             task_repository=self._task_repository,
         )
-        self._runner_assignment_task: asyncio.Task | None = None
+        self._runner_assignment_task: object | None = None
         self._runner_assignment_loop_running = False
         self._query = TaskQueryService(
             get_or_404=self._get_or_404,
@@ -1859,19 +1859,19 @@ class TaskService:
     def _load_runtime_control(db: Session) -> dict:
         return get_runtime_control_service().get_runtime_control(db)
 
-    async def start_worker_loop(self) -> None:
+    def start_worker_loop(self) -> None:
         if is_manager_role():
-            await self._dispatcher.start()
+            self._dispatcher.start()
         if is_runner_role():
-            await self._runner_registry.start()
-            await self._start_runner_assignment_loop()
+            self._runner_registry.start()
+            self._start_runner_assignment_loop()
 
-    async def stop_worker_loop(self) -> None:
+    def stop_worker_loop(self) -> None:
         if is_manager_role():
-            await self._dispatcher.stop()
+            self._dispatcher.stop()
         if is_runner_role():
-            await self._stop_runner_assignment_loop()
-            await self._runner_registry.stop()
+            self._stop_runner_assignment_loop()
+            self._runner_registry.stop()
 
     def _on_task_claimed(self, task_id: str, lease_epoch: int, dispatch_target: str) -> None:
         if dispatch_target != WORKER_INSTANCE_ID:
@@ -1906,43 +1906,41 @@ class TaskService:
     def _run_task_locally(self, task_id: str, lease_epoch: int) -> None:
         if task_id in _running_tasks and not _running_tasks[task_id].done():
             return
-        asyncio_task = asyncio.create_task(self._runner.execute_task(task_id, lease_epoch), name=f"sa_task_{task_id}")
+        asyncio_task = threading.Thread(target=self._runner.execute_task(task_id, lease_epoch), name=f"sa_task_{task_id}")
         _running_tasks[task_id] = asyncio_task
         _running_task_epochs[task_id] = lease_epoch
 
-    async def _start_runner_assignment_loop(self) -> None:
+    def _start_runner_assignment_loop(self) -> None:
         if self._runner_assignment_task and not self._runner_assignment_task.done():
             return
         self._runner_assignment_loop_running = True
-        self._runner_assignment_task = asyncio.create_task(
+        self._runner_assignment_task = threading.Thread(target=
             self._runner_assignment_loop(),
             name="sa_runner_assignment_loop",
         )
 
-    async def _stop_runner_assignment_loop(self) -> None:
+    def _stop_runner_assignment_loop(self) -> None:
         self._runner_assignment_loop_running = False
         task = self._runner_assignment_task
         if task and not task.done():
             task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
+                task
+            except Exception:
                 pass
         self._runner_assignment_task = None
 
-    async def _runner_assignment_loop(self) -> None:
+    def _runner_assignment_loop(self) -> None:
         while self._runner_assignment_loop_running:
             try:
                 _runner_assignment_runtime_state.last_tick_ts = _time.time()
                 self._poll_runner_assignments_once()
                 _runner_assignment_runtime_state.last_success_ts = _time.time()
                 _runner_assignment_runtime_state.last_error = None
-            except asyncio.CancelledError:
-                raise
             except Exception as exc:
                 _runner_assignment_runtime_state.last_error = str(exc)
                 logger.warning("runner assignment loop failed: %s", exc, exc_info=True)
-            await asyncio.sleep(RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS)
+            time.sleep(RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS)
 
     def _poll_runner_assignments_once(self) -> None:
         db_gen = self._runner._deps.get_db()
@@ -2242,7 +2240,7 @@ class TaskService:
             },
         )
 
-    async def _execute_task(self, task_id: str) -> None:
+    def _execute_task(self, task_id: str) -> None:
         from app.db import get_db
         db_gen = get_db()
         db: Session = next(db_gen)
@@ -2298,7 +2296,7 @@ class TaskService:
                 svc.result_dir = row.output_path
             cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
             orch = Orchestrator(config=cfg, on_event=on_event)
-            result = await orch.execute(task_id)
+            result = orch.execute(task_id)
             _flush_stages(task_id, event_buffer)
             db.expire(row); db.refresh(row)
             if row.status == "cancelled":
@@ -2330,7 +2328,7 @@ class TaskService:
                 _sr_out_dir = Path(row.output_path or "") / row.task_id / "output" if row.output_path else None
                 _sr_status = result.status.value if result else "error"
                 if _sr_run_dir and _sr_out_dir:
-                    await get_self_reflection_service().trigger_async(
+                    get_self_reflection_service().trigger_async(
                         task_id=task_id,
                         run_dir=_sr_run_dir,
                         output_dir=_sr_out_dir,
@@ -2339,7 +2337,7 @@ class TaskService:
                     )
             except Exception as _sr_exc:
                 logger.warning("self-reflection trigger failed: %s", _sr_exc)
-        except asyncio.CancelledError:
+        except Exception:
             pass
         except Exception as exc:
             log_event(logger, logging.ERROR, "task execution failed",

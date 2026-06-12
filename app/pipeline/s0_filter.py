@@ -10,7 +10,10 @@ pipeline/s0_filter.py — Stage 0: 文件过滤 + 目录探索 + 预扫描
 """
 from __future__ import annotations
 
-import asyncio
+import subprocess
+import threading
+import queue
+import time
 import json
 import os
 from pathlib import Path
@@ -61,7 +64,7 @@ class FilterStage(BaseStage):
     stage_num = 0
     stage_name = "文件过滤"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
@@ -104,11 +107,11 @@ class FilterStage(BaseStage):
                 f"filter_engine={ctx.selected_filter_engine}"
             ),
         )
-        ctx.total_input_file_count = await asyncio.to_thread(_count_input_files, cfg.target_dir)
+        ctx.total_input_file_count = _count_input_files(cfg.target_dir)
 
         if ctx.selected_filter_engine == "agent":
             try:
-                stats = await run_agent_filter_engine(ctx)
+                stats = run_agent_filter_engine(ctx)
                 (workspace / "filter_summary.json").write_text(
                     json.dumps({
                         "total_input_file_count": ctx.total_input_file_count,
@@ -152,18 +155,16 @@ class FilterStage(BaseStage):
         extra_env = {**os.environ, "TMPDIR": str(task_tmp)}
         if cfg.skip_path_patterns:
             extra_env["SECFLOW_SA_SKIP_PATH_PATTERNS"] = " ".join(cfg.skip_path_patterns)
-        proc = await asyncio.create_subprocess_exec(
-            "bash", filter_script, cfg.target_dir,
-            str(workspace / "filtered_files.txt"),
-            "--arch", arch_str,
-            *cfg.analyse_targets,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = subprocess.run(
+            ["bash", filter_script, cfg.target_dir,
+             str(workspace / "filtered_files.txt"),
+             "--arch", arch_str,
+             *cfg.analyse_targets],
+            capture_output=True,
             env=extra_env,
         )
-        stdout, stderr_bytes = await proc.communicate()
-        _out = (stdout or b"").decode("utf-8", errors="replace").strip()
-        _err = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
+        _out = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+        _err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
         _cli = (_out + ("\n" + _err if _err else "")).strip()
         if _cli:
             ctx.emit_event("cli_output", stage="filter", text=_cli[:3000])
@@ -202,7 +203,7 @@ class ExploreStage(BaseStage):
     stage_num = 0
     stage_name = "探索目录"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
@@ -245,7 +246,7 @@ class ExploreStage(BaseStage):
         )
 
         explore_session = str(ctx.sess_dir / "explore.jsonl")
-        ar = await run_agent_with_stage_guard(
+        ar = run_agent_with_stage_guard(
             ctx=ctx,
             stage="explore",
             context="explore",
@@ -291,7 +292,7 @@ class PrescanStage(BaseStage):
     stage_num = 0
     stage_name = "预扫描"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
@@ -319,15 +320,13 @@ class PrescanStage(BaseStage):
         ctx.emit_event("stage", stage="prescan")
         cmd = (["python3", prescan_script] if prescan_script.endswith(".py")
                else ["bash", prescan_script])
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, cfg.target_dir, str(workspace),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = subprocess.run(
+            [*cmd, cfg.target_dir, str(workspace)],
+            capture_output=True,
             env={**os.environ, "TMPDIR": str(ctx.task_tmp)},
         )
-        stdout, stderr_bytes = await proc.communicate()
-        _pout = (stdout or b"").decode("utf-8", errors="replace").strip()
-        _perr = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
+        _pout = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+        _perr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
         _pcli = (_pout + ("\n" + _perr if _perr else "")).strip()
         if _pcli:
             ctx.emit_event("cli_output", stage="prescan", text=_pcli[:3000])

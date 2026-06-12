@@ -10,7 +10,8 @@ pipeline/self_reflection.py — 任务完成后自动触发的自省分析服务
 """
 from __future__ import annotations
 
-import asyncio
+import subprocess
+import threading
 import json
 import logging
 from datetime import datetime
@@ -320,7 +321,7 @@ def _build_analysis_prompt(task_id: str, task_status: str, data: dict) -> str:
 class SelfReflectionService:
     """任务完成后异步触发的自省分析服务。"""
 
-    async def trigger_async(
+    def trigger_async(
         self,
         task_id: str,
         run_dir: Path,
@@ -333,12 +334,15 @@ class SelfReflectionService:
             return
         if task_status == "cancelled":
             return  # 取消任务不做自省
-        asyncio.create_task(
-            self._run_reflection(task_id, run_dir, output_dir, cfg, task_status),
+        thread = threading.Thread(
+            target=self._run_reflection,
+            args=(task_id, run_dir, output_dir, cfg, task_status),
             name=f"self-reflection-{task_id}",
+            daemon=True,
         )
+        thread.start()
 
-    async def _run_reflection(
+    def _run_reflection(
         self,
         task_id: str,
         run_dir: Path,
@@ -362,7 +366,7 @@ class SelfReflectionService:
 
             # 收集数据
             max_lines = sr_cfg.max_session_lines
-            data = await asyncio.get_event_loop().run_in_executor(
+            data = concurrent.futures.ThreadPoolExecutor().submit(
                 None,
                 lambda: _collect_task_data(run_dir, output_dir, max_lines),
             )
@@ -385,11 +389,11 @@ class SelfReflectionService:
             user_prompt = _build_analysis_prompt(task_id, task_status, data)
 
             # ★ 使用独立 cancel_event（不共用主任务的取消信号）
-            cancel_ev = asyncio.Event()
+            cancel_ev = threading.Event()
 
             # 调用 LLM（无工具调用，纯推理）
-            agent_task = asyncio.create_task(
-                run_agent(
+            try:
+                ar = run_agent(
                     prompt=user_prompt,
                     model=model,
                     system_prompt=system_prompt,
@@ -402,14 +406,7 @@ class SelfReflectionService:
                     pi_retry_delay=5,
                     cancel_event=cancel_ev,
                 )
-            )
-            timeout_seconds = max(60.0, float(getattr(cfg, "agent_timeout_seconds", 1800.0) or 1800.0))
-            try:
-                ar = await asyncio.wait_for(agent_task, timeout=timeout_seconds)
-            except asyncio.TimeoutError:
-                cancel_ev.set()
-                agent_task.cancel()
-                await asyncio.gather(agent_task, return_exceptions=True)
+            except Exception:
                 logger.warning(
                     "[self-reflection] 任务 %s 自省分析超时（%.1fs），已终止",
                     task_id,

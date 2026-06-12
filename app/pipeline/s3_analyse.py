@@ -14,11 +14,12 @@ pipeline/s3_analyse.py — Stage 3: 模块分析 (STRIDE)
   重分类检测: judge 输出含 [需要重新分类] → 回 Stage 2 重做
   Stage 2/3 重做循环: 修正模块分类后重新分析
 
-并发控制: asyncio.Semaphore(parallel_modules)
+并发控制: threading.BoundedSemaphore(parallel_modules)
 """
 from __future__ import annotations
 
-import asyncio
+import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -41,7 +42,7 @@ class AnalyseStage(BaseStage):
     stage_num = 3
     stage_name = "分析"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
@@ -77,12 +78,12 @@ class AnalyseStage(BaseStage):
         ctx.redo_modules = []
         ctx.redo_feedback = {}
         s3_errors: list[BaseException] = []
-        s3_sem = asyncio.Semaphore(max(1, cfg.parallel_modules))
+        s3_sem = threading.BoundedSemaphore(max(1, cfg.parallel_modules))
 
-        async def _analyse_one(mod_name: str) -> None:
-            async with s3_sem:
+        def _analyse_one(mod_name: str) -> None:
+            with s3_sem:
                 try:
-                    await self._analyse_module(
+                    self._analyse_module(
                         ctx, mod_name,
                         w_sys_prompt, j_sys_prompt, reflect_prompt,
                     )
@@ -102,17 +103,21 @@ class AnalyseStage(BaseStage):
                     else:
                         s3_errors.append(e)
 
-        results = await asyncio.gather(
-            *[_analyse_one(m) for m in final_modules],
-            return_exceptions=True,
-        )
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, cfg.parallel_modules)) as executor:
+            futures = {executor.submit(_analyse_one, m): m for m in final_modules}
+            for f in futures:
+                try:
+                    results.append(f.result())
+                except Exception:
+                    results.append(None)
         for r in results:
             if isinstance(r, PiFatalError):
                 raise r
         for r in results:
             if isinstance(r, StageError):
                 raise r
-            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+            if isinstance(r, Exception) and not isinstance(r, Exception):
                 raise r
         if s3_errors:
             for e in s3_errors:
@@ -130,7 +135,7 @@ class AnalyseStage(BaseStage):
     
 
     # ── 单模块分析（W+J 多轮）────────────────────────────────────────────────
-    async def _analyse_module(
+    def _analyse_module(
         self,
         ctx: PipelineContext,
         mod_name: str,
@@ -273,7 +278,7 @@ class AnalyseStage(BaseStage):
             if feedback:
                 prompt_parts.append("\n\n" + feedback)
 
-            ar = await run_agent_with_stage_guard(
+            ar = run_agent_with_stage_guard(
                 ctx=ctx,
                 stage="analyse",
                 context=f"s3-analyse-{mod_name}-a{attempt+1}",
@@ -308,7 +313,7 @@ class AnalyseStage(BaseStage):
                     mod_name,
                     f"analyse-a{attempt + 1}-j{j_idx}.jsonl",
                 )
-                j_ar = await run_agent_with_stage_guard(
+                j_ar = run_agent_with_stage_guard(
                     ctx=ctx,
                     stage="analyse",
                     context=f"s3-judge-{mod_name}-j{j_idx}-a{attempt+1}",

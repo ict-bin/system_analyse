@@ -10,7 +10,8 @@ pipeline/s0_validate_details.py — Stage 0.3: 校验 details/ JSON 完整性
 """
 from __future__ import annotations
 
-import asyncio
+import subprocess
+import threading
 import json
 import os
 from pathlib import Path
@@ -25,7 +26,7 @@ class ValidateDetailsStage(BaseStage):
     stage_num = 0
     stage_name = "详情校验"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         workspace = ctx.workspace
 
@@ -63,13 +64,13 @@ class ValidateDetailsStage(BaseStage):
         ctx.emit_event("stage", stage="validate_details")
 
         if os.path.isfile(validate_script):
-            proc = await asyncio.create_subprocess_exec(
+            proc = subprocess.run(
                 "python3", validate_script, str(workspace),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env={**os.environ, "TMPDIR": str(ctx.task_tmp)},
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = proc.communicate()
             out = (stdout or b"").decode("utf-8", errors="replace").strip()
             if out:
                 ctx.emit_event("cli_output", stage="validate_details", text=out[:2000])
@@ -98,7 +99,7 @@ class ValidateDetailsStage(BaseStage):
                 if ctx.invalid_detail_files:
                     ctx.emit_event("log", level="info",
                                    msg=f"[S0-ValidateDetails] 补全 {len(ctx.invalid_detail_files)} 个问题文件")
-                    await self._repair_details(ctx, ctx.invalid_detail_files, details_dir)
+                    self._repair_details(ctx, ctx.invalid_detail_files, details_dir)
             except Exception as e:
                 ctx.emit_event("log", level="warn",
                                msg=f"[S0-ValidateDetails] 校验报告解析失败: {e}")
@@ -139,7 +140,7 @@ class ValidateDetailsStage(BaseStage):
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    async def _repair_details(
+    def _repair_details(
         self,
         ctx: PipelineContext,
         problem_files: list[str],
@@ -150,25 +151,24 @@ class ValidateDetailsStage(BaseStage):
         import concurrent.futures
 
         cfg = ctx.cfg
-        loop = asyncio.get_event_loop()
         catalog = ctx.file_catalog or {}
         target_dir = cfg.target_dir
 
-        async def _repair_one(rel: str) -> None:
+        def _repair_one(rel: str) -> None:
             ftype = _get_file_type_from_catalog(catalog, rel)
-            data = await loop.run_in_executor(
+            data = loop.run_in_executor(
                 None, _extract_python_info,
                 os.path.join(target_dir, rel), rel, ftype
             )
             detail_path = details_dir / (rel.lstrip("/") + ".json")
             _write_detail_json(detail_path, data)
 
-        sem = asyncio.Semaphore(max(1, getattr(cfg, "parallel_sub_workers", 4)))
+        sem = threading.BoundedSemaphore(max(1, getattr(cfg, "parallel_sub_workers", 4)))
 
-        async def _bounded_repair(rel: str) -> None:
-            async with sem:
-                await _repair_one(rel)
+        def _bounded_repair(rel: str) -> None:
+            with sem:
+                _repair_one(rel)
 
-        await asyncio.gather(*[_bounded_repair(f) for f in problem_files])
+        # [THREAD] replaced: # GATHER   # *[_bounded_repair(f) for f in problem_files])
         ctx.emit_event("log", level="info",
                        msg=f"[S0-ValidateDetails] 已修复 {len(problem_files)} 个问题文件")
