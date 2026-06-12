@@ -159,12 +159,11 @@ class Orchestrator:
         )
         for model_summary in validation["models"]:
             _logger.info(
-                "runtime model source=configcenter provider=%s model=%s contextWindow=%s contextLength=%s maxTokens=%s",
+                "runtime model source=configcenter provider=%s model=%s contextWindow=%s contextLength=%s",
                 model_summary["provider_key"],
                 model_summary["model_id"],
                 model_summary["contextWindow"],
                 model_summary["contextLength"],
-                model_summary["maxTokens"],
             )
 
         # ── 目录初始化（统一逻辑，不再区分 resume/fresh 模式）────────────────

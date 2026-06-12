@@ -16,8 +16,7 @@ logger = logging.getLogger("sa.llm_sync")
 # pi 的 models.json 写入目录（与 Dockerfile 中 PI_CODING_AGENT_DIR 一致）
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
 _DEFAULT_CONTEXT_WINDOW = 128000
-_DEFAULT_MAX_TOKENS = 8192
-_REQUIRED_MODEL_FIELDS = ("contextWindow", "contextLength", "maxTokens")
+_REQUIRED_MODEL_FIELDS = ("contextWindow", "contextLength")
 
 
 def _env_var_name(provider_key: str) -> str:
@@ -57,8 +56,8 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         _DEFAULT_CONTEXT_WINDOW,
     )
     max_tokens = _as_positive_int(
-        provider.get("max_tokens") or provider.get("maxTokens") or extra_config.get("max_tokens") or extra_config.get("maxTokens"),
-        _DEFAULT_MAX_TOKENS,
+        provider.get("max_tokens") or extra_config.get("max_tokens"),
+        0,
     )
     pi_models = extra_config.get("pi_models")
     raw_models = pi_models if isinstance(pi_models, list) else (
@@ -74,7 +73,6 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         entry.setdefault("reasoning", False)
         entry.setdefault("input", ["text"])
         entry.setdefault("contextWindow", context_window)
-        entry.setdefault("maxTokens", max_tokens)
         entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
         # Keep contextLength for compatibility, but pi examples use contextWindow.
         entry.setdefault("contextLength", entry["contextWindow"])
@@ -93,7 +91,7 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict:
                 "baseUrl": "...",
                 "api": "openai-completions",
                 "apiKey": "<ENV_VAR_NAME>",
-                "models": [{"id": "<model_id>", "contextWindow": 128000, "maxTokens": 8192}]
+                "models": [{"id": "<model_id>", "contextWindow": 128000}]
             }
         }
     }
@@ -145,12 +143,11 @@ def write_pi_models_file(models_json: dict[str, Any], *, source: str) -> dict[st
     )
     for model_summary in validation["models"]:
         logger.info(
-            "LLM Provider %s/%s contextWindow=%s contextLength=%s maxTokens=%s",
+            "LLM Provider %s/%s contextWindow=%s contextLength=%s",
             model_summary["provider_key"],
             model_summary["model_id"],
             model_summary["contextWindow"],
             model_summary["contextLength"],
-            model_summary["maxTokens"],
         )
     return validation
 
@@ -200,7 +197,6 @@ def validate_pi_models_file(
                     "model_id": model.get("id"),
                     "contextWindow": model.get("contextWindow"),
                     "contextLength": model.get("contextLength"),
-                    "maxTokens": model.get("maxTokens"),
                 }
             )
             model_count += 1
