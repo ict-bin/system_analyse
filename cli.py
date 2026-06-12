@@ -2,7 +2,8 @@
 """system_analyse CLI — 四阶段流水线"""
 
 from __future__ import annotations
-import asyncio, os, sys, time
+import threading
+import time, os, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -262,7 +263,7 @@ _CONFIG_SEARCH = [
 ]
 
 
-async def main():
+def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print('用法: python3 cli.py "对解包后的所有文件进行威胁分析与模块分析"')
         sys.exit(0)
@@ -304,7 +305,7 @@ async def main():
 ╚══════════════════════════════════════════════╝""")
 
     orch = Orchestrator(config=cfg, on_event=lambda e: render_event(e, quiet=quiet))
-    result = await orch.execute()
+    result = orch.execute()
 
     if not quiet:
         dur_str = _fmt_dur(result.total_duration_ms / 1000)
@@ -314,4 +315,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

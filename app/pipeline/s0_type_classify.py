@@ -9,9 +9,9 @@ pipeline/s0_type_classify.py — Stage 0: 文件类型分类
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
+import subprocess
 from pathlib import Path
 
 from .base import BaseStage
@@ -24,7 +24,7 @@ class TypeClassifyStage(BaseStage):
     stage_num = 0
     stage_name = "文件类型分类"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
         workspace = ctx.workspace
 
@@ -72,14 +72,14 @@ class TypeClassifyStage(BaseStage):
             return
 
         ctx.emit_event("stage", stage="type_classify")
-        proc = await asyncio.create_subprocess_exec(
+        proc = subprocess.run(
             "python3", classify_script,
             ctx.cfg.target_dir, str(workspace),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env={**os.environ, "TMPDIR": str(ctx.task_tmp)},
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = proc.communicate()
         out = (stdout or b"").decode("utf-8", errors="replace").strip()
         err = (stderr or b"").decode("utf-8", errors="replace").strip()
         combined = (out + ("\n" + err if err else "")).strip()

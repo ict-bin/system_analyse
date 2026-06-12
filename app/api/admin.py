@@ -33,22 +33,22 @@ class RuntimeOperatorRequest(BaseModel):
 
 
 @router.get("/admin/runtime")
-async def get_runtime_overview(db: Session = Depends(get_db)):
+def get_runtime_overview(db: Session = Depends(get_db)):
     return get_task_service().get_runtime_overview(db)
 
 
 @router.get("/admin/runtime-control")
-async def get_runtime_control(db: Session = Depends(get_db)):
+def get_runtime_control(db: Session = Depends(get_db)):
     return get_runtime_control_service().get_runtime_control(db)
 
 
 @router.put("/admin/runtime-control")
-async def save_runtime_control(body: RuntimeControlSaveRequest, db: Session = Depends(get_db)):
+def save_runtime_control(body: RuntimeControlSaveRequest, db: Session = Depends(get_db)):
     return get_runtime_control_service().save_runtime_control(db, body.model_dump())
 
 
 @router.post("/admin/runtime-control/pause-claim")
-async def pause_runtime_claim(body: RuntimePauseClaimRequest, db: Session = Depends(get_db)):
+def pause_runtime_claim(body: RuntimePauseClaimRequest, db: Session = Depends(get_db)):
     return get_runtime_control_service().pause_claim(
         db,
         seconds=body.seconds,
@@ -58,7 +58,7 @@ async def pause_runtime_claim(body: RuntimePauseClaimRequest, db: Session = Depe
 
 
 @router.post("/admin/runtime-control/resume-claim")
-async def resume_runtime_claim(body: RuntimeOperatorRequest, db: Session = Depends(get_db)):
+def resume_runtime_claim(body: RuntimeOperatorRequest, db: Session = Depends(get_db)):
     return get_runtime_control_service().resume_claim(
         db,
         reason=body.reason,
@@ -67,7 +67,7 @@ async def resume_runtime_claim(body: RuntimeOperatorRequest, db: Session = Depen
 
 
 @router.post("/admin/runtime-control/drain")
-async def enable_runtime_drain(body: RuntimeOperatorRequest, db: Session = Depends(get_db)):
+def enable_runtime_drain(body: RuntimeOperatorRequest, db: Session = Depends(get_db)):
     return get_runtime_control_service().set_drain_mode(
         db,
         enabled=True,
@@ -77,7 +77,7 @@ async def enable_runtime_drain(body: RuntimeOperatorRequest, db: Session = Depen
 
 
 @router.post("/admin/runtime-control/activate")
-async def disable_runtime_drain(body: RuntimeOperatorRequest, db: Session = Depends(get_db)):
+def disable_runtime_drain(body: RuntimeOperatorRequest, db: Session = Depends(get_db)):
     return get_runtime_control_service().set_drain_mode(
         db,
         enabled=False,

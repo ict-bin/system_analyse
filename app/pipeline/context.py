@@ -3,9 +3,9 @@ pipeline/context.py — 流水线上下文（各阶段共享的状态容器）
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
@@ -45,7 +45,7 @@ class PipelineContext:
     """orchestrator 初始化后注入。None 表示未启用断点续跑。"""
 
     # ── 取消事件 ──────────────────────────────────────────────
-    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
     # ── 输出目录（最终交付件） ────────────────────────────────
     final_out_dir: Path = field(default_factory=lambda: Path("."))
@@ -84,26 +84,26 @@ class PipelineContext:
 
     # ── 预处理新增字段 ────────────────────────────────────────────────
     file_catalog: dict = field(default_factory=dict)
-    # TypeClassifyStage 产出的 file_catalog.json 解析结果
+    """TypeClassifyStage 产出的 file_catalog.json 解析结果"""
 
     details_dir: Path | None = None
-    # workspace/details/ 目录，SubReaderStage 完成后注入，None=尚未生成
+    """workspace/details/ 目录，SubReaderStage 完成后注入，None=尚未生成"""
 
     classify_context_path: Path | None = None
-    # workspace/classify_context.md，SubReaderStage 生成，ClassifyStage 注入 prompt
+    """workspace/classify_context.md，SubReaderStage 生成，ClassifyStage 注入 prompt"""
 
     path_group_map: dict[str, str] = field(default_factory=dict)
-    # PathGroupStage v2 产出: 文件路径 → 路径推断模块名 的映射
+    """PathGroupStage v2 产出: 文件路径 → 路径推断模块名 的映射"""
 
     # ── 模块依赖图 ──────────────────────────────────────────────────
     module_dependency_graph: dict | None = None
-    # S3 用: orchestrator 在 S2 后构建，S3 做风险排序
+    """S3 用: orchestrator 在 S2 后构建，S3 做风险排序"""
 
     invalid_detail_files: list[str] = field(default_factory=list)
-    # ValidateDetailsStage 发现的无效 details JSON 列表
+    """ValidateDetailsStage 发现的无效 details JSON 列表"""
 
     unknown_files: list[str] = field(default_factory=list)
-    # TypeClassifyStage 识别出的 UNKNOWN 类型文件列表
+    """TypeClassifyStage 识别出的 UNKNOWN 类型文件列表"""
 
     classified_modules: list[str] = field(default_factory=list)
     """粗分类后的模块名列表（workspace/modules/<name>/files.list）"""
@@ -139,7 +139,7 @@ class PipelineContext:
 
     @property
     def deleted_list_path(self) -> Path:
-        """workspace/deleted.list：全局已确认排除文件（append-only，asyncio.Lock 保护）。"""
+        """workspace/deleted.list：全局已确认排除文件（append-only，threading.Lock 保护）。"""
         return self.workspace / "deleted.list"
 
     def load_confirmed_deleted(self) -> set[str]:
@@ -169,14 +169,7 @@ class PipelineContext:
         module_name: "str | None",
         attempt: int,
     ) -> str:
-        """返回 judge feedback 文件的相对路径字符串（相对于 workspace）。
-
-        供各阶段 Worker 的 prompt 引用，格式：
-          有模块: judge_output/<stage_key>/<module_name>/feedback_a<attempt>.md
-          无模块: judge_output/<stage_key>/feedback_a<attempt>.md
-
-        对应 write_judge_feedback() 的写入路径，读取时直接 `read <returned_path>`。
-        """
+        """返回 judge feedback 文件的相对路径字符串（相对于 workspace）。"""
         if module_name:
             return f"judge_output/{stage_key}/{module_name}/feedback_a{attempt}.md"
         else:
@@ -386,7 +379,7 @@ class PipelineContext:
         }
 
     def make_j_base(self) -> dict:
-        """构建 Judge 的公共 kwargs（无 tools/cwd）。session_file 由各阶段按需单独传入。"""
+        """构建 Judge 的公共 kwargs。"""
         return {
             "thinking_level": self.cfg.judges.default_thinking_level or "off",
             "cancel_event": self.cancel_event,

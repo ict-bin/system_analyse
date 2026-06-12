@@ -4,9 +4,10 @@ pipeline/helpers.py — 各阶段共用的底层函数
 """
 from __future__ import annotations
 
-import asyncio
 import concurrent.futures
 import os
+import threading
+import time
 import re
 import shutil
 import subprocess
@@ -118,8 +119,8 @@ def check_agent_result(ar: AgentResult, context: str = "") -> None:
         raise StageError(msg)
 
 
-async def run_agent_checked(context: str = "", **kwargs) -> AgentResult:
-    ar = await run_agent(**kwargs)
+def run_agent_checked(context: str = "", **kwargs) -> AgentResult:
+    ar = run_agent(**kwargs)
     check_agent_result(ar, context)
     return ar
 
@@ -134,7 +135,7 @@ def _get_session_mtime(session_file: "str | None") -> float:
         return 0.0
 
 
-async def run_agent_with_stage_guard(
+def run_agent_with_stage_guard(
     *,
     ctx: "PipelineContext",
     stage: str,
@@ -144,7 +145,7 @@ async def run_agent_with_stage_guard(
     timeout_seconds: float | None = None,  # deprecated — kept for API compat
     **kwargs,
 ) -> AgentResult:
-    """Run an agent with periodic heartbeat events.
+    """Run an agent with periodic heartbeat events using threads.
 
     卡死检测已下沉到 runner._run_with_api_retry 内层（per-pi-process 级别）。
     这里只负责心跳事件。
@@ -158,23 +159,41 @@ async def run_agent_with_stage_guard(
                 return dict(payload)
         return {}
 
-    agent_task = asyncio.create_task(run_agent_checked(context=context, **kwargs))
+    result_holder: dict = {"result": None, "error": None, "done": False}
+    lock = threading.Lock()
+    stop_heartbeat = threading.Event()
+
+    def _run_agent():
+        try:
+            r = run_agent_checked(context=context, **kwargs)
+            with lock:
+                result_holder["result"] = r
+                result_holder["done"] = True
+        except Exception as e:
+            with lock:
+                result_holder["error"] = e
+                result_holder["done"] = True
+
+    agent_thread = threading.Thread(target=_run_agent, daemon=True)
+    agent_thread.start()
+
     heartbeat_index = 0
     started_monotonic = time.monotonic()
     try:
         while True:
-            try:
-                return await asyncio.wait_for(asyncio.shield(agent_task), timeout=heartbeat_every)
-            except asyncio.TimeoutError:
-                heartbeat_index += 1
-                elapsed = time.monotonic() - started_monotonic
-                payload = _payload(heartbeat_index)
-                payload["elapsed_seconds"] = round(elapsed, 3)
-                ctx.emit_event("heartbeat", stage=stage, **payload)
+            agent_thread.join(timeout=heartbeat_every)
+            with lock:
+                if result_holder["done"]:
+                    if result_holder["error"]:
+                        raise result_holder["error"]
+                    return result_holder["result"]
+            heartbeat_index += 1
+            elapsed = time.monotonic() - started_monotonic
+            payload = _payload(heartbeat_index)
+            payload["elapsed_seconds"] = round(elapsed, 3)
+            ctx.emit_event("heartbeat", stage=stage, **payload)
     finally:
-        if not agent_task.done():
-            agent_task.cancel()
-            await asyncio.gather(agent_task, return_exceptions=True)
+        stop_heartbeat.set()
 
 # ── 模块目录发现 ──────────────────────────────────────────────────────────────
 
@@ -394,11 +413,11 @@ def get_module_deleted_files(mod_dir: Path) -> set[str]:
     return {ln.strip() for ln in p.read_text("utf-8", errors="replace").splitlines() if ln.strip()}
 
 
-async def archive_module_deletions(
+def archive_module_deletions(
     workspace: "Path",
     mod_name: str,
     mod_dir: "Path",
-    lock: "asyncio.Lock",
+    lock: "threading.Lock",
     ctx: "PipelineContext",
 ) -> int:
     """Archive modules/<mod>/deleted/files.list → workspace/deleted.list (lock-protected).
@@ -415,7 +434,7 @@ async def archive_module_deletions(
                  deleted_flist.read_text("utf-8", errors="replace").splitlines()
                  if ln.strip()]
     if files:
-        async with lock:
+        with lock:
             with open(str(workspace / "deleted.list"), "a", encoding="utf-8") as f:
                 for fp in files:
                     f.write(fp + "\n")
@@ -1157,7 +1176,7 @@ def pre_read_module(target_dir: str, mod_dir: Path) -> str:
     return prefix + result_str
 
 
-async def collect_file_summaries(
+def collect_file_summaries(
     ctx: "PipelineContext",
     mod_name: str,
     mod_dir: Path,
@@ -1168,12 +1187,11 @@ async def collect_file_summaries(
     files_override: "list[str] | None" = None,
 ) -> str:
     """
-    主从模式：子 Worker 并行分批读取文件，返回合并的文件摘要字符串。
+    主从模式：子 Worker 并行分批读取文件，返回合并的文件摘要字符串（线程版）。
 
     files_override: 若指定，只处理这些文件（用于 details/ 存在时只补充不清晰的文件），
                     而非 mod_dir/files.list 中的全部文件。
     """
-    """主从模式：子 Worker 并行分批读取文件，返回合并的文件摘要字符串。"""
     w_base = ctx.make_w_base()
     if files_override is not None:
         files = [f for f in files_override if f.strip()]
@@ -1189,71 +1207,82 @@ async def collect_file_summaries(
                    module=mod_name, batches=len(batches), files=len(files),
                    parallel=parallel)
 
-    semaphore = asyncio.Semaphore(max(1, parallel))
     results: list[str | None] = [None] * len(batches)
-    loop = asyncio.get_event_loop()
 
-    async def _run_batch(idx: int, batch: list[str]) -> None:
-        async with semaphore:
-            ctx.emit_event("stage", stage="2-sub",
-                           module=mod_name, batch=idx + 1, total=len(batches))
+    def _run_batch(idx: int, batch: list[str]) -> None:
+        ctx.emit_event("stage", stage="2-sub",
+                       module=mod_name, batch=idx + 1, total=len(batches))
 
-            pre_reads: list[tuple[str, list[str]]] = []
-            for relpath in batch:
-                fullpath = os.path.join(target_dir, relpath)
-                ftype, lines = await loop.run_in_executor(None, pre_read_file, fullpath)
-                pre_reads.append((ftype, lines))
+        pre_reads: list[tuple[str, list[str]]] = []
+        for relpath in batch:
+            fullpath = os.path.join(target_dir, relpath)
+            ftype, lines = pre_read_file(fullpath)
+            pre_reads.append((ftype, lines))
 
-            parts = [f"以下是 {len(batch)} 个文件的内容摘要，直接分析，无需再读文件：\n"]
-            for relpath, (ftype, lines) in zip(batch, pre_reads):
-                fname = os.path.basename(relpath)
-                parts.append(f"\n=== {fname} ({ftype}) ===")
-                parts.append(f"路径: {relpath}")
-                if lines:
-                    content_preview = '\n'.join(lines[:40])
-                    parts.append(f"内容:\n{content_preview}")
-                else:
-                    parts.append("内容: (空文件或无法读取)")
-            prompt = '\n'.join(parts)
-            session_file = ctx.session_path(
-                "sub_read",
-                mod_name,
-                f"batch{idx + 1}.jsonl",
-            )
-
-            ar = await run_agent_with_stage_guard(
-                ctx=ctx,
-                stage="2-sub",
-                context=f"s2-sub-{mod_name}-batch{idx+1}",
-                heartbeat_payload_factory=lambda beat, module=mod_name, batch_no=idx + 1, total=len(batches), session=session_file: {
-                    "module": module,
-                    "batch": batch_no,
-                    "total": total,
-                    "heartbeat": beat,
-                    "session_file": session,
-                },
-                prompt=prompt,
-                model=sub_model or w_base.get("model", ""),
-                tools=[],
-                system_prompt=sub_prompt_template,
-                cwd=w_base["cwd"],
-                thinking_level=w_base.get("thinking_level", "off"),
-                session_file=session_file,
-                cancel_event=w_base.get("cancel_event"),
-                max_retries=w_base.get("max_retries", 3),
-                retry_delay=w_base.get("retry_delay", 10),
-                pi_max_retries=w_base.get("pi_max_retries", -1),
-                pi_retry_delay=w_base.get("pi_retry_delay", 10),
-            )
-            ctx.tokens += ar.token_usage
-            if ar.output:
-                raw = re.sub(r'<result>.*?</result>', '', ar.output, flags=re.DOTALL).strip()
-                results[idx] = raw
+        parts = [f"以下是 {len(batch)} 个文件的内容摘要，直接分析，无需再读文件：\n"]
+        for relpath, (ftype, lines) in zip(batch, pre_reads):
+            fname = os.path.basename(relpath)
+            parts.append(f"\n=== {fname} ({ftype}) ===")
+            parts.append(f"路径: {relpath}")
+            if lines:
+                content_preview = '\n'.join(lines[:40])
+                parts.append(f"内容:\n{content_preview}")
             else:
-                results[idx] = '\n'.join(
-                    f"{f} | unknown | (分析失败) | -" for f in batch)
+                parts.append("内容: (空文件或无法读取)")
+        prompt = '\n'.join(parts)
+        session_file = ctx.session_path(
+            "sub_read",
+            mod_name,
+            f"batch{idx + 1}.jsonl",
+        )
 
-    await asyncio.gather(*[_run_batch(i, b) for i, b in enumerate(batches)])
+        ar = run_agent_with_stage_guard(
+            ctx=ctx,
+            stage="2-sub",
+            context=f"s2-sub-{mod_name}-batch{idx+1}",
+            heartbeat_payload_factory=lambda beat, module=mod_name, batch_no=idx + 1, total=len(batches), session=session_file: {
+                "module": module,
+                "batch": batch_no,
+                "total": total,
+                "heartbeat": beat,
+                "session_file": session,
+            },
+            prompt=prompt,
+            model=sub_model or w_base.get("model", ""),
+            tools=[],
+            system_prompt=sub_prompt_template,
+            cwd=w_base["cwd"],
+            thinking_level=w_base.get("thinking_level", "off"),
+            session_file=session_file,
+            cancel_event=w_base.get("cancel_event"),
+            max_retries=w_base.get("max_retries", 3),
+            retry_delay=w_base.get("retry_delay", 10),
+            pi_max_retries=w_base.get("pi_max_retries", -1),
+            pi_retry_delay=w_base.get("pi_retry_delay", 10),
+        )
+        ctx.tokens += ar.token_usage
+        if ar.output:
+            raw = re.sub(r'<result>.*?</result>', '', ar.output, flags=re.DOTALL).strip()
+            results[idx] = raw
+        else:
+            results[idx] = '\n'.join(
+                f"{f} | unknown | (分析失败) | -" for f in batch)
+
+    # Run batches in parallel using ThreadPoolExecutor with semaphore for concurrency control
+    semaphore = threading.BoundedSemaphore(max(1, parallel))
+    lock = threading.Lock()
+
+    def _run_batch_guarded(idx: int, batch: list[str]) -> None:
+        with semaphore:
+            _run_batch(idx, batch)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, parallel)) as executor:
+        futures = [executor.submit(_run_batch_guarded, i, b) for i, b in enumerate(batches)]
+        for f in futures:
+            try:
+                f.result()
+            except Exception:
+                pass
 
     all_lines = []
     for r in results:

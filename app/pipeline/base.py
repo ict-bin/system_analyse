@@ -21,25 +21,19 @@ class BaseStage(ABC):
         """阶段名（用于日志）。"""
 
     @abstractmethod
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         """执行阶段逻辑，就地修改 ctx。"""
 
 
 class Pipeline:
-    """将多个 BaseStage 串联成流水线。
-
-    各 Stage 通过自身的 checkpoint 逆辑决定是否执行，无需外部传入 start_stage。
-    """
+    """将多个 BaseStage 串联成流水线。"""
 
     def __init__(self, stages: list[BaseStage]):
         self._stages = sorted(stages, key=lambda s: s.stage_num)
 
-    async def run(self, ctx: PipelineContext) -> PipelineContext:
+    def run(self, ctx: PipelineContext) -> PipelineContext:
         for stage in self._stages:
-            await stage.execute(ctx)
-            # 文件过滤阶段后无文件，终止后续阶段空跑
-            # 仅针对 FilterStage（stage_name=="文件过滤"）检测，避免其他 stage_num==0
-            # 的新预处理阶段（TypeClassify/SubReader/ValidateDetails等）错误触发该中断
+            stage.execute(ctx)
             if stage.stage_name == "文件过滤" and ctx.filter_count == 0:
                 ctx.emit_event(
                     "log",

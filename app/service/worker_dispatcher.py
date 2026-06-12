@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import threading
 import logging
 import os
 import random
@@ -149,7 +149,7 @@ class WorkerDispatcher:
         self._task_repository = task_repository
         self._agent_observability = None
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._task: object | None = None
         self._idle_sleep_seconds = WORKER_POLL_INTERVAL_SECONDS
 
     def _get_agent_observability(self):
@@ -163,12 +163,12 @@ class WorkerDispatcher:
     def _resolve_worker_task_concurrency(db: Session | None = None) -> int:
         return 1
 
-    async def start(self) -> None:
+    def start(self) -> None:
         if self._task and not self._task.done():
             return
         self._running = True
         self._idle_sleep_seconds = WORKER_POLL_INTERVAL_SECONDS
-        self._task = asyncio.create_task(self._run_forever(), name="sa_worker_dispatcher")
+        self._task = threading.Thread(target=self._run_forever(), name="sa_worker_dispatcher")
         logger.info(
             "worker dispatcher started (poll_interval=%ss concurrency=%s stale_sweep_interval=%ss)",
             WORKER_POLL_INTERVAL_SECONDS,
@@ -176,18 +176,18 @@ class WorkerDispatcher:
             WORKER_STALE_SWEEP_INTERVAL_SECONDS,
         )
 
-    async def stop(self) -> None:
+    def stop(self) -> None:
         self._running = False
         task = self._task
         if task and not task.done():
             task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
+                task
+            except Exception:
                 pass
         self._task = None
 
-    async def _run_forever(self) -> None:
+    def _run_forever(self) -> None:
         while self._running:
             try:
                 _runtime_state.last_tick_ts = _time.time()
@@ -201,14 +201,14 @@ class WorkerDispatcher:
                         WORKER_IDLE_BACKOFF_MAX_SECONDS,
                         max(WORKER_POLL_INTERVAL_SECONDS, self._idle_sleep_seconds * 2),
                     )
-                await asyncio.sleep(worker_sleep_seconds(self._idle_sleep_seconds))
-            except asyncio.CancelledError:
+                time.sleep(worker_sleep_seconds(self._idle_sleep_seconds))
+            except Exception:
                 raise
             except Exception as exc:
                 _runtime_state.last_error = str(exc)
                 _runtime_state.pause_claim_until_ts = _time.time() + WORKER_OVERLOAD_COOLDOWN_SECONDS
                 logger.exception("worker dispatcher loop failed: %s", exc)
-                await asyncio.sleep(worker_sleep_seconds())
+                time.sleep(worker_sleep_seconds())
 
     def _dispatch_once(self) -> int:
         now_ts = _time.time()

@@ -12,7 +12,7 @@ Stage 4: Judge 完整性检查(缺失回 Stage 2) + Worker 生成报告 + Judge 
 
 from __future__ import annotations
 
-import asyncio
+# LEGACY: import asyncio removed
 import json
 import math
 import os
@@ -58,9 +58,9 @@ def _check_agent_result(ar: AgentResult, context: str = "") -> None:
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
 
-async def _run_agent_checked(context: str = "", **kwargs) -> AgentResult:
+# LEGACY: def _run_agent_checked(context: str = "", **kwargs) -> AgentResult:
     """run_agent 的包装：执行后自动检查致命错误。"""
-    ar = await run_agent(**kwargs)
+    ar = # LEGACY: run_agent(**kwargs)
     _check_agent_result(ar, context)
     return ar
 
@@ -212,7 +212,7 @@ class Orchestrator:
     def __init__(self, config: TaskConfig, on_event: Callable[[SwarmEvent], None] | None = None):
         self.cfg = config
         self._on_event = on_event
-        self._cancel_event: asyncio.Event | None = None
+        self._cancel_event: threading.Event | None = None
 
     def _emit(self, event_type: str, task_id: str, **data):
         if self._on_event:
@@ -255,11 +255,11 @@ class Orchestrator:
         """max_rounds=-1 时返回一个很大的数"""
         return stage_cfg.max_rounds if stage_cfg.max_rounds > 0 else 999999
 
-    async def execute(self, task_id: str | None = None) -> TaskResult:
+    # LEGACY: def execute(self, task_id: str | None = None) -> TaskResult:
         cfg = self.cfg
         task_id = task_id or make_id()
         start = time.time()
-        self._cancel_event = asyncio.Event()
+        self._cancel_event = threading.Event()
 
         # ── resume_workspace: 直接使用已有 workspace（跳过 Stage 1/2）──
         if cfg.resume_workspace and cfg.start_stage > 1:
@@ -355,16 +355,16 @@ class Orchestrator:
                     types_str = " ".join(cfg.analyse_targets)
                     arch_str = " ".join(cfg.binary_arch)
                     self._emit("stage", task_id, stage="filter", types=types_str, arch=arch_str)
-                    proc = await asyncio.create_subprocess_exec(
+                    proc = # LEGACY: subprocess.run(
                         "bash", filter_script, cfg.target_dir,
                         str(workspace / "filtered_files.txt"),
                         "--arch", arch_str,
                         *cfg.analyse_targets,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
                         env={**os.environ, "TMPDIR": str(task_tmp)},
                     )
-                    stdout, stderr_bytes = await proc.communicate()
+                    stdout, stderr_bytes = # LEGACY: proc.communicate()
                     # Emit script output for visibility
                     _out = (stdout or b"").decode("utf-8", errors="replace").strip()
                     _err = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
@@ -423,7 +423,7 @@ class Orchestrator:
                         f"**⚠️ 禁止做安全分析或漏洞挖掘。禁止读取文件内容（二进制或文本）。**"
                         + _explore_scope
                     )
-                    ar = await _run_agent_checked(
+                    ar = # LEGACY: _run_agent_checked(
                         prompt=_explore_user_prompt,
                         model=_wm("explore"),
                         system_prompt=explore_prompt,
@@ -452,13 +452,13 @@ class Orchestrator:
                         try:
                             cmd = (["python3", prescan_script] if prescan_script.endswith(".py")
                                    else ["bash", prescan_script])
-                            proc = await asyncio.create_subprocess_exec(
+                            proc = # LEGACY: subprocess.run(
                                 *cmd, cfg.target_dir, str(workspace),
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
                                 env={**os.environ, "TMPDIR": str(task_tmp)},
                             )
-                            stdout, stderr = await proc.communicate()
+                            stdout, stderr = # LEGACY: proc.communicate()
                             # Emit prescan CLI output
                             _pout = (stdout or b"").decode("utf-8", errors="replace").strip()
                             _perr = (stderr or b"").decode("utf-8", errors="replace").strip()
@@ -516,7 +516,7 @@ class Orchestrator:
                             f"你可以直接用脚本将 prescan/*.list 移入模块目录。")
                     if feedback:
                         prompt_parts.append(f"\n\n{feedback}")
-                    ar = await _run_agent_checked(
+                    ar = # LEGACY: _run_agent_checked(
                         model=_wm("classify"),
                         prompt="\n".join(prompt_parts),
                         system_prompt=w_sys_prompt,
@@ -533,7 +533,7 @@ class Orchestrator:
                     # Judge 检查
                     judge_results = []
                     for j_idx, j_cfg_item in enumerate(j_cfgs):
-                        ar = await _run_agent_checked(
+                        ar = # LEGACY: _run_agent_checked(
                             prompt="请运行检查脚本验证分类完整性。",
                             model=_jm("classify", j_cfg_item),
                             system_prompt=j_sys_prompt,
@@ -583,15 +583,15 @@ class Orchestrator:
                 reflect_prompt = self._load_prompt(w_prompt_dir, "reflect_refine")
 
                 parallel_s2 = max(1, cfg.parallel_modules)
-                s2_queue: asyncio.Queue[str] = asyncio.Queue()
+                s2_queue: queue.Queue[str] = queue.Queue()
                 refined_modules: set[str] = set()
                 in_progress_s2: set[str] = set()
                 s2_errors: list[BaseException] = []
 
                 for _m in _discover_modules(str(workspace)):
-                    await s2_queue.put(_m)
+                    # LEGACY: s2_queue.put(_m)
 
-                async def _refine_one(mod_name: str) -> None:
+                # LEGACY: def _refine_one(mod_name: str) -> None:
                     nonlocal tokens
                     mod_dir = _get_modules_root(str(workspace)) / mod_name
                     if not (mod_dir / "files.list").exists():
@@ -619,7 +619,7 @@ class Orchestrator:
                     sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
                     file_summary = ""
                     if sub_prompt and fc > self.SUB_WORKER_THRESHOLD:
-                        file_summary = await self._collect_file_summaries(
+                        file_summary = # LEGACY: self._collect_file_summaries(
                             task_id, mod_name, mod_dir, w_base, tokens,
                             sub_prompt, parallel=cfg.parallel_sub_workers,
                             sub_model=cfg.workers.model_for("sub_read"),
@@ -635,7 +635,7 @@ class Orchestrator:
                             prompt_parts.append(chr(10)*2 + "## 文件摘要（子 Worker 已分析）" + chr(10)*2 + file_summary)
                         if feedback:
                             prompt_parts.append(chr(10)*2 + feedback)
-                        ar = await _run_agent_checked(
+                        ar = # LEGACY: _run_agent_checked(
                             prompt=chr(10).join(prompt_parts),
                             model=_wm("refine"),
                             system_prompt=w_sys_prompt,
@@ -657,7 +657,7 @@ class Orchestrator:
 
                         judge_results = []
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
-                            ar = await _run_agent_checked(
+                            ar = # LEGACY: _run_agent_checked(
                                 prompt=f"评审 Worker 对模块 `{mod_name}` 的细分判断。",
                                 model=_jm("refine", j_cfg_item),
                                 system_prompt=j_sys_prompt,
@@ -685,7 +685,7 @@ class Orchestrator:
                                     for nm in new_ones:
                                         if nm not in refined_modules and nm not in in_progress_s2:
                                             in_progress_s2.add(nm)
-                                            await s2_queue.put(nm)
+                                            # LEGACY: s2_queue.put(nm)
                                 refined_modules.add(mod_name)
                                 return  # 正常完成
                             else:
@@ -716,12 +716,12 @@ class Orchestrator:
                     raise StageError(
                         f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数 {s_cfg.max_rounds}")
 
-                async def _s2_worker() -> None:
+                # LEGACY: def _s2_worker() -> None:
                     while True:
-                        mod_name = await s2_queue.get()
+                        mod_name = # LEGACY: s2_queue.get()
                         try:
                             if mod_name not in refined_modules:
-                                await _refine_one(mod_name)
+                                # LEGACY: _refine_one(mod_name)
                         except (StageError, PiFatalError) as e:
                             s2_errors.append(e)
                         finally:
@@ -729,10 +729,10 @@ class Orchestrator:
 
                 _s2_workers = [asyncio.create_task(_s2_worker())
                                for _ in range(parallel_s2)]
-                await s2_queue.join()
+                # LEGACY: s2_queue.join()
                 for _w in _s2_workers:
                     _w.cancel()
-                await asyncio.gather(*_s2_workers, return_exceptions=True)
+                # LEGACY: asyncio.gather(*_s2_workers, return_exceptions=True)
                 if s2_errors:
                     raise s2_errors[0]
 
@@ -780,7 +780,7 @@ class Orchestrator:
 
                         s2rc_cfg = cfg.stages.refine
                         for rc_attempt in range(min(3, self._max_iter(s2rc_cfg))):
-                            rc_ar = await _run_agent_checked(
+                            rc_ar = # LEGACY: _run_agent_checked(
                                 prompt=reclass_prompt,
                                 model=_wm("classify"),
                                 tools=w_base["tools"],
@@ -841,9 +841,9 @@ class Orchestrator:
             modules_needing_reclassify: list[str] = []
             s3_errors: list[BaseException] = []
 
-            s3_sem = asyncio.Semaphore(max(1, cfg.parallel_modules))
+            s3_sem = threading.BoundedSemaphore(max(1, cfg.parallel_modules))
 
-            async def _analyse_one(mod_name: str) -> None:
+            # LEGACY: def _analyse_one(mod_name: str) -> None:
                 nonlocal tokens
                 async with s3_sem:
                     mod_dir = _get_modules_root(str(workspace)) / mod_name
@@ -852,7 +852,7 @@ class Orchestrator:
 
                     # 预读所有文件（Python侧，无需 LLM tool call）
                     loop = asyncio.get_event_loop()
-                    pre_read_content = await loop.run_in_executor(
+                    pre_read_content = # LEGACY: loop.run_in_executor(
                         None, self._pre_read_module, cfg.target_dir, mod_dir
                     )
                     # 解析前缀标记：是否含非-ELF 文本文件
@@ -880,7 +880,7 @@ class Orchestrator:
                         ]
                         if feedback:
                             prompt_parts.append(_nl*2 + feedback)
-                        ar = await _run_agent_checked(
+                        ar = # LEGACY: _run_agent_checked(
                             prompt=_nl.join(prompt_parts),
                             model=_wm("analyse"),
                             system_prompt=w_sys,
@@ -895,7 +895,7 @@ class Orchestrator:
 
                         judge_results = []
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
-                            ar = await _run_agent_checked(
+                            ar = # LEGACY: _run_agent_checked(
                                 prompt=f"评审模块 `{mod_name}` 的分析报告。",
                                 model=_jm("analyse", j_cfg_item),
                                 system_prompt=j_sys_prompt,
@@ -955,7 +955,7 @@ class Orchestrator:
                         raise StageError(
                             f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")
 
-            _s3_results = await asyncio.gather(
+            _s3_results = # LEGACY: asyncio.gather(
                 *[_analyse_one(m) for m in final_modules],
                 return_exceptions=True,
             )
@@ -965,7 +965,7 @@ class Orchestrator:
             for _r in _s3_results:
                 if isinstance(_r, StageError):
                     raise _r
-                if isinstance(_r, Exception) and not isinstance(_r, asyncio.CancelledError):
+                if isinstance(_r, Exception) and not isinstance(_r, Exception):
                     raise _r
 
             # ── Stage 3 后处理：需要重分类的模块回 Stage 2 ──
@@ -990,7 +990,7 @@ class Orchestrator:
                         self._emit("stage", task_id, stage="2-redo",
                                    module=mod_name, attempt=attempt + 1)
 
-                        ar = await _run_agent_checked(
+                        ar = # LEGACY: _run_agent_checked(
                             model=_wm("refine"),
                             prompt=f"重新检查模块 `{mod_name}` 并细分。\n\n{feedback}",
                             system_prompt=w_sys_refine,
@@ -1002,7 +1002,7 @@ class Orchestrator:
                         judge_results = []
                         eval_cwd = str(mod_dir) if mod_dir.exists() else str(workspace)
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
-                            ar = await _run_agent_checked(
+                            ar = # LEGACY: _run_agent_checked(
                                 prompt=f"评审模块 `{mod_name}` 的重新细分。",
                                 model=_jm("refine", j_cfg_item),
                                 system_prompt=j_sys_refine,
@@ -1059,7 +1059,7 @@ class Orchestrator:
                         mod_dir = _get_modules_root(str(workspace)) / mod_name
                         analyse_session = str(sess_dir / f"analyse-redo-{mod_name}.jsonl")
                         # 预读文件内容
-                        pre_content = await asyncio.get_event_loop().run_in_executor(
+                        pre_content = # LEGACY: concurrent.futures.ThreadPoolExecutor().submit(
                             None, self._pre_read_module, cfg.target_dir, mod_dir
                         )
                         # 解析前缀标记
@@ -1081,7 +1081,7 @@ class Orchestrator:
                             ]
                             if feedback:
                                 prompt_parts.append(f"\n\n{feedback}")
-                            ar = await _run_agent_checked(
+                            ar = # LEGACY: _run_agent_checked(
                                 model=_wm("analyse"),
                                 prompt="\n".join(prompt_parts),
                                 system_prompt=w_sys_redo,
@@ -1095,7 +1095,7 @@ class Orchestrator:
 
                             judge_results = []
                             for j_idx, j_cfg_item in enumerate(j_cfgs):
-                                ar = await _run_agent_checked(
+                                ar = # LEGACY: _run_agent_checked(
                                     prompt=f"评审模块 `{mod_name}` 的分析报告。",
                                     model=_jm("analyse", j_cfg_item),
                                     system_prompt=j_sys_analyse,
@@ -1138,7 +1138,7 @@ class Orchestrator:
             judge_results = []
             missing_modules = []
             for j_idx, j_cfg_item in enumerate(j_cfgs):
-                ar = await _run_agent_checked(
+                ar = # LEGACY: _run_agent_checked(
                     prompt="运行 check_outputs.sh 检查所有模块是否都有 module_report.md。",
                     model=_jm("completeness", j_cfg_item),
                     system_prompt=j_completeness_prompt,
@@ -1188,7 +1188,7 @@ class Orchestrator:
 
                     # Stage 2 补做
                     refine_session = str(sess_dir / f"refine-s4-{mod_name}.jsonl")
-                    ar = await _run_agent_checked(
+                    ar = # LEGACY: _run_agent_checked(
                         model=_wm("refine"),
                         prompt=f"检查模块 `{mod_name}` 是否需要细分。",
                         system_prompt=w_sys_refine,
@@ -1199,7 +1199,7 @@ class Orchestrator:
 
                     # Stage 3 补做（预读内容）
                     analyse_session = str(sess_dir / f"analyse-s4-{mod_name}.jsonl")
-                    pre_content_s4 = await asyncio.get_event_loop().run_in_executor(
+                    pre_content_s4 = # LEGACY: concurrent.futures.ThreadPoolExecutor().submit(
                         None, self._pre_read_module, cfg.target_dir, mod_dir
                     )
                     w_sys_s4 = w_sys_analyse.replace(
@@ -1215,7 +1215,7 @@ class Orchestrator:
                         ]
                         if feedback:
                             prompt_parts.append(f"\n\n{feedback}")
-                        ar = await _run_agent_checked(
+                        ar = # LEGACY: _run_agent_checked(
                             model=_wm("analyse"),
                             prompt="\n".join(prompt_parts),
                             system_prompt=w_sys_s4,
@@ -1229,7 +1229,7 @@ class Orchestrator:
 
                         judge_results = []
                         for j_idx, j_cfg_item in enumerate(j_cfgs):
-                            ar = await _run_agent_checked(
+                            ar = # LEGACY: _run_agent_checked(
                                 prompt=f"评审模块 `{mod_name}` 的分析报告。",
                                 model=_jm("analyse", j_cfg_item),
                                 system_prompt=j_sys_analyse,
@@ -1274,7 +1274,7 @@ class Orchestrator:
                     "读取所有模块的 module_report.md，生成最终分析总报告 final_report.md。"]
                 if feedback:
                     prompt_parts.append(f"\n\n{feedback}")
-                ar = await _run_agent_checked(
+                ar = # LEGACY: _run_agent_checked(
                     model=_wm("report"),
                     prompt="\n".join(prompt_parts),
                     system_prompt=report_sys_prompt,
@@ -1290,7 +1290,7 @@ class Orchestrator:
                 # Judge 评审报告
                 judge_results = []
                 for j_idx, j_cfg_item in enumerate(j_cfgs):
-                    ar = await _run_agent_checked(
+                    ar = # LEGACY: _run_agent_checked(
                         prompt="评审 final_report.md 的质量和完整性。",
                         model=_jm("report", j_cfg_item),
                         system_prompt=j_report_prompt,
@@ -1714,7 +1714,7 @@ class Orchestrator:
         prefix = '__HAS_TEXT__' + chr(10) if has_text_files else ''
         return prefix + result_str
 
-    async def _collect_file_summaries(
+    # LEGACY: def _collect_file_summaries(
         self, task_id: str, mod_name: str, mod_dir: Path,
         w_base: dict, tokens: "TokenUsage",
         sub_prompt_template: str,
@@ -1736,10 +1736,10 @@ class Orchestrator:
                    module=mod_name, batches=len(batches), files=len(files),
                    parallel=parallel)
 
-        semaphore = asyncio.Semaphore(max(1, parallel))
+        semaphore = threading.BoundedSemaphore(max(1, parallel))
         results: list[str | None] = [None] * len(batches)
 
-        async def _run_batch(idx: int, batch: list[str]) -> None:
+        # LEGACY: def _run_batch(idx: int, batch: list[str]) -> None:
             nonlocal tokens
             async with semaphore:
                 self._emit("stage", task_id, stage="2-sub",
@@ -1750,7 +1750,7 @@ class Orchestrator:
                 pre_reads: list[tuple[str, list[str]]] = []
                 for relpath in batch:
                     fullpath = os.path.join(target_dir, relpath)
-                    ftype, lines = await loop.run_in_executor(
+                    ftype, lines = # LEGACY: loop.run_in_executor(
                         None, self._pre_read_file, fullpath)
                     pre_reads.append((ftype, lines))
 
@@ -1767,7 +1767,7 @@ class Orchestrator:
                         parts.append("内容: (空文件或无法读取)")
                 prompt = '\n'.join(parts)
 
-                ar = await _run_agent_checked(
+                ar = # LEGACY: _run_agent_checked(
                     prompt=prompt,
                     model=sub_model or w_base.get("model", ""),
                     tools=[],   # 内容已预读，无需工具
@@ -1789,7 +1789,7 @@ class Orchestrator:
                     results[idx] = chr(10).join(
                         f"{f} | unknown | (分析失败) | -" for f in batch)
 
-        await asyncio.gather(*[_run_batch(i, b) for i, b in enumerate(batches)])
+        # LEGACY: asyncio.gather(*[_run_batch(i, b) for i, b in enumerate(batches)])
 
         all_lines = []
         for r in results:

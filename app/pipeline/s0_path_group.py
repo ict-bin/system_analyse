@@ -293,7 +293,7 @@ class PathGroupStage(BaseStage):
     stage_num = 0
     stage_name = "路径先验分组"
 
-    async def execute(self, ctx: PipelineContext) -> None:
+    def execute(self, ctx: PipelineContext) -> None:
         cp = ctx.checkpoint
 
         if cp and cp.is_done("s0_pathgroup"):

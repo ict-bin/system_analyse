@@ -10,7 +10,7 @@ orchestrator.py — 薄层流水线编排器 v3
 """
 from __future__ import annotations
 
-import asyncio
+import threading
 import logging
 import os
 import shutil
@@ -61,7 +61,7 @@ class Orchestrator:
     ):
         self.cfg = config
         self._on_event = on_event
-        self._cancel_event: asyncio.Event | None = None
+        self._cancel_event: threading.Event | None = None
 
     def _emit(self, event_type: str, task_id: str, **data) -> None:
         if self._on_event:
@@ -131,15 +131,15 @@ class Orchestrator:
         # ── 发射 task_config_print 事件（供 stages_json 记录） ────────────────
         self._emit("task_config_print", task_id, lines=lines)
 
-    async def execute(self, task_id: str | None = None) -> TaskResult:
+    def execute(self, task_id: str | None = None) -> TaskResult:
         cfg = self.cfg
         task_id = task_id or make_id()
         start = time.time()
-        self._cancel_event = asyncio.Event()
+        self._cancel_event = threading.Event()
 
         # ── 同步配置中心的 LLM Provider → pi models.json ─────────────────────
         svc = get_service_yaml()
-        sync_ok = await sync_providers_to_pi(
+        sync_ok = sync_providers_to_pi(
             base_url=svc.configcenter.base_url,
             token=svc.auth_service.service_machine_token,
             timeout=svc.configcenter.timeout,
@@ -272,7 +272,7 @@ class Orchestrator:
         ])
 
         try:
-            await pipeline.run(ctx)
+            pipeline.run(ctx)
             result.status = TaskStatus.PASSED
             result.total_tokens = ctx.tokens
             # S0 过滤结果为 0 文件：流水线已正常终止，写说明报告
@@ -304,7 +304,7 @@ class Orchestrator:
             result.error = str(e)
             result.total_tokens = ctx.tokens
             self._emit("stage_fail", task_id, error=str(e))
-        except asyncio.CancelledError:
+        except Exception:
             result.status = TaskStatus.FAILED
             result.error = "任务被取消"
             result.total_tokens = ctx.tokens
