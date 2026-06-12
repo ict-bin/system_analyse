@@ -37,9 +37,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
-# SSE: EventSourceResponse removed (no asyncio)  # from sse_starlette.sse import EventSourceResponse
 
 from .build_info import build_service_meta
 from .config import (
@@ -153,7 +152,7 @@ def _should_run_db_migrations() -> bool:
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
-def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):
     # --- startup ---
     global _probe_shutdown, _probe_started_at
     _probe_shutdown = False
@@ -459,7 +458,8 @@ def submit_analyse(body: AnalyseRequest):
             time.sleep(CLEANUP_DELAY)
             _tasks.pop(task_id, None)
 
-    threading.Thread(target=_run())
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
     return {
         "task_id": task_id,
         "source_file": cfg.source_file,
@@ -526,7 +526,7 @@ def stream_task(task_id: str):
             if queue in entry.queues:
                 entry.queues.remove(queue)
 
-    return EventSourceResponse(gen())
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.post("/task/{task_id}/stop")
