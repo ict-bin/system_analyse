@@ -9,9 +9,14 @@ SERVICE_NAME="${SECFLOW_PROBE_SERVICE_NAME:-secflow-app}"
 PYTHON_BIN="$(command -v python3 || command -v python)"
 rm -f "${PID_FILE}" "${STARTED_AT_FILE}"
 
-echo "[${SERVICE_NAME}] starting independent probe process"
-"${PYTHON_BIN}" -m app.probe_process &
-probe_pid=$!
+start_probe() {
+    echo "[${SERVICE_NAME}] starting independent probe process"
+    "${PYTHON_BIN}" -m app.probe_process &
+    probe_pid=$!
+    echo "[${SERVICE_NAME}] probe pid=${probe_pid}"
+}
+
+start_probe
 
 echo "[${SERVICE_NAME}] starting main process: $*"
 "$@" &
@@ -38,6 +43,13 @@ cleanup() {
 trap 'terminate_children' TERM INT
 
 set +e
+while kill -0 "${main_pid}" 2>/dev/null; do
+    if ! kill -0 "${probe_pid}" 2>/dev/null; then
+        echo "[${SERVICE_NAME}] probe exited unexpectedly; restarting"
+        start_probe
+    fi
+    sleep 1
+done
 wait "${main_pid}"
 main_status=$?
 set -e
