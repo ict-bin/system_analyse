@@ -268,7 +268,7 @@ class AnalyseStage(BaseStage):
         w_sys = w_sys_prompt.replace("{{PRE_READ_CONTENT}}", pre_read_content) \
                             .replace("{{MODULE_NAME}}", mod_name)
         # read 工具始终开放：Worker 需要通过 read details/<path>.json 获取完整符号表
-        w_tools_s3 = ["read", "write", "bash"]
+        w_tools_s3 = ["read", "write", "edit", "bash"]
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
