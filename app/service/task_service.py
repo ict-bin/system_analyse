@@ -1909,7 +1909,7 @@ class TaskService:
             return
         task_thread = threading.Thread(target=self._runner.execute_task, args=(task_id, lease_epoch), name=f"sa_task_{task_id}", daemon=True)
         task_thread.start()
-        _running_tasks[task_id] = asyncio_task
+        _running_tasks[task_id] = task_thread
         _running_task_epochs[task_id] = lease_epoch
 
     def _start_runner_assignment_loop(self) -> None:
