@@ -64,14 +64,13 @@ class ValidateDetailsStage(BaseStage):
         ctx.emit_event("stage", stage="validate_details")
 
         if os.path.isfile(validate_script):
-            proc = subprocess.run(
-                "python3", validate_script, str(workspace),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            result = subprocess.run(
+                ["python3", validate_script, str(workspace)],
+                capture_output=True,
                 env={**os.environ, "TMPDIR": str(ctx.task_tmp)},
             )
-            stdout, stderr = proc.communicate()
-            out = (stdout or b"").decode("utf-8", errors="replace").strip()
+            out = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+            err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
             if out:
                 ctx.emit_event("cli_output", stage="validate_details", text=out[:2000])
         else:

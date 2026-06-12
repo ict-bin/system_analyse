@@ -72,16 +72,13 @@ class TypeClassifyStage(BaseStage):
             return
 
         ctx.emit_event("stage", stage="type_classify")
-        proc = subprocess.run(
-            "python3", classify_script,
-            ctx.cfg.target_dir, str(workspace),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        result = subprocess.run(
+            ["python3", classify_script, ctx.cfg.target_dir, str(workspace)],
+            capture_output=True,
             env={**os.environ, "TMPDIR": str(ctx.task_tmp)},
         )
-        stdout, stderr = proc.communicate()
-        out = (stdout or b"").decode("utf-8", errors="replace").strip()
-        err = (stderr or b"").decode("utf-8", errors="replace").strip()
+        out = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+        err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
         combined = (out + ("\n" + err if err else "")).strip()
         if combined:
             ctx.emit_event("cli_output", stage="type_classify", text=combined[:2000])
