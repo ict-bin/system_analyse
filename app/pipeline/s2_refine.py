@@ -309,9 +309,9 @@ class RefineStage(BaseStage):
         # 等待 LLM 全部完成
         self._queue.join()
 
-        # 停止 LLM workers
-        for w in llm_workers:
-            w.cancel()
+        # 停止 LLM workers (send sentinel values to daemon threads)
+        for _ in llm_workers:
+            self._queue.put(None)
         # [THREAD] replaced: # GATHER   # *llm_workers, return_exceptions=True)
 
         # 标记 commit 队列结束
@@ -342,6 +342,9 @@ class RefineStage(BaseStage):
     def _llm_worker(self) -> None:
         while True:
             mod_name = self._queue.get()
+            if mod_name is None:  # sentinel to stop
+                self._queue.task_done()
+                return
             self._in_progress.add(mod_name)
             try:
                 if mod_name not in self._refined:
