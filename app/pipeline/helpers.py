@@ -186,7 +186,16 @@ def run_agent_with_stage_guard(
                 if result_holder["done"]:
                     if result_holder["error"]:
                         raise result_holder["error"]
-                    return result_holder["result"]
+                    result = result_holder["result"]
+                    if getattr(result, "rate_limit_event_due", False):
+                        ctx.emit_event(
+                            "task_rate_limited_retrying",
+                            stage=stage,
+                            http_status=429,
+                            retry_delay_seconds=int(getattr(result, "retry_delay_seconds", 30) or 30),
+                            consecutive_rate_limit_count=int(getattr(result, "consecutive_rate_limit_count", 0) or 0),
+                        )
+                    return result
             heartbeat_index += 1
             elapsed = time.monotonic() - started_monotonic
             payload = _payload(heartbeat_index)

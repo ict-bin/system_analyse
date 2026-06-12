@@ -493,6 +493,43 @@ def test_run_agent_with_stage_guard_enforces_timeout():
     print("  ✅ run_agent_with_stage_guard 硬超时生效")
 
 
+def test_run_agent_with_stage_guard_emits_rate_limit_timeline_event_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        setup_prompts(tmp)
+        ctx = make_ctx(tmp)
+        events: list[dict] = []
+
+        def collect(ev: SwarmEvent):
+            events.append({"type": ev.type, **ev.data})
+
+        ctx.emit = collect
+        ar = make_ar(output="retry later", error="429 too many requests")
+        ar.rate_limited = True
+        ar.retry_delay_seconds = 30
+        ar.consecutive_rate_limit_count = 10
+        ar.rate_limit_event_due = True
+
+        with patch("app.pipeline.helpers.run_agent_checked", return_value=ar):
+            result = run_agent_with_stage_guard(
+                ctx=ctx,
+                stage="analyse",
+                context="rate-limit-check",
+                prompt="hello",
+                model="test-model",
+                tools=["read"],
+                cwd=tmp,
+            )
+
+        assert result is ar
+        rate_events = [event for event in events if event["type"] == "task_rate_limited_retrying"]
+        assert len(rate_events) == 1
+        assert rate_events[0]["stage"] == "analyse"
+        assert rate_events[0]["http_status"] == 429
+        assert rate_events[0]["retry_delay_seconds"] == 30
+        assert rate_events[0]["consecutive_rate_limit_count"] == 10
+        print("  ✅ run_agent_with_stage_guard 透传 429 限流事件")
+
+
 # ─── 6. FilterStage ─────────────────────────────────────────────────────────────
 
 def test_filter_stage_no_script():

@@ -87,6 +87,10 @@ class AgentResult:
         self.exit_code: int = 0
         self.error: str | None = None
         self.fatal: bool = False
+        self.rate_limited: bool = False
+        self.consecutive_rate_limit_count: int = 0
+        self.retry_delay_seconds: int = 0
+        self.rate_limit_event_due: bool = False
 
 
 # ─── 内部异常 ─────────────────────────────────────────────────────────────────
@@ -314,7 +318,12 @@ _RETRYABLE_QUERY_ENGINE_401_PATTERNS = [
 ]
 
 _RATE_LIMIT_PATTERNS = ["rate limit", "429", "too many requests", "network_error", "finish_reason"]
-_RATE_LIMIT_EXTRA_DELAY = 60
+_RATE_LIMIT_EXTRA_DELAY = 30
+
+
+def _should_emit_rate_limit_event(streak: int) -> bool:
+    streak = max(0, int(streak or 0))
+    return streak == 1 or (streak > 0 and streak % 10 == 0)
 
 _PI_CRASH_PATTERNS = [
     "cannot find module", "module not found", "syntaxerror",
@@ -866,6 +875,7 @@ def _run_with_api_retry(
     restart_count: int = 0
 
     api_attempt = 0
+    rate_limit_streak = 0
     query_engine_401_failures = 0
     effective_prompt = prompt
 
@@ -1112,36 +1122,51 @@ def _run_with_api_retry(
         query_engine_401_failures = 0
 
         if _is_retryable_api_error(result):
-            api_attempt += 1
-            can_retry = (max_retries == -1) or (api_attempt <= max_retries)
-            if can_retry:
-                delay = _backoff(retry_delay, api_attempt)
-                err_lower = (result.error or "").lower()
-                is_rate_limit = any(p in err_lower for p in _RATE_LIMIT_PATTERNS)
-                if is_rate_limit:
-                    delay = max(delay, _RATE_LIMIT_EXTRA_DELAY)
-                label = f"{api_attempt}/{_fmt_max(max_retries)}"
-                kind = "限流" if is_rate_limit else "API"
+            err_lower = (result.error or "").lower()
+            is_rate_limit = any(p in err_lower for p in _RATE_LIMIT_PATTERNS)
+            if is_rate_limit:
+                rate_limit_streak += 1
+                delay = _RATE_LIMIT_EXTRA_DELAY
+                result.rate_limited = True
+                result.consecutive_rate_limit_count = rate_limit_streak
+                result.retry_delay_seconds = int(delay)
+                result.rate_limit_event_due = _should_emit_rate_limit_event(rate_limit_streak)
                 _log_warn(
-                    f"{kind}错误 [{label}], {delay:.0f}s 后重试: "
+                    f"限流错误 [streak={rate_limit_streak}], {delay:.0f}s 后重试: "
                     f"{(result.error or '')[:200]}"
                 )
                 if on_stream:
-                    on_stream(f"\n⚠️ {kind}错误，{delay:.0f}s 后重试 ({label})...\n")
+                    on_stream(f"\n⚠️ 限流错误，{delay:.0f}s 后重试 (连续第 {rate_limit_streak} 次)...\n")
                 if _session_has_assistant_content(session_file):
                     effective_prompt = "继续完成上次未完成的任务。"
                     _log_warn("session 已有内容，重试时发送「继续」而非重复完整 prompt")
                 time.sleep(delay)
                 continue
-            else:
-                _log_error(
-                    f"API 重试耗尽 [{api_attempt}/{max_retries}]: "
+            rate_limit_streak = 0
+            api_attempt += 1
+            can_retry = (max_retries == -1) or (api_attempt <= max_retries)
+            if can_retry:
+                delay = _backoff(retry_delay, api_attempt)
+                label = f"{api_attempt}/{_fmt_max(max_retries)}"
+                _log_warn(
+                    f"API错误 [{label}], {delay:.0f}s 后重试: "
                     f"{(result.error or '')[:200]}"
                 )
-                result.error = (
-                    result.error or ""
-                ) + f" [API 重试耗尽: {api_attempt} 次失败]"
-                return result
+                if on_stream:
+                    on_stream(f"\n⚠️ API错误，{delay:.0f}s 后重试 ({label})...\n")
+                if _session_has_assistant_content(session_file):
+                    effective_prompt = "继续完成上次未完成的任务。"
+                    _log_warn("session 已有内容，重试时发送「继续」而非重复完整 prompt")
+                time.sleep(delay)
+                continue
+            _log_error(
+                f"API 重试耗尽 [{api_attempt}/{max_retries}]: "
+                f"{(result.error or '')[:200]}"
+            )
+            result.error = (
+                result.error or ""
+            ) + f" [API 重试耗尽: {api_attempt} 次失败]"
+            return result
 
         if result.exit_code != 0 and result.error:
             err_lower = (result.error or "").lower()

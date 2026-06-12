@@ -158,6 +158,18 @@ class TaskRunner:
 
         def _record_stage_timeline_if_needed(event: SwarmEvent) -> None:
             stage_name = _normalize_stage_name(event.data.get("stage"))
+            if str(event.type or "").strip().lower() == "task_rate_limited_retrying":
+                payload = dict(event.data or {})
+                self._deps.record_timeline_event(
+                    task_id=task_id,
+                    project_id=getattr(task_snapshot, "project_id", None),
+                    stage_name=stage_name,
+                    event_type="task_rate_limited_retrying",
+                    message="智能体请求被 429 限流，30 秒后自动重试",
+                    level="warning",
+                    payload=payload,
+                )
+                return
             if not stage_name:
                 return
             raw_type = str(event.type or "").strip().lower()
