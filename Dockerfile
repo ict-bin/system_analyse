@@ -41,4 +41,4 @@ COPY scripts/entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
-CMD ["python3", "main.py"]
+CMD ["./scripts/start-with-probe.sh", "python3", "main.py"]
