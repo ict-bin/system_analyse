@@ -312,13 +312,14 @@ class RefineStage(BaseStage):
         # 停止 LLM workers (send sentinel values to daemon threads)
         for _ in llm_workers:
             self._queue.put(None)
-        # [THREAD] replaced: # GATHER   # *llm_workers, return_exceptions=True)
+        for w in llm_workers:
+            w.join()
 
         # 标记 commit 队列结束
         self._commit_queue.put(None)
 
         # 等待 commit 完成
-        commit_task
+        commit_thread.join()
 
         if self._errors:
             for e in self._errors:
