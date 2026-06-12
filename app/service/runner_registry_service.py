@@ -63,6 +63,8 @@ class RunnerRegistryService:
             try:
                 task
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
         self._task = None
 

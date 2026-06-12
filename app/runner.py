@@ -403,6 +403,8 @@ class _StdoutReader:
             if buf.strip():
                 self.line_queue.put(buf.decode("utf-8", errors="replace"))
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
         finally:
             self.done.set()
@@ -461,6 +463,8 @@ class _StderrReader:
                 chunks.append(chunk)
             self.data = b"".join(chunks)
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
         finally:
             self.result.set()
@@ -814,6 +818,8 @@ def _session_has_assistant_content(session_file: "str | None") -> bool:
                 try:
                     obj = json.loads(line)
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     continue
                 msg = obj.get("message") or {}
                 if isinstance(msg, dict) and msg.get("role") == "assistant":
@@ -827,6 +833,8 @@ def _session_has_assistant_content(session_file: "str | None") -> bool:
                     if len(text.strip()) > 10:
                         return True
     except Exception:
+        import traceback
+        traceback.print_exc()
         pass
     return False
 
@@ -1013,6 +1021,8 @@ def _run_with_api_retry(
             try:
                 proc.stdin.close()
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
 
             # Get stderr
@@ -1232,6 +1242,8 @@ def run_agents_parallel(
             try:
                 f.result()
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
 
     return results  # type: ignore[return-value]

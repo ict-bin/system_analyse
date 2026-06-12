@@ -133,6 +133,8 @@ class TaskRepository:
         try:
             db.execute(text("SELECT RELEASE_LOCK(:lock_key)"), {"lock_key": lock_key})
         except Exception:
+            import traceback
+            traceback.print_exc()
             db.rollback()
 
     @staticmethod

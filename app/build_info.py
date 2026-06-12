@@ -13,6 +13,8 @@ def _read_build_version() -> str | None:
     try:
         payload = json.loads(BUILD_META_PATH.read_text(encoding="utf-8"))
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
     value = payload.get("build_version")
     normalized = str(value or "").strip()

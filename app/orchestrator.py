@@ -68,6 +68,8 @@ class Orchestrator:
             try:
                 self._on_event(SwarmEvent(type=event_type, task_id=task_id, data=data))
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
 
     def stop(self) -> None:
@@ -232,6 +234,8 @@ class Orchestrator:
                 try:
                     self._on_event(event)
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     pass
 
         ctx = PipelineContext(

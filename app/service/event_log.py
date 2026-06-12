@@ -115,6 +115,8 @@ def strip_final_marker(path: Optional[Path]) -> None:
                     lines.pop()
                     continue
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
             break
         if len(lines) != len(content.splitlines(keepends=True)):

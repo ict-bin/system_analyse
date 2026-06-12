@@ -110,6 +110,8 @@ def _extract_classify_body(framework_path: Path) -> str | None:
             return None
         return body
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -126,6 +128,8 @@ def _write_classify_framework(workspace: Path) -> None:
     try:
         template = _CLASSIFY_FRAMEWORK_TEMPLATE_PATH.read_text("utf-8")
     except Exception:
+        import traceback
+        traceback.print_exc()
         # 最简 fallback：直接给 Worker 一个可用但无基础设施的脚本
         template = (
             "#!/usr/bin/env bash\n"
@@ -157,6 +161,8 @@ def _write_classify_framework(workspace: Path) -> None:
         import os as _os
         _os.chmod(str(framework_path), 0o755)
     except Exception:
+        import traceback
+        traceback.print_exc()
         pass
 
 
@@ -588,6 +594,8 @@ class ClassifyStage(BaseStage):
                         if flist.exists():
                             total_classified += sum(1 for l in flist.read_text("utf-8").splitlines() if l.strip())
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     pass
                 coverage = f"{total_classified}/{filtered_total}" if filtered_total > 0 else str(total_classified)
                 incremental_guidance = (

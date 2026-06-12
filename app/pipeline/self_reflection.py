@@ -59,6 +59,8 @@ def _collect_task_data(
         try:
             data["evaluation_summary"] = json.loads(summary_path.read_text("utf-8", errors="replace"))
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
 
     # 2. round_*.json 文件聚合
@@ -74,6 +76,8 @@ def _collect_task_data(
                 if isinstance(payload, dict):
                     all_rounds.append(payload)
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
 
     # 按 stage 聚合统计
@@ -162,6 +166,8 @@ def _collect_task_data(
                         try:
                             obj = json.loads(line)
                         except Exception:
+                            import traceback
+                            traceback.print_exc()
                             continue
                         # Only look at messages with toolCall content
                         if not isinstance(obj, dict):
@@ -175,6 +181,8 @@ def _collect_task_data(
                                         name = item.get("name", "unknown")
                                         tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
         data["session_tool_stats"] = tool_call_counts
 
@@ -186,6 +194,8 @@ def _collect_task_data(
                 "utf-8", errors="replace"
             )[:_FINAL_REPORT_EXCERPT]
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
 
     # 5. Low-score module reports (score < 70 or no report)
@@ -213,6 +223,8 @@ def _collect_task_data(
                             "content": text[:_MODULE_REPORT_EXCERPT],
                         })
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     pass
 
     return data
@@ -407,6 +419,8 @@ class SelfReflectionService:
                     cancel_event=cancel_ev,
                 )
             except Exception:
+                import traceback
+                traceback.print_exc()
                 logger.warning(
                     "[self-reflection] 任务 %s 自省分析超时（%.1fs），已终止",
                     task_id,

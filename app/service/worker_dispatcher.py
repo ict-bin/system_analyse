@@ -186,6 +186,8 @@ class WorkerDispatcher:
             try:
                 task
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
         self._task = None
 
@@ -205,6 +207,8 @@ class WorkerDispatcher:
                     )
                 time.sleep(worker_sleep_seconds(self._idle_sleep_seconds))
             except Exception:
+                import traceback
+                traceback.print_exc()
                 raise
             except Exception as exc:
                 _runtime_state.last_error = str(exc)

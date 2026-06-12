@@ -66,6 +66,8 @@ def _load_auth() -> tuple[str, ssl.SSLContext] | tuple[None, None]:
         with open(K8S_TOKEN_PATH, "r", encoding="utf-8") as fh:
             token = fh.read().strip()
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None, None
     if not token:
         return None, None

@@ -112,10 +112,14 @@ class CheckpointManager:
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             tmp.rename(target)
         except Exception:
+            import traceback
+            traceback.print_exc()
             # 写入失败不影响主流程，只是续跑时需要重新执行该阶段
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
 
     def is_done(self, name: str) -> bool:
@@ -127,6 +131,8 @@ class CheckpointManager:
         try:
             self._resolve(name).unlink(missing_ok=True)
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
 
     def clear_all(self) -> None:
@@ -139,6 +145,8 @@ class CheckpointManager:
             (self._dir / _S2_MODULES_DIR).mkdir(exist_ok=True)
             (self._dir / _S3_MODULES_DIR).mkdir(exist_ok=True)
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
 
     # ── 模块级批量操作 ────────────────────────────────────────────────────
@@ -192,6 +200,8 @@ class CheckpointManager:
                     data = json.loads(p.read_text(encoding="utf-8"))
                     stages[key] = {"done": True, **data}
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     stages[key] = {"done": True, "completed_at": None, "extra": {}}
             else:
                 stages[key] = {"done": False}
@@ -206,6 +216,8 @@ class CheckpointManager:
                     data = json.loads(p.read_text(encoding="utf-8"))
                     result[p.stem] = {"done": True, **data}
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     result[p.stem] = {"done": True}
             return result
 

@@ -33,6 +33,8 @@ def process_group_id(proc: subprocess.Popen) -> int | None:
     except ProcessLookupError:
         return None
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -46,6 +48,8 @@ def process_group_exists(pgid: int | None) -> bool:
     except PermissionError:
         return True
     except Exception:
+        import traceback
+        traceback.print_exc()
         return False
     return True
 
@@ -66,6 +70,8 @@ def _read_proc_name(pid: int, field: str) -> str:
             errors="replace",
         ).strip()
     except Exception:
+        import traceback
+        traceback.print_exc()
         return ""
 
 
@@ -77,6 +83,8 @@ def _pid1_is_reaper_process() -> bool:
     try:
         pid1_exe = os.path.basename(os.readlink("/proc/1/exe")).lower()
     except Exception:
+        import traceback
+        traceback.print_exc()
         pid1_exe = ""
     return pid1_exe in _PID1_REAPER_NAMES
 
@@ -99,6 +107,8 @@ def cleanup_orphan_pi_processes(
             comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
             exe = os.path.basename(os.readlink(proc_dir / "exe"))
         except Exception:
+            import traceback
+            traceback.print_exc()
             continue
         if comm != "pi" and exe != "node":
             continue
@@ -121,11 +131,15 @@ def cleanup_orphan_pi_processes(
                 ).strip()
             )
         except Exception:
+            import traceback
+            traceback.print_exc()
             pgid = None
         if orphan_verifier is not None:
             try:
                 kill_allowed, reason = orphan_verifier(pid, ppid, pgid)
             except Exception:
+                import traceback
+                traceback.print_exc()
                 kill_allowed, reason = False, "orphan_verifier_failed"
             if not kill_allowed:
                 logger(
@@ -145,6 +159,8 @@ def cleanup_orphan_pi_processes(
         except ProcessLookupError:
             continue
         except Exception:
+            import traceback
+            traceback.print_exc()
             continue
     return killed
 
@@ -158,6 +174,8 @@ def _wait_with_timeout(proc: subprocess.Popen, timeout: float) -> None:
             proc.wait()
             result[0] = True
         except Exception:
+            import traceback
+            traceback.print_exc()
             result[0] = False
 
     t = threading.Thread(target=_waiter, daemon=True)

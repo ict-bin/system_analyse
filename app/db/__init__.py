@@ -105,6 +105,8 @@ def _run_migrations(engine) -> None:
                 conn.commit()
                 logger.info("Migration applied: %s", stmt[:60])
             except Exception:
+                import traceback
+                traceback.print_exc()
                 conn.rollback()
 
 
@@ -154,4 +156,6 @@ def ping_db() -> bool:
             conn.execute(text("SELECT 1"))
         return True
     except Exception:
+        import traceback
+        traceback.print_exc()
         return False

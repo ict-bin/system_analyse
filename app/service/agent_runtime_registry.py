@@ -17,6 +17,8 @@ def _normalize_path(value: str | None) -> str | None:
     try:
         return str(Path(raw).resolve(strict=False))
     except Exception:
+        import traceback
+        traceback.print_exc()
         return raw
 
 

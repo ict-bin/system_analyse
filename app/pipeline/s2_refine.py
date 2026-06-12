@@ -270,6 +270,8 @@ class RefineStage(BaseStage):
             if not any(ln.strip() for ln in fl.read_text("utf-8", errors="replace").splitlines()):
                 return False
         except Exception:
+            import traceback
+            traceback.print_exc()
             return False
         return not (mod_dir / ".snapshot").exists()
 
@@ -370,6 +372,8 @@ class RefineStage(BaseStage):
                             traceback_text=_tb.format_exc(),
                         )
                     except Exception:
+                        import traceback
+                        traceback.print_exc()
                         pass
                 fatal = PiFatalError(f"S2 refine {mod_name}: {type(e).__name__}: {e}")
                 fatal.fatal = True

@@ -497,6 +497,8 @@ class SubReaderStage(BaseStage):
                                             existing["confidence"] = item["confidence"]
                                         _write_detail_json(dp, existing)
                             except Exception:
+                                import traceback
+                                traceback.print_exc()
                                 pass
 
     def _build_classify_context(

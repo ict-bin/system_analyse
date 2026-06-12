@@ -71,6 +71,8 @@ class RegistryService:
                 return False
             return resp.status_code == 200
         except Exception:
+            import traceback
+            traceback.print_exc()
             return False
 
     def _loop(self) -> None:

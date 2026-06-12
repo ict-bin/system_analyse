@@ -21,6 +21,8 @@ def _read_status_value(proc_dir: pathlib.Path, key: str) -> int | None:
     try:
         status = (proc_dir / "status").read_text(encoding="utf-8", errors="replace")
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
     prefix = f"{key}:"
     for line in status.splitlines():
@@ -57,6 +59,8 @@ def _iter_agent_processes_for_cleanup() -> list[dict[str, Any]]:
             ).strip()
             pgid = int(stat) if stat else None
         except Exception:
+            import traceback
+            traceback.print_exc()
             continue
         is_pi_runtime = comm == "pi" or exe == "node"
         is_python_runtime = comm.lower() in {"python", "python3"} or exe.lower().startswith("python")
@@ -73,6 +77,8 @@ def _iter_agent_processes_for_cleanup() -> list[dict[str, Any]]:
                 if idx + 1 < len(tokens):
                     session_arg_path = tokens[idx + 1]
             except Exception:
+                import traceback
+                traceback.print_exc()
                 session_arg_path = None
         items.append(
             {

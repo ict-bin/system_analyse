@@ -92,6 +92,8 @@ def _read_text(path: pathlib.Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace").strip()
     except Exception:
+        import traceback
+        traceback.print_exc()
         return ""
 
 
@@ -102,6 +104,8 @@ def _normalize_path(raw: str | None) -> str | None:
     try:
         return str(pathlib.Path(value).resolve(strict=False))
     except Exception:
+        import traceback
+        traceback.print_exc()
         return value
 
 
@@ -171,6 +175,8 @@ def _iter_agent_processes() -> list[dict[str, Any]]:
         try:
             command = (proc_dir / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
         except Exception:
+            import traceback
+            traceback.print_exc()
             continue
         exe = None
         with contextlib.suppress(Exception):
@@ -243,6 +249,8 @@ def _path_belongs_to_root(path_value: str | None, root: str | None) -> bool:
         pathlib.Path(path_value).relative_to(pathlib.Path(root))
         return True
     except Exception:
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -275,6 +283,8 @@ def _path_mtime(path_value: str | None) -> datetime | None:
     try:
         return datetime.fromtimestamp(pathlib.Path(normalized).stat().st_mtime)
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -288,6 +298,8 @@ def _read_execution_lock_payload(task_root: str | None) -> dict[str, Any] | None
         payload = json.loads(lock_path.read_text(encoding="utf-8"))
         return payload if isinstance(payload, dict) else None
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -312,6 +324,8 @@ def _session_descriptor_map(task_row: AppSaTask) -> dict[str, dict[str, Any]]:
             write_json_atomic=None,
         )
     except Exception:
+        import traceback
+        traceback.print_exc()
         return {}
     result: dict[str, dict[str, Any]] = {}
     for node in (catalog.get("index") or {}).get("nodes") or []:
@@ -339,6 +353,8 @@ def _parse_session_jsonl_file(path: pathlib.Path) -> tuple[dict, list[dict], lis
         try:
             payload = json.loads(raw)
         except Exception:
+            import traceback
+            traceback.print_exc()
             continue
         if not isinstance(payload, dict):
             continue
@@ -500,6 +516,8 @@ class AgentObservabilityService:
         try:
             build_worker_slot_cluster_snapshot(db, project_id=project_id)
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
 
         processes: list[dict[str, Any]] = []
@@ -536,6 +554,8 @@ class AgentObservabilityService:
                 if started_at_ts is not None:
                     process_age_seconds = max(0, int(time.time() - float(started_at_ts)))
             except Exception:
+                import traceback
+                traceback.print_exc()
                 process_age_seconds = None
             if task_row is not None and str(task_status or "").strip() in _RUNNING_TASK_STATUSES and runtime_evidence["live_runtime_evidence"]:
                 owner_kind = "tracked"

@@ -196,6 +196,8 @@ try:
 
         app.include_router(runner_internal_router)
 except Exception:
+    import traceback
+    traceback.print_exc()
     logger.exception("failed to include runner internal observability router")
 
 
@@ -483,6 +485,8 @@ def _notify(entry: TaskEntry):
                 "cost": entry.result.total_tokens.cost,
             })
     except Exception:
+        import traceback
+        traceback.print_exc()
         log_event(logger, logging.WARNING, "callback notification failed",
                   event="callback_failed", task_id=entry.task_id,
                   callback_url=entry.callback_url or "")

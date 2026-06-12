@@ -596,6 +596,8 @@ def _resolve_worker_http_port(worker: Any) -> int:
     try:
         return max(1, int(getattr(worker, "http_port", 0) or 8080))
     except Exception:
+        import traceback
+        traceback.print_exc()
         return 8080
 
 
@@ -816,6 +818,8 @@ def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, Any]:
             try:
                 snapshot_results.append(f.result())
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
     for worker, urls, snapshot, error_detail in snapshot_results:
         if snapshot is None:
@@ -979,6 +983,8 @@ def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, Any]:
             try:
                 summary_results.append(f.result())
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
     for worker, urls, worker_summary, error_detail in summary_results:
         if worker_summary is None:
@@ -1795,6 +1801,8 @@ def cancel_task(
             payload={"owner_cleanup": cleanup},
         )
     except Exception:
+        import traceback
+        traceback.print_exc()
         logger.exception("failed to record aggregate cleanup event for cancelled task")
     return result
 
@@ -1862,6 +1870,8 @@ def get_task_reflection(task_id: str, db: Session = Depends(get_db)):
             or "/data/self-reflection"
         )
     except Exception:
+        import traceback
+        traceback.print_exc()
         pass
 
     from pathlib import Path
@@ -1885,6 +1895,8 @@ def get_task_reflection(task_id: str, db: Session = Depends(get_db)):
                     "utf-8", errors="replace"
                 )
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
     return {
         "task_id": task_id,

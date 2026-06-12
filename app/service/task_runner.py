@@ -248,18 +248,17 @@ class TaskRunner:
                     self._deps.flush_stages(task_id, event_buffer)
                 last_stage_flush_count = len(event_buffer)
             orch = Orchestrator(config=cfg, on_event=on_event)
-            task_supervisor = threading.Thread(target=
-                self._supervise_running_task(task_id, lease_epoch, orch),
+            task_supervisor = threading.Thread(
+                target=self._supervise_running_task,
+                args=(task_id, lease_epoch, orch),
                 name=f"sa_supervise_{task_id}",
+                daemon=True,
             )
+            task_supervisor.start()
             try:
                 result = orch.execute(task_id)
             finally:
-                task_supervisor.cancel()
-                try:
-                    task_supervisor
-                except Exception:
-                    pass
+                pass  # supervisor thread is daemon
             # 最终增量刷新剩余 events
             if events_file is not None:
                 persisted = append_events(events_file, event_buffer[last_stage_flush_count:])
@@ -269,6 +268,8 @@ class TaskRunner:
                 self._deps.flush_stages(task_id, event_buffer)
             self._persist_task_result(task_id, lease_epoch, task_snapshot, result, event_buffer, events_file)
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
         except Exception as exc:
             log_event(
@@ -643,6 +644,8 @@ class TaskRunner:
                 except StopIteration:
                     pass
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
 
     def _supervise_running_task(self, task_id: str, lease_epoch: int, orch: Orchestrator) -> None:

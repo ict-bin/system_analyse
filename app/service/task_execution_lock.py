@@ -18,6 +18,8 @@ def _read_runner_boot_id() -> str:
     try:
         value = _RUNNER_BOOT_ID_PATH.read_text("utf-8").strip()
     except Exception:
+        import traceback
+        traceback.print_exc()
         value = ""
     return value or f"pid-{RUNNER_MAIN_PID}"
 

@@ -68,6 +68,8 @@ def render_metrics() -> str:
         lines.extend(_render_task_metrics())
         lines.extend(_render_agent_observability_metrics())
     except Exception:
+        import traceback
+        traceback.print_exc()
         lines.append("secflow_sa_up 0")
     return "\n".join(lines) + "\n"
 
@@ -78,6 +80,8 @@ def render_summary_metrics() -> str:
         lines.append("secflow_sa_up 1")
         lines.extend(_render_request_metrics())
     except Exception:
+        import traceback
+        traceback.print_exc()
         lines.append("secflow_sa_up 0")
     return "\n".join(lines) + "\n"
 
@@ -139,6 +143,8 @@ def _render_task_metrics() -> list[str]:
             except StopIteration:
                 pass
     except Exception:
+        import traceback
+        traceback.print_exc()
         rows = []
 
     status_counts: dict[str, int] = defaultdict(int)
@@ -529,6 +535,8 @@ def _load_json(path: Path | None) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -561,6 +569,8 @@ def _load_checkpoint_summary(row: AppSaTask) -> dict[str, Any] | None:
 
         return CheckpointManager(workspace).load_summary()
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -633,6 +643,8 @@ def _render_agent_observability_metrics() -> list[str]:
             except StopIteration:
                 pass
     except Exception:
+        import traceback
+        traceback.print_exc()
         return []
 
     processes = list(snapshot.get("processes") or [])

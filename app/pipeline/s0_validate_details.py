@@ -40,6 +40,8 @@ class ValidateDetailsStage(BaseStage):
                         e["path"] for e in data.get("invalid", [])
                     ]
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     pass
             ctx.emit_event("log", level="info",
                            msg="[S0-ValidateDetails] checkpoint 已完成，跳过")

@@ -48,6 +48,8 @@ def _safe_int(value: object) -> int | None:
             return None
         return int(value)
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -66,6 +68,8 @@ def _parse_iso_timestamp(value: object) -> float | None:
 
         return datetime.fromisoformat(raw).timestamp()
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 

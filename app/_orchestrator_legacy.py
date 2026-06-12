@@ -219,6 +219,8 @@ class Orchestrator:
             try:
                 self._on_event(SwarmEvent(type=event_type, task_id=task_id, data=data))
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
 
     def _make_stream_handler(self, task_id: str, stage: str):
@@ -1570,6 +1572,8 @@ class Orchestrator:
                     try:
                         text = raw.decode('utf-8', errors='ignore')
                     except Exception:
+                        import traceback
+                        traceback.print_exc()
                         return ('binary', [])
                     lines = [l.strip() for l in text.splitlines() if l.strip()][:120]
                     return ('text', lines)
@@ -1601,6 +1605,8 @@ class Orchestrator:
             r = sp.run(["strings", "-n", "6", fullpath], capture_output=True, text=True, timeout=15)
             res["strings_head"] = r.stdout.splitlines()[:50]
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
         return res
 
@@ -1637,6 +1643,8 @@ class Orchestrator:
                         content_full = f.read()
                     return relpath, 'text', {"content": content_full}
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     return relpath, 'binary', {}
 
         # 并行读取全部文件（无数量上限）
@@ -1656,6 +1664,8 @@ class Orchestrator:
             try:
                 _, ftype, data = fut.result(timeout=20)
             except Exception:
+                import traceback
+                traceback.print_exc()
                 ftype, data = 'unknown', {}
             parts.append(f"### {rp}")
             if ftype == 'ELF':

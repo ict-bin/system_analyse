@@ -238,6 +238,8 @@ def discover_modules(workspace: str | Path) -> list[str]:
                 try:
                     shutil.move(str(sub), str(target))
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     pass
             else:
                 # 目标已存在：将 sub 的 files.list 去重追加到 target，再删除 sub
@@ -249,6 +251,8 @@ def discover_modules(workspace: str | Path) -> list[str]:
                                 _fh.write(f + "\n")
                     shutil.rmtree(str(sub), ignore_errors=True)
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     pass
     # ── 收集第一层叶节点模块 ──────────────────────────────────────────
     result = []
@@ -331,6 +335,8 @@ def load_prompt(source, name: str, role: str | None = None) -> str:
             if isinstance(prompt, str) and prompt.strip():
                 return prompt.strip()
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
 
     # source 可能是完整 cfg 对象，而不是 prompt_dir 字符串。
@@ -342,6 +348,8 @@ def load_prompt(source, name: str, role: str | None = None) -> str:
             role_obj = getattr(source, role)
             prompt_dir = str(getattr(role_obj, "system_prompt_dir", "") or "")
         except Exception:
+            import traceback
+            traceback.print_exc()
             prompt_dir = ""
     if not prompt_dir:
         prompt_dir = str(source or "")
@@ -728,6 +736,8 @@ def fix_orphan_dirs_before_judge(
                 shutil.move(str(d), str(target))
                 fixed.append(f"{d.name} → modules/{correct_name}")
             except Exception:
+                import traceback
+                traceback.print_exc()
                 # move 失败则直接删除孤儿目录，避免污染 check
                 shutil.rmtree(str(d), ignore_errors=True)
                 fixed.append(f"{d.name} (removed, move failed)")
@@ -746,6 +756,8 @@ def fix_orphan_dirs_before_judge(
                 shutil.rmtree(str(d), ignore_errors=True)
                 fixed.append(f"{d.name} merged → modules/{correct_name}")
             except Exception:
+                import traceback
+                traceback.print_exc()
                 shutil.rmtree(str(d), ignore_errors=True)
                 fixed.append(f"{d.name} (removed, merge failed)")
     return fixed
@@ -1009,6 +1021,8 @@ def pre_read_file(fullpath: str) -> tuple[str, list[str]]:
                 try:
                     text = raw.decode('utf-8', errors='ignore')
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     return ('binary', [])
                 lines = [l.strip() for l in text.splitlines() if l.strip()][:120]
                 return ('text', lines)
@@ -1063,6 +1077,8 @@ def read_one_elf(fullpath: str) -> dict:
         _filtered = [s for s in r.stdout.splitlines() if _ident_re.match(s)]
         res["strings_head"] = _filtered[:50]
     except Exception:
+        import traceback
+        traceback.print_exc()
         pass
     return res
 
@@ -1097,6 +1113,8 @@ def pre_read_module(target_dir: str, mod_dir: Path) -> str:
                     content_full = f.read()
                 return relpath, 'text', {"content": content_full}
             except Exception:
+                import traceback
+                traceback.print_exc()
                 return relpath, 'binary', {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
@@ -1113,6 +1131,8 @@ def pre_read_module(target_dir: str, mod_dir: Path) -> str:
         try:
             _, ftype, data = fut.result(timeout=20)
         except Exception:
+            import traceback
+            traceback.print_exc()
             ftype, data = 'unknown', {}
         parts.append(f"### {rp}")
         if ftype == 'ELF':
@@ -1282,6 +1302,8 @@ def collect_file_summaries(
             try:
                 f.result()
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
 
     all_lines = []
@@ -1338,6 +1360,8 @@ def load_detail_json(details_dir: "Path", rel_path: str) -> "dict | None":
     try:
         return _json.loads(p.read_text(encoding="utf-8"))
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -1537,6 +1561,8 @@ def pre_read_module_with_details(
                 content_full = f.read()
             return relpath, "text", {"content": content_full}
         except Exception:
+            import traceback
+            traceback.print_exc()
             return relpath, "binary", {}
 
     # 预先确定哪些文件需要原始读取（并行处理）
@@ -1559,6 +1585,8 @@ def pre_read_module_with_details(
             try:
                 raw_results[rp] = fut.result(timeout=20)
             except Exception:
+                import traceback
+                traceback.print_exc()
                 raw_results[rp] = (rp, "unknown", {})
 
     for rp in files:
@@ -1734,6 +1762,8 @@ def generate_modules_list(modules_dir: Path, output_path: Path) -> None:
                 dep_bonus[name] = int(node.get("dependency_risk_bonus") or 0)
                 dep_count[name] = int(node.get("dependency_count") or 0)
         except Exception:
+            import traceback
+            traceback.print_exc()
             dep_bonus = {}
             dep_count = {}
 

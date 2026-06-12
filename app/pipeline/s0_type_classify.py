@@ -44,6 +44,8 @@ class TypeClassifyStage(BaseStage):
                                    f"（{ctx.file_catalog.get('filtered_count', 0)} 个文件，"
                                    f"{len(ctx.unknown_files)} 个 UNKNOWN）")
             except Exception:
+                import traceback
+                traceback.print_exc()
                 cp.clear("s0_type_classify")
             else:
                 return

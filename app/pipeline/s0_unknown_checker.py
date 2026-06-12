@@ -139,6 +139,8 @@ class UnknownCheckerStage(BaseStage):
                 try:
                     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     catalog = {"files": []}
 
             # 建立 path → index 映射

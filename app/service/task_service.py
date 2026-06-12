@@ -396,6 +396,8 @@ def _clear_task_execution_lock(output_path: str | None, task_id: str) -> None:
     try:
         lock_path.unlink(missing_ok=True)
     except Exception:
+        import traceback
+        traceback.print_exc()
         pass
 
 
@@ -405,6 +407,8 @@ def _read_task_execution_lock_payload(lock_path: Path | None) -> dict[str, objec
     try:
         payload = json.loads(lock_path.read_text("utf-8"))
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -413,6 +417,8 @@ def _coerce_lock_epoch(value: object) -> int | None:
     try:
         epoch = int(value)  # type: ignore[arg-type]
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
     return epoch if epoch >= 0 else None
 
@@ -457,6 +463,8 @@ def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) ->
                 try:
                     _shutil.copy2(str(snapshot), str(mod_dir / "files.list"))
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     pass
             else:
                 # 无快照 → 手动将 deleted/ 和 recover/ 中的文件追加回 files.list
@@ -507,6 +515,8 @@ def _nonempty_files_list(path: Path) -> bool:
     try:
         return any(line.strip() for line in path.read_text("utf-8", errors="replace").splitlines())
     except Exception:
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -1929,6 +1939,8 @@ class TaskService:
             try:
                 task
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
         self._runner_assignment_task = None
 
@@ -2340,6 +2352,8 @@ class TaskService:
             except Exception as _sr_exc:
                 logger.warning("self-reflection trigger failed: %s", _sr_exc)
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
         except Exception as exc:
             log_event(logger, logging.ERROR, "task execution failed",
@@ -2359,6 +2373,8 @@ class TaskService:
                     db.commit()
                     _invalidate_slot_summary_cache(r.project_id)
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
         finally:
             _running_tasks.pop(task_id, None)
@@ -2410,10 +2426,14 @@ class TaskService:
             db.add(event)
             db.commit()
         except Exception:
+            import traceback
+            traceback.print_exc()
             try:
                 if db is not None:
                     db.rollback()
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
         finally:
             if db_gen is not None:

@@ -110,6 +110,8 @@ class AnalyseStage(BaseStage):
                 try:
                     results.append(f.result())
                 except Exception:
+                    import traceback
+                    traceback.print_exc()
                     results.append(None)
         for r in results:
             if isinstance(r, PiFatalError):
@@ -187,6 +189,8 @@ class AnalyseStage(BaseStage):
                 _score = _cp_data.get("extra", {}).get("score")
                 _score_str = f" (score={_score})" if _score is not None else ""
             except Exception:
+                import traceback
+                traceback.print_exc()
                 _score_str = ""
             ctx.emit_event("log", level="info",
                            msg=f"[S3] {mod_name} checkpoint 已完成，跳过{_score_str}")
@@ -499,6 +503,8 @@ def _build_module_dep_graph(workspace: Path) -> dict:
             try:
                 d = json.loads(dp.read_text(encoding="utf-8"))
             except Exception:
+                import traceback
+                traceback.print_exc()
                 continue
             if not isinstance(d, dict): continue
             for sym in (d.get("symbols") or d.get("exports") or d.get("functions") or []):

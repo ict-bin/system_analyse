@@ -50,6 +50,8 @@ class ThreadedProbeServer:
             try:
                 httpd.server_close()
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
         thread = self._thread
         if thread and thread.is_alive():
@@ -132,5 +134,7 @@ class ThreadedProbeServer:
             try:
                 httpd.server_close()
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
             logger.info("probe server stopped host=%s port=%s", self._host, self._port)

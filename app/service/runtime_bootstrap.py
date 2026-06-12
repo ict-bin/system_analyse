@@ -64,6 +64,8 @@ class RuntimeBootstrap:
 
                 get_registry_service().stop()
         except Exception:
+            import traceback
+            traceback.print_exc()
             pass
 
     def status(self) -> dict:
@@ -113,6 +115,8 @@ class RuntimeBootstrap:
             try:
                 self._stop_event.wait(timeout=DB_INIT_RETRY_SECONDS)
             except Exception:
+                import traceback
+                traceback.print_exc()
                 pass
 
     def _sync_providers_once(self, svc_yaml) -> None:
