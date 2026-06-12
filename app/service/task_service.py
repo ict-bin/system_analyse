@@ -13,6 +13,7 @@ import os
 import re
 import time as _time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -80,6 +81,40 @@ RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS = max(
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
 _running_task_epochs: dict[str, int] = {}
+
+
+@dataclass
+class RunnerAssignmentRuntimeState:
+    last_tick_ts: float = 0.0
+    last_success_ts: float = 0.0
+    last_error: str | None = None
+    last_rows_seen: int = 0
+    last_skipped_expired_task_id: str | None = None
+    last_skipped_expired_lease_epoch: int | None = None
+    last_skipped_expired_lease_expires_at: str | None = None
+    last_spawned_task_id: str | None = None
+    last_spawned_lease_epoch: int | None = None
+
+    def snapshot(self) -> dict[str, object]:
+        now_ts = _time.time()
+        max_gap = max(10.0, RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS * 4)
+        loop_fresh = (self.last_tick_ts > 0.0) and ((now_ts - self.last_tick_ts) <= max_gap)
+        return {
+            "runner_assignment_loop_last_tick_ts": self.last_tick_ts or None,
+            "runner_assignment_loop_last_success_ts": self.last_success_ts or None,
+            "runner_assignment_loop_last_error": self.last_error,
+            "runner_assignment_loop_fresh": loop_fresh if self.last_tick_ts > 0.0 else self.last_error is None,
+            "runner_assignment_loop_last_rows_seen": self.last_rows_seen,
+            "runner_assignment_loop_last_skipped_expired_task_id": self.last_skipped_expired_task_id,
+            "runner_assignment_loop_last_skipped_expired_lease_epoch": self.last_skipped_expired_lease_epoch,
+            "runner_assignment_loop_last_skipped_expired_lease_expires_at": self.last_skipped_expired_lease_expires_at,
+            "runner_assignment_loop_last_spawned_task_id": self.last_spawned_task_id,
+            "runner_assignment_loop_last_spawned_lease_epoch": self.last_spawned_lease_epoch,
+            "runner_assignment_poll_interval_seconds": RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS,
+        }
+
+
+_runner_assignment_runtime_state = RunnerAssignmentRuntimeState()
 
 ANALYSIS_MODE_BINARY = "binary"
 ANALYSIS_MODE_SOURCE = "source"
@@ -313,7 +348,15 @@ def _record_abnormal_reason(row: AppSaTask, reason: dict | None, *, changed: boo
     flag_modified(row, "stages_json")
 
 def get_worker_runtime_health() -> dict:
-    return _get_dispatcher_runtime_health(len(_running_tasks))
+    if is_runner_role() and not is_manager_role():
+        return {
+            "worker_running_tasks": len(_running_tasks),
+            **_runner_assignment_runtime_state.snapshot(),
+        }
+    health = _get_dispatcher_runtime_health(len(_running_tasks))
+    if is_runner_role():
+        health.update(_runner_assignment_runtime_state.snapshot())
+    return health
 
 
 def get_runtime_tracking_snapshot() -> dict[str, int]:
@@ -1890,10 +1933,14 @@ class TaskService:
     async def _runner_assignment_loop(self) -> None:
         while self._runner_assignment_loop_running:
             try:
+                _runner_assignment_runtime_state.last_tick_ts = _time.time()
                 self._poll_runner_assignments_once()
+                _runner_assignment_runtime_state.last_success_ts = _time.time()
+                _runner_assignment_runtime_state.last_error = None
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                _runner_assignment_runtime_state.last_error = str(exc)
                 logger.warning("runner assignment loop failed: %s", exc, exc_info=True)
             await asyncio.sleep(RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS)
 
@@ -1904,19 +1951,50 @@ class TaskService:
             current_concurrency = 1
             available_slots = max(0, current_concurrency - len(_running_tasks))
             if available_slots <= 0:
+                _runner_assignment_runtime_state.last_rows_seen = 0
                 return
             rows = self._task_repository.list_tasks_assigned_to_instance(
                 db,
                 instance_id=WORKER_INSTANCE_ID,
                 limit=available_slots,
             )
+            _runner_assignment_runtime_state.last_rows_seen = len(rows)
             now = now_local()
             for row in rows:
                 if row.task_id in _running_tasks:
                     continue
                 if row.lease_expires_at and row.lease_expires_at < now:
+                    lease_epoch = int(row.lease_epoch or 0)
+                    lease_expires_at = _safe_isoformat(row.lease_expires_at)
+                    _runner_assignment_runtime_state.last_skipped_expired_task_id = row.task_id
+                    _runner_assignment_runtime_state.last_skipped_expired_lease_epoch = lease_epoch
+                    _runner_assignment_runtime_state.last_skipped_expired_lease_expires_at = lease_expires_at
+                    logger.warning(
+                        "runner assignment skipped expired lease task_id=%s lease_epoch=%s lease_expires_at=%s now=%s worker_instance_id=%s",
+                        row.task_id,
+                        lease_epoch,
+                        lease_expires_at,
+                        isoformat_local(now),
+                        WORKER_INSTANCE_ID,
+                    )
+                    self._record_timeline_event(
+                        task_id=row.task_id,
+                        project_id=row.project_id,
+                        event_type="runner_assignment_skipped_expired_lease",
+                        message="Runner 发现任务租约已过期，跳过本地执行",
+                        level="warning",
+                        payload={
+                            "runner_instance_id": WORKER_INSTANCE_ID,
+                            "lease_epoch": lease_epoch,
+                            "lease_expires_at": lease_expires_at,
+                            "runner_now": isoformat_local(now),
+                        },
+                    )
                     continue
-                self._run_task_locally(row.task_id, int(row.lease_epoch or 0))
+                lease_epoch = int(row.lease_epoch or 0)
+                self._run_task_locally(row.task_id, lease_epoch)
+                _runner_assignment_runtime_state.last_spawned_task_id = row.task_id
+                _runner_assignment_runtime_state.last_spawned_lease_epoch = lease_epoch
         finally:
             try:
                 next(db_gen)
