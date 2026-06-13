@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from app.copy_utils import safe_copy2
 if TYPE_CHECKING:
     from .context import PipelineContext
 
@@ -633,7 +634,7 @@ def commit_split_plan(workspace: "Path", mod_name: str) -> dict[str, list[str] |
         if not child_snapshot.exists():
             child_flist = mods_root / child / "files.list"
             if child_flist.exists():
-                shutil.copy2(str(child_flist), str(child_snapshot))
+                safe_copy2(str(child_flist), str(child_snapshot))
     return {
         "applied": True,
         "new_modules": sorted(set(new_modules)),
@@ -659,7 +660,7 @@ def restore_module_for_retry(
 
     if snapshot_path.exists():
         mod_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(snapshot_path), str(mod_dir / "files.list"))
+        safe_copy2(str(snapshot_path), str(mod_dir / "files.list"))
 
     split_dir = mod_dir / "split"
     if split_dir.exists():

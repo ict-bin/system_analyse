@@ -22,6 +22,7 @@ import queue
 import time
 from pathlib import Path
 
+from app.copy_utils import safe_copy2
 from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
@@ -505,7 +506,7 @@ class RefineStage(BaseStage):
         # ── 初始化 .snapshot（W+J 需要参考原始文件清单）──
         snapshot_path = mod_dir / ".snapshot"
         if not snapshot_path.exists():
-            shutil.copy2(str(mod_dir / "files.list"), str(snapshot_path))
+            safe_copy2(str(mod_dir / "files.list"), str(snapshot_path))
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
@@ -774,7 +775,7 @@ class RefineStage(BaseStage):
         for flist in mods_root.glob("*/files.list"):
             mod_name = flist.parent.name
             if flist.stat().st_size > 0 and not (snap_dir / f"{mod_name}.snapshot").exists():
-                shutil.copy2(str(flist), str(snap_dir / f"{mod_name}.snapshot"))
+                safe_copy2(str(flist), str(snap_dir / f"{mod_name}.snapshot"))
                 snap_created += 1
         if snap_created:
             ctx.emit_event("log", level="info", msg=f"[S2全局检查] 补创建 {snap_created} 个模块快照")

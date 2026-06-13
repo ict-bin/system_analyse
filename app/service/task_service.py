@@ -24,6 +24,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.copy_utils import safe_copy2
 from app.config import load_service_config
 from app.db.models import AppSaTask, AppSaTaskEvent
 from app.logging_utils import log_event
@@ -461,7 +462,7 @@ def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) ->
             snapshot = snapshots_dir / f"{mod_dir.name}.snapshot"
             if snapshot.exists():
                 try:
-                    _shutil.copy2(str(snapshot), str(mod_dir / "files.list"))
+                    safe_copy2(str(snapshot), str(mod_dir / "files.list"))
                 except Exception:
                     import traceback
                     traceback.print_exc()

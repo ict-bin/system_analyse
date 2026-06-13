@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .copy_utils import safe_copy2
 from .models import (
     AgentInstanceConfig,
     StageLoopConfig,
@@ -615,7 +616,7 @@ class Orchestrator:
                     snapshot_path = snapshots_dir / f"{mod_name}.snapshot"
                     if not snapshot_path.exists():  # 只在第一次保存，重试时不覆盖
                         import shutil as _sh2
-                        _sh2.copy2(str(mod_dir / "files.list"), str(snapshot_path))
+                        safe_copy2(str(mod_dir / "files.list"), str(snapshot_path))
 
                     # 超过阈値时，先用子 Worker 收集文件摘要
                     sub_prompt = self._load_prompt(w_prompt_dir, "step2_sub_read")
@@ -1372,7 +1373,7 @@ class Orchestrator:
         report_src = workspace / "final_report.md"
         report_dst = result_dir / "final_report.md"
         if report_src.exists():
-            shutil.copy2(str(report_src), str(report_dst))
+            safe_copy2(str(report_src), str(report_dst))
         elif result.status in (TaskStatus.FAILED, TaskStatus.ERROR):
             # 失败/错误时也输出 final_report.md，记录失败原因和已完成的进度
             self._write_failure_report(

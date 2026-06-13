@@ -24,6 +24,7 @@ import shutil
 import time
 from pathlib import Path
 
+from app.copy_utils import safe_copy2
 from .base import BaseStage
 from .context import PipelineContext
 from .evaluation import utc_now_iso
@@ -490,7 +491,7 @@ class FinalReportStage(BaseStage):
         report_src = workspace / "final_report.md"
         report_dst = final_out_dir / "final_report.md"
         if report_src.exists():
-            shutil.copy2(str(report_src), str(report_dst))
+            safe_copy2(str(report_src), str(report_dst))
         ctx.final_report_path = str(report_dst)
 
         # modules.list — 按风险等级排序

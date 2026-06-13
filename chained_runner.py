@@ -10,6 +10,7 @@ import subprocess
 import zipfile
 from pathlib import Path
 
+from app.copy_utils import safe_copy2
 from app.logging_utils import configure_container_logging, log_event
 from app.time_utils import isoformat_local, now_local
 
@@ -124,7 +125,7 @@ def sync_tree(src: Path, dst: Path, *, exclude_run: bool = False) -> None:
             src_file = root_path / name
             if exclude_run and RUN_ROOT in src_file.parents:
                 continue
-            shutil.copy2(src_file, target_root / name)
+            safe_copy2(src_file, target_root / name)
 
 
 def prepare_input() -> Path:
@@ -165,7 +166,7 @@ def copy_if_missing(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() or not src.is_file():
         return
-    shutil.copy2(src, dst)
+    safe_copy2(src, dst)
 
 
 def ensure_default_config(config_dir: Path) -> None:
