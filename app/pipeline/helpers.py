@@ -281,10 +281,16 @@ def discover_modules(workspace: str | Path) -> list[str]:
 
 
 def read_module_files(mod_dir: str | Path) -> list[str]:
-    """读取模块 files.list，返回去空白后的相对路径列表。"""
+    """读取模块 files.list 或快照文件，返回去空白后的相对路径列表。"""
     mod_dir = Path(mod_dir)
+    if mod_dir.exists():
+        target = mod_dir if mod_dir.is_file() else mod_dir / "files.list"
+    elif mod_dir.name in {"files.list", ".snapshot"} or mod_dir.suffix == ".snapshot":
+        target = mod_dir
+    else:
+        target = mod_dir / "files.list"
     try:
-        raw = (mod_dir / "files.list").read_text("utf-8").splitlines()
+        raw = target.read_text("utf-8").splitlines()
     except OSError:
         return []
     return [line.strip() for line in raw if line.strip()]

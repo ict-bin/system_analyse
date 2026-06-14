@@ -61,6 +61,9 @@ def _snapshot_file_path(mod_dir: Path, workspace: Path | None = None) -> Path:
     snapshot = mod_dir / ".snapshot"
     if snapshot.exists() and snapshot.is_file():
         return snapshot
+    nested_snapshot = snapshot / "files.list"
+    if nested_snapshot.exists() and nested_snapshot.is_file():
+        return nested_snapshot
     if workspace is not None:
         legacy_snapshot = workspace / ".s2_snapshots" / f"{mod_dir.name}.snapshot"
         if legacy_snapshot.exists() and legacy_snapshot.is_file():
@@ -70,11 +73,23 @@ def _snapshot_file_path(mod_dir: Path, workspace: Path | None = None) -> Path:
 
 def _ensure_snapshot_file(mod_dir: Path, workspace: Path | None = None) -> Path:
     snapshot = mod_dir / ".snapshot"
-    if snapshot.exists() and snapshot.is_dir():
-        shutil.rmtree(str(snapshot), ignore_errors=True)
     legacy_snapshot: Path | None = None
     if workspace is not None:
         legacy_snapshot = workspace / ".s2_snapshots" / f"{mod_dir.name}.snapshot"
+    if snapshot.exists() and snapshot.is_dir():
+        nested_snapshot = snapshot / "files.list"
+        salvaged_lines = _read_lines(nested_snapshot)
+        shutil.rmtree(str(snapshot), ignore_errors=True)
+        if salvaged_lines:
+            _write_lines(snapshot, salvaged_lines)
+            return snapshot
+        if legacy_snapshot and legacy_snapshot.exists() and legacy_snapshot.is_file():
+            safe_copy2(str(legacy_snapshot), str(snapshot))
+            return snapshot
+        files_list = mod_dir / "files.list"
+        if files_list.exists() and files_list.is_file():
+            safe_copy2(str(files_list), str(snapshot))
+            return snapshot
     if snapshot.exists() and snapshot.is_file():
         return snapshot
     if legacy_snapshot and legacy_snapshot.exists() and legacy_snapshot.is_file():
@@ -86,6 +101,11 @@ def _ensure_snapshot_file(mod_dir: Path, workspace: Path | None = None) -> Path:
     return snapshot
 
 
+def _normalize_snapshot_layout(mod_dir: Path, workspace: Path | None = None) -> Path:
+    """收敛历史/非法 snapshot 形态，确保后续逻辑面对的是单文件快照。"""
+    return _ensure_snapshot_file(mod_dir, workspace)
+
+
 def _validate_module(mod_dir: Path) -> dict:
     """
     校验单模块:
@@ -93,7 +113,7 @@ def _validate_module(mod_dir: Path) -> dict:
     返回 {pass: bool, missing: [...], extra: [...]} 供 Judge 参考，不抛异常。
     """
     mod_name = mod_dir.name
-    snapshot = _read_lines(_snapshot_file_path(mod_dir))
+    snapshot = _read_lines(_snapshot_file_path(mod_dir, mod_dir.parent.parent if mod_dir.parent.name == "modules" else None))
 
     if not snapshot:
         return {"pass": False, "missing": ["NO_SNAPSHOT"], "extra": [],
@@ -537,7 +557,7 @@ class RefineStage(BaseStage):
             j_sys_prompt += _gran_hint
 
         # ── 初始化 .snapshot（W+J 需要参考原始文件清单）──
-        snapshot_path = _ensure_snapshot_file(mod_dir, workspace)
+        snapshot_path = _normalize_snapshot_layout(mod_dir, workspace)
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
@@ -579,6 +599,7 @@ class RefineStage(BaseStage):
             ctx.emit_event("stage_result", stage=2, module=mod_name, split=was_split, new_modules=new_ones)
 
             # ── Python 校验（替代 check_module.sh）──
+            _normalize_snapshot_layout(mod_dir, workspace)
             py_validation = _validate_module(mod_dir)
 
             # ── Judge ──

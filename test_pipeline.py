@@ -867,6 +867,32 @@ def test_refine_snapshot_directory_does_not_crash():
         assert snap.read_text(encoding="utf-8").splitlines() == ["a.c", "b.c"]
 
 
+def test_refine_snapshot_directory_with_nested_files_list_is_normalized():
+    with tempfile.TemporaryDirectory() as tmp:
+        mod_dir = Path(tmp) / "modules" / "crypto_kms"
+        mod_dir.mkdir(parents=True)
+        (mod_dir / "files.list").write_text("live.c\n", encoding="utf-8")
+        nested = mod_dir / ".snapshot"
+        nested.mkdir()
+        (nested / "files.list").write_text("orig_a.c\norig_b.c\n", encoding="utf-8")
+
+        from app.pipeline.s2_refine import _ensure_snapshot_file
+
+        snap = _ensure_snapshot_file(mod_dir)
+        assert snap.is_file()
+        assert snap.read_text(encoding="utf-8").splitlines() == ["orig_a.c", "orig_b.c"]
+
+
+def test_read_module_files_accepts_snapshot_file_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot = Path(tmp) / "coap.snapshot"
+        snapshot.write_text("a.c\nb.c\n", encoding="utf-8")
+
+        from app.pipeline.helpers import read_module_files
+
+        assert read_module_files(snapshot) == ["a.c", "b.c"]
+
+
 def test_resume_cleanup_restores_from_module_snapshot(tmp_path: Path):
     from app.service.task_service import _cleanup_resume_intermediate_files
 
