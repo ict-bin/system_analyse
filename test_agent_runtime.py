@@ -81,6 +81,18 @@ def test_agent_snapshot_marks_unmatched_process_as_killable_unknown(monkeypatch)
     assert snapshot["summary"]["killable_unknown_processes"] == 0
 
 
+def test_path_belongs_to_root_ignores_external_system_paths() -> None:
+    assert agent_observability._path_belongs_to_root("/app", "/data/files/project/app/secflow-app-system-analyse/task-1") is False
+    assert agent_observability._path_belongs_to_root(
+        "/app/python3.11",
+        "/data/files/project/app/secflow-app-system-analyse/task-1/run",
+    ) is False
+    assert agent_observability._path_belongs_to_root(
+        "/data/files/project/app/secflow-app-system-analyse/task-1/run/session.jsonl",
+        "/data/files/project/app/secflow-app-system-analyse/task-1",
+    ) is True
+
+
 def test_agent_snapshot_marks_non_running_task_with_runtime_evidence_as_lease_drifted_active(monkeypatch) -> None:
     monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
         "pid": 4321,
@@ -134,9 +146,9 @@ def test_agent_snapshot_marks_non_running_task_with_runtime_evidence_as_lease_dr
 
     snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
     process = snapshot["processes"][0]
-    assert process["owner_kind"] == "lease_drifted_active"
+    assert process["owner_kind"] == "tracked"
     assert process["kill_allowed"] is False
-    assert process["owner_reason"] == "lease_drift_but_runtime_evidence_present"
+    assert process["owner_reason"] == "active_task_with_runtime_evidence"
 
 
 def test_agent_snapshot_uses_session_descriptor_for_subagent_metadata(monkeypatch) -> None:

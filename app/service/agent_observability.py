@@ -245,12 +245,16 @@ def _task_roots(row: AppSaTask) -> list[str]:
 def _path_belongs_to_root(path_value: str | None, root: str | None) -> bool:
     if not path_value or not root:
         return False
-    try:
-        pathlib.Path(path_value).relative_to(pathlib.Path(root))
+    if path_value == root:
         return True
-    except Exception:
-        import traceback
-        traceback.print_exc()
+    try:
+        path_obj = pathlib.Path(path_value)
+        root_obj = pathlib.Path(root)
+        if hasattr(path_obj, "is_relative_to"):
+            return path_obj.is_relative_to(root_obj)
+        path_obj.relative_to(root_obj)
+        return True
+    except (TypeError, ValueError):
         return False
 
 

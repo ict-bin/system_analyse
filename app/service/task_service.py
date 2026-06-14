@@ -449,6 +449,12 @@ def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) ->
     modules_dir = workspace / "modules"
     snapshots_dir = workspace / ".s2_snapshots"
 
+    def _snapshot_candidates(mod_dir: Path) -> list[Path]:
+        return [
+            mod_dir / ".snapshot",
+            snapshots_dir / f"{mod_dir.name}.snapshot",
+        ]
+
     # ── S2 级：逐模块清理 deleted/ 和 recover/ ────────────────────────────
     if modules_dir.exists():
         for mod_dir in sorted(modules_dir.iterdir()):
@@ -459,15 +465,19 @@ def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) ->
             if not deleted_dir.exists() and not recover_dir.exists():
                 continue
             # 快照存在 → 直接恢复原始 files.list（自动覆盖 deleted/recover 内容）
-            snapshot = snapshots_dir / f"{mod_dir.name}.snapshot"
-            if snapshot.exists():
+            restored_from_snapshot = False
+            for snapshot in _snapshot_candidates(mod_dir):
+                if not snapshot.exists() or not snapshot.is_file():
+                    continue
                 try:
                     safe_copy2(str(snapshot), str(mod_dir / "files.list"))
+                    restored_from_snapshot = True
+                    break
                 except Exception:
                     import traceback
                     traceback.print_exc()
                     pass
-            else:
+            if not restored_from_snapshot:
                 # 无快照 → 手动将 deleted/ 和 recover/ 中的文件追加回 files.list
                 files_list_path = mod_dir / "files.list"
                 existing: set[str] = set()

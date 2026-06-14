@@ -852,6 +852,49 @@ def test_refine_stage_reclassify_cleanup_path():
     print("  ✅ RefineStage 补分类收尾路径不崩溃")
 
 
+def test_refine_snapshot_directory_does_not_crash():
+    with tempfile.TemporaryDirectory() as tmp:
+        mod_dir = Path(tmp) / "modules" / "core_message"
+        mod_dir.mkdir(parents=True)
+        (mod_dir / "files.list").write_text("a.c\nb.c\n", encoding="utf-8")
+        (mod_dir / ".snapshot").mkdir()
+
+        from app.pipeline.s2_refine import _read_lines, _ensure_snapshot_file
+
+        assert _read_lines(mod_dir / ".snapshot") == set()
+        snap = _ensure_snapshot_file(mod_dir)
+        assert snap.is_file()
+        assert snap.read_text(encoding="utf-8").splitlines() == ["a.c", "b.c"]
+
+
+def test_resume_cleanup_restores_from_module_snapshot(tmp_path: Path):
+    from app.service.task_service import _cleanup_resume_intermediate_files
+
+    task_id = "sat_test"
+    workspace = tmp_path / task_id / "run" / "workspace"
+    mod_dir = workspace / "modules" / "api_server"
+    deleted_dir = mod_dir / "deleted"
+    deleted_dir.mkdir(parents=True)
+    (mod_dir / "files.list").write_text("trimmed.c\n", encoding="utf-8")
+    (mod_dir / ".snapshot").write_text("full_a.c\nfull_b.c\n", encoding="utf-8")
+    (deleted_dir / "files.list").write_text("removed.c\n", encoding="utf-8")
+
+    _cleanup_resume_intermediate_files(str(tmp_path), task_id)
+
+    assert (mod_dir / "files.list").read_text(encoding="utf-8").splitlines() == ["full_a.c", "full_b.c"]
+    assert not deleted_dir.exists()
+
+
+def test_system_analyse_runner_connection_error_uses_infinite_retry():
+    from app.runner import AgentResult, _is_infinite_retry_api_error
+
+    result = AgentResult()
+    result.error = "Connection error. [API 重试耗尽: 6 次失败]"
+    result.exit_code = 1
+
+    assert _is_infinite_retry_api_error(result) is True
+
+
 def test_analyse_stage_stub():
     """AnalyseStage 骨架：不崩溃，更新 ctx.analysed_modules。"""
     with tempfile.TemporaryDirectory() as tmp:

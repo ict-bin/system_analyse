@@ -18,7 +18,7 @@
     "analyse_targets": ["all"],
     "parallel_modules": 1,
     "parallel_sub_workers": 1,
-    "agent_max_retries": 100,
+    "agent_max_retries": -1,
     "agent_retry_delay": 30,
     "pi_max_retries": -1,
     "pi_retry_delay": 10,

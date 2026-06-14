@@ -171,6 +171,18 @@ class TaskRunner:
                     payload=payload,
                 )
                 return
+            if str(event.type or "").strip().lower() == "task_api_retrying":
+                payload = dict(event.data or {})
+                self._deps.record_timeline_event(
+                    task_id=task_id,
+                    project_id=getattr(task_snapshot, "project_id", None),
+                    stage_name=stage_name,
+                    event_type="task_api_retrying",
+                    message="智能体 API 错误，已进入无限重试",
+                    level="warning",
+                    payload=payload,
+                )
+                return
             if not stage_name:
                 return
             raw_type = str(event.type or "").strip().lower()

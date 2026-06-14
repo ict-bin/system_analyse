@@ -447,7 +447,7 @@ class ServiceConfig(BaseModel):
     )
     parallel_modules: int = Field(default=1, description="Stage 2/3 并行处理的模块数，默认 1")
     parallel_sub_workers: int = Field(default=1, description="单模块内子 Worker 并行数，默认 1")
-    agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
+    agent_max_retries: int = Field(default=-1, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=3.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     agent_timeout_seconds: float = Field(default=0.0, description="已废弃，保留兼容")
@@ -524,7 +524,7 @@ class TaskConfig(BaseModel):
         default=True,
         description="是否允许单个模块失败后继续推进其他模块和后续阶段",
     )
-    agent_max_retries: int = Field(default=5, description="API 错误最大重试次数，-1=无限")
+    agent_max_retries: int = Field(default=-1, description="API 错误最大重试次数，-1=无限")
     agent_retry_delay: float = Field(default=3.0, description="API 重试首次等待秒数")
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     agent_timeout_seconds: float = Field(default=0.0, description="已废弃，保留兼容")

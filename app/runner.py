@@ -91,6 +91,9 @@ class AgentResult:
         self.consecutive_rate_limit_count: int = 0
         self.retry_delay_seconds: int = 0
         self.rate_limit_event_due: bool = False
+        self.api_retry_event_due: bool = False
+        self.consecutive_api_retry_count: int = 0
+        self.api_retry_reason: str | None = None
 
 
 # ─── 内部异常 ─────────────────────────────────────────────────────────────────
@@ -131,6 +134,12 @@ def _backoff(base_delay: float, attempt: int) -> float:
 
 def _fmt_max(n: int) -> str:
     return "∞" if n < 0 else str(n)
+
+
+def _should_emit_api_retry_event(consecutive_retries: int, delay_seconds: float) -> bool:
+    retries = max(0, int(consecutive_retries or 0))
+    delay = max(0.0, float(delay_seconds or 0))
+    return delay >= 30.0 and retries > 0 and retries % 10 == 0
 
 
 def _normalize_timeout_seconds(timeout_seconds: float | int | None) -> float | None:
@@ -320,10 +329,32 @@ _RETRYABLE_QUERY_ENGINE_401_PATTERNS = [
 _RATE_LIMIT_PATTERNS = ["rate limit", "429", "too many requests", "network_error", "finish_reason"]
 _RATE_LIMIT_EXTRA_DELAY = 30
 
+_INFINITE_RETRY_API_PATTERNS = [
+    "connection error",
+    "econnrefused",
+    "econnreset",
+    "etimedout",
+    "enotfound",
+    "socket hang up",
+    "fetch failed",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "server error",
+    "internal error",
+]
+
 
 def _should_emit_rate_limit_event(streak: int) -> bool:
     streak = max(0, int(streak or 0))
     return streak == 1 or (streak > 0 and streak % 10 == 0)
+
+
+def _is_infinite_retry_api_error(result: "AgentResult") -> bool:
+    error_text = (result.error or "").lower()
+    if not error_text:
+        return False
+    return any(pattern in error_text for pattern in _INFINITE_RETRY_API_PATTERNS)
 
 _PI_CRASH_PATTERNS = [
     "cannot find module", "module not found", "syntaxerror",
@@ -1144,10 +1175,15 @@ def _run_with_api_retry(
                 continue
             rate_limit_streak = 0
             api_attempt += 1
-            can_retry = (max_retries == -1) or (api_attempt <= max_retries)
+            infinite_retry = True
+            can_retry = True
             if can_retry:
                 delay = _backoff(retry_delay, api_attempt)
-                label = f"{api_attempt}/{_fmt_max(max_retries)}"
+                result.retry_delay_seconds = int(delay)
+                result.consecutive_api_retry_count = int(api_attempt)
+                result.api_retry_reason = str(result.error or "").strip()[:500] or None
+                result.api_retry_event_due = _should_emit_api_retry_event(api_attempt, delay)
+                label = f"{api_attempt}/{_fmt_max(-1 if infinite_retry else max_retries)}"
                 _log_warn(
                     f"API错误 [{label}], {delay:.0f}s 后重试: "
                     f"{(result.error or '')[:200]}"

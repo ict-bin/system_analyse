@@ -45,12 +45,45 @@ from .helpers import (
 def _read_lines(path: Path) -> set[str]:
     if not path.exists():
         return set()
+    if path.is_dir():
+        return set()
     return {ln.strip() for ln in path.read_text("utf-8", errors="replace").splitlines() if ln.strip()}
 
 
 def _write_lines(path: Path, lines: set[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.is_dir():
+        shutil.rmtree(str(path), ignore_errors=True)
     path.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8")
+
+
+def _snapshot_file_path(mod_dir: Path, workspace: Path | None = None) -> Path:
+    snapshot = mod_dir / ".snapshot"
+    if snapshot.exists() and snapshot.is_file():
+        return snapshot
+    if workspace is not None:
+        legacy_snapshot = workspace / ".s2_snapshots" / f"{mod_dir.name}.snapshot"
+        if legacy_snapshot.exists() and legacy_snapshot.is_file():
+            return legacy_snapshot
+    return snapshot
+
+
+def _ensure_snapshot_file(mod_dir: Path, workspace: Path | None = None) -> Path:
+    snapshot = mod_dir / ".snapshot"
+    if snapshot.exists() and snapshot.is_dir():
+        shutil.rmtree(str(snapshot), ignore_errors=True)
+    legacy_snapshot: Path | None = None
+    if workspace is not None:
+        legacy_snapshot = workspace / ".s2_snapshots" / f"{mod_dir.name}.snapshot"
+    if snapshot.exists() and snapshot.is_file():
+        return snapshot
+    if legacy_snapshot and legacy_snapshot.exists() and legacy_snapshot.is_file():
+        safe_copy2(str(legacy_snapshot), str(snapshot))
+        return snapshot
+    files_list = mod_dir / "files.list"
+    if files_list.exists() and files_list.is_file():
+        safe_copy2(str(files_list), str(snapshot))
+    return snapshot
 
 
 def _validate_module(mod_dir: Path) -> dict:
@@ -60,7 +93,7 @@ def _validate_module(mod_dir: Path) -> dict:
     返回 {pass: bool, missing: [...], extra: [...]} 供 Judge 参考，不抛异常。
     """
     mod_name = mod_dir.name
-    snapshot = _read_lines(mod_dir / ".snapshot")
+    snapshot = _read_lines(_snapshot_file_path(mod_dir))
 
     if not snapshot:
         return {"pass": False, "missing": ["NO_SNAPSHOT"], "extra": [],
@@ -115,7 +148,7 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
     """
     mods_root = workspace / "modules"
     mod_name = mod_dir.name
-    snapshot = _read_lines(mod_dir / ".snapshot")
+    snapshot = _read_lines(_snapshot_file_path(mod_dir, workspace))
     deleted_set = _read_lines(mod_dir / "deleted" / "files.list")
 
     # ── 读取 Worker 产物 ──
@@ -184,8 +217,8 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
             new_modules.append(child)
             # 如果目标在 LLM 处理中，追加到其 .snapshot
             if child in in_progress:
-                snap = target_dir / ".snapshot"
-                if snap.exists():
+                snap = _ensure_snapshot_file(target_dir, workspace)
+                if snap.exists() and snap.is_file():
                     snap_set = _read_lines(snap)
                     _write_lines(snap, snap_set | files)
 
@@ -196,8 +229,8 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
         merged_targets.append(target)
         # 如果目标在 LLM 处理中，追加到其 .snapshot + 记录待处理
         if target in in_progress:
-            snap = target_dir / ".snapshot"
-            if snap.exists():
+            snap = _ensure_snapshot_file(target_dir, workspace)
+            if snap.exists() and snap.is_file():
                 snap_set = _read_lines(snap)
                 _write_lines(snap, snap_set | files)
             merge_targets_in_progress.add(target)
@@ -504,9 +537,7 @@ class RefineStage(BaseStage):
             j_sys_prompt += _gran_hint
 
         # ── 初始化 .snapshot（W+J 需要参考原始文件清单）──
-        snapshot_path = mod_dir / ".snapshot"
-        if not snapshot_path.exists():
-            safe_copy2(str(mod_dir / "files.list"), str(snapshot_path))
+        snapshot_path = _ensure_snapshot_file(mod_dir, workspace)
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):

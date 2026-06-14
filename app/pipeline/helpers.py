@@ -196,6 +196,14 @@ def run_agent_with_stage_guard(
                             retry_delay_seconds=int(getattr(result, "retry_delay_seconds", 30) or 30),
                             consecutive_rate_limit_count=int(getattr(result, "consecutive_rate_limit_count", 0) or 0),
                         )
+                    if getattr(result, "api_retry_event_due", False):
+                        ctx.emit_event(
+                            "task_api_retrying",
+                            stage=stage,
+                            retry_delay_seconds=int(getattr(result, "retry_delay_seconds", 30) or 30),
+                            consecutive_api_retry_count=int(getattr(result, "consecutive_api_retry_count", 0) or 0),
+                            reason=str(getattr(result, "api_retry_reason", "") or ""),
+                        )
                     return result
             heartbeat_index += 1
             elapsed = time.monotonic() - started_monotonic
