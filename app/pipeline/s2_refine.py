@@ -51,86 +51,52 @@ def _read_lines(path: Path) -> set[str]:
 
 
 def _write_lines(path: Path, lines: set[str]) -> None:
-    if not path.parent.exists():
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            # Read-only filesystem: parent already exists or can't be created;
-            # defer failure to the write below so we get a clear error.
-            pass
+    """Write lines to a file. Creates parent directories if needed.
+
+    .snapshot is always a flat file — never a directory.
+    If path is a directory (corrupted state), it is deleted first.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.is_dir():
-        # Can't convert directory to file on read-only filesystem
-        try:
-            shutil.rmtree(str(path))
-        except OSError:
-            pass
+        shutil.rmtree(str(path), ignore_errors=True)
     path.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8")
 
 
-def _snapshot_file_path(mod_dir: Path, workspace: Path | None = None) -> Path:
-    snapshot = mod_dir / ".snapshot"
-    if snapshot.exists() and snapshot.is_file():
-        return snapshot
-    nested_snapshot = snapshot / "files.list"
-    if nested_snapshot.exists() and nested_snapshot.is_file():
-        return nested_snapshot
-    if workspace is not None:
-        legacy_snapshot = workspace / ".s2_snapshots" / f"{mod_dir.name}.snapshot"
-        if legacy_snapshot.exists() and legacy_snapshot.is_file():
-            return legacy_snapshot
-    return snapshot
+def _snapshot_file_path(mod_dir: Path) -> Path:
+    """Return .snapshot path — always a flat file in the module directory."""
+    return mod_dir / ".snapshot"
 
 
-def _ensure_snapshot_file(mod_dir: Path, workspace: Path | None = None) -> Path:
-    """Ensure a canonical snapshot exists for the module.
+def _create_snapshot_file(mod_dir: Path) -> Path:
+    """Ensure .snapshot exists as a flat file.
 
-    Returns a Path to the snapshot content (either a file or a dir/file).
-    On read-only filesystems a directory .snapshot/ is kept in place;
-    callers must use _snapshot_file_path() to resolve the actual file.
+    Only called once at S2 module entry (before any LLM work).
+    - If .snapshot is a valid file → keep it
+    - If .snapshot is a directory (corrupted from previous run) → delete & recreate
+    - If .snapshot is missing → create from files.list
     """
     snapshot = mod_dir / ".snapshot"
-    legacy_snapshot: Path | None = None
-    if workspace is not None:
-        legacy_snapshot = workspace / ".s2_snapshots" / f"{mod_dir.name}.snapshot"
-    if snapshot.exists() and snapshot.is_dir():
-        nested_snapshot = snapshot / "files.list"
-        salvaged_lines = _read_lines(nested_snapshot)
-        # Try to convert directory to flat file (best-effort).
-        # On read-only NFS this will silently keep the directory layout.
-        try:
-            shutil.rmtree(str(snapshot))
-        except OSError:
-            # Read-only filesystem: keep directory, ensure files.list is up-to-date
-            if salvaged_lines:
-                try:
-                    _write_lines(nested_snapshot, salvaged_lines)
-                except OSError:
-                    pass
-            return nested_snapshot
-        if salvaged_lines:
-            _write_lines(snapshot, salvaged_lines)
+
+    if snapshot.exists():
+        if snapshot.is_file():
             return snapshot
-        if legacy_snapshot and legacy_snapshot.exists() and legacy_snapshot.is_file():
-            safe_copy2(str(legacy_snapshot), str(snapshot))
-            return snapshot
-        files_list = mod_dir / "files.list"
-        if files_list.exists() and files_list.is_file():
-            safe_copy2(str(files_list), str(snapshot))
-            return snapshot
-    if snapshot.exists() and snapshot.is_file():
-        return snapshot
-    if legacy_snapshot and legacy_snapshot.exists() and legacy_snapshot.is_file():
-        safe_copy2(str(legacy_snapshot), str(snapshot))
-        return snapshot
+        # Corrupted: directory form (previous-run residue, never created by current code)
+        if snapshot.is_dir():
+            shutil.rmtree(str(snapshot), ignore_errors=True)
+            # If rmtree failed (e.g. read-only NFS), .snapshot is still a directory.
+            # We must NOT call safe_copy2 on it — shutil.copy2 would copy INTO the
+            # directory instead of overwriting, causing .snapshot/files.list EROFS.
+            if snapshot.exists():
+                raise StageError(
+                    f"模块 {mod_dir.name} 的 .snapshot 是目录且无法删除"
+                    f"（可能是只读文件系统残留），请使用 restart 重建任务"
+                )
+
+    # Create from current files.list
     files_list = mod_dir / "files.list"
     if files_list.exists() and files_list.is_file():
         safe_copy2(str(files_list), str(snapshot))
     return snapshot
-
-
-def _normalize_snapshot_layout(mod_dir: Path, workspace: Path | None = None) -> Path:
-    """收敛历史/非法 snapshot 形态，确保后续逻辑面对的是单文件快照。"""
-    return _ensure_snapshot_file(mod_dir, workspace)
 
 
 def _validate_module(mod_dir: Path) -> dict:
@@ -140,7 +106,7 @@ def _validate_module(mod_dir: Path) -> dict:
     返回 {pass: bool, missing: [...], extra: [...]} 供 Judge 参考，不抛异常。
     """
     mod_name = mod_dir.name
-    snapshot = _read_lines(_snapshot_file_path(mod_dir, mod_dir.parent.parent if mod_dir.parent.name == "modules" else None))
+    snapshot = _read_lines(_snapshot_file_path(mod_dir))
 
     if not snapshot:
         return {"pass": False, "missing": ["NO_SNAPSHOT"], "extra": [],
@@ -195,7 +161,7 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
     """
     mods_root = workspace / "modules"
     mod_name = mod_dir.name
-    snapshot = _read_lines(_snapshot_file_path(mod_dir, workspace))
+    snapshot = _read_lines(_snapshot_file_path(mod_dir))
     deleted_set = _read_lines(mod_dir / "deleted" / "files.list")
 
     # ── 读取 Worker 产物 ──
@@ -264,7 +230,7 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
             new_modules.append(child)
             # 如果目标在 LLM 处理中，追加到其 .snapshot
             if child in in_progress:
-                snap = _ensure_snapshot_file(target_dir, workspace)
+                snap = _create_snapshot_file(target_dir)
                 if snap.exists() and snap.is_file():
                     snap_set = _read_lines(snap)
                     _write_lines(snap, snap_set | files)
@@ -276,7 +242,7 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
         merged_targets.append(target)
         # 如果目标在 LLM 处理中，追加到其 .snapshot + 记录待处理
         if target in in_progress:
-            snap = _ensure_snapshot_file(target_dir, workspace)
+            snap = _create_snapshot_file(target_dir)
             if snap.exists() and snap.is_file():
                 snap_set = _read_lines(snap)
                 _write_lines(snap, snap_set | files)
@@ -584,7 +550,7 @@ class RefineStage(BaseStage):
             j_sys_prompt += _gran_hint
 
         # ── 初始化 .snapshot（W+J 需要参考原始文件清单）──
-        snapshot_path = _normalize_snapshot_layout(mod_dir, workspace)
+        _create_snapshot_file(mod_dir)
 
         feedback = ""
         for attempt in range(max_iter(s_cfg)):
@@ -626,7 +592,7 @@ class RefineStage(BaseStage):
             ctx.emit_event("stage_result", stage=2, module=mod_name, split=was_split, new_modules=new_ones)
 
             # ── Python 校验（替代 check_module.sh）──
-            _normalize_snapshot_layout(mod_dir, workspace)
+            _create_snapshot_file(mod_dir)
             py_validation = _validate_module(mod_dir)
 
             # ── Judge ──

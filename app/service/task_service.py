@@ -1803,7 +1803,7 @@ class TaskService:
                 raise HTTPException(
                     400,
                     f"任务格式版本不兼容（任务版本: {existing or '无'}，当前版本: {required}）。"
-                    f"目录格式已变更（.snapshot 支持目录形态），请使用 restart 重新创建任务。",
+                    f"目录格式已变更（.snapshot 强制规范化为纯文件），请使用 restart 重新创建任务。",
                 )
         health = _inspect_resume_health(row)
         if not health["can_resume"]:

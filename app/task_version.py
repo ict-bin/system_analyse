@@ -5,8 +5,8 @@ task_version.py — 任务格式版本控制
 大版本（V1.x → V2.x）表示任务目录格式发生了不兼容变更，旧任务目录必须清空重建。
 
 版本号命名规则:
-  - V1.0: 初始格式（.snapshot 为文件）
-  - V2.0: .snapshot 支持目录形态（兼容只读 NFS）；引入 .task_version 文件本身
+  - V1.0: 初始格式（.snapshot 为文件；无 .task_version）
+  - V2.0: .snapshot 始终为文件（S2 每次强制规范化），代码不允许目录形态；引入 .task_version
 
 使用方式:
   1. 在 orchestrator.execute() 和 task_service 的 resume/restart 入口调用
@@ -24,7 +24,7 @@ logger = logging.getLogger("sa.task_version")
 
 # ── 当前任务格式版本 ──────────────────────────────────────────────────────────
 # 增变大版本号的场景（不兼容变更）:
-#   V2.0: .snapshot 从纯文件变为支持目录形态；引入 .task_version 文件
+#   V2.0: .snapshot 始终为文件（S2 每次 _create_snapshot_file 强制规范化为文件）；引入 .task_version
 TASK_FORMAT_VERSION = "2.0"
 
 _VERSION_FILE_NAME = ".task_version"

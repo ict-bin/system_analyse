@@ -117,7 +117,8 @@
 ## 禁止访问的目录
 - `prescan/` — 关键词预扫描中间产物，不代表模块文件内容
 - `modules_pre_filter_backup/` — S1.5 安全过滤备份，只读
-- `.s2_snapshots/` — 快照备份，只读
+- `modules/*/.snapshot` — 模块快照文件，**禁止 Worker 读取或写入**（Python 自动管理）
+- `.s2_snapshots/` — 历史快照备份，只读
 - `filtered_files.txt` — 只读，禁止写入或修改
 
 ## deleted/ 子文件夹（S2 专用）

@@ -191,7 +191,7 @@ AFTER=$(cat modules/mbedtls_*/files.list | sort -u | wc -l)
 echo "拆分后: $AFTER 个文件"
 [ "$BEFORE" -eq "$AFTER" ] && echo "✅ 完整" || { echo "❌ 丢失 $((BEFORE-AFTER)) 个"; exit 1; }
 
-# 删除原模块目录（快照已保存在 .s2_snapshots/ 中）
+# 删除原模块目录（快照已保存在 modules/$MOD/.snapshot 中，Python 自动管理，**禁止 Worker 触碰**）
 # 若已创建 deleted/，只删 files.list （不要 rm -rf 整个目录）。若无 deleted/，可直接 rm -rf
 if [ -d "modules/$MOD/deleted" ]; then
     rm -f modules/$MOD/files.list
