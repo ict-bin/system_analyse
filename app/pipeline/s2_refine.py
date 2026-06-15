@@ -51,9 +51,19 @@ def _read_lines(path: Path) -> set[str]:
 
 
 def _write_lines(path: Path, lines: set[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Read-only filesystem: parent already exists or can't be created;
+            # defer failure to the write below so we get a clear error.
+            pass
     if path.exists() and path.is_dir():
-        shutil.rmtree(str(path), ignore_errors=True)
+        # Can't convert directory to file on read-only filesystem
+        try:
+            shutil.rmtree(str(path))
+        except OSError:
+            pass
     path.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8")
 
 
@@ -72,6 +82,12 @@ def _snapshot_file_path(mod_dir: Path, workspace: Path | None = None) -> Path:
 
 
 def _ensure_snapshot_file(mod_dir: Path, workspace: Path | None = None) -> Path:
+    """Ensure a canonical snapshot exists for the module.
+
+    Returns a Path to the snapshot content (either a file or a dir/file).
+    On read-only filesystems a directory .snapshot/ is kept in place;
+    callers must use _snapshot_file_path() to resolve the actual file.
+    """
     snapshot = mod_dir / ".snapshot"
     legacy_snapshot: Path | None = None
     if workspace is not None:
@@ -79,7 +95,18 @@ def _ensure_snapshot_file(mod_dir: Path, workspace: Path | None = None) -> Path:
     if snapshot.exists() and snapshot.is_dir():
         nested_snapshot = snapshot / "files.list"
         salvaged_lines = _read_lines(nested_snapshot)
-        shutil.rmtree(str(snapshot), ignore_errors=True)
+        # Try to convert directory to flat file (best-effort).
+        # On read-only NFS this will silently keep the directory layout.
+        try:
+            shutil.rmtree(str(snapshot))
+        except OSError:
+            # Read-only filesystem: keep directory, ensure files.list is up-to-date
+            if salvaged_lines:
+                try:
+                    _write_lines(nested_snapshot, salvaged_lines)
+                except OSError:
+                    pass
+            return nested_snapshot
         if salvaged_lines:
             _write_lines(snapshot, salvaged_lines)
             return snapshot

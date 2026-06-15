@@ -38,6 +38,7 @@ from .pipeline import (
     StageError, PiFatalError,
 )
 from .pipeline.checkpoint import CheckpointManager
+from .task_version import ensure_task_format_version
 from .pipeline.helpers import (
     discover_modules, get_modules_root,
     write_failure_report, generate_modules_list, strip_target_prefix,
@@ -170,7 +171,8 @@ class Orchestrator:
         # 断点续跑通过 workspace/.checkpoint/ 目录中的标记文件驱动，
         # 不再依赖 cfg.start_stage / cfg.resume_workspace。
         out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # 任务格式版本校验：不兼容版本自动清空重建
+        ensure_task_format_version(out_dir)
         run_dir = out_dir / "run"
         run_dir.mkdir(exist_ok=True)
         final_out_dir = out_dir / "output"

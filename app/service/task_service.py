@@ -26,6 +26,10 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.copy_utils import safe_copy2
 from app.config import load_service_config
+from app.task_version import (
+    ensure_task_format_version, get_task_root, is_task_format_compatible,
+    read_task_version, TASK_FORMAT_VERSION,
+)
 from app.db.models import AppSaTask, AppSaTaskEvent
 from app.logging_utils import log_event
 from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
@@ -1774,6 +1778,33 @@ class TaskService:
                 },
             )
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
+        # ── 任务格式版本校验 ────────────────────────────────────────────────
+        task_root = get_task_root(row.output_path, task_id)
+        if task_root is not None:
+            compatible, existing, required = is_task_format_compatible(task_root)
+            if not compatible:
+                self._record_task_operation_event(
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    operation="resume_task",
+                    event_type="task_operation_rejected",
+                    message="任务续跑被拒绝：任务格式版本不兼容",
+                    level="error",
+                    payload={
+                        "reason": "task_version_mismatch",
+                        "existing_version": existing,
+                        "required_version": required,
+                        "status": previous_status,
+                        "before_status": previous_status,
+                        "after_status": previous_status,
+                        "changed": False,
+                    },
+                )
+                raise HTTPException(
+                    400,
+                    f"任务格式版本不兼容（任务版本: {existing or '无'}，当前版本: {required}）。"
+                    f"目录格式已变更（.snapshot 支持目录形态），请使用 restart 重新创建任务。",
+                )
         health = _inspect_resume_health(row)
         if not health["can_resume"]:
             missing = health.get("missing_artifacts") or []
