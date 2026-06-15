@@ -106,7 +106,7 @@ class UnknownCheckerStage(BaseStage):
                 system_prompt=checker_prompt,
                 tools=["bash", "read"],
                 cwd=str(workspace),
-                task_pi_dir=getattr(cfg, "task_pi_dir", ""),
+                task_pi_dir=cfg.role_pi_dir("workers"),
                 thinking_level="off",
                 session_file=session,
                 cancel_event=ctx.cancel_event,

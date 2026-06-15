@@ -94,6 +94,15 @@ class AgentResult:
         self.api_retry_event_due: bool = False
         self.consecutive_api_retry_count: int = 0
         self.api_retry_reason: str | None = None
+        self.agent_role: str | None = None
+        self.runtime_dir: str | None = None
+        self.context_window: int = 0
+        self.proxy_reserved_tokens: int = 0
+        self.compaction_requested: bool = False
+        self.compaction_completed: bool = False
+        self.context_overflow_retrying: bool = False
+        self.context_budget_exceeded_preflight: bool = False
+        self.context_overflow_failed_after_compaction: bool = False
 
 
 # ─── 内部异常 ─────────────────────────────────────────────────────────────────
@@ -193,6 +202,16 @@ def _single_input_token_limit(context_window: int) -> int:
     return max(1, int(context_window * _SINGLE_INPUT_CONTEXT_RATIO))
 
 
+def _effective_context_limit(context_window: int, proxy_reserved_tokens: int = 0) -> int:
+    reserve = max(int(proxy_reserved_tokens or 0), 4096)
+    response_headroom = 4096
+    return max(1, int(context_window) - reserve - response_headroom)
+
+
+def _preflight_context_token_limit(context_window: int, proxy_reserved_tokens: int = 0) -> int:
+    return max(1, int(_effective_context_limit(context_window, proxy_reserved_tokens) * _SINGLE_INPUT_CONTEXT_RATIO))
+
+
 def _build_agent_env(
     base_env: dict[str, str] | None,
     *,
@@ -211,23 +230,33 @@ def _parse_context_overflow_details(error_text: str | None) -> dict[str, int]:
     lowered = text.lower()
     details = {
         "input_tokens": 0,
+        "actual_input_tokens": 0,
         "requested_output_tokens": 0,
         "context_length": 0,
+        "provider_reported_context_length": 0,
         "max_input_tokens": 0,
+        "proxy_reserved_tokens": 0,
     }
-    if "context length" not in lowered and "input tokens" not in lowered:
+    if "context length" not in lowered and "input tokens" not in lowered and "prefill_context_length_exceeded" not in lowered:
         return details
 
     patterns = {
         "input_tokens": r"passed\s+(\d+)\s+input tokens",
+        "actual_input_tokens": r"input has\s+(\d+)\s+tokens",
         "requested_output_tokens": r"requested\s+(\d+)\s+output tokens",
         "context_length": r"context length is only\s+(\d+)\s+tokens",
+        "provider_reported_context_length": r"maximum context length is\s+(\d+)\s+tokens",
         "max_input_tokens": r"maximum input length(?: of)?\s+(\d+)\s+tokens",
+        "proxy_reserved_tokens": r"reserves\s+(\d+)\s+safety-buffer tokens",
     }
     for key, pattern in patterns.items():
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             details[key] = int(match.group(1))
+    if details["provider_reported_context_length"] and not details["context_length"]:
+        details["context_length"] = details["provider_reported_context_length"]
+    if details["actual_input_tokens"] and not details["input_tokens"]:
+        details["input_tokens"] = details["actual_input_tokens"]
     return details
 
 
@@ -237,8 +266,8 @@ def _is_context_overflow_error(error_text: str | None) -> bool:
         return True
     lowered = str(error_text or "").lower()
     return (
-        "context length" in lowered
-        and "input tokens" in lowered
+        ("context length" in lowered or "prefill_context_length_exceeded" in lowered)
+        and ("input tokens" in lowered or "input has" in lowered)
         and ("badrequesterror" in lowered or "400" in lowered)
     )
 
@@ -250,11 +279,12 @@ def _format_context_overflow_failure(
     single_input_tokens: int,
     single_input_limit: int,
     compaction_attempted: bool,
+    proxy_reserved_tokens: int = 0,
 ) -> str:
     action = "已先触发一次会话自动压缩并重试" if compaction_attempted else "未能触发会话自动压缩"
     return (
         f"{action}，但当前单次输入估算约 {single_input_tokens} tokens，"
-        f"超过上下文窗口 75% 阈值 {single_input_limit}/{context_window}，"
+        f"超过有效预算阈值 75%: {single_input_limit}/{context_window}（proxy_reserved={max(int(proxy_reserved_tokens or 0), 4096)}），"
         f"本次请求不再继续重试。原始错误: {original_error or 'unknown'}"
     )
 
@@ -529,6 +559,7 @@ def run_agent(
     cwd: str = ".",
     env: dict[str, str] | None = None,
     task_pi_dir: str | None = None,
+    agent_role: str = "",
     thinking_level: str = "off",
     session_file: str | None = None,
     on_stream: Callable[[str], None] | None = None,
@@ -579,6 +610,7 @@ def run_agent(
                     prompt=prompt,
                     system_prompt=system_prompt,
                     model=model,
+                    agent_role=agent_role,
                     tools=tools,
                     thinking_level=thinking_level,
                     session_file=session_file,
@@ -590,6 +622,7 @@ def run_agent(
                     retry_delay=retry_delay,
                     pi_max_retries=pi_max_retries,
                     pi_retry_delay=pi_retry_delay,
+                    task_pi_dir=task_pi_dir,
                     timeout_seconds=timeout_seconds,
                     model_stuck_timeout=model_stuck_timeout,
                     model_stuck_max_activations=model_stuck_max_activations,
@@ -645,6 +678,7 @@ def _run_with_context_overflow_recovery(
     prompt: str,
     system_prompt: str,
     model: str,
+    agent_role: str,
     tools: list[str],
     thinking_level: str,
     session_file: str | None,
@@ -656,10 +690,56 @@ def _run_with_context_overflow_recovery(
     retry_delay: float,
     pi_max_retries: int,
     pi_retry_delay: float,
+    task_pi_dir: str | None = None,
     timeout_seconds: float | None = None,
     model_stuck_timeout: float | None = None,
     model_stuck_max_activations: int | None = None,
 ) -> AgentResult:
+    base_context_window = _model_context_window(model)
+    preflight_limit = _preflight_context_token_limit(base_context_window)
+    preflight_tokens = _single_input_token_estimate(system_prompt, prompt)
+    runtime_dir = str(task_pi_dir or (env.get("PI_CODING_AGENT_DIR") if env else "")).strip() or None
+    if preflight_tokens > preflight_limit:
+        preflight_result = AgentResult()
+        preflight_result.agent_role = agent_role or None
+        preflight_result.runtime_dir = runtime_dir
+        preflight_result.context_window = base_context_window
+        preflight_result.proxy_reserved_tokens = 4096
+        preflight_result.context_budget_exceeded_preflight = True
+        if not session_file:
+            preflight_result.error = _format_context_overflow_failure(
+                "preflight_context_budget_exceeded_without_session",
+                context_window=base_context_window,
+                single_input_tokens=preflight_tokens,
+                single_input_limit=preflight_limit,
+                compaction_attempted=False,
+                proxy_reserved_tokens=4096,
+            )
+            preflight_result.context_overflow_failed_after_compaction = True
+            return preflight_result
+        preflight_result.compaction_requested = True
+        compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+        _run_with_pi_retry(
+            args=compaction_args, cwd=cwd, env=env,
+            prompt=_COMPACTION_TRIGGER_PROMPT,
+            cancel_event=cancel_event, on_stream=None,
+            max_retries=max_retries, retry_delay=retry_delay,
+            pi_max_retries=pi_max_retries, pi_retry_delay=pi_retry_delay,
+            timeout_seconds=None,
+        )
+        preflight_result.compaction_completed = True
+        refreshed_preflight_limit = _preflight_context_token_limit(base_context_window)
+        if preflight_tokens > refreshed_preflight_limit:
+            preflight_result.error = _format_context_overflow_failure(
+                "preflight_context_budget_exceeded",
+                context_window=base_context_window,
+                single_input_tokens=preflight_tokens,
+                single_input_limit=refreshed_preflight_limit,
+                compaction_attempted=True,
+                proxy_reserved_tokens=4096,
+            )
+            preflight_result.context_overflow_failed_after_compaction = True
+            return preflight_result
     result = _run_with_pi_retry(
         args=args, cwd=cwd, env=env, prompt=prompt,
         cancel_event=cancel_event, on_stream=on_stream,
@@ -669,17 +749,26 @@ def _run_with_context_overflow_recovery(
         model_stuck_timeout=model_stuck_timeout,
         model_stuck_max_activations=model_stuck_max_activations,
     )
+    result.agent_role = agent_role or None
+    result.runtime_dir = runtime_dir
+    result.context_window = base_context_window
     if not _is_context_overflow_error(result.error):
         return result
 
     overflow = _parse_context_overflow_details(result.error)
     context_window = overflow["context_length"] or _model_context_window(model)
+    proxy_reserved_tokens = overflow["proxy_reserved_tokens"]
     single_input_tokens = _single_input_token_estimate(system_prompt, prompt)
-    single_input_limit = _single_input_token_limit(context_window)
+    single_input_limit = _preflight_context_token_limit(context_window, proxy_reserved_tokens)
     compaction_attempted = False
+    result.agent_role = agent_role or None
+    result.runtime_dir = runtime_dir
+    result.context_window = context_window
+    result.proxy_reserved_tokens = proxy_reserved_tokens
 
     if session_file:
         compaction_attempted = True
+        result.compaction_requested = True
         msg = (
             "检测到智能体单次请求触发上下文超限，先触发一次会话自动压缩，"
             "随后重试原请求。"
@@ -696,6 +785,7 @@ def _run_with_context_overflow_recovery(
             pi_max_retries=pi_max_retries, pi_retry_delay=pi_retry_delay,
             timeout_seconds=None,
         )
+        result.compaction_completed = True
 
     if single_input_tokens > single_input_limit:
         result.error = _format_context_overflow_failure(
@@ -704,10 +794,13 @@ def _run_with_context_overflow_recovery(
             single_input_tokens=single_input_tokens,
             single_input_limit=single_input_limit,
             compaction_attempted=compaction_attempted,
+            proxy_reserved_tokens=proxy_reserved_tokens,
         )
+        result.context_overflow_failed_after_compaction = compaction_attempted or not session_file
         return result
 
     if not session_file:
+        result.context_overflow_failed_after_compaction = True
         return result
 
     retry_result = _run_with_pi_retry(
@@ -717,6 +810,13 @@ def _run_with_context_overflow_recovery(
         pi_max_retries=pi_max_retries, pi_retry_delay=pi_retry_delay,
         timeout_seconds=None,
     )
+    retry_result.agent_role = agent_role or None
+    retry_result.runtime_dir = runtime_dir
+    retry_result.context_window = context_window
+    retry_result.proxy_reserved_tokens = proxy_reserved_tokens
+    retry_result.compaction_requested = compaction_attempted
+    retry_result.compaction_completed = compaction_attempted
+    retry_result.context_overflow_retrying = compaction_attempted
     return retry_result
 
 

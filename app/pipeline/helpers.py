@@ -204,6 +204,51 @@ def run_agent_with_stage_guard(
                             consecutive_api_retry_count=int(getattr(result, "consecutive_api_retry_count", 0) or 0),
                             reason=str(getattr(result, "api_retry_reason", "") or ""),
                         )
+                    if getattr(result, "compaction_requested", False):
+                        ctx.emit_event(
+                            "task_context_compaction_requested",
+                            stage=stage,
+                            role=str(getattr(result, "agent_role", "") or ""),
+                            runtime_dir=str(getattr(result, "runtime_dir", "") or ""),
+                            context_window=int(getattr(result, "context_window", 0) or 0),
+                        )
+                    if getattr(result, "compaction_completed", False):
+                        ctx.emit_event(
+                            "task_context_compaction_completed",
+                            stage=stage,
+                            role=str(getattr(result, "agent_role", "") or ""),
+                            runtime_dir=str(getattr(result, "runtime_dir", "") or ""),
+                            context_window=int(getattr(result, "context_window", 0) or 0),
+                        )
+                    if getattr(result, "context_budget_exceeded_preflight", False):
+                        ctx.emit_event(
+                            "task_context_budget_exceeded_preflight",
+                            stage=stage,
+                            role=str(getattr(result, "agent_role", "") or ""),
+                            runtime_dir=str(getattr(result, "runtime_dir", "") or ""),
+                            context_window=int(getattr(result, "context_window", 0) or 0),
+                            proxy_reserved_tokens=int(getattr(result, "proxy_reserved_tokens", 0) or 0),
+                            error=str(getattr(result, "error", "") or ""),
+                        )
+                    if getattr(result, "context_overflow_retrying", False):
+                        ctx.emit_event(
+                            "task_context_overflow_retrying",
+                            stage=stage,
+                            role=str(getattr(result, "agent_role", "") or ""),
+                            runtime_dir=str(getattr(result, "runtime_dir", "") or ""),
+                            context_window=int(getattr(result, "context_window", 0) or 0),
+                            proxy_reserved_tokens=int(getattr(result, "proxy_reserved_tokens", 0) or 0),
+                        )
+                    if getattr(result, "context_overflow_failed_after_compaction", False):
+                        ctx.emit_event(
+                            "task_context_overflow_failed_after_compaction",
+                            stage=stage,
+                            role=str(getattr(result, "agent_role", "") or ""),
+                            runtime_dir=str(getattr(result, "runtime_dir", "") or ""),
+                            context_window=int(getattr(result, "context_window", 0) or 0),
+                            proxy_reserved_tokens=int(getattr(result, "proxy_reserved_tokens", 0) or 0),
+                            error=str(getattr(result, "error", "") or ""),
+                        )
                     return result
             heartbeat_index += 1
             elapsed = time.monotonic() - started_monotonic

@@ -274,6 +274,36 @@ class WorkerDispatcherGlobalLimitTests(unittest.TestCase):
         self.assertEqual(cleaned, [("/tmp/out", "task-1")])
         self.assertTrue(any(item["event_type"] == "task_lease_recovered" for item in events))
 
+    def test_task_auto_recovered_only_emits_for_recently_recovered_task(self):
+        repo = FakeRepository(
+            pending_rows=[SimpleNamespace(task_id="task-1", project_id="p1"), SimpleNamespace(task_id="task-2", project_id="p1")],
+            running_count=0,
+            lock_ok=True,
+        )
+        events = []
+        spawned = []
+        dispatcher = wd.WorkerDispatcher(
+            get_db=_fake_db_gen,
+            clear_task_execution_lock=lambda output_path, task_id: None,
+            cleanup_resume_files=lambda output_path, task_id: None,
+            claim_task_lease=lambda db, row, dispatch_target: 7,
+            spawn_task=lambda task_id, lease_epoch, dispatch_target: spawned.append((task_id, lease_epoch, dispatch_target)),
+            record_timeline_event=lambda **kwargs: events.append(kwargs),
+            select_dispatch_target=lambda db: "runner-a",
+            get_running_tasks_count=lambda: 0,
+            load_runtime_control=lambda db: {},
+            task_repository=repo,
+        )
+        dispatcher._agent_observability = SimpleNamespace(build_snapshot=lambda db, project_id=None: {"processes": []})
+        wd._runtime_state.recently_recovered_task_ids = {"task-1"}
+        claimed = dispatcher._claim_pending_tasks(SimpleNamespace(), available_slots=2, current_concurrency=2)
+        self.assertEqual(claimed, 2)
+        self.assertEqual(len(spawned), 2)
+        auto_recovered = [item for item in events if item["event_type"] == "task_auto_recovered"]
+        self.assertEqual(len(auto_recovered), 1)
+        self.assertEqual(auto_recovered[0]["task_id"], "task-1")
+        self.assertEqual(auto_recovered[0]["payload"]["reason"], "lease_recovered_and_reclaimed")
+
 
 if __name__ == "__main__":
     unittest.main()

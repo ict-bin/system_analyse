@@ -79,6 +79,7 @@ class WorkerRuntimeState:
     control_reason: str | None = None
     control_updated_at: str | None = None
     current_worker_task_concurrency: int = WORKER_TASK_CONCURRENCY
+    recently_recovered_task_ids: set[str] | None = None
 
     def snapshot(self, running_tasks_count: int) -> dict:
         now_ts = _time.time()
@@ -282,6 +283,8 @@ class WorkerDispatcher:
         return _runtime_state.control_pause_claim_until_ts > now_ts
 
     def _recover_stale_tasks_if_due(self, db: Session, now: datetime, now_ts: float) -> None:
+        if _runtime_state.recently_recovered_task_ids is None:
+            _runtime_state.recently_recovered_task_ids = set()
         if (
             _runtime_state.last_stale_recovery_ts > 0.0
             and (now_ts - _runtime_state.last_stale_recovery_ts) < WORKER_STALE_SWEEP_INTERVAL_SECONDS
@@ -345,6 +348,7 @@ class WorkerDispatcher:
             should_recover=_should_recover,
         )
         for stale in recovered_rows:
+            _runtime_state.recently_recovered_task_ids.add(str(getattr(stale, "task_id", "") or ""))
             self._record_timeline_event(
                 task_id=stale.task_id,
                 project_id=stale.project_id,
@@ -361,6 +365,8 @@ class WorkerDispatcher:
         _runtime_state.last_stale_recovery_ts = now_ts
 
     def _claim_pending_tasks(self, db: Session, available_slots: int, current_concurrency: int) -> int:
+        if _runtime_state.recently_recovered_task_ids is None:
+            _runtime_state.recently_recovered_task_ids = set()
         pending_rows = self._task_repository.list_pending_tasks(db, available_slots)
         claimed_count = 0
         _runtime_state.last_claim_attempt_ts = _time.time()
@@ -388,6 +394,20 @@ class WorkerDispatcher:
                 },
             )
             self._spawn_task(row.task_id, lease_epoch, dispatch_target)
+            if str(getattr(row, "task_id", "") or "") in _runtime_state.recently_recovered_task_ids:
+                _runtime_state.recently_recovered_task_ids.discard(str(getattr(row, "task_id", "") or ""))
+                self._record_timeline_event(
+                    task_id=row.task_id,
+                    project_id=getattr(row, "project_id", None),
+                    event_type="task_auto_recovered",
+                    message="任务已由系统自动恢复并重新调度",
+                    payload={
+                        "dispatcher_instance_id": dispatch_target,
+                        "lease_epoch_after": lease_epoch,
+                        "reason": "lease_recovered_and_reclaimed",
+                        "previous_status": "running",
+                    },
+                )
         return claimed_count
 
     def _claim_pending_tasks_with_global_limit(self, db: Session, available_slots: int, current_concurrency: int) -> int:

@@ -518,6 +518,7 @@ class TaskConfig(BaseModel):
     function_name: str = Field(default="", description="兼容字段：用于归档命名")
     cwd: str = Field(default="/data/target")
     task_pi_dir: str = Field(default="", description="任务级 PI runtime 目录")
+    task_pi_dirs: dict[str, str] = Field(default_factory=dict, description="按角色划分的任务级 PI runtime 目录")
 
     max_rounds_exceeded_action: str = Field(default="treat_as_passed")
     continue_on_module_failure: bool = Field(
@@ -607,6 +608,14 @@ class TaskConfig(BaseModel):
 
     def get_prompt(self, role: str, key: str) -> str:
         return self.prompt_overrides.get_prompt(role, key)
+
+    def role_pi_dir(self, role: str) -> str:
+        role_key = str(role or "").strip().lower()
+        role_dirs = self.task_pi_dirs if isinstance(self.task_pi_dirs, dict) else {}
+        candidate = str(role_dirs.get(role_key) or "").strip()
+        if candidate:
+            return candidate
+        return str(self.task_pi_dir or "").strip()
 
 
 # ─── Token 统计 ───────────────────────────────────────────────────────────────
