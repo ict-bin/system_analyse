@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Any, Callable
 
 from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
@@ -313,6 +313,10 @@ class TaskRepository:
         worker_instance_id: str,
         task_config_json: dict,
         resolved_snapshot: dict,
+        agent_auth_json: dict[str, Any] | None,
+        role_config_snapshot: dict[str, Any] | None,
+        provider_runtime_summary: dict[str, Any] | None,
+        llm_binding_snapshot: dict[str, Any] | None,
         lease_deadline: Callable[[], datetime],
     ) -> bool:
         updated = db.query(AppSaTask).filter(
@@ -326,6 +330,10 @@ class TaskRepository:
                 "task_config_json": {
                     **task_config_json,
                     "resolved_config_snapshot": resolved_snapshot,
+                    "agent_auth_json": agent_auth_json,
+                    "role_config_snapshot": role_config_snapshot,
+                    "provider_runtime_summary": provider_runtime_summary,
+                    "llm_binding_snapshot": llm_binding_snapshot,
                 },
                 "dispatch_started_at": now_local(),
                 "lease_expires_at": lease_deadline(),

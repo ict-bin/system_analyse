@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable
+from typing import Any, Callable
 
 from app.copy_utils import safe_copy2
 from sqlalchemy.orm import Session
@@ -27,6 +27,7 @@ from app.service.agent_cleanup import AgentCleanupService
 from app.service.task_execution_lock import TaskExecutionLockConflict, RUNNER_PROCESS_TOKEN
 from app.service.task_repository import TaskRepository
 from app.service.worker_dispatcher import WORKER_INSTANCE_ID, lease_deadline
+from app.time_utils import isoformat_local, now_local
 
 logger = logging.getLogger("sa.task_runner")
 LEASE_HEARTBEAT_FAILURE_TOLERANCE = 3
@@ -71,6 +72,109 @@ def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None)
         encoding="utf-8",
     )
     return str(task_pi_dir), "task_scoped"
+
+
+def _read_json_file(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _normalize_agent_auth_snapshot(agent_task_key: dict | None) -> dict[str, Any] | None:
+    if not isinstance(agent_task_key, dict):
+        return None
+    payload = {
+        "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
+        "agent_task_key_name": str(agent_task_key.get("name") or "").strip() or None,
+        "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
+        "agent_task_key_secret": str(agent_task_key.get("secret") or "").strip() or None,
+        "agent_task_key_source": str(agent_task_key.get("source") or "").strip() or None,
+    }
+    return payload if any(payload.values()) else None
+
+
+def _build_role_runtime_summary(
+    role_name: str,
+    role_config: Any,
+    *,
+    models_json: dict[str, Any] | None,
+    settings_json: dict[str, Any] | None,
+) -> dict[str, Any]:
+    agents = []
+    for index, agent in enumerate(getattr(role_config, "agents", []) or []):
+        if hasattr(agent, "model_dump"):
+            payload = agent.model_dump(mode="json")
+        elif isinstance(agent, dict):
+            payload = dict(agent)
+        else:
+            payload = {"model": str(getattr(agent, "model", "") or "").strip() or None}
+        payload.setdefault("index", index)
+        agents.append(payload)
+    stage_models = getattr(role_config, "stage_models", {}) or {}
+    return {
+        "role_name": role_name,
+        "config_file_key": None,
+        "provider_key": None,
+        "provider_type": None,
+        "model": str(getattr(role_config, "default_model", "") or "").strip() or None,
+        "model_selector": None,
+        "default_model": str(getattr(role_config, "default_model", "") or "").strip() or None,
+        "default_tools": list(getattr(role_config, "default_tools", []) or []),
+        "default_thinking_level": str(getattr(role_config, "default_thinking_level", "") or "").strip() or None,
+        "system_prompt_dir": str(getattr(role_config, "system_prompt_dir", "") or "").strip() or None,
+        "agent_count": len(agents),
+        "agents": agents,
+        "stage_models": dict(stage_models) if isinstance(stage_models, dict) else {},
+        "models_json": models_json,
+        "settings_json": settings_json,
+    }
+
+
+def _build_runtime_config_snapshots(
+    *,
+    cfg: Any,
+    agent_task_key: dict | None,
+    task_pi_dir: str | None,
+    agent_runtime_mode: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    frozen_at = isoformat_local(now_local()) or datetime.utcnow().isoformat()
+    runtime_dir = Path(task_pi_dir) if task_pi_dir else Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
+    models_path = Path(os.environ.get("PI_MODELS_JSON")) if not task_pi_dir and os.environ.get("PI_MODELS_JSON") else (runtime_dir / "models.json")
+    settings_path = runtime_dir / "settings.json"
+    models_json = _read_json_file(models_path)
+    settings_json = _read_json_file(settings_path)
+    agent_auth_json = _normalize_agent_auth_snapshot(agent_task_key)
+
+    role_config_snapshot = {
+        "workers": cfg.workers.model_dump(mode="json"),
+        "judges": cfg.judges.model_dump(mode="json"),
+    }
+    provider_runtime_summary = {
+        "workers": _build_role_runtime_summary("workers", cfg.workers, models_json=models_json, settings_json=settings_json),
+        "judges": _build_role_runtime_summary("judges", cfg.judges, models_json=models_json, settings_json=settings_json),
+    }
+    llm_binding_snapshot = {
+        "version": 1,
+        "frozen_at": frozen_at,
+        "agent_runtime_mode": agent_runtime_mode,
+        "agent_task_key": {
+            "id": str((agent_task_key or {}).get("id") or "").strip() or None,
+            "name": str((agent_task_key or {}).get("name") or "").strip() or None,
+            "prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
+            "secret": str((agent_task_key or {}).get("secret") or "").strip() or None,
+            "source": str((agent_task_key or {}).get("source") or "").strip() or None,
+        } if isinstance(agent_task_key, dict) else None,
+        "runtime_files": {
+            "models_json": models_json,
+            "settings_json": settings_json,
+        },
+        "roles": role_config_snapshot,
+    }
+    return agent_auth_json, role_config_snapshot, provider_runtime_summary, llm_binding_snapshot
 
 
 @dataclass
@@ -501,6 +605,17 @@ class TaskRunner:
                 payload={"agent_runtime_mode": "global"},
             )
         resolved_snapshot = cfg.model_dump(mode="json")
+        (
+            agent_auth_json,
+            role_config_snapshot,
+            provider_runtime_summary,
+            llm_binding_snapshot,
+        ) = _build_runtime_config_snapshots(
+            cfg=cfg,
+            agent_task_key=agent_task_key,
+            task_pi_dir=task_pi_dir,
+            agent_runtime_mode=agent_runtime_mode,
+        )
         log_event(
             logger,
             logging.INFO,
@@ -523,6 +638,10 @@ class TaskRunner:
                 worker_instance_id=WORKER_INSTANCE_ID,
                 task_config_json=task_snapshot.task_config_json,
                 resolved_snapshot=resolved_snapshot,
+                agent_auth_json=agent_auth_json,
+                role_config_snapshot=role_config_snapshot,
+                provider_runtime_summary=provider_runtime_summary,
+                llm_binding_snapshot=llm_binding_snapshot,
                 lease_deadline=lease_deadline,
             )
             if not updated:

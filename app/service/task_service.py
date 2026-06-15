@@ -1355,6 +1355,11 @@ class TaskService:
             logger.warning("get_task: failed to compute effective_config for %s: %s", task_id, _exc)
             result["effective_config_json"] = row.task_config_json or {}
             result["effective_config_source"] = {}
+        task_config = row.task_config_json if isinstance(row.task_config_json, dict) else {}
+        result["agent_auth_json"] = task_config.get("agent_auth_json") if isinstance(task_config.get("agent_auth_json"), dict) else None
+        result["role_config_snapshot"] = task_config.get("role_config_snapshot") if isinstance(task_config.get("role_config_snapshot"), dict) else None
+        result["provider_runtime_summary"] = task_config.get("provider_runtime_summary") if isinstance(task_config.get("provider_runtime_summary"), dict) else None
+        result["llm_binding_snapshot"] = task_config.get("llm_binding_snapshot") if isinstance(task_config.get("llm_binding_snapshot"), dict) else None
         return result
 
     def get_timeline(self, db: Session, task_id: str) -> dict:
