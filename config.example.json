@@ -16,6 +16,7 @@
     "enable_final_check": false,
     "stages": {
         "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "security_filter": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
         "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
         "analyse":     {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
         "final_check": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"}
