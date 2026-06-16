@@ -1,14 +1,19 @@
 {
-    "analyse_targets": ["binary"],
+    "analyse_targets": ["binary", "source"],
     "binary_arch": ["all"],
-    "parallel_modules": 40,
-    "parallel_sub_workers": 40,
+    "parallel_modules": 4,
+    "parallel_sub_workers": 4,
+    "security_focus_categories": ["all"],
+    "module_granularity": "coarse",
+    "filter_engine": "script",
     "agent_max_retries": -1,
-    "agent_retry_delay": 30,
+    "agent_retry_delay": 3,
     "pi_max_retries": -1,
-    "pi_retry_delay": 10,
+    "pi_retry_delay": 5,
     "model_stuck_timeout": 1800,
     "model_stuck_max_activations": 5,
+    "continue_on_module_failure": true,
+    "enable_final_check": false,
     "stages": {
         "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
         "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
@@ -20,11 +25,15 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "vllm/zai-org/GLM-5"}
+            {"model": "gaiasec/auto"}
         ],
         "stage_models": {
-            "sub_read": "vllm/zai-org/GLM-5",
-            "analyse":  "vllm/zai-org/GLM-5"
+            "explore":  "gaiasec/auto",
+            "classify": "gaiasec/auto",
+            "sub_read": "gaiasec/auto",
+            "refine":   "gaiasec/auto",
+            "analyse":  "gaiasec/auto",
+            "report":   "gaiasec/auto"
         }
     },
     "judges": {
@@ -32,10 +41,14 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "vllm/zai-org/GLM-5"}
+            {"model": "gaiasec/auto"}
         ],
         "stage_models": {
-            "analyse": "vllm/zai-org/GLM-5"
+            "classify":     "gaiasec/auto",
+            "refine":       "gaiasec/auto",
+            "analyse":      "gaiasec/auto",
+            "completeness": "gaiasec/auto",
+            "report":       "gaiasec/auto"
         }
     },
     "output_dir": "/data/output",
