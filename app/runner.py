@@ -1196,6 +1196,13 @@ def _run_with_api_retry(
                 term_timeout=2.0,
                 kill_timeout=2.0,
             )
+            # Close all pipes to prevent fd leak (each pipe = 2 fds in parent)
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if pipe:
+                        pipe.close()
+                except Exception:
+                    pass
 
         # Extract output
         for msg in reversed(result.messages):

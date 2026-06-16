@@ -34,4 +34,7 @@ if [ -d /data/config/prompts ]; then
     echo "[entrypoint] custom prompts found at /data/config/prompts/"
 fi
 
+# Raise fd limit before starting Python (runner spawns many pi subprocesses)
+ulimit -n 65536 2>/dev/null || true
+
 exec "$@"
