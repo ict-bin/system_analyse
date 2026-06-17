@@ -10,18 +10,14 @@
     "agent_retry_delay": 3,
     "pi_max_retries": -1,
     "pi_retry_delay": 5,
-    "agent_timeout_seconds": 1800.0,
-    "model_stuck_timeout": 1800,
-    "model_stuck_max_activations": 5,
     "max_rounds_exceeded_action": "treat_as_passed",
     "continue_on_module_failure": true,
     "enable_final_check": false,
     "stages": {
-        "classify":        {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
-        "security_filter": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
-        "refine":          {"min_rounds": 2, "max_rounds": 3, "pass_mode": "majority"},
-        "analyse":         {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
-        "final_check":     {"min_rounds": 1, "max_rounds": 1, "pass_mode": "all"}
+        "classify":    {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
+        "refine":      {"min_rounds": 2, "max_rounds": 3, "pass_mode": "majority"},
+        "analyse":     {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
+        "final_check": {"min_rounds": 1, "max_rounds": 1, "pass_mode": "all"}
     },
     "workers": {
         "default_model": "",
@@ -29,7 +25,7 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gptplus_openai/gpt-5.4", "tools": null, "system_prompt": null, "thinking_level": null}
+            {"model": "gptplus_openai/gpt-5.4"}
         ],
         "stage_models": {
             "explore": "gptplus_minimax/MiniMax-M2.7"
@@ -41,7 +37,7 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gptplus_openai/gpt-5.4", "tools": null, "system_prompt": null, "thinking_level": null}
+            {"model": "gptplus_openai/gpt-5.4"}
         ],
         "stage_models": {}
     },
