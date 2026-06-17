@@ -102,7 +102,8 @@ def _create_snapshot_file(mod_dir: Path) -> Path:
 def _validate_module(mod_dir: Path) -> dict:
     """
     校验单模块:
-      .snapshot 文件集合 == files.list ∪ split/*/files.list ∪ split/_merge_to/*/files.list ∪ deleted/files.list
+      .snapshot == files.list ∪ split/*/files.list ∪ deleted/files.list
+      (_merge_to files excluded — they are validated in target modules)
     返回 {pass: bool, missing: [...], extra: [...]} 供 Judge 参考，不抛异常。
     """
     mod_name = mod_dir.name
@@ -117,19 +118,10 @@ def _validate_module(mod_dir: Path) -> dict:
     split_files: set[str] = set()
     for child_dir in sorted((mod_dir / "split").iterdir()) if (mod_dir / "split").exists() else []:
         if child_dir.name.startswith("_"):
-            for sub in (child_dir / "files.list" for _ in [1]):
-                continue
+            continue
         fl = child_dir / "files.list" if child_dir.is_dir() else None
         if fl and fl.exists():
             split_files |= _read_lines(fl)
-
-    merge_root = mod_dir / "split" / "_merge_to"
-    if merge_root.exists():
-        for d in sorted(merge_root.iterdir()):
-            if d.is_dir():
-                fl = d / "files.list"
-                if fl.exists():
-                    split_files |= _read_lines(fl)
 
     covered = kept | split_files | deleted
     missing = sorted(snapshot - covered)
@@ -187,11 +179,13 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
 
     # ── 完整性校验 ──
     covered = set().union(*child_map.values()) if child_map else set()
-    covered |= set().union(*merge_map.values()) if merge_map else set()
     covered |= deleted_set
     covered |= kept
-    if snapshot and covered != snapshot:
-        missing = snapshot - covered
+    # _merge_to files go TO other modules — excluded from THIS module's snapshot check.
+    # Target modules validate their own snapshots independently.
+    merge_covered = set().union(*merge_map.values()) if merge_map else set()
+    if snapshot and (covered | merge_covered) != snapshot:
+        missing = snapshot - (covered | merge_covered)
         # ★ 允许已在其他模块中的文件隐式通过（redo 时子模块来源于上轮拆分）
         mods_root = workspace / "modules"
         truly_missing: set[str] = set()
