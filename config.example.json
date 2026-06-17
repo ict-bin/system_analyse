@@ -1,10 +1,10 @@
 {
     "analyse_targets": ["binary", "source"],
-    "binary_arch": ["arm", "aarch64"],
-    "parallel_modules": 1,
-    "parallel_sub_workers": 1,
+    "binary_arch": ["all"],
+    "parallel_modules": 4,
+    "parallel_sub_workers": 4,
     "security_focus_categories": ["all"],
-    "module_granularity": "fine",
+    "module_granularity": "coarse",
     "filter_engine": "script",
     "agent_max_retries": -1,
     "agent_retry_delay": 3,
@@ -14,10 +14,10 @@
     "continue_on_module_failure": true,
     "enable_final_check": false,
     "stages": {
-        "classify":    {"min_rounds": 1, "max_rounds": 5, "pass_mode": "all"},
-        "refine":      {"min_rounds": 1, "max_rounds": 3, "pass_mode": "all"},
-        "analyse":     {"min_rounds": 1, "max_rounds": 5, "pass_mode": "all"},
-        "final_check": {"min_rounds": 1, "max_rounds": 1, "pass_mode": "all"}
+        "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "analyse":     {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "final_check": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"}
     },
     "workers": {
         "default_model": "",
