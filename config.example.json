@@ -14,9 +14,9 @@
     "continue_on_module_failure": true,
     "enable_final_check": false,
     "stages": {
-        "classify":    {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
-        "refine":      {"min_rounds": 2, "max_rounds": 3, "pass_mode": "majority"},
-        "analyse":     {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
+        "classify":    {"min_rounds": 1, "max_rounds": 5, "pass_mode": "majority"},
+        "refine":      {"min_rounds": 1, "max_rounds": 3, "pass_mode": "majority"},
+        "analyse":     {"min_rounds": 1, "max_rounds": 5, "pass_mode": "majority"},
         "final_check": {"min_rounds": 1, "max_rounds": 1, "pass_mode": "all"}
     },
     "workers": {
@@ -25,11 +25,9 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gptplus_openai/gpt-5.4"}
+            {"model": "gaiasec/auto"}
         ],
-        "stage_models": {
-            "explore": "gptplus_minimax/MiniMax-M2.7"
-        }
+        "stage_models": {}
     },
     "judges": {
         "default_model": "",
@@ -37,7 +35,7 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gptplus_openai/gpt-5.4"}
+            {"model": "gaiasec/auto"}
         ],
         "stage_models": {}
     },
