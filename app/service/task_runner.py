@@ -108,41 +108,26 @@ def _build_role_models_json(
 
 def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None, cfg: Any) -> tuple[dict[str, str], str]:
     role_dirs: dict[str, str] = {}
+    # A Runner pod processes one task at a time — no isolation needed.
+    # When agent_task_key provides custom credentials, write auth.json
+    # to the global pi dir; pi config is always at $PI_CODING_AGENT_DIR.
     if not task_root:
-        return role_dirs, "task_scoped"
-    agents_root = Path(task_root) / ".pi" / "agents"
-    agents_root.mkdir(parents=True, exist_ok=True)
+        return role_dirs, "global"
     global_pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
-    models_src = Path(os.environ.get("PI_MODELS_JSON") or (global_pi_dir / "models.json"))
-    settings_src = global_pi_dir / "settings.json"
-    global_models_json = _read_json_file(models_src)
-    global_settings_json = _read_json_file(settings_src)
-    merged_settings = _merge_pi_settings(global_settings_json)
-    auth_payload = {
-        "agent_task_key_id": str((agent_task_key or {}).get("id") or "").strip() or None,
-        "agent_task_key_name": str((agent_task_key or {}).get("name") or "").strip() or None,
-        "agent_task_key_prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
-        "agent_task_key_secret": str((agent_task_key or {}).get("secret") or "").strip() or None,
-        "agent_task_key_source": str((agent_task_key or {}).get("source") or "").strip() or None,
-    }
-    for role_name, role_config in (("workers", cfg.workers), ("judges", cfg.judges)):
-        role_dir = agents_root / role_name
-        role_dir.mkdir(parents=True, exist_ok=True)
-        models_json = _build_role_models_json(role_name, role_config, global_models_json=global_models_json)
-        (role_dir / "models.json").write_text(
-            json.dumps(models_json, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        (role_dir / "settings.json").write_text(
-            json.dumps(merged_settings, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        (role_dir / "auth.json").write_text(
+    secret = str((agent_task_key or {}).get("secret") or "").strip()
+    if secret:
+        auth_payload = {
+            "agent_task_key_id": str((agent_task_key or {}).get("id") or "").strip() or None,
+            "agent_task_key_name": str((agent_task_key or {}).get("name") or "").strip() or None,
+            "agent_task_key_prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
+            "agent_task_key_secret": secret,
+            "agent_task_key_source": str((agent_task_key or {}).get("source") or "").strip() or None,
+        }
+        (global_pi_dir / "auth.json").write_text(
             json.dumps(auth_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        role_dirs[role_name] = str(role_dir)
-    return role_dirs, "task_scoped"
+    return role_dirs, "global"
 
 
 def _read_json_file(path: Path | None) -> dict[str, Any] | None:

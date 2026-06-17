@@ -228,9 +228,9 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
             existing = _read_lines(target_dir / "files.list")
             _write_lines(target_dir / "files.list", existing | files)
             new_modules.append(child)
-            # 如果目标在 LLM 处理中，追加到其 .snapshot
+            # 如果目标在 LLM 处理中，追加到其 .snapshot（只追加不创建）
             if child in in_progress:
-                snap = _create_snapshot_file(target_dir)
+                snap = target_dir / ".snapshot"
                 if snap.exists() and snap.is_file():
                     snap_set = _read_lines(snap)
                     _write_lines(snap, snap_set | files)
@@ -242,10 +242,15 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
         merged_targets.append(target)
         # 如果目标在 LLM 处理中，追加到其 .snapshot + 记录待处理
         if target in in_progress:
-            snap = _create_snapshot_file(target_dir)
+            snap = target_dir / ".snapshot"
             if snap.exists() and snap.is_file():
                 snap_set = _read_lines(snap)
                 _write_lines(snap, snap_set | files)
+            # 若 snapshot 不存在：LLM Worker 尚未创建，等其 _create_snapshot_file
+            # 从 files.list（已含 merge 文件）创建时自然包含
+            merge_targets_in_progress.add(target)
+        else:
+            # 目标不在 in_progress: 直接由 _commit_worker 入 _queue 重跑
             merge_targets_in_progress.add(target)
 
     # 处理原模块
@@ -432,11 +437,10 @@ class RefineStage(BaseStage):
                 fatal.fatal = True
                 self._errors.append(fatal)
             finally:
-                # LLM 完成后，如果被 merge 过 → 也要入 commit 队列
+                # LLM 完成后，如果被 merge 过 → 重新入 LLM 队列（完整 W+J）
                 if mod_name in self._pending_merge_targets:
-                    mod_dir = get_modules_root(str(self._ctx.workspace)) / mod_name
-                    self._commit_queue.put((mod_dir, False, []))
                     self._pending_merge_targets.discard(mod_name)
+                    self._queue.put(mod_name)
                 self._in_progress.discard(mod_name)
                 self._queue.task_done()
 
@@ -456,16 +460,25 @@ class RefineStage(BaseStage):
                 new_ones = list(commit_info.get("new_modules") or [])
                 for nm in new_ones:
                     self._commit_children.add(nm)  # ★ 记录给 Orchestrator
-                # 记录被 merge 的 LLM 处理中模块（等 LLM 结束后入队列）
+                # merge 目标：in_progress → 等 LLM 结束再入队；其他 → 直接入队
                 for target in merge_in_progress:
-                    self._pending_merge_targets.add(target)
+                    if target in self._in_progress:
+                        self._pending_merge_targets.add(target)
+                    else:
+                        if target in self._refined:
+                            self._refined.discard(target)
+                        self._in_progress.add(target)
+                        self._queue.put(target)
 
                 if mod_dir.exists() and not (mod_dir / "files.list").exists():
                     shutil.rmtree(str(mod_dir), ignore_errors=True)
 
-                # 新子模块入 LLM 队列（去重）
+                # 新子模块：直接入 LLM 队列（已 refined 的先移除）
                 for nm in new_ones:
-                    if nm not in self._refined and nm not in self._in_progress:
+                    if nm not in self._in_progress:
+                        was_refined = nm in self._refined
+                        if was_refined:
+                            self._refined.discard(nm)
                         self._in_progress.add(nm)
                         self._queue.put(nm)
 
