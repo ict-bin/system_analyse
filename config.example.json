@@ -1,56 +1,51 @@
 {
     "analyse_targets": ["binary", "source"],
     "binary_arch": ["all"],
-    "parallel_modules": 4,
-    "parallel_sub_workers": 4,
+    "parallel_modules": 1,
+    "parallel_sub_workers": 1,
     "security_focus_categories": ["all"],
-    "module_granularity": "coarse",
+    "module_granularity": "fine",
     "filter_engine": "script",
     "agent_max_retries": -1,
     "agent_retry_delay": 3,
     "pi_max_retries": -1,
     "pi_retry_delay": 5,
+    "agent_timeout_seconds": 1800.0,
     "model_stuck_timeout": 1800,
     "model_stuck_max_activations": 5,
+    "max_rounds_exceeded_action": "treat_as_passed",
     "continue_on_module_failure": true,
     "enable_final_check": false,
     "stages": {
-        "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
+        "classify":        {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
         "security_filter": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
-        "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
-        "analyse":     {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
-        "final_check": {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"}
+        "refine":          {"min_rounds": 2, "max_rounds": 3, "pass_mode": "majority"},
+        "analyse":         {"min_rounds": 2, "max_rounds": 5, "pass_mode": "majority"},
+        "final_check":     {"min_rounds": 1, "max_rounds": 1, "pass_mode": "all"}
     },
     "workers": {
+        "default_model": "",
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
         "system_prompt_dir": "/opt/system_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gaiasec/auto"}
+            {"model": "gaiasec/auto", "tools": null, "system_prompt": null, "thinking_level": null}
         ],
-        "stage_models": {
-            "explore":  "gaiasec/auto",
-            "classify": "gaiasec/auto",
-            "sub_read": "gaiasec/auto",
-            "refine":   "gaiasec/auto",
-            "analyse":  "gaiasec/auto",
-            "report":   "gaiasec/auto"
-        }
+        "stage_models": {}
     },
     "judges": {
+        "default_model": "",
         "default_tools": ["read", "bash", "grep", "find"],
         "system_prompt_dir": "/opt/system_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gaiasec/auto"}
+            {"model": "gaiasec/auto", "tools": null, "system_prompt": null, "thinking_level": null}
         ],
-        "stage_models": {
-            "classify":     "gaiasec/auto",
-            "refine":       "gaiasec/auto",
-            "analyse":      "gaiasec/auto",
-            "completeness": "gaiasec/auto",
-            "report":       "gaiasec/auto"
-        }
+        "stage_models": {}
+    },
+    "prompt_overrides": {
+        "workers": {},
+        "judges": {}
     },
     "output_dir": "/data/output",
     "archive_dir": "/data/output",
