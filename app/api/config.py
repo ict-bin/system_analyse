@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import Depends, HTTPException, Query
+from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -20,28 +20,27 @@ logger = logging.getLogger("sa.api.config")
 
 
 class ConfigSaveRequest(BaseModel):
-    project_id: str
     config: Dict[str, Any]
 
 
 @router.get("/config")
-def get_config(project_id: str = Query(...), db: Session = Depends(get_db)):
+def get_config(db: Session = Depends(get_db)):
     try:
-        return get_config_service().get_config(db, project_id)
+        return get_config_service().get_config(db)
     except SQLAlchemyError as exc:
-        logger.error("get_config failed for project %s: %s", project_id, exc)
+        logger.error("get_config failed: %s", exc)
         raise HTTPException(status_code=503, detail="数据库暂时不可用，请稍后重试") from exc
 
 
 @router.put("/config")
 def save_config(body: ConfigSaveRequest, db: Session = Depends(get_db)):
     try:
-        return get_config_service().save_config(db, body.project_id, body.config)
+        return get_config_service().save_config(db, body.config)
     except SQLAlchemyError as exc:
-        logger.error("save_config failed for project %s: %s", body.project_id, exc)
+        logger.error("save_config failed: %s", exc)
         raise HTTPException(status_code=503, detail="保存失败，数据库暂时不可用") from exc
     except Exception as exc:
-        logger.error("save_config unexpected error for project %s: %s", body.project_id, exc, exc_info=True)
+        logger.error("save_config unexpected error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"保存失败：{exc}") from exc
 
 

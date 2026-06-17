@@ -14,6 +14,7 @@ from app.db.models import AppSaModelsConfig, AppSaProjectConfig
 from app.models import normalize_max_rounds_exceeded_action
 
 logger = logging.getLogger("sa.config_service")
+_GLOBAL_CONFIG_PROJECT_ID = "__global__"
 
 # Fields in workers/judges that must NOT be stored in DB — always use fixed defaults
 _ROLE_READONLY_FIELDS = {"system_prompt_dir"}
@@ -108,6 +109,34 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
 
 
 class ConfigService:
+    def _latest_legacy_project_row(self, db: Session) -> AppSaProjectConfig | None:
+        return (
+            db.query(AppSaProjectConfig)
+            .filter(AppSaProjectConfig.project_id != _GLOBAL_CONFIG_PROJECT_ID)
+            .order_by(AppSaProjectConfig.updated_at.desc())
+            .first()
+        )
+
+    def _ensure_global_config_row(self, db: Session) -> AppSaProjectConfig | None:
+        row = db.query(AppSaProjectConfig).filter_by(project_id=_GLOBAL_CONFIG_PROJECT_ID).first()
+        if row is not None:
+            return row
+        legacy_row = self._latest_legacy_project_row(db)
+        if legacy_row is None:
+            return None
+        migrated = AppSaProjectConfig(
+            project_id=_GLOBAL_CONFIG_PROJECT_ID,
+            config_json=dict(legacy_row.config_json or {}),
+        )
+        db.add(migrated)
+        db.commit()
+        db.refresh(migrated)
+        logger.info(
+            "migrated system-analysis project config to global config from project %s",
+            legacy_row.project_id,
+        )
+        return migrated
+
     @staticmethod
     def _sanitize_runtime_settings(raw: Any, *, updated_at: str | None = None) -> dict:
         payload = dict(_DEFAULT_RUNTIME_SETTINGS)
@@ -184,8 +213,8 @@ class ConfigService:
                     cleaned.setdefault(role, {})[key] = content
         return cleaned
 
-    def get_config(self, db: Session, project_id: str) -> dict:
-        row = db.query(AppSaProjectConfig).filter_by(project_id=project_id).first()
+    def get_config(self, db: Session, project_id: str | None = None) -> dict:
+        row = self._ensure_global_config_row(db)
         if row and row.config_json:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
@@ -206,17 +235,10 @@ class ConfigService:
         ).model_dump(mode="json")
         data["worker_task_concurrency"] = int(runtime_settings["worker_task_concurrency"])
         data["agent_timeout_seconds"] = float(runtime_settings["agent_timeout_seconds"])
-        data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
-        # self_reflection.output_dir 空时自动填充项目级路径
-        sr = data.setdefault("self_reflection", {})
-        if not sr.get("output_dir"):
-            sr["output_dir"] = (
-                f"/data/files/{project_id}/app/secflow-app-system-analyse/self-reflection"
-            )
         return data
 
-    def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
+    def save_config(self, db: Session, config_data: dict, project_id: str | None = None) -> dict:
         # Strip meta-fields and task-execution-only overrides from the stored blob
         # start_stage / resume_workspace are ephemeral per-run values set by
         # resume_task / restart_task; they must never be persisted in project config.
@@ -245,12 +267,12 @@ class ConfigService:
         for role_key in ("workers", "judges"):
             if isinstance(blob.get(role_key), dict):
                 blob[role_key] = {k: v for k, v in blob[role_key].items() if k not in _ROLE_READONLY_FIELDS}
-        row = db.query(AppSaProjectConfig).filter_by(project_id=project_id).first()
+        row = self._ensure_global_config_row(db)
         if row:
             row.config_json = blob
             flag_modified(row, "config_json")
         else:
-            row = AppSaProjectConfig(project_id=project_id, config_json=blob)
+            row = AppSaProjectConfig(project_id=_GLOBAL_CONFIG_PROJECT_ID, config_json=blob)
             db.add(row)
         db.commit()
         db.refresh(row)
@@ -267,7 +289,6 @@ class ConfigService:
         ).model_dump(mode="json")
         result["worker_task_concurrency"] = int(runtime_settings["worker_task_concurrency"])
         result["agent_timeout_seconds"] = float(runtime_settings["agent_timeout_seconds"])
-        result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result
 
