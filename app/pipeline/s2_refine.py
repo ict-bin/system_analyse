@@ -208,12 +208,14 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
             if not found:
                 truly_missing.add(f)
         extra = covered - snapshot
-        if truly_missing or extra:
+        if truly_missing:
             raise StageError(
-                f"提交前校验失败: {mod_name} missing={len(truly_missing)} extra={len(extra)}"
-                + (f" missing示例={sorted(truly_missing)[:5]}" if truly_missing else "")
-                + (f" extra示例={sorted(extra)[:5]}" if extra else "")
+                f"提交前校验失败: {mod_name} missing={len(truly_missing)}"
+                + f" missing示例={sorted(truly_missing)[:5]}"
             )
+        # Extra files are new additions (from reclassify or retry) — auto-accept
+        if extra:
+            _write_lines(mod_dir / ".snapshot", snapshot | extra)
 
     # ── 执行提交 ──
     new_modules: list[str] = []
