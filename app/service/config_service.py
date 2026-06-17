@@ -65,6 +65,8 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "pi_max_retries": -1,
     "agent_timeout_seconds": 1800.0,
     "pi_retry_delay": 5,
+    "model_stuck_timeout": 1800,
+    "model_stuck_max_activations": 5,
     "stages": {
         "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
         "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
@@ -77,9 +79,16 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "system_prompt_dir": "/app/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gaiasec/auto", "tools": None, "system_prompt": None, "thinking_level": None},
+            {"model": "local_minimax/MiniMax/MiniMax-M2.5", "tools": None, "system_prompt": None, "thinking_level": None},
         ],
-        "stage_models": {},
+        "stage_models": {
+            "explore": "local_minimax/MiniMax/MiniMax-M2.5",
+            "classify": "local_minimax/MiniMax/MiniMax-M2.5",
+            "sub_read": "local_minimax/MiniMax/MiniMax-M2.5",
+            "refine": "local_minimax/MiniMax/MiniMax-M2.5",
+            "analyse": "local_minimax/MiniMax/MiniMax-M2.5",
+            "report": "local_minimax/MiniMax/MiniMax-M2.5",
+        },
     },
     "judges": {
         "default_model": "",
@@ -87,9 +96,15 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "system_prompt_dir": "/app/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gaiasec/auto", "tools": None, "system_prompt": None, "thinking_level": None},
+            {"model": "local_minimax/MiniMax/MiniMax-M2.5", "tools": None, "system_prompt": None, "thinking_level": None},
         ],
-        "stage_models": {},
+        "stage_models": {
+            "classify": "local_minimax/MiniMax/MiniMax-M2.5",
+            "refine": "local_minimax/MiniMax/MiniMax-M2.5",
+            "analyse": "local_minimax/MiniMax/MiniMax-M2.5",
+            "completeness": "local_minimax/MiniMax/MiniMax-M2.5",
+            "report": "local_minimax/MiniMax/MiniMax-M2.5",
+        },
     },
     "prompt_overrides": {},
     "output_dir": "/data/output",
