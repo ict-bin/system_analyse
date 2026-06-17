@@ -102,8 +102,7 @@ def _create_snapshot_file(mod_dir: Path) -> Path:
 def _validate_module(mod_dir: Path) -> dict:
     """
     校验单模块:
-      .snapshot == files.list ∪ split/*/files.list ∪ deleted/files.list
-      (_merge_to files excluded — they are validated in target modules)
+      .snapshot 文件集合 == files.list ∪ split/*/files.list ∪ split/_merge_to/*/files.list ∪ deleted/files.list
     返回 {pass: bool, missing: [...], extra: [...]} 供 Judge 参考，不抛异常。
     """
     mod_name = mod_dir.name
@@ -118,10 +117,19 @@ def _validate_module(mod_dir: Path) -> dict:
     split_files: set[str] = set()
     for child_dir in sorted((mod_dir / "split").iterdir()) if (mod_dir / "split").exists() else []:
         if child_dir.name.startswith("_"):
-            continue
+            for sub in (child_dir / "files.list" for _ in [1]):
+                continue
         fl = child_dir / "files.list" if child_dir.is_dir() else None
         if fl and fl.exists():
             split_files |= _read_lines(fl)
+
+    merge_root = mod_dir / "split" / "_merge_to"
+    if merge_root.exists():
+        for d in sorted(merge_root.iterdir()):
+            if d.is_dir():
+                fl = d / "files.list"
+                if fl.exists():
+                    split_files |= _read_lines(fl)
 
     covered = kept | split_files | deleted
     missing = sorted(snapshot - covered)
@@ -179,13 +187,11 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
 
     # ── 完整性校验 ──
     covered = set().union(*child_map.values()) if child_map else set()
+    covered |= set().union(*merge_map.values()) if merge_map else set()
     covered |= deleted_set
     covered |= kept
-    # _merge_to files go TO other modules — excluded from THIS module's snapshot check.
-    # Target modules validate their own snapshots independently.
-    merge_covered = set().union(*merge_map.values()) if merge_map else set()
-    if snapshot and (covered | merge_covered) != snapshot:
-        missing = snapshot - (covered | merge_covered)
+    if snapshot and covered != snapshot:
+        missing = snapshot - covered
         # ★ 允许已在其他模块中的文件隐式通过（redo 时子模块来源于上轮拆分）
         mods_root = workspace / "modules"
         truly_missing: set[str] = set()
@@ -202,14 +208,12 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
             if not found:
                 truly_missing.add(f)
         extra = covered - snapshot
-        if truly_missing:
+        if truly_missing or extra:
             raise StageError(
-                f"提交前校验失败: {mod_name} missing={len(truly_missing)}"
-                + f" missing示例={sorted(truly_missing)[:5]}"
+                f"提交前校验失败: {mod_name} missing={len(truly_missing)} extra={len(extra)}"
+                + (f" missing示例={sorted(truly_missing)[:5]}" if truly_missing else "")
+                + (f" extra示例={sorted(extra)[:5]}" if extra else "")
             )
-        # Extra files are new additions (from reclassify or retry) — auto-accept
-        if extra:
-            _write_lines(mod_dir / ".snapshot", snapshot | extra)
 
     # ── 执行提交 ──
     new_modules: list[str] = []
@@ -242,6 +246,11 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
             if snap.exists() and snap.is_file():
                 snap_set = _read_lines(snap)
                 _write_lines(snap, snap_set | files)
+            merge_targets_in_progress.add(target)
+        else:
+            # 目标不在 in_progress（已 refined），其 snapshot 已被 commit 清理。
+            # 新文件通过重新入队后 _create_snapshot_file 从 files.list 重建。
+            # 标记为需要重新入队（由 _commit_worker 处理）。
             merge_targets_in_progress.add(target)
 
     # 处理原模块
@@ -452,9 +461,15 @@ class RefineStage(BaseStage):
                 new_ones = list(commit_info.get("new_modules") or [])
                 for nm in new_ones:
                     self._commit_children.add(nm)  # ★ 记录给 Orchestrator
-                # 记录被 merge 的 LLM 处理中模块（等 LLM 结束后入队列）
+                # merge 目标处理:
+                #   in_progress → 追加了 snapshot，入 pending 队列等 LLM 结束 commit
+                #   非 in_progress → 已 refined，snapshot 已删，需重新 W+J
                 for target in merge_in_progress:
-                    self._pending_merge_targets.add(target)
+                    if target in self._in_progress:
+                        self._pending_merge_targets.add(target)
+                    elif target in self._refined:
+                        self._refined.discard(target)
+                        self._queue.put(target)
 
                 if mod_dir.exists() and not (mod_dir / "files.list").exists():
                     shutil.rmtree(str(mod_dir), ignore_errors=True)
