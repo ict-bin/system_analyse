@@ -110,6 +110,11 @@ def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None,
     role_dirs: dict[str, str] = {}
     if not task_root:
         return role_dirs, "task_scoped"
+    # Only create per-task pi dir when agent_task_key provides custom credentials.
+    # Without a key, pi uses the global $PI_CODING_AGENT_DIR (synced from config center).
+    secret = str((agent_task_key or {}).get("secret") or "").strip()
+    if not secret:
+        return role_dirs, "global"
     agents_root = Path(task_root) / ".pi" / "agents"
     agents_root.mkdir(parents=True, exist_ok=True)
     global_pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))

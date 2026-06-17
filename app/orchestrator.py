@@ -211,13 +211,6 @@ class Orchestrator:
             (pi_settings_dir / "settings.json").write_text(
                 _json.dumps(pi_settings, indent=2), encoding="utf-8"
             )
-            # Copy global models.json to workspace .pi/agent/ so pi finds it
-            # even when HOME is overridden to workspace/ in make_w_base().
-            global_models = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")) / "models.json"
-            if global_models.exists():
-                ws_agent_dir = pi_settings_dir / "agent"
-                ws_agent_dir.mkdir(exist_ok=True)
-                shutil.copy2(str(global_models), str(ws_agent_dir / "models.json"))
         except Exception as _pi_cfg_err:
             _log.warning("pi settings.json 写入失败（非致命）: %s", _pi_cfg_err)
 
