@@ -222,6 +222,14 @@ def _build_agent_env(
     if normalized_pi_dir:
         payload["PI_CODING_AGENT_DIR"] = normalized_pi_dir
         payload["PI_MODELS_JSON"] = str(Path(normalized_pi_dir) / "models.json")
+    else:
+        # Always pin PI_CODING_AGENT_DIR to the global dir.
+        # make_w_base() overrides HOME to workspace/, which can cause pi
+        # to look for models.json under $HOME/.pi/agent/ (non-existent)
+        # instead of the globally-synced $PI_CODING_AGENT_DIR.
+        global_pi_dir = os.environ.get("PI_CODING_AGENT_DIR", "")
+        if global_pi_dir:
+            payload["PI_CODING_AGENT_DIR"] = global_pi_dir
     return payload or None
 
 
