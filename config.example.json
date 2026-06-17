@@ -14,9 +14,9 @@
     "continue_on_module_failure": true,
     "enable_final_check": false,
     "stages": {
-        "classify":    {"min_rounds": 1, "max_rounds": 5, "pass_mode": "majority"},
-        "refine":      {"min_rounds": 1, "max_rounds": 3, "pass_mode": "majority"},
-        "analyse":     {"min_rounds": 1, "max_rounds": 5, "pass_mode": "majority"},
+        "classify":    {"min_rounds": 1, "max_rounds": 5, "pass_mode": "all"},
+        "refine":      {"min_rounds": 1, "max_rounds": 3, "pass_mode": "all"},
+        "analyse":     {"min_rounds": 1, "max_rounds": 5, "pass_mode": "all"},
         "final_check": {"min_rounds": 1, "max_rounds": 1, "pass_mode": "all"}
     },
     "workers": {
