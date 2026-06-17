@@ -248,9 +248,7 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
                 _write_lines(snap, snap_set | files)
             merge_targets_in_progress.add(target)
         else:
-            # 目标不在 in_progress: 已 refined 或还未被领取。
-            # snapshot 不存在（refined 已删）或尚未创建（未入队），
-            # 重新入 LLM 队列后会 _create_snapshot_file 从 files.list 重建。
+            # 目标不在 in_progress: 直接由 _commit_worker 入 _queue 重跑
             merge_targets_in_progress.add(target)
 
     # 处理原模块
@@ -460,9 +458,7 @@ class RefineStage(BaseStage):
                 new_ones = list(commit_info.get("new_modules") or [])
                 for nm in new_ones:
                     self._commit_children.add(nm)  # ★ 记录给 Orchestrator
-                # merge 目标处理:
-                #   in_progress → snapshot 已更新，入 pending 队列等 LLM 结束后重新 W+J
-                #   非 in_progress → re-queue 到 LLM 队列
+                # merge 目标：in_progress → 等 LLM 结束再入队；其他 → 直接入队
                 for target in merge_in_progress:
                     if target in self._in_progress:
                         self._pending_merge_targets.add(target)
@@ -475,7 +471,7 @@ class RefineStage(BaseStage):
                 if mod_dir.exists() and not (mod_dir / "files.list").exists():
                     shutil.rmtree(str(mod_dir), ignore_errors=True)
 
-                # 新子模块入 LLM 队列（去重）
+                # 新子模块：直接入 LLM 队列（已 refined 的先移除）
                 for nm in new_ones:
                     if nm not in self._in_progress:
                         was_refined = nm in self._refined
