@@ -228,9 +228,9 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
             existing = _read_lines(target_dir / "files.list")
             _write_lines(target_dir / "files.list", existing | files)
             new_modules.append(child)
-            # 如果目标在 LLM 处理中，追加到其 .snapshot
+            # 如果目标在 LLM 处理中，追加到其 .snapshot（只追加不创建）
             if child in in_progress:
-                snap = _create_snapshot_file(target_dir)
+                snap = target_dir / ".snapshot"
                 if snap.exists() and snap.is_file():
                     snap_set = _read_lines(snap)
                     _write_lines(snap, snap_set | files)
@@ -242,10 +242,12 @@ def _commit_one_module(mod_dir: Path, workspace: Path, in_progress: set[str]) ->
         merged_targets.append(target)
         # 如果目标在 LLM 处理中，追加到其 .snapshot + 记录待处理
         if target in in_progress:
-            snap = _create_snapshot_file(target_dir)
+            snap = target_dir / ".snapshot"
             if snap.exists() and snap.is_file():
                 snap_set = _read_lines(snap)
                 _write_lines(snap, snap_set | files)
+            # 若 snapshot 不存在：LLM Worker 尚未创建，等其 _create_snapshot_file
+            # 从 files.list（已含 merge 文件）创建时自然包含
             merge_targets_in_progress.add(target)
         else:
             # 目标不在 in_progress: 直接由 _commit_worker 入 _queue 重跑
