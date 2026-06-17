@@ -1,6 +1,6 @@
 {
     "analyse_targets": ["binary", "source"],
-    "binary_arch": ["all"],
+    "binary_arch": ["arm", "aarch64"],
     "parallel_modules": 1,
     "parallel_sub_workers": 1,
     "security_focus_categories": ["all"],
@@ -29,9 +29,11 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gaiasec/auto", "tools": null, "system_prompt": null, "thinking_level": null}
+            {"model": "gptplus_openai/gpt-5.4", "tools": null, "system_prompt": null, "thinking_level": null}
         ],
-        "stage_models": {}
+        "stage_models": {
+            "explore": "gptplus_minimax/MiniMax-M2.7"
+        }
     },
     "judges": {
         "default_model": "",
@@ -39,7 +41,7 @@
         "system_prompt_dir": "/opt/system_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
-            {"model": "gaiasec/auto", "tools": null, "system_prompt": null, "thinking_level": null}
+            {"model": "gptplus_openai/gpt-5.4", "tools": null, "system_prompt": null, "thinking_level": null}
         ],
         "stage_models": {}
     },
