@@ -344,6 +344,27 @@ class SuperFastReportStage(BaseStage):
         _run_w(ctx, "report", s_cfg, _v_report, (ws / "final_report.md",),
                ["生成总报告:\n1. ls -d modules/*/\n2. read modules/*/module_report.md\n3. 写 final_report.md"],
                w_sys, w_model, w_session, w_base)
+        # ── 组装输出目录（极速模式同样需要把产物搬到 final_out_dir，否则 API/前端读不到结果）──
+        final_out_dir = ctx.final_out_dir
+        final_mods = discover_modules(str(ws))
+        modules_out = final_out_dir / "modules"
+        if modules_out.exists():
+            shutil.rmtree(str(modules_out))
+        modules_out.mkdir(parents=True, exist_ok=True)
+        for mod in final_mods:
+            src = get_modules_root(str(ws)) / mod
+            dst = modules_out / mod
+            if src.is_dir():
+                shutil.copytree(str(src), str(dst))
+        report_src = ws / "final_report.md"
+        report_dst = final_out_dir / "final_report.md"
+        if report_src.exists():
+            shutil.copy2(str(report_src), str(report_dst))
+        ctx.final_report_path = str(report_dst)
+        generate_modules_list(modules_out, final_out_dir / "modules.list")
+        strip_target_prefix(modules_out, cfg.target_dir)
+        if report_dst.exists():
+            strip_target_prefix(report_dst.parent, cfg.target_dir)
         ctx.emit_event("stage_result", stage=4)
 
 ###############################################################################
