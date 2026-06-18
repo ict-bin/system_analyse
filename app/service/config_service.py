@@ -52,6 +52,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds_exceeded_action": "treat_as_passed",
     "continue_on_module_failure": True,
     "enable_final_check": False,
+    "super_fast_mode": False,
     "analyse_targets": ["binary", "source"],
     "binary_arch": ["all"],
     "security_focus_categories": ["all"],
