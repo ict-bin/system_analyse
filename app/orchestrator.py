@@ -128,6 +128,7 @@ class Orchestrator:
             f"agent_retry_delay          = {cfg.agent_retry_delay}s",
             f"pi_max_retries             = {cfg.pi_max_retries}",
             f"pi_retry_delay             = {cfg.pi_retry_delay}s",
+            f"super_fast_mode            = {cfg.super_fast_mode}",
         ]
 
         # ── 逐行写入日志 ─────────────────────────────────────────────────────

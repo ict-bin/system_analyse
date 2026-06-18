@@ -704,6 +704,8 @@ class TaskRunner:
                 svc.enable_final_check = bool(tcfg["enable_final_check"])
             if "continue_on_module_failure" in tcfg:
                 svc.continue_on_module_failure = bool(tcfg["continue_on_module_failure"])
+            if "super_fast_mode" in tcfg:
+                svc.super_fast_mode = bool(tcfg["super_fast_mode"])
             # 断点续跑由文件系统 .checkpoint/ 驱动，不再读取 start_stage/resume_workspace
             if row.output_path:
                 svc.output_dir = row.output_path
