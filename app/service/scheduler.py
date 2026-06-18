@@ -673,7 +673,18 @@ def set_scheduler(s: SchedulerService) -> None:
 
 
 def get_scheduler() -> SchedulerService | None:
-    return _scheduler_instance
+    if _scheduler_instance is not None:
+        return _scheduler_instance
+    # fallback: 从 TaskService 获取 (bootstrap 线程可能尚未完成)
+    try:
+        from app.service.task_service import get_task_service
+        ts = get_task_service()
+        if hasattr(ts, '_scheduler') and ts._scheduler is not None:
+            set_scheduler(ts._scheduler)
+            return ts._scheduler
+    except Exception:
+        pass
+    return None
 
 
 def create_scheduler_router():
