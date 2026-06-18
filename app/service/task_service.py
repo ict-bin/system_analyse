@@ -1260,6 +1260,11 @@ class TaskService:
             cleanup_resume=_cleanup_resume_intermediate_files,
         )
         set_scheduler(self._scheduler)
+        # 自动注册本地 pod 作为 executor
+        self._scheduler.register_pod(
+            WORKER_INSTANCE_ID, os.environ.get("SA_POD_IP", "127.0.0.1"),
+            role="manager", max_tasks=WORKER_TASK_CONCURRENCY,
+        )
         self._runner_assignment_task: object | None = None
         self._runner_assignment_loop_running = False
         self._query = TaskQueryService(
