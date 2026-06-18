@@ -636,6 +636,16 @@ class SuperFastRefineStage(BaseStage):
     stage_name = "快速细分类"
 
     def execute(self, ctx: PipelineContext) -> None:
+        try:
+            self._execute(ctx)
+        except Exception as e:
+            import traceback
+            _log.error("[SF-S2] FATAL: %s: %s\n%s", type(e).__name__, e, traceback.format_exc())
+            ctx.emit_event("log", level="error",
+                           msg=f"[SF-S2] FATAL: {type(e).__name__}: {e}")
+            raise
+
+    def _execute(self, ctx: PipelineContext) -> None:
         cfg = ctx.cfg; ws = ctx.workspace
         modules = discover_modules(str(ws))
         if not modules:
