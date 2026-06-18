@@ -89,7 +89,7 @@ def _v_analyse(mod_dir: Path) -> tuple[bool, list[str]]:
     rp = mod_dir / "module_report.md"
     if not rp.exists(): return False, ["module_report.md 不存在"]
     text = rp.read_text("utf-8", errors="replace")
-    for tag in ["RISK_LEVEL:", "RISK_SCORE:", "## 1.", "## 5.", "<result>"]:
+    for tag in ["RISK_LEVEL:", "RISK_SCORE:", "<result>"]:
         if tag not in text: errors.append(f"缺少 {tag}")
     return len(errors) == 0, errors
 
@@ -297,14 +297,18 @@ class SuperFastAnalyseStage(BaseStage):
         if not files: return
         s_cfg = cfg.stages.analyse
         from .helpers import load_granularity_prompt, build_granularity_hint
-        w_sys = load_granularity_prompt(cfg, "step3_analyse", granularity, "workers")
+        w_sys = load_granularity_prompt(cfg, "step3_fast_score", granularity, "workers")
         gh = build_granularity_hint(granularity)
         if gh and gh not in w_sys: w_sys += gh
         w_model = cfg.workers.model_for("analyse")
         w_session = ctx.session_path("analyse", f"{mod_name}.jsonl")
+        # 极速模式仅评分：预注入 ELF 符号 + 源码函数名作评分依据，输出极短
         es = _elf_summ(files, cfg.target_dir)
-        w_sys = w_sys.replace("{{PRE_READ_CONTENT}}",
-                               "## 文件符号\n\n" + es if es else "（无 ELF 文件）")
+        ss = _src_summ(files, cfg.target_dir)
+        pre = ""
+        if es: pre += "## 导出/导入符号\n\n" + es + "\n\n"
+        if ss: pre += "## 源码函数名\n\n" + ss
+        w_sys = w_sys.replace("{{PRE_READ_CONTENT}}", pre or "（无符号/函数信息，请基于模块名与文件清单评估）")
         w_base = dict(
             tools=["write"], cwd=str(ws), thinking_level="off",
             session_file=w_session, cancel_event=ctx.cancel_event,
@@ -313,7 +317,7 @@ class SuperFastAnalyseStage(BaseStage):
             task_pi_dir=cfg.role_pi_dir("workers"),
         )
         _run_w(ctx, "analyse", s_cfg, _v_analyse, (mod_dir,),
-               [f"分析 `{mod_name}`, 写 modules/{mod_name}/module_report.md。"],
+               [f"对模块 `{mod_name}` 进行快速安全威胁评分，仅用一次 write 写入 modules/{mod_name}/module_report.md（仅评分，不要详细报告）。"],
                w_sys, w_model, w_session, w_base)
 
 ###############################################################################
