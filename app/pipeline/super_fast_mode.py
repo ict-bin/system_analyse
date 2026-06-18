@@ -346,9 +346,19 @@ class SuperFastReportStage(BaseStage):
 # 辅助
 ###############################################################################
 
+# refine 摘要 prompt 体积上限：防止超大模块（如 2021 文件的 other 兑底模块）
+# 生成几百 KB 摘要擑爆 LLM 上下文窗口 → 反复 compaction → refine 退化卡死。
+_SUMM_MAX_FILES = 300
+_SUMM_MAX_CHARS = 40000
+
+
 def _elf_summ(files, target_dir):
     lines = []
+    total = 0
+    processed = 0
     for rp in files:
+        if processed >= _SUMM_MAX_FILES or total >= _SUMM_MAX_CHARS:
+            break
         ext = Path(rp).suffix.lower()
         fp = str(Path(target_dir) / rp)
         if ext not in {".so", ".ko", ".o", ".a", ".elf", ".axf"}:
@@ -360,30 +370,42 @@ def _elf_summ(files, target_dir):
             elf = read_one_elf(fp)
             ex, im, nd = elf.get("exports", []), elf.get("imports", []), elf.get("needed", [])
             if ex or im or nd:
-                lines.append(f"**{rp}**")
-                if ex: lines.append(f"  exports({len(ex)}): {', '.join(str(s) for s in ex[:20])}")
-                if im: lines.append(f"  imports({len(im)}): {', '.join(str(s) for s in im[:20])}")
-                if nd: lines.append(f"  needed: {', '.join(str(s) for s in nd)}")
-                lines.append("")
+                block = [f"**{rp}**"]
+                if ex: block.append(f"  exports({len(ex)}): {', '.join(str(s) for s in ex[:20])}")
+                if im: block.append(f"  imports({len(im)}): {', '.join(str(s) for s in im[:20])}")
+                if nd: block.append(f"  needed: {', '.join(str(s) for s in nd)}")
+                block.append("")
+                lines.extend(block)
+                total += sum(len(x) + 1 for x in block)
+                processed += 1
         except Exception: pass
     return "\n".join(lines)
 
 def _src_summ(files, target_dir):
     # 函数名提取：C/C++ 用 tree-sitter，sh/py 用安全线性正则（按语言分派）。
-    # 彻底替代原来 (?:\w+(?:\s*::\s*)?)+ 的灵难性回溯正则。
+    # 并对超大模块限制摘要体积（文件数 + 总字符双上限），防止 prompt 擑爆上下文。
     from .func_extract import extract_function_names, _CPP_EXTS, _SH_EXTS, _PY_EXTS
     supported = _CPP_EXTS | _SH_EXTS | _PY_EXTS
+    src_files = [rp for rp in files if Path(rp).suffix.lower() in supported]
     lines = []
-    for rp in files:
-        if Path(rp).suffix.lower() not in supported: continue
+    total = 0
+    shown = 0
+    truncated = 0
+    for idx, rp in enumerate(src_files):
+        if shown >= _SUMM_MAX_FILES or total >= _SUMM_MAX_CHARS:
+            truncated = len(src_files) - idx
+            break
         try:
             with open(str(Path(target_dir)/rp), "r", encoding="utf-8", errors="replace") as f:
                 content = f.read(64*1024)
         except (OSError, UnicodeDecodeError): continue
         funcs = extract_function_names(rp, content, limit=200)
         if funcs:
-            lines.append(f"**{rp}**: {', '.join(funcs[:20])}")
-            if len(funcs) > 20: lines[-1] += f" ... (共{len(funcs)}个)"
+            line = f"**{rp}**: {', '.join(funcs[:20])}"
+            if len(funcs) > 20: line += f" ... (共{len(funcs)}个)"
+            lines.append(line); total += len(line) + 1; shown += 1
+    if truncated > 0:
+        lines.append(f"\n... (模块文件较多，已截断函数名摘要以控制上下文；另有约 {truncated} 个源码文件未列出）")
     return "\n".join(lines)
 
 def _commit_r(mod_dir, ws):

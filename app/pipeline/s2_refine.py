@@ -551,6 +551,18 @@ class RefineStage(BaseStage):
                 sub_model=cfg.workers.model_for("sub_read"), target_dir=cfg.target_dir,
             )
 
+        # 限制文件摘要体积：防止超大模块（如 other 兑底模块含数千文件）生成巨型摘要
+        # 擑爆 LLM 上下文窗口 → 反复 compaction → refine 退化卡死。
+        _REFINE_SUMMARY_MAX_CHARS = 60000
+        if file_summary and len(file_summary) > _REFINE_SUMMARY_MAX_CHARS:
+            _orig_len = len(file_summary)
+            file_summary = file_summary[:_REFINE_SUMMARY_MAX_CHARS] + (
+                f"\n\n... (文件摘要过长，已截断 {_orig_len - _REFINE_SUMMARY_MAX_CHARS} 字符以控制上下文；"
+                f"该模块文件数量很大，请优先考虑拆分)"
+            )
+            ctx.emit_event("log", level="warning",
+                           msg=f"[S2] {mod_name}: 文件摘要 {_orig_len} 字符超限，已截断至 {_REFINE_SUMMARY_MAX_CHARS}")
+
         granularity = getattr(cfg, "module_granularity", "fine") or "fine"
         w_sys_prompt = load_granularity_prompt(cfg, "step2_refine", granularity, "workers")
         j_sys_prompt = load_granularity_prompt(cfg, "step2_check_refine", granularity, "judges")
