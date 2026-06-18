@@ -12,6 +12,7 @@ from app.agent_process import AgentProcessHandle
 from app import agent_process
 from app import runner
 from app.service import task_runner
+from app.service.scheduler import TaskGuard
 
 
 def _overflow_result() -> runner.AgentResult:
@@ -27,6 +28,17 @@ def _overflow_result() -> runner.AgentResult:
 
 
 class RunAgentTests(unittest.TestCase):
+    def test_task_guard_done_delegates_to_complete_and_fail(self):
+        guard = TaskGuard("sat_test")
+        calls = []
+
+        with patch.object(guard, "complete", side_effect=lambda: calls.append("completed")):
+            with patch.object(guard, "fail", side_effect=lambda: calls.append("failed")):
+                guard.done("completed")
+                guard.done("failed")
+
+        self.assertEqual(calls, ["completed", "failed"])
+
     def test_is_fatal_error_ignores_context_overflow_wrapped_as_invalid_request(self):
         result = runner.AgentResult()
         result.error = (

@@ -736,6 +736,16 @@ while __import__('time').time() < deadline:
     def fail(self) -> None:
         self._notify("failed")
 
+    def done(self, status: str) -> None:
+        normalized = str(status or "").strip().lower()
+        if normalized == "completed":
+            self.complete()
+            return
+        if normalized == "failed":
+            self.fail()
+            return
+        self._notify(normalized or "unknown")
+
     def cleanup(self) -> None:
         if self._hb_proc and self._hb_proc.poll() is None:
             try:
