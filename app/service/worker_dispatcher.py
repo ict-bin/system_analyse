@@ -207,10 +207,6 @@ class WorkerDispatcher:
                         max(WORKER_POLL_INTERVAL_SECONDS, self._idle_sleep_seconds * 2),
                     )
                 time.sleep(worker_sleep_seconds(self._idle_sleep_seconds))
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                raise
             except Exception as exc:
                 _runtime_state.last_error = str(exc)
                 _runtime_state.pause_claim_until_ts = _time.time() + WORKER_OVERLOAD_COOLDOWN_SECONDS
