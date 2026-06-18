@@ -34,20 +34,38 @@ from sqlalchemy.orm import Session
 
 from app.time_utils import now_local
 
+# 复用 worker_dispatcher 的 DB 协调常量，确保与部署环境变量 (SECFLOW_SYSTEM_ANALYSE_*) 完全一致。
+# scheduler.py 不再用 SA_SCHEDULER_* 的 lease/global 语义，避免“租约时长/全局并发”两套配置漂移。
+from app.service.worker_dispatcher import (
+    MAX_RUNNING_TASKS_GLOBAL as _DB_MAX_GLOBAL,
+    GLOBAL_CLAIM_LOCK_KEY as _DB_LOCK_KEY,
+    GLOBAL_CLAIM_LOCK_TIMEOUT_SECONDS as _DB_LOCK_TIMEOUT,
+    TASK_LEASE_TIMEOUT_SECONDS as _DB_LEASE_TIMEOUT,
+    WORKER_STALE_SWEEP_INTERVAL_SECONDS as _DB_STALE_SWEEP,
+    WORKER_INSTANCE_ID as _DB_WORKER_ID,
+    lease_deadline as _db_lease_deadline,
+    _runtime_state as _wd_runtime_state,
+)
+
 logger = logging.getLogger("sa.scheduler")
 
 # ─── 环境变量 ──────────────────────────────────────────────────────────────────
 
+# 循环节奏（调度器自身）仍由 SA_SCHEDULER_* 控制
 POLL_INTERVAL = float(os.environ.get("SA_SCHEDULER_POLL_INTERVAL", "3"))
 HEARTBEAT_INTERVAL = float(os.environ.get("SA_SCHEDULER_HEARTBEAT_INTERVAL", "15"))
-LEASE_TIMEOUT = max(30, int(os.environ.get("SA_SCHEDULER_LEASE_TIMEOUT", "300")))
 POD_STALE_TIMEOUT = max(60, int(os.environ.get("SA_SCHEDULER_POD_STALE_TIMEOUT", "120")))
 TASK_CONCURRENCY = int(os.environ.get("SA_SCHEDULER_TASK_CONCURRENCY", "1"))
-MAX_GLOBAL_TASKS = max(0, int(os.environ.get("SA_SCHEDULER_MAX_GLOBAL_TASKS", "0")))
-STALE_SWEEP_INTERVAL = float(os.environ.get("SA_SCHEDULER_STALE_SWEEP_INTERVAL", "30"))
 OVERLOAD_COOLDOWN = float(os.environ.get("SA_SCHEDULER_OVERLOAD_COOLDOWN", "30"))
 
-INSTANCE_ID = str(os.environ.get("POD_NAME") or f"sa-{uuid.uuid4().hex[:8]}")
+# DB 协调语义（租约时长 / 全局并发 / 全局锁 / 僵死扫描）统一取自 worker_dispatcher，
+# 让调度器派发、runner 领取、supervisor 续租三方使用同一套 lease 时序，避免取消/回收时序错乱。
+LEASE_TIMEOUT = _DB_LEASE_TIMEOUT
+MAX_GLOBAL_TASKS = _DB_MAX_GLOBAL
+STALE_SWEEP_INTERVAL = float(_DB_STALE_SWEEP)
+
+# 调度器实例 id 与 worker_dispatcher 保持同一身份 (POD_NAME)
+INSTANCE_ID = _DB_WORKER_ID or str(os.environ.get("POD_NAME") or f"sa-{uuid.uuid4().hex[:8]}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -112,6 +130,10 @@ class SchedulerService:
         load_runtime_control: Callable | None = None,
         clear_task_lock: Callable | None = None,
         cleanup_resume: Callable | None = None,
+        select_dispatch_target: Callable | None = None,
+        claim_task_lease: Callable | None = None,
+        get_running_tasks_count: Callable | None = None,
+        build_should_recover: Callable | None = None,
     ):
         self._get_db = get_db
         self._task_repo = task_repo
@@ -120,6 +142,11 @@ class SchedulerService:
         self._load_control = load_runtime_control or (lambda db: {})
         self._clear_lock = clear_task_lock or (lambda *a, **kw: None)
         self._cleanup_resume = cleanup_resume or (lambda *a, **kw: None)
+        # DB-backed 派发依赖（生产路径）：未注入时回退到内存 pod 注册表（仅单元测试/调试）。
+        self._select_dispatch_target = select_dispatch_target
+        self._claim_task_lease = claim_task_lease
+        self._get_running_tasks_count = get_running_tasks_count or (lambda: 0)
+        self._build_should_recover = build_should_recover
 
         self._pods: dict[str, PodInfo] = {}
         self._tasks: dict[str, TaskAssignment] = {}
@@ -160,9 +187,15 @@ class SchedulerService:
     def _run(self) -> None:
         while self._running and not self._stop.is_set():
             try:
+                # 同步更新 worker_dispatcher 运行时状态，让 manager 探针/可观测性反映新调度器 tick 活性。
+                _wd_runtime_state.last_tick_ts = _time.time()
                 self._tick()
+                _wd_runtime_state.last_success_ts = _time.time()
+                _wd_runtime_state.last_error = None
+                self._last_error = None
             except Exception as exc:
                 self._last_error = str(exc)
+                _wd_runtime_state.last_error = str(exc)
                 logger.exception("scheduler tick: %s", exc)
             self._stop.wait(timeout=POLL_INTERVAL)
 
@@ -255,13 +288,13 @@ class SchedulerService:
 
     def _reap_stale_tasks(self, db: Session, now: float) -> None:
         """回收过期任务, 使用 TaskRepository 现有方法."""
-        from datetime import datetime as _dt
-        now_local = __import__('app.time_utils', fromlist=['now_local']).now_local()
+        now_dt = now_local()
+        should_recover = self._build_should_recover(db) if self._build_should_recover else None
         rows = self._task_repo.recover_stale_running_tasks(
-            db, now=now_local, lease_timeout_seconds=LEASE_TIMEOUT,
+            db, now=now_dt, lease_timeout_seconds=LEASE_TIMEOUT,
             clear_task_execution_lock=self._clear_lock,
             cleanup_resume_files=self._cleanup_resume,
-            should_recover=None,
+            should_recover=should_recover,
         )
         for row in rows:
             tid = row.task_id
@@ -275,6 +308,63 @@ class SchedulerService:
     # ── 任务分配 ──────────────────────────────────────────────────────────
 
     def _dispatch(self, db: Session, now: float) -> None:
+        """派发 pending 任务（DB-backed 生产路径）。
+
+        通过 runner 注册表选最闲 runner + DB 租约认领，rollout 安全；
+        runner 侧 _runner_assignment_loop 轮询 DB 领取，manager 本身不执行任务。
+        未注入 select/claim 回调时（如纯单元测试）回退到内存 pod 注册表。
+        """
+        if self._select_dispatch_target is None or self._claim_task_lease is None:
+            self._dispatch_in_memory(db, now)
+            return
+        if MAX_GLOBAL_TASKS > 0:
+            if not self._task_repo.try_acquire_global_claim_lock(
+                db, lock_key=_DB_LOCK_KEY, timeout_seconds=_DB_LOCK_TIMEOUT):
+                return
+            try:
+                remaining = MAX_GLOBAL_TASKS - self._task_repo.count_running_tasks(db)
+                if remaining <= 0:
+                    return
+                self._dispatch_db(db, now, batch_limit=remaining)
+            finally:
+                self._task_repo.release_global_claim_lock(db, lock_key=_DB_LOCK_KEY)
+        else:
+            self._dispatch_db(db, now, batch_limit=None)
+
+    def _dispatch_db(self, db: Session, now: float, batch_limit: int | None) -> None:
+        batch = max(1, batch_limit) if batch_limit is not None else 64
+        pending_rows = self._task_repo.list_pending_tasks(db, batch)
+        claimed = 0
+        for row in pending_rows:
+            if batch_limit is not None and claimed >= batch_limit:
+                break
+            target = self._select_dispatch_target(db)
+            if not target:
+                # 暂无可用 runner（空闲槽 0 或未注册），任务留 pending，下轮重试。
+                break
+            lease_epoch = self._claim_task_lease(db, row, target)
+            if not lease_epoch:
+                continue
+            claimed += 1
+            self._record_event(
+                row.task_id, getattr(row, "project_id", None),
+                "task_dispatched", "任务已被调度器认领", "info",
+                {"dispatcher_instance_id": target, "lease_epoch": lease_epoch,
+                 "scheduler_instance_id": INSTANCE_ID},
+            )
+            self._spawn_task(row.task_id, lease_epoch, target)
+            if row.task_id in self._recovered_task_ids:
+                self._recovered_task_ids.discard(row.task_id)
+                self._record_event(
+                    row.task_id, getattr(row, "project_id", None),
+                    "task_auto_recovered",
+                    "任务已由系统自动恢复并重新调度", "info",
+                    {"dispatcher_instance_id": target, "lease_epoch": lease_epoch,
+                     "reason": "lease_recovered_and_reclaimed"},
+                )
+
+    def _dispatch_in_memory(self, db: Session, now: float) -> None:
+        """遗留的内存 pod 注册表派发（仅 select/claim 未注入时的回退，不用于生产）。"""
         if MAX_GLOBAL_TASKS > 0:
             running = self._task_repo.count_running_tasks(db)
             if running >= MAX_GLOBAL_TASKS:
@@ -291,7 +381,6 @@ class SchedulerService:
             if i >= len(available):
                 break
             pod = available[i]
-            from app.time_utils import now_local, datetime as _dt
             deadline = now_local() + __import__('datetime').timedelta(seconds=LEASE_TIMEOUT)
             lease_epoch = self._task_repo.claim_task_lease(
                 db, row, worker_instance_id=pod.pod_id,
@@ -308,18 +397,11 @@ class SchedulerService:
                     lease_expires=now + LEASE_TIMEOUT, last_heartbeat=now,
                 )
 
-            self._spawn_task(row.task_id, pod.pod_id)
+            self._spawn_task(row.task_id, lease_epoch, pod.pod_id)
             self._record_event(row.task_id, getattr(row, "project_id", None),
                                "task_assigned",
                                f"任务已分配给 {pod.pod_id}", None,
                                {"pod_id": pod.pod_id, "lease_epoch": lease_epoch})
-            if row.task_id in self._recovered_task_ids:
-                self._recovered_task_ids.discard(row.task_id)
-                self._record_event(row.task_id, getattr(row, "project_id", None),
-                                   "task_auto_recovered",
-                                   "任务已由系统自动恢复并重新调度", None,
-                                   {"pod_id": pod.pod_id, "lease_epoch": lease_epoch,
-                                    "reason": "lease_recovered_and_reclaimed"})
 
     def _notify_cleanup(self, pod_id: str, task_ids: list[str]) -> None:
         """通知 executor pod 清理指定任务的所有残留进程."""

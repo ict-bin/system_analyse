@@ -1249,22 +1249,21 @@ class TaskService:
             load_runtime_control=self._load_runtime_control,
             task_repository=self._task_repository,
         )
-        # 新调度器 (与旧 WorkerDispatcher 并行, 逐步切换)
+        # 统一调度器 (单一权威派发器, 已切换为 DB-backed)。旧 WorkerDispatcher 保留类但不再启动。
         self._scheduler = SchedulerService(
             get_db=get_db,
             task_repo=self._task_repository,
-            spawn_task=self._on_task_claimed_scheduler,
+            spawn_task=self._on_task_claimed,
             record_event=lambda task_id, project_id, event_type, message, level='info', payload=None: self._record_timeline_event(task_id=task_id, project_id=project_id, event_type=event_type, message=message, level=level, payload=payload),
             load_runtime_control=self._load_runtime_control,
             clear_task_lock=_clear_task_execution_lock,
             cleanup_resume=_cleanup_resume_intermediate_files,
+            select_dispatch_target=self._select_dispatch_target,
+            claim_task_lease=self._claim_task_lease,
+            get_running_tasks_count=lambda: len(_running_tasks),
+            build_should_recover=self._build_should_recover,
         )
         set_scheduler(self._scheduler)
-        # 自动注册本地 pod 作为 executor
-        self._scheduler.register_pod(
-            WORKER_INSTANCE_ID, os.environ.get("SA_POD_IP", "127.0.0.1"),
-            role="manager", max_tasks=WORKER_TASK_CONCURRENCY,
-        )
         self._runner_assignment_task: object | None = None
         self._runner_assignment_loop_running = False
         self._query = TaskQueryService(
@@ -1937,6 +1936,47 @@ class TaskService:
     def _load_runtime_control(db: Session) -> dict:
         return get_runtime_control_service().get_runtime_control(db)
 
+    def _build_should_recover(self, db: Session):
+        """构建僵死回收判定: 若 owner runner 仍有运行证据则不回收 (rollout/重启防误杀)。
+
+        返回一个 predicate(stale_row)->bool; 返回 None 表示无法判定时按默认全部回收。
+        """
+        try:
+            from app.service.agent_observability import AgentObservabilityService
+            snapshot = AgentObservabilityService().build_snapshot(db, project_id=None)
+        except Exception:
+            return None
+        processes_by_task_id = {
+            str(item.get("task_id") or ""): item
+            for item in snapshot.get("processes", [])
+            if str(item.get("task_id") or "").strip()
+        }
+
+        def _should_recover(stale) -> bool:
+            linked = processes_by_task_id.get(str(stale.task_id))
+            runtime_evidence = (
+                linked.get("runtime_evidence")
+                if isinstance(linked, dict) and isinstance(linked.get("runtime_evidence"), dict)
+                else {}
+            )
+            owner_kind = str((linked or {}).get("owner_kind") or "")
+            if owner_kind in {"tracked", "lease_drifted_active"} or bool(runtime_evidence.get("live_runtime_evidence")):
+                self._record_timeline_event(
+                    task_id=stale.task_id,
+                    project_id=getattr(stale, "project_id", None),
+                    event_type="task_lease_drift_preserved_due_to_runtime_evidence",
+                    message="任务租约漂移，但仍检测到智能体运行证据，暂不回收",
+                    level="warning",
+                    payload={
+                        "owner_kind": owner_kind or "lease_drifted_active",
+                        "runtime_evidence": runtime_evidence,
+                    },
+                )
+                return False
+            return True
+
+        return _should_recover
+
     def start_worker_loop(self) -> None:
         if is_manager_role():
             # 确保 DB 已初始化
@@ -1951,9 +1991,9 @@ class TaskService:
                         run_migrations=False)
             except Exception:
                 pass
-            self._dispatcher.start()
+            # 已完全切换到新调度器 (SchedulerService, DB-backed)。旧 WorkerDispatcher 不再启动。
             self._scheduler.start()
-            # Fix record_event positional→keyword args adapter
+            # record_event positional→keyword args adapter
             self._scheduler._record_event = lambda tid,pid,typ,msg,lvl='info',pay=None: self._record_timeline_event(task_id=tid,project_id=pid,event_type=typ,message=msg,level=lvl,payload=pay)
         if is_runner_role():
             self._runner_registry.start()
