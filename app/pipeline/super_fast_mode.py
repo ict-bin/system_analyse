@@ -421,3 +421,4 @@ def _commit_r(mod_dir, ws):
 def build_super_fast_pipeline():
     return [FilterStage(), SuperFastClassifyStage(), SuperFastRefineStage(),
             SuperFastAnalyseStage(), SuperFastReportStage()]
+
