@@ -168,6 +168,8 @@ class SuperFastClassifyStage(BaseStage):
             f"输出: modules/<模块名>/files.list\n"
             f"classify_framework.sh 已就绪, 直接 bash classify_framework.sh\n"
             f"⚠️ super_fast_mode: details/ 和 classify_context.md 不可用, 不要 read。\n"
+            f"⚠️ 本阶段只做文件分类，不分析威胁。威胁分析由后续 stage 负责。\n"
+            f"写入 modules/<模块名>/files.list 后立即结束。"
         )
         if ctx.prescan_summary:
             prompt_parts.append("\n\n# 预扫描摘要\n\n" + ctx.prescan_summary)
