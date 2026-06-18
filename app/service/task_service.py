@@ -1254,7 +1254,7 @@ class TaskService:
             get_db=get_db,
             task_repo=self._task_repository,
             spawn_task=self._on_task_claimed_scheduler,
-            record_event=self._record_timeline_event,
+            record_event=lambda task_id, project_id, event_type, message, level='info', payload=None: self._record_timeline_event(task_id=task_id, project_id=project_id, event_type=event_type, message=message, level=level, payload=payload),
             load_runtime_control=self._load_runtime_control,
             clear_task_lock=_clear_task_execution_lock,
             cleanup_resume=_cleanup_resume_intermediate_files,
