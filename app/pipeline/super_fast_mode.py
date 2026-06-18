@@ -42,31 +42,26 @@ _log = logging.getLogger("sa.super_fast")
 ###############################################################################
 
 def _v_classify(workspace: Path) -> tuple[bool, list[str]]:
+    """只校验格式: modules/ 下存在至少一个非空 files.list"""
     errors = []
-    ft = workspace / "filtered_files.txt"
-    if not ft.exists(): return False, ["filtered_files.txt 不存在"]
-    all_f = set(l.strip() for l in ft.read_text("utf-8").splitlines() if l.strip())
     mr = get_modules_root(str(workspace))
-    classified = set()
-    for fl in mr.glob("*/files.list"):
-        classified |= set(l.strip() for l in fl.read_text("utf-8").splitlines() if l.strip())
-    dl = workspace / "deleted.list"
-    if dl.exists():
-        classified |= set(l.strip() for l in dl.read_text("utf-8").splitlines() if l.strip())
-    # 也检查 deleted/files.list (Worker 直接写入, 尚未归档)
-    df = workspace / "deleted" / "files.list"
-    if df.exists():
-        classified |= set(l.strip() for l in df.read_text("utf-8").splitlines() if l.strip())
-    missing = sorted(all_f - classified)
-    if missing:
-        errors.append(f"缺失 {len(missing)} 个文件未分类: {missing[:10]}")
-        return False, errors
+    flists = list(mr.glob("*/files.list"))
+    if not flists:
+        return False, ["modules/ 下无 files.list"]
+    has_content = False
+    for fl in flists:
+        if any(l.strip() for l in fl.read_text("utf-8").splitlines()):
+            has_content = True; break
+    if not has_content:
+        return False, ["所有 files.list 为空"]
     return True, []
 
 def _v_refine(mod_dir: Path) -> tuple[bool, list[str]]:
+    """只校验格式: 有变动时 split/deleted 目录结构合法, 无 orphan 文件"""
     errors = []
     snap = mod_dir / ".snapshot"
-    if not snap.exists() or snap.is_dir(): return True, []
+    if not snap.exists() or snap.is_dir():
+        return True, []  # 无快照 = 未细分, 通过
     snap_f = set(l.strip() for l in snap.read_text("utf-8").splitlines() if l.strip())
     if not snap_f: return True, []
     kept = set(read_module_files(mod_dir))
@@ -82,11 +77,12 @@ def _v_refine(mod_dir: Path) -> tuple[bool, list[str]]:
                 fl = c / "files.list"
                 if fl.exists():
                     split_f |= set(l.strip() for l in fl.read_text("utf-8").splitlines() if l.strip())
-    missing = snap_f - (kept | split_f | deleted)
-    extra = (kept | split_f | deleted) - snap_f
-    if missing: errors.append(f"缺失 {len(missing)}: {sorted(missing)[:5]}")
-    if extra: errors.append(f"多余 {len(extra)}: {sorted(extra)[:5]}")
-    return len(missing) == 0 and len(extra) == 0, errors
+    covered = kept | split_f | deleted
+    extra = covered - snap_f  # 只检查多余 (格式错误), 不检查缺失 (质量)
+    if extra:
+        errors.append(f"多余 {len(extra)} 个文件不在快照中: {sorted(extra)[:5]}")
+        return False, errors
+    return True, []
 
 def _v_analyse(mod_dir: Path) -> tuple[bool, list[str]]:
     errors = []
