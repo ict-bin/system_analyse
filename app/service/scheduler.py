@@ -493,103 +493,98 @@ def run_heartbeat_process(scheduler_url: str, pod_id: str, task_id: str,
 # 进程清理 — 任务结束后（任何状态）清理所有关联进程
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def cleanup_task_processes(task_id: str) -> int:
+def cleanup_task_processes(task_id: str, protected_pids: set[int] | None = None) -> int:
     """清理指定任务的所有关联进程。
 
-    查找规则:
-      1. /proc/{pid}/cmdline 中包含 task_id 的进程
-      2. 进程名为 pi 或 python
-      3. 排除非任务进程: 父进程不是当前 executor 主进程
-    
-    清理流程: SIGTERM → 等 2s → SIGKILL
+    白名单机制: 保护系统进程 (main.py, uvicorn, probe, cleanup自身),
+    杀除白名单外的所有 task_id 关联进程。
+
+    清理流程: SIGTERM → 等 2s → SIGKILL (ESRCH 视为已退出)
     返回清理的进程数。
     """
     import glob as _glob
 
-    executor_pid = os.getpid()
+    if protected_pids is None:
+        protected_pids = _build_protected_set()
+    protected_pids.add(os.getpid())  # 保护清理进程自身
+
     task_pids: set[int] = set()
 
-    # 扫描 /proc
     for proc_dir in _glob.glob("/proc/[0-9]*"):
         try:
             pid = int(os.path.basename(proc_dir))
-            if pid == executor_pid or pid == 1:
+            if pid in protected_pids:
                 continue
-            # 读 cmdline
             cmdline_path = os.path.join(proc_dir, "cmdline")
             with open(cmdline_path, "rb") as f:
                 cmdline = f.read().decode("utf-8", errors="replace")
-            # 必须包含 task_id
             if task_id not in cmdline:
                 continue
-            # 必须是 pi 或 python 进程 (排除 bash/sh/java 等)
-            cmd_parts = cmdline.replace("\x00", " ").strip().split()
-            if not cmd_parts:
-                continue
-            exe_name = os.path.basename(cmd_parts[0])
-            if not ("pi" in exe_name or "python" in exe_name):
-                continue
-            # 检查父进程: 必须是当前 executor 进程的子进程
-            # (避免误杀其他 pod 的同 task_id 进程)
-            stat_path = os.path.join(proc_dir, "stat")
-            with open(stat_path, "r") as f:
-                stat = f.read()
-            ppid = int(stat.split()[3])  # /proc/PID/stat 第4列是 PPID
-            # 允许父进程是 executor 或 executor 的子进程
-            if not _is_descendant_of(ppid, executor_pid):
-                continue
+            # 白名单: 只保护 infrastructure 进程
+            # 其他含 task_id 的进程一律清理
             task_pids.add(pid)
-        except (OSError, ValueError, IndexError):
+        except (OSError, ValueError):
             continue
 
     if not task_pids:
         return 0
 
-    logger.info("cleaning up %d processes for task %s: %s",
-                len(task_pids), task_id, sorted(task_pids))
+    logger.info("cleaning up %d processes for task %s (protected=%d): %s",
+                len(task_pids), task_id, len(protected_pids), sorted(task_pids))
 
-    # SIGTERM
+    killed = 0
     for pid in task_pids:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
 
-    # 等待 2 秒
     time.sleep(2)
 
-    # SIGKILL 仍未退出的
-    killed = 0
     for pid in list(task_pids):
         try:
-            os.kill(pid, 0)  # 检查是否存活
             os.kill(pid, signal.SIGKILL)
             killed += 1
         except OSError:
-            killed += 1  # 已经退出
+            killed += 1
 
     logger.info("cleaned up %d processes for task %s", killed, task_id)
     return killed
 
 
-def _is_descendant_of(pid: int, ancestor_pid: int, max_depth: int = 10) -> bool:
-    """检查 pid 是否是 ancestor_pid 的子孙进程。"""
-    if pid == ancestor_pid:
-        return True
-    for _ in range(max_depth):
-        if pid <= 1:
-            return False
-        try:
-            with open(f"/proc/{pid}/stat", "r") as f:
-                ppid = int(f.read().split()[3])
-            if ppid == ancestor_pid:
-                return True
-            if ppid <= 1:
-                return False
-            pid = ppid
-        except (OSError, ValueError, IndexError):
-            return False
-    return False
+def _build_protected_set() -> set[int]:
+    """构建受保护进程白名单: main.py, uvicorn, probe 及其一级子进程。"""
+    protected: set[int] = {1, os.getpid()}  # init + cleanup自身
+    my_pid = os.getpid()
+    try:
+        # 扫描所有进程, 保护 infrastructure
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == my_pid:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().decode("utf-8", errors="replace")
+                # 保护 infrastructure 进程
+                cmd = cmdline.replace("\x00", " ").strip()
+                is_infra = any(kw in cmd for kw in [
+                    "main.py",        # executor 主进程
+                    "uvicorn",        # HTTP server
+                    "probe_process",  # health probe
+                    "probe_sidecar",  # health probe
+                    "gunicorn",       # WSGI server
+                    "entrypoint.sh",  # container entry
+                    "start-with-probe.sh",
+                ])
+                if is_infra:
+                    protected.add(pid)
+            except (OSError, ValueError):
+                pass
+    except (OSError, FileNotFoundError):
+        pass
+    return protected
 
 
 class TaskGuard:
