@@ -367,6 +367,18 @@ class TaskRunner:
                     payload=payload,
                 )
                 return
+            if str(event.type or "").strip().lower() == "task_fatal_retrying":
+                payload = dict(event.data or {})
+                self._deps.record_timeline_event(
+                    task_id=task_id,
+                    project_id=getattr(task_snapshot, "project_id", None),
+                    stage_name=stage_name,
+                    event_type="task_fatal_retrying",
+                    message="智能体基础设施异常，已进入 30 秒固定间隔重试",
+                    level="warning",
+                    payload=payload,
+                )
+                return
             if str(event.type or "").strip().lower() == "task_context_compaction_requested":
                 payload = dict(event.data or {})
                 self._deps.record_timeline_event(
@@ -410,7 +422,7 @@ class TaskRunner:
                     project_id=getattr(task_snapshot, "project_id", None),
                     stage_name=stage_name,
                     event_type="task_context_overflow_retrying",
-                    message="智能体上下文超限，压缩后准备重试一次",
+                    message="智能体上下文持续超限，已进入无限压缩重试",
                     level="warning",
                     payload=payload,
                 )

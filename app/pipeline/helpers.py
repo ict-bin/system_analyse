@@ -204,6 +204,17 @@ def run_agent_with_stage_guard(
                             consecutive_api_retry_count=int(getattr(result, "consecutive_api_retry_count", 0) or 0),
                             reason=str(getattr(result, "api_retry_reason", "") or ""),
                         )
+                    if getattr(result, "fatal_retry_event_due", False):
+                        ctx.emit_event(
+                            "task_fatal_retrying",
+                            stage=stage,
+                            retry_delay_seconds=int(getattr(result, "retry_delay_seconds", 30) or 30),
+                            consecutive_fatal_retry_count=int(getattr(result, "consecutive_fatal_retry_count", 0) or 0),
+                            reason=str(getattr(result, "fatal_retry_reason", "") or ""),
+                            role=str(getattr(result, "agent_role", "") or ""),
+                            runtime_dir=str(getattr(result, "runtime_dir", "") or ""),
+                            context_window=int(getattr(result, "context_window", 0) or 0),
+                        )
                     if getattr(result, "compaction_requested", False):
                         ctx.emit_event(
                             "task_context_compaction_requested",
@@ -230,7 +241,7 @@ def run_agent_with_stage_guard(
                             proxy_reserved_tokens=int(getattr(result, "proxy_reserved_tokens", 0) or 0),
                             error=str(getattr(result, "error", "") or ""),
                         )
-                    if getattr(result, "context_overflow_retrying", False):
+                    if getattr(result, "context_overflow_retrying", False) and getattr(result, "context_overflow_retry_event_due", False):
                         ctx.emit_event(
                             "task_context_overflow_retrying",
                             stage=stage,
@@ -238,6 +249,7 @@ def run_agent_with_stage_guard(
                             runtime_dir=str(getattr(result, "runtime_dir", "") or ""),
                             context_window=int(getattr(result, "context_window", 0) or 0),
                             proxy_reserved_tokens=int(getattr(result, "proxy_reserved_tokens", 0) or 0),
+                            context_overflow_retry_count=int(getattr(result, "context_overflow_retry_count", 0) or 0),
                         )
                     if getattr(result, "context_overflow_failed_after_compaction", False):
                         ctx.emit_event(

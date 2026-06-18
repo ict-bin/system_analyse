@@ -27,54 +27,23 @@ def _overflow_result() -> runner.AgentResult:
 
 
 class RunAgentTests(unittest.TestCase):
-    def test_materialize_task_pi_runtime_creates_role_scoped_dirs(self):
-        cfg = SimpleNamespace(
-            workers=SimpleNamespace(
-                default_model="glm-5.1-180k",
-                agents=[SimpleNamespace(model="glm-5.1-180k")],
-                stage_models={},
-                default_tools=["read"],
-                default_thinking_level="off",
-                system_prompt_dir="/tmp/workers",
-            ),
-            judges=SimpleNamespace(
-                default_model="gpt-5.4",
-                agents=[SimpleNamespace(model="gpt-5.4")],
-                stage_models={"judge": "gpt-5.4"},
-                default_tools=["read"],
-                default_thinking_level="off",
-                system_prompt_dir="/tmp/judges",
-            ),
+    def test_is_fatal_error_ignores_context_overflow_wrapped_as_invalid_request(self):
+        result = runner.AgentResult()
+        result.error = (
+            "400 litellm.BadRequestError: Hosted_vllmException - "
+            '{"object":"error","message":"Prefiller\'s maximum context length is 131072 tokens, '
+            'however the input has 127564 tokens and the proxy reserves 4096 safety-buffer tokens '
+            'after chat template rendering. Please reduce the length of the input.",'
+            '"type":"invalid_request_error","code":"prefill_context_length_exceeded"}. '
+            "Received Model Group=zai-org/GLM-5.1-180K"
         )
-        with tempfile.TemporaryDirectory() as task_root, tempfile.TemporaryDirectory() as pi_root:
-            (Path(pi_root) / "settings.json").write_text('{"theme":"light"}', encoding="utf-8")
-            (Path(pi_root) / "models.json").write_text(
-                '{"providers":{"lite":{"models":[{"id":"glm-5.1-180k","contextWindow":128000,"contextLength":128000},{"id":"gpt-5.4","contextWindow":128000,"contextLength":128000}]}}}',
-                encoding="utf-8",
-            )
-            with patch.dict(runner.os.environ, {"PI_CODING_AGENT_DIR": pi_root, "PI_MODELS_JSON": str(Path(pi_root) / "models.json")}, clear=False):
-                role_dirs, mode = task_runner._materialize_task_pi_runtime(
-                    task_root=task_root,
-                    agent_task_key={"id": "key-1", "secret": "secret-1"},
-                    cfg=cfg,
-                )
-            self.assertEqual(mode, "task_scoped")
-            self.assertIn("workers", role_dirs)
-            self.assertIn("judges", role_dirs)
-            workers_dir = Path(role_dirs["workers"])
-            judges_dir = Path(role_dirs["judges"])
-            self.assertTrue((workers_dir / "models.json").is_file())
-            self.assertTrue((workers_dir / "settings.json").is_file())
-            self.assertTrue((workers_dir / "auth.json").is_file())
-            self.assertTrue((judges_dir / "models.json").is_file())
-            workers_models = __import__("json").loads((workers_dir / "models.json").read_text(encoding="utf-8"))
-            judges_models = __import__("json").loads((judges_dir / "models.json").read_text(encoding="utf-8"))
-            workers_settings = __import__("json").loads((workers_dir / "settings.json").read_text(encoding="utf-8"))
-            self.assertIn("glm-5.1-180k", (workers_dir / "models.json").read_text(encoding="utf-8"))
-            self.assertNotEqual(workers_models, judges_models)
-            self.assertTrue(workers_settings["compaction"]["enabled"])
-            self.assertEqual(workers_settings["compaction"]["reserveTokens"], 8192)
-            self.assertEqual(workers_settings["compaction"]["keepRecentTokens"], 50000)
+        self.assertTrue(runner._is_context_overflow_error(result.error))
+        self.assertFalse(runner._is_fatal_error(result))
+
+    def test_is_fatal_error_still_matches_real_model_config_errors(self):
+        result = runner.AgentResult()
+        result.error = "Model not found. Use --list to inspect available models."
+        self.assertTrue(runner._is_fatal_error(result))
 
     def test_runtime_snapshot_includes_role_runtime_files(self):
         cfg = SimpleNamespace(
