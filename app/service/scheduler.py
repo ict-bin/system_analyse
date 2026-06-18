@@ -166,12 +166,31 @@ class SchedulerService:
                 logger.exception("scheduler tick: %s", exc)
             self._stop.wait(timeout=POLL_INTERVAL)
 
+    def _init_db_if_needed(self) -> None:
+        try:
+            from app.db import init_db
+            from app.config import get_service_yaml
+            svc = get_service_yaml()
+            init_db(svc.database.url, pool_size=svc.database.pool_size,
+                    max_overflow=svc.database.max_overflow,
+                    pool_timeout=svc.database.pool_timeout,
+                    pool_recycle=svc.database.pool_recycle,
+                    run_migrations=False)
+        except Exception:
+            pass
+
     def _tick(self) -> None:
         now = _time.time()
         self._last_tick = now
 
-        db_gen = self._get_db()
-        db: Session = next(db_gen)
+        # 确保 DB 已初始化
+        try:
+            db_gen = self._get_db()
+            db: Session = next(db_gen)
+        except RuntimeError:
+            self._init_db_if_needed()
+            db_gen = self._get_db()
+            db: Session = next(db_gen)
         try:
             # 加载运行时控制
             self._apply_control(self._load_control(db), now)
