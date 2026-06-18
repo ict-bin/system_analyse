@@ -14,6 +14,8 @@ start_probe() {
     "${PYTHON_BIN}" -m app.probe_process &
     probe_pid=$!
     echo "[${SERVICE_NAME}] probe pid=${probe_pid}"
+    # 保护 probe 不被 OOM killer 杀掉
+    echo -1000 > /proc/${probe_pid}/oom_score_adj 2>/dev/null || true
 }
 
 start_probe
@@ -21,6 +23,9 @@ start_probe
 echo "[${SERVICE_NAME}] starting main process: $*"
 "$@" &
 main_pid=$!
+# 保护 main 进程, 优先杀任务子进程
+main_oom_score="${SECFLOW_MAIN_OOM_SCORE:--500}"
+echo "${main_oom_score}" > /proc/${main_pid}/oom_score_adj 2>/dev/null || true
 
 printf '%s\n' "${main_pid}" > "${PID_FILE}"
 date +%s > "${STARTED_AT_FILE}"
