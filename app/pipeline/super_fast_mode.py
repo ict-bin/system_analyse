@@ -388,11 +388,14 @@ def _build_task_config_like(svc: "ServiceConfig", target_dir: str, output_dir: s
                             pass_mode=getattr(sc, "pass_mode", "all"),
                         ))
 
+    _td = target_dir
+    _od = output_dir
+
     @_dc
     class _FakeCfg:
         task: str = "super_fast_analysis"
-        target_dir: str = target_dir
-        output_dir: str = output_dir
+        target_dir: str = field(default=_td)
+        output_dir: str = field(default=_od)
         analyse_targets: list = field(default_factory=lambda: getattr(svc, "analyse_targets", ["all"]))
         binary_arch: list = field(default_factory=lambda: getattr(svc, "binary_arch", ["all"]))
         security_focus_categories: list = field(default_factory=lambda: getattr(svc, "security_focus_categories", ["all"]))
@@ -409,6 +412,7 @@ def _build_task_config_like(svc: "ServiceConfig", target_dir: str, output_dir: s
         pi_retry_delay: float = 5.0
         max_rounds_exceeded_action: str = "treat_as_passed"
         enable_final_check: bool = False
+        super_fast_mode: bool = True
         prompt_overrides: object = None
         start_stage: int = 0
         resume_workspace: str = ""
