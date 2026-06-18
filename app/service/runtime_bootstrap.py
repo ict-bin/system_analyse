@@ -54,19 +54,8 @@ class RuntimeBootstrap:
         if self._task and self._task.is_alive():
             self._task.join(timeout=5.0)
         self._task = None
-        try:
-            if is_dispatcher_role() or is_runner_role():
-                from app.service.task_service import get_task_service
-
-                get_task_service().stop_worker_loop()
-            if is_api_role():
-                from app.service.registry_service import get_registry_service
-
-                get_registry_service().stop()
-        except Exception:
-            import traceback
-            traceback.print_exc()
-            pass
+        # worker_loop/runner loop 是 daemon 线程, 随进程退出自然终止
+        # 不再显式调用 stop_worker_loop(), 避免 _running=False 导致无法恢复
 
     def status(self) -> dict:
         return asdict(self._status)
