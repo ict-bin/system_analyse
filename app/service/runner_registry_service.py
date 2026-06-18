@@ -35,6 +35,10 @@ IDLE_PI_REAPER_INTERVAL_SECONDS = max(
     5,
     int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_IDLE_PI_REAPER_INTERVAL_SECONDS", "30")),
 )
+IDLE_PI_REAPER_CONFIRM_ROUNDS = max(
+    1,
+    int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_IDLE_PI_REAPER_CONFIRM_ROUNDS", "2")),
+)
 _RUNNING_TASK_STATUSES = {"pending", "queued", "running"}
 
 
@@ -61,6 +65,7 @@ class RunnerRegistryService:
         self._last_idle_pi_reaper_killed_count = 0
         self._idle_pi_reaper_runs_total = 0
         self._idle_pi_reaper_failures_total = 0
+        self._idle_pi_reaper_idle_streak = 0
 
     def start(self) -> None:
         if not is_runner_role() or (self._task and self._task.is_alive()):
@@ -183,10 +188,12 @@ class RunnerRegistryService:
             "last_idle_pi_reaper_killed_count": self._last_idle_pi_reaper_killed_count,
             "idle_pi_reaper_runs_total": self._idle_pi_reaper_runs_total,
             "idle_pi_reaper_failures_total": self._idle_pi_reaper_failures_total,
+            "idle_pi_reaper_idle_streak": self._idle_pi_reaper_idle_streak,
         }
 
     def _worker_idle_for_pi_reaping(self) -> bool:
         if int(self._get_running_tasks_count() or 0) > 0:
+            self._idle_pi_reaper_idle_streak = 0
             return False
         db_gen = self._get_db()
         db: Session = next(db_gen)
@@ -200,7 +207,36 @@ class RunnerRegistryService:
                 )
                 .count()
             )
-            return int(active_owned or 0) == 0
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+        if int(active_owned or 0) != 0:
+            self._idle_pi_reaper_idle_streak = 0
+            return False
+        self._idle_pi_reaper_idle_streak += 1
+        return self._idle_pi_reaper_idle_streak >= IDLE_PI_REAPER_CONFIRM_ROUNDS
+
+    def _worker_has_residual_pi_for_reaping(self) -> bool:
+        from app.service.agent_observability import AgentObservabilityService
+
+        db_gen = self._get_db()
+        db: Session = next(db_gen)
+        try:
+            snapshot = AgentObservabilityService().build_snapshot(db, project_id=None)
+            summary = dict(snapshot.get("summary") or {})
+            residual_count = int(
+                summary.get("residual_pi_process_count")
+                or summary.get("residual_processes")
+                or 0
+            )
+            unknown_count = int(
+                summary.get("unknown_pi_process_count")
+                or summary.get("unknown_processes")
+                or 0
+            )
+            return (residual_count + unknown_count) > 0
         finally:
             try:
                 next(db_gen)
@@ -215,6 +251,9 @@ class RunnerRegistryService:
             try:
                 if not self._worker_idle_for_pi_reaping():
                     continue
+                if not self._worker_has_residual_pi_for_reaping():
+                    self._idle_pi_reaper_idle_streak = 0
+                    continue
                 logger.info("idle_pi_reaper_scan_started: worker_instance_id=%s", WORKER_INSTANCE_ID)
                 report = self._cleanup_idle_runtime() or {}
                 self._last_idle_pi_reaper_at = time.time()
@@ -223,6 +262,7 @@ class RunnerRegistryService:
                     or report.get("killed_pid_count")
                     or 0
                 )
+                self._idle_pi_reaper_idle_streak = 0
                 logger.info(
                     "idle_pi_reaper_cleanup_finished: worker_instance_id=%s killed_count=%s",
                     WORKER_INSTANCE_ID,

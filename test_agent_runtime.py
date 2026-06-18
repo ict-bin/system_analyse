@@ -428,12 +428,69 @@ def test_runner_registry_idle_reaper_runs_only_when_worker_idle() -> None:
         def wait(self, seconds):
             del seconds
             wait_calls["count"] += 1
-            return wait_calls["count"] > 1
+            return wait_calls["count"] > 2
 
     service._stop_event = _StopEvent()
-    service._idle_pi_reaper_loop()
+    with patch.object(service, "_worker_has_residual_pi_for_reaping", return_value=True):
+        service._idle_pi_reaper_loop()
 
     assert cleanup_calls == ["cleanup"]
     status = service.idle_pi_reaper_status()
     assert status["last_idle_pi_reaper_killed_count"] == 2
-    assert status["idle_pi_reaper_runs_total"] == 1
+    assert status["idle_pi_reaper_runs_total"] == 2
+
+
+def test_runner_registry_idle_reaper_requires_confirmed_idle_rounds() -> None:
+    class _TaskCountQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def count(self):
+            return 0
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskCountQuery()
+
+    def _db_gen():
+        yield _Db()
+
+    service = runner_registry_service.RunnerRegistryService(
+        get_db=_db_gen,
+        get_running_tasks_count=lambda: 0,
+        cleanup_idle_runtime=lambda: {"killed_process_count": 1},
+    )
+
+    assert service._worker_idle_for_pi_reaping() is False
+    assert service._worker_idle_for_pi_reaping() is True
+    assert service.idle_pi_reaper_status()["idle_pi_reaper_idle_streak"] == 2
+
+
+def test_runner_registry_idle_reaper_skips_cleanup_when_no_residual_pi() -> None:
+    cleanup_calls = []
+
+    def _db_gen():
+        yield SimpleNamespace()
+
+    service = runner_registry_service.RunnerRegistryService(
+        get_db=_db_gen,
+        get_running_tasks_count=lambda: 0,
+        cleanup_idle_runtime=lambda: cleanup_calls.append("cleanup") or {"killed_process_count": 1},
+    )
+    service._running = True
+
+    wait_calls = {"count": 0}
+
+    class _StopEvent:
+        def wait(self, seconds):
+            del seconds
+            wait_calls["count"] += 1
+            return wait_calls["count"] > 1
+
+    service._stop_event = _StopEvent()
+    with patch.object(service, "_worker_idle_for_pi_reaping", return_value=True), \
+         patch.object(service, "_worker_has_residual_pi_for_reaping", return_value=False):
+        service._idle_pi_reaper_loop()
+
+    assert cleanup_calls == []
