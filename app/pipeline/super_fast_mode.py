@@ -51,9 +51,6 @@ from .helpers import (
     enforce_filter_constraint,
     generate_modules_list,
     get_modules_root,
-    load_granularity_prompt,
-    load_prompt,
-    max_iter,
     max_rounds_exceeded_treated_as_passed,
     module_has_nonempty_files,
     read_module_files,
@@ -68,6 +65,29 @@ if TYPE_CHECKING:
     from ..models import ServiceConfig, TokenUsage
 
 _log = logging.getLogger("sa.super_fast")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 精简版 Worker System Prompt (只做当前阶段的事, 比标准 prompt 短 10x)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SF_SYS_CLASSIFY = """\
+你是系统分析专家。按文件名和路径分组文件到模块, 不读文件内容, 不分析威胁。
+用 write 工具写入 modules/<模块名>/files.list, 零遗漏。一次完成, 用 <result>done</result> 结束。"""
+
+_SF_SYS_REFINE = """\
+你是系统分析专家。根据 ELF 符号/函数名前缀拆分子模块。
+操作: split/<子模块>/files.list, _merge_to/<目标>/files.list, deleted/files.list。
+不读文件内容, 用 <result>done</result> 结束。"""
+
+_SF_SYS_ANALYSE = """\
+你是安全分析专家。生成 module_report.md:
+<!-- RISK_LEVEL: 高/中/低/信息 -->\n<!-- RISK_SCORE: 0-100 -->\n## 1.模块风险等级\n## 2.文件清单\n## 3.模块功能概述\n## 4.分类合理性自检\n## 5.威胁分析(STRIDE)\n## 6.对外暴露面评估\n<result>摘要</result>
+ELF 符号已预注入, 不读文件, 用 write 工具, 写完即止。"""
+
+_SF_SYS_REPORT = """\
+你是报告专家。读 modules/*/module_report.md 生成 final_report.md。
+必须含 7 章节: ## 1.分析概况 ## 2.模块清单 ## 3.高风险威胁清单 ## 4.攻击面汇总 ## 5.STRIDE统计 ## 6.修复建议 ## 7.结论
+用 <result>done</result> 结束。"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -478,7 +498,7 @@ class SuperFastClassifyStage(BaseStage):
 
         ctx.emit_event("stage", stage=1, mode="super_fast")
 
-        w_sys = load_prompt(cfg, "step1_classify", "workers")
+        w_sys = _SF_SYS_CLASSIFY
         w_model = cfg.workers.model_for("classify")
         sess = ctx.session_path("classify.jsonl")
 
@@ -555,7 +575,7 @@ class SuperFastRefineStage(BaseStage):
         max_r = getattr(sc, "max_rounds", -1) if sc else -1
         gran = getattr(cfg, "module_granularity", "fine") or "fine"
 
-        w_sys = load_granularity_prompt(cfg, "step2_refine", gran, "workers")
+        w_sys = _SF_SYS_REFINE
         gh = build_granularity_hint(gran)
         if gh and gh not in w_sys: w_sys += gh
         w_model = cfg.workers.model_for("refine")
@@ -646,7 +666,7 @@ class SuperFastAnalyseStage(BaseStage):
         max_r = getattr(sc, "max_rounds", -1) if sc else -1
         gran = getattr(cfg, "module_granularity", "fine") or "fine"
 
-        w_sys = load_granularity_prompt(cfg, "step3_analyse", gran, "workers")
+        w_sys = _SF_SYS_ANALYSE
         gh = build_granularity_hint(gran)
         if gh and gh not in w_sys: w_sys += gh
         w_model = cfg.workers.model_for("analyse")
@@ -691,7 +711,7 @@ class SuperFastReportStage(BaseStage):
 
         ctx.emit_event("stage", stage=4, mode="super_fast")
 
-        w_sys = load_prompt(cfg, "step4_final_report", "workers")
+        w_sys = _SF_SYS_REPORT
         w_model = cfg.workers.model_for("report")
         sess = ctx.session_path("report.jsonl")
 
