@@ -53,6 +53,10 @@ def _v_classify(workspace: Path) -> tuple[bool, list[str]]:
     dl = workspace / "deleted.list"
     if dl.exists():
         classified |= set(l.strip() for l in dl.read_text("utf-8").splitlines() if l.strip())
+    # 也检查 deleted/files.list (Worker 直接写入, 尚未归档)
+    df = workspace / "deleted" / "files.list"
+    if df.exists():
+        classified |= set(l.strip() for l in df.read_text("utf-8").splitlines() if l.strip())
     missing = sorted(all_f - classified)
     if missing:
         errors.append(f"缺失 {len(missing)} 个文件未分类: {missing[:10]}")
