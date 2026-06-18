@@ -188,7 +188,7 @@ class SuperFastClassifyStage(BaseStage):
         if ctx.filtered_files:
             enforce_filter_constraint(ws, set(ctx.filtered_files))
         ctx.classified_modules = discover_modules(str(ws))
-        ctx.emit_event("stage_result", stage=1, modules=len(ctx.classified_modules))
+        ctx.emit_event("stage_result", stage=1, modules=ctx.classified_modules)
 
 ###############################################################################
 # S2: 细分类 — 拷贝 s2_refine 的单模块 Worker, 删 Judge
@@ -204,7 +204,7 @@ class SuperFastRefineStage(BaseStage):
 
         granularity = getattr(cfg, "module_granularity", "fine") or "fine"
         parallel = max(1, cfg.parallel_modules)
-        ctx.emit_event("stage", stage=2, mode="super_fast", modules=len(modules))
+        ctx.emit_event("stage", stage=2, mode="super_fast", modules=modules)
 
         with ThreadPoolExecutor(max_workers=parallel) as pool:
             futs = {pool.submit(self._one, ctx, m, granularity): m for m in modules}
@@ -215,7 +215,7 @@ class SuperFastRefineStage(BaseStage):
                                    msg=f"[SF-S2] {futs[fut]} 失败: {e}")
 
         ctx.refined_modules = discover_modules(str(ws))
-        ctx.emit_event("stage_result", stage=2, modules=len(ctx.refined_modules))
+        ctx.emit_event("stage_result", stage=2, modules=ctx.refined_modules)
 
     def _one(self, ctx, mod_name, granularity):
         cfg, ws = ctx.cfg, ctx.workspace
@@ -275,7 +275,7 @@ class SuperFastAnalyseStage(BaseStage):
         if not modules: return
         granularity = getattr(cfg, "module_granularity", "fine") or "fine"
         parallel = max(1, cfg.parallel_modules)
-        ctx.emit_event("stage", stage=3, mode="super_fast", modules=len(modules))
+        ctx.emit_event("stage", stage=3, mode="super_fast", modules=modules)
         with ThreadPoolExecutor(max_workers=parallel) as pool:
             futs = {pool.submit(self._one, ctx, m, granularity): m for m in modules}
             for fut in as_completed(futs):
@@ -286,7 +286,7 @@ class SuperFastAnalyseStage(BaseStage):
         ctx.analysed_modules = [d.name for d in mr.iterdir()
                                 if d.is_dir() and (d/"module_report.md").exists()
                                 and module_has_nonempty_files(d)]
-        ctx.emit_event("stage_result", stage=3, modules=len(ctx.analysed_modules))
+        ctx.emit_event("stage_result", stage=3, modules=ctx.analysed_modules)
 
     def _one(self, ctx, mod_name, granularity):
         cfg, ws = ctx.cfg, ctx.workspace
