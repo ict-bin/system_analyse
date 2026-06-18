@@ -161,6 +161,12 @@ async def lifespan(app: FastAPI):
     if not _external_probe_process_enabled():
         _ensure_probe_server_started()
     get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
+    # 挂载调度器内部 API
+    try:
+        from .service.scheduler import create_scheduler_router
+        app.include_router(create_scheduler_router())
+    except Exception:
+        pass
 
     yield
 

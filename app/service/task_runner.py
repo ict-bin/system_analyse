@@ -27,6 +27,7 @@ from app.service.agent_cleanup import AgentCleanupService
 from app.service.task_execution_lock import TaskExecutionLockConflict, RUNNER_PROCESS_TOKEN
 from app.service.task_repository import TaskRepository
 from app.service.worker_dispatcher import WORKER_INSTANCE_ID, lease_deadline
+from app.service.scheduler import TaskGuard
 from app.time_utils import isoformat_local, now_local
 
 logger = logging.getLogger("sa.task_runner")
@@ -536,8 +537,15 @@ class TaskRunner:
                 daemon=True,
             )
             task_supervisor.start()
+            # 调度器任务守卫: 心跳 + 结束通知
+            guard = TaskGuard(task_id, scheduler_url="", pod_id=WORKER_INSTANCE_ID)
+            guard.start()
             try:
                 result = orch.execute(task_id)
+                guard.done("completed")
+            except Exception:
+                guard.done("failed")
+                raise
             finally:
                 pass  # supervisor thread is daemon
             # 最终增量刷新剩余 events

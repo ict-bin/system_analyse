@@ -67,6 +67,10 @@ from app.service.worker_dispatcher import (
     lease_deadline as _lease_deadline,
     WorkerDispatcher,
 )
+from app.service.scheduler import (
+    SchedulerService, ExecutorAgent, TaskGuard,
+    set_scheduler, INSTANCE_ID as SCHEDULER_INSTANCE_ID,
+)
 from app.time_utils import isoformat_local, now_local
 
 logger = logging.getLogger("sa.task_service")
@@ -1245,6 +1249,17 @@ class TaskService:
             load_runtime_control=self._load_runtime_control,
             task_repository=self._task_repository,
         )
+        # 新调度器 (与旧 WorkerDispatcher 并行, 逐步切换)
+        self._scheduler = SchedulerService(
+            get_db=get_db,
+            task_repo=self._task_repository,
+            spawn_task=self._on_task_claimed_scheduler,
+            record_event=self._record_timeline_event,
+            load_runtime_control=self._load_runtime_control,
+            clear_task_lock=_clear_task_execution_lock,
+            cleanup_resume=_cleanup_resume_intermediate_files,
+        )
+        set_scheduler(self._scheduler)
         self._runner_assignment_task: object | None = None
         self._runner_assignment_loop_running = False
         self._query = TaskQueryService(
@@ -1920,6 +1935,7 @@ class TaskService:
     def start_worker_loop(self) -> None:
         if is_manager_role():
             self._dispatcher.start()
+            self._scheduler.start()
         if is_runner_role():
             self._runner_registry.start()
             self._start_runner_assignment_loop()
@@ -1927,6 +1943,7 @@ class TaskService:
     def stop_worker_loop(self) -> None:
         if is_manager_role():
             self._dispatcher.stop()
+            self._scheduler.stop()
         if is_runner_role():
             self._stop_runner_assignment_loop()
             self._runner_registry.stop()
@@ -1935,6 +1952,12 @@ class TaskService:
         if dispatch_target != WORKER_INSTANCE_ID:
             return
         self._run_task_locally(task_id, lease_epoch)
+
+    def _on_task_claimed_scheduler(self, task_id: str, pod_id: str) -> None:
+        """调度器回调: 分配任务到指定 pod 执行。"""
+        if pod_id == WORKER_INSTANCE_ID or pod_id == SCHEDULER_INSTANCE_ID:
+            self._run_task_locally(task_id, 0)
+        # 远程 pod 通过 ExecutorAgent 接收, 此处仅记录
 
     @staticmethod
     def _select_dispatch_target(db: Session) -> str | None:
