@@ -1934,6 +1934,18 @@ class TaskService:
 
     def start_worker_loop(self) -> None:
         if is_manager_role():
+            # 确保 DB 已初始化 (绕过 bootstrap 的 db_ready 检查)
+            try:
+                from app.db import init_db
+                from app.config import get_service_yaml
+                svc = get_service_yaml()
+                init_db(svc.database.url, pool_size=svc.database.pool_size,
+                        max_overflow=svc.database.max_overflow,
+                        pool_timeout=svc.database.pool_timeout,
+                        pool_recycle=svc.database.pool_recycle,
+                        run_migrations=False)
+            except Exception:
+                pass
             self._dispatcher.start()
             self._scheduler.start()
         if is_runner_role():

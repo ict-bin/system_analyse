@@ -954,9 +954,10 @@ class TaskRunner:
         heartbeat_failures = 0
         while True:
             time.sleep(loop_interval)
-            db_gen = self._deps.get_db()
-            db: Session = next(db_gen)
+            db = None
             try:
+                db_gen = self._deps.get_db()
+                db = next(db_gen)
                 row = self._deps.task_repository.get_task(db, task_id)
                 if not row or row.status == "cancelled":
                     orch.stop()
@@ -1005,8 +1006,14 @@ class TaskRunner:
                         continue
                     heartbeat_failures = 0
                     last_heartbeat_ts = now_ts
+            except Exception:
+                logger.exception(
+                    "supervisor loop exception (task_id=%s lease_epoch=%s), will retry",
+                    task_id, lease_epoch,
+                )
             finally:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
+                if db is not None:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
