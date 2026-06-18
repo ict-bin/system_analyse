@@ -1997,8 +1997,20 @@ class TaskService:
         return str(best_runner["instance_id"]) if best_runner else None
 
     def _run_task_locally(self, task_id: str, lease_epoch: int) -> None:
-        if task_id in _running_tasks and _running_tasks[task_id].is_alive():
-            return
+        if task_id in _running_tasks:
+            old_epoch = _running_task_epochs.get(task_id)
+            if old_epoch == lease_epoch and _running_tasks[task_id].is_alive():
+                return
+            if old_epoch != lease_epoch:
+                logger.warning(
+                    "task %s lease_epoch changed (%s -> %s), removing stale execution to allow restart",
+                    task_id, old_epoch, lease_epoch,
+                )
+                _running_tasks.pop(task_id, None)
+                _running_task_epochs.pop(task_id, None)
+            elif not _running_tasks[task_id].is_alive():
+                _running_tasks.pop(task_id, None)
+                _running_task_epochs.pop(task_id, None)
         task_thread = threading.Thread(target=self._runner.execute_task, args=(task_id, lease_epoch), name=f"sa_task_{task_id}", daemon=True)
         task_thread.start()
         _running_tasks[task_id] = task_thread
@@ -2056,7 +2068,9 @@ class TaskService:
             now = now_local()
             for row in rows:
                 if row.task_id in _running_tasks:
-                    continue
+                    old_epoch = _running_task_epochs.get(row.task_id)
+                    if old_epoch == int(row.lease_epoch or 0) and _running_tasks[row.task_id].is_alive():
+                        continue
                 if row.lease_expires_at and row.lease_expires_at < now:
                     lease_epoch = int(row.lease_epoch or 0)
                     lease_expires_at = _safe_isoformat(row.lease_expires_at)

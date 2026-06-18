@@ -234,33 +234,27 @@ class SchedulerService:
             logger.warning("pod %s marked stale, %d tasks recycled", pid, len(stale_tasks))
 
     def _reap_stale_tasks(self, db: Session, now: float) -> None:
-        """回收过期任务，含 runtime evidence 检测."""
-        # 用 DB 侧回收 (保留原逻辑)
-        rows = self._task_repo.list_running_tasks_with_expired_lease(
-            db, now_local(), LEASE_TIMEOUT,
+        """回收过期任务, 使用 TaskRepository 现有方法."""
+        from datetime import datetime as _dt
+        now_local = __import__('app.time_utils', fromlist=['now_local']).now_local()
+        rows = self._task_repo.recover_stale_running_tasks(
+            db, now=now_local, lease_timeout_seconds=LEASE_TIMEOUT,
+            clear_task_execution_lock=self._clear_lock,
+            cleanup_resume_files=self._cleanup_resume,
+            should_recover=None,
         )
         for row in rows:
             tid = row.task_id
-            # 跳过已知 pod 仍在运行的任务
-            with self._lock:
-                if tid in self._tasks:
-                    t = self._tasks[tid]
-                    if t.pod_id in self._pods and self._pods[t.pod_id].is_healthy:
-                        continue  # pod 健康, 租约由心跳维持
-            # 回收
             self._recovered_task_ids.add(tid)
-            self._task_repo.reset_task_to_pending(db, tid)
             self._record_event(tid, getattr(row, "project_id", None),
                                "task_lease_recovered",
                                "任务租约过期，已回收并重新排队",
                                "warning",
-                               {"dispatcher_instance_id": INSTANCE_ID,
-                                "lease_epoch": getattr(row, "lease_epoch", 0)})
+                               {"lease_epoch": getattr(row, "lease_epoch", 0)})
 
     # ── 任务分配 ──────────────────────────────────────────────────────────
 
     def _dispatch(self, db: Session, now: float) -> None:
-        # 全局并发限制
         if MAX_GLOBAL_TASKS > 0:
             running = self._task_repo.count_running_tasks(db)
             if running >= MAX_GLOBAL_TASKS:
@@ -272,15 +266,16 @@ class SchedulerService:
         if not available:
             return
 
-        pending = self._task_repo.list_pending_tasks(db, len(available))
-        for i, row in enumerate(pending):
+        pending_rows = self._task_repo.list_pending_tasks(db, len(available))
+        for i, row in enumerate(pending_rows):
             if i >= len(available):
                 break
             pod = available[i]
-
-            # 写 DB lease
+            from app.time_utils import now_local, datetime as _dt
+            deadline = now_local() + __import__('datetime').timedelta(seconds=LEASE_TIMEOUT)
             lease_epoch = self._task_repo.claim_task_lease(
-                db, row.task_id, pod.pod_id, LEASE_TIMEOUT,
+                db, row, worker_instance_id=pod.pod_id,
+                lease_deadline=lambda: deadline,
             )
             if not lease_epoch:
                 continue
@@ -293,19 +288,16 @@ class SchedulerService:
                     lease_expires=now + LEASE_TIMEOUT, last_heartbeat=now,
                 )
 
-            # 通知 executor 执行
             self._spawn_task(row.task_id, pod.pod_id)
             self._record_event(row.task_id, getattr(row, "project_id", None),
                                "task_assigned",
-                               f"任务已分配给 {pod.pod_id}",
-                               None,
+                               f"任务已分配给 {pod.pod_id}", None,
                                {"pod_id": pod.pod_id, "lease_epoch": lease_epoch})
             if row.task_id in self._recovered_task_ids:
                 self._recovered_task_ids.discard(row.task_id)
                 self._record_event(row.task_id, getattr(row, "project_id", None),
                                    "task_auto_recovered",
-                                   "任务已由系统自动恢复并重新调度",
-                                   None,
+                                   "任务已由系统自动恢复并重新调度", None,
                                    {"pod_id": pod.pod_id, "lease_epoch": lease_epoch,
                                     "reason": "lease_recovered_and_reclaimed"})
 
