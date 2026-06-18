@@ -191,6 +191,12 @@ class SchedulerService:
             self._init_db_if_needed()
             db_gen = self._get_db()
             db: Session = next(db_gen)
+
+        # 本地 pod 自动续心跳 (无需 ExecutorAgent)
+        with self._lock:
+            for pod in self._pods.values():
+                if pod.status == "online":
+                    pod.last_heartbeat = now
         try:
             # 加载运行时控制
             self._apply_control(self._load_control(db), now)
@@ -237,20 +243,15 @@ class SchedulerService:
 
     def _reap_stale_pods(self, now: float) -> None:
         with self._lock:
-            stale = [pid for pid, p in self._pods.items() if not p.is_healthy]
+            stale = [pid for pid, p in self._pods.items()
+                     if p.status == "online" and not p.is_healthy]
         for pid in stale:
-            stale_tasks = list(self._pods[pid].task_ids)
-            # 调度器主动通知 executor 清理
-            self._notify_cleanup(pid, stale_tasks)
             with self._lock:
-                for tid in stale_tasks:
-                    self._tasks.pop(tid, None)
-                    self._record_event(tid, None, "task_pod_stale",
-                                       f"pod {pid} 失联, 任务回收", "warning",
-                                       {"pod_id": pid})
-                self._pods[pid].task_ids.clear()
                 self._pods[pid].status = "stale"
-            logger.warning("pod %s marked stale, %d tasks recycled", pid, len(stale_tasks))
+                for tid in list(self._pods[pid].task_ids):
+                    self._tasks.pop(tid, None)
+                self._pods[pid].task_ids.clear()
+            logger.warning("pod %s marked stale", pid)
 
     def _reap_stale_tasks(self, db: Session, now: float) -> None:
         """回收过期任务, 使用 TaskRepository 现有方法."""
