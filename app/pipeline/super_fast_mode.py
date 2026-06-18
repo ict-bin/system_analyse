@@ -71,22 +71,115 @@ _log = logging.getLogger("sa.super_fast")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SF_SYS_CLASSIFY = """\
-你是系统分析专家。按文件名和路径分组文件到模块, 不读文件内容, 不分析威胁。
-用 write 工具写入 modules/<模块名>/files.list, 零遗漏。一次完成, 用 <result>done</result> 结束。"""
+你是系统分析专家。任务: 将 filtered_files.txt 全部文件按功能分组到模块。
+
+## 严格输出格式
+每个模块写入 `modules/<模块名>/files.list` (每行一个文件相对路径, 与 filtered_files.txt 一致)
+
+## 分类规则
+- 按文件名前缀 + 目录路径分组
+- 同目录同前缀 → 同一模块
+- **不要读文件内容**, 不看源码, 不分析威胁
+- 零遗漏: 每个文件都要归入某个模块
+
+## 示例
+filtered_files.txt:
+  src/crypto/aes.c
+  src/crypto/rsa.c
+  src/network/tcp.c
+  lib/libssl.so
+
+→ modules/crypto/files.list: src/crypto/aes.c\nsrc/crypto/rsa.c
+→ modules/network/files.list: src/network/tcp.c
+→ modules/libssl/files.list: lib/libssl.so
+
+用 <result>done</result> 结束。"""
 
 _SF_SYS_REFINE = """\
-你是系统分析专家。根据 ELF 符号/函数名前缀拆分子模块。
-操作: split/<子模块>/files.list, _merge_to/<目标>/files.list, deleted/files.list。
-不读文件内容, 用 <result>done</result> 结束。"""
+你是系统分析专家。任务: 检查模块是否需细分为子模块。
+
+## 严格输出格式 (三选一或多选)
+如需拆分 → `modules/{mod}/split/<子模块名>/files.list`
+如需合并 → `modules/{mod}/split/_merge_to/<目标模块名>/files.list`
+如需排除 → `modules/{mod}/deleted/files.list`
+(files.list 每行一个文件相对路径)
+
+## 判断规则
+- 根据 ELF 符号前缀 / 源码函数名前缀聚类
+- 同前缀 ≥3 个文件 → 可拆分为独立子模块
+- 无明确分组 → 不拆分, 直接结束
+- **不要读文件内容**
+
+用 <result>done</result> 结束。"""
 
 _SF_SYS_ANALYSE = """\
-你是安全分析专家。生成 module_report.md:
-<!-- RISK_LEVEL: 高/中/低/信息 -->\n<!-- RISK_SCORE: 0-100 -->\n## 1.模块风险等级\n## 2.文件清单\n## 3.模块功能概述\n## 4.分类合理性自检\n## 5.威胁分析(STRIDE)\n## 6.对外暴露面评估\n<result>摘要</result>
-ELF 符号已预注入, 不读文件, 用 write 工具, 写完即止。"""
+你是安全分析专家。任务: 对模块做 STRIDE 威胁分析, 写入 module_report.md。
+
+## 严格输出格式 (用 write 工具写入 modules/<模块名>/module_report.md)
+```
+<!-- RISK_LEVEL: 高 -->
+<!-- RISK_SCORE: 85 -->
+
+# 模块分析报告: <模块名>
+
+## 1. 模块风险等级
+- 风险等级: 高/中/低/信息
+- 风险评分: 0-100
+
+## 2. 文件清单
+| 文件路径 | 类型 | 功能描述 |
+|----------|------|----------|
+
+## 3. 模块功能概述
+
+## 4. 分类合理性自检
+[分类合理] 或 [分类问题] <path> 应归入 <target>
+
+## 5. 威胁分析 (STRIDE)
+按 S/T/R/I/D/E 分类, 标注位置/触发条件/影响/风险等级
+
+## 6. 对外暴露面评估
+
+<result>摘要</result>
+```
+
+## 规则
+- ELF 符号已预注入到本 prompt, 不读文件
+- 基于导出函数推断攻击面
+- 基于导入函数匹配危险调用
+- 用 write 工具写报告, 写完即止
+
+用 <result>done</result> 结束。"""
 
 _SF_SYS_REPORT = """\
-你是报告专家。读 modules/*/module_report.md 生成 final_report.md。
-必须含 7 章节: ## 1.分析概况 ## 2.模块清单 ## 3.高风险威胁清单 ## 4.攻击面汇总 ## 5.STRIDE统计 ## 6.修复建议 ## 7.结论
+你是报告专家。任务: 汇总所有模块报告生成总报告。
+
+## 严格输出格式 (写入 final_report.md, 7 章节缺一不可)
+```
+# 固件系统威胁分析总报告
+## 1. 分析概况
+| 项目 | 值 |
+|------|------|
+| 分析模块数 | N |
+| 高风险模块数 | N |
+## 2. 模块清单
+| 模块名 | 文件数 | 功能 | 风险等级 |
+|--------|--------|------|----------|
+## 3. 高风险威胁清单
+## 4. 攻击面汇总
+## 5. STRIDE 威胁统计
+| 类别 | 总数 |
+|------|------|
+| S/T/R/I/D/E | N |
+## 6. 修复建议
+## 7. 结论
+```
+
+## 操作
+1. `ls -d modules/*/` 列出模块
+2. `read modules/*/module_report.md` 读取报告
+3. 汇总统计后写入 final_report.md
+
 用 <result>done</result> 结束。"""
 
 
