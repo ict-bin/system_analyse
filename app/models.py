@@ -507,6 +507,7 @@ class ServiceConfig(BaseModel):
         default_factory=SelfReflectionConfig,
         description="自省分析配置"
     )
+    super_fast_mode: bool = Field(default=False, description="超快速模式开关")
 
 
 # ─── 运行时任务 ───────────────────────────────────────────────────────────────
@@ -597,6 +598,7 @@ class TaskConfig(BaseModel):
         default_factory=SelfReflectionConfig,
         description="自省分析配置"
     )
+    super_fast_mode: bool = Field(default=False, description="超快速模式开关")
 
     @property
     def worker_count(self) -> int:

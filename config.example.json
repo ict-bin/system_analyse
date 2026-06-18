@@ -13,6 +13,7 @@
     "max_rounds_exceeded_action": "treat_as_passed",
     "continue_on_module_failure": true,
     "enable_final_check": false,
+    "super_fast_mode": false,
     "stages": {
         "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
         "refine":      {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},

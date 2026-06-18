@@ -274,6 +274,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "") -> TaskCon
         resume_workspace=svc.resume_workspace,
         skip_path_patterns=svc.skip_path_patterns,
         self_reflection=svc.self_reflection.model_copy(deep=True),
+        super_fast_mode=bool(getattr(svc, "super_fast_mode", False)),
     )
 
     _backfill_role(cfg.workers)

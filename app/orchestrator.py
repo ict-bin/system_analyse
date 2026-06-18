@@ -37,6 +37,11 @@ from .pipeline import (
     CompletenessCheckStage, FinalReportStage,
     StageError, PiFatalError,
 )
+# super_fast_mode 可选导入 (独立文件, 删除即失效)
+try:
+    from .pipeline.super_fast_mode import build_super_fast_pipeline
+except ImportError:
+    build_super_fast_pipeline = None
 from .pipeline.checkpoint import CheckpointManager
 from .task_version import ensure_task_format_version
 from .pipeline.helpers import (
@@ -259,22 +264,25 @@ class Orchestrator:
         )
 
         # ── 组装并运行 Pipeline ───────────────────────────────────────────────
-        pipeline = Pipeline([
-            FilterStage(),
-            TypeClassifyStage(),         # S0.1: 文件类型识别 → file_catalog.json
-            UnknownCheckerStage(),       # S0.2: UNKNOWN 类型识别
-            ExploreStage(),              # S0.3: 目录探索 → keywords.txt
-            PrescanStage(),              # S0.4: 预扫描 → keyword_summary.txt
-            PathGroupStage(),            # S0.5: 路径先验分组
-            SubReaderStage(),            # S0.6: 全量文件预读 → details/*.json
-            ValidateDetailsStage(),      # S0.7: 校验 details/ 完整性
-            ClassifyStage(),
-            SecurityFocusFilterStage(),  # S1.5: 安全维度过滤 + 无用模块过滤
-            RefineStage(),
-            AnalyseStage(),
-            CompletenessCheckStage(),
-            FinalReportStage(),
-        ])
+        if cfg.super_fast_mode and build_super_fast_pipeline is not None:
+            pipeline = Pipeline(build_super_fast_pipeline())
+        else:
+            pipeline = Pipeline([
+                FilterStage(),
+                TypeClassifyStage(),         # S0.1: 文件类型识别 → file_catalog.json
+                UnknownCheckerStage(),       # S0.2: UNKNOWN 类型识别
+                ExploreStage(),              # S0.3: 目录探索 → keywords.txt
+                PrescanStage(),              # S0.4: 预扫描 → keyword_summary.txt
+                PathGroupStage(),            # S0.5: 路径先验分组
+                SubReaderStage(),            # S0.6: 全量文件预读 → details/*.json
+                ValidateDetailsStage(),      # S0.7: 校验 details/ 完整性
+                ClassifyStage(),
+                SecurityFocusFilterStage(),  # S1.5: 安全维度过滤 + 无用模块过滤
+                RefineStage(),
+                AnalyseStage(),
+                CompletenessCheckStage(),
+                FinalReportStage(),
+            ])
 
         try:
             pipeline.run(ctx)
