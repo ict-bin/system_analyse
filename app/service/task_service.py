@@ -1939,7 +1939,7 @@ class TaskService:
 
     def start_worker_loop(self) -> None:
         if is_manager_role():
-            # 确保 DB 已初始化 (绕过 bootstrap 的 db_ready 检查)
+            # 确保 DB 已初始化
             try:
                 from app.db import init_db
                 from app.config import get_service_yaml
@@ -1953,6 +1953,8 @@ class TaskService:
                 pass
             self._dispatcher.start()
             self._scheduler.start()
+            # Fix record_event positional→keyword args adapter
+            self._scheduler._record_event = lambda tid,pid,typ,msg,lvl='info',pay=None: self._record_timeline_event(task_id=tid,project_id=pid,event_type=typ,message=msg,level=lvl,payload=pay)
         if is_runner_role():
             self._runner_registry.start()
             self._start_runner_assignment_loop()
