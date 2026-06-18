@@ -556,10 +556,6 @@ class TaskRunner:
             else:
                 self._deps.flush_stages(task_id, event_buffer)
             self._persist_task_result(task_id, lease_epoch, task_snapshot, result, event_buffer, events_file)
-        except Exception:
-            import traceback
-            traceback.print_exc()
-            pass
         except Exception as exc:
             log_event(
                 logger,
@@ -569,6 +565,8 @@ class TaskRunner:
                 task_id=task_id,
                 error=str(exc),
             )
+            import traceback
+            traceback.print_exc()
             self._persist_task_error(task_id, lease_epoch, event_buffer, exc, events_file, pre_cleanup_report=pre_cleanup_report)
         finally:
             post_project_id = getattr(task_snapshot, "project_id", None) if task_snapshot is not None else None
@@ -620,6 +618,9 @@ class TaskRunner:
             payload=report,
         )
         return report
+
+    def force_cleanup_all_agents(self, *, phase: str) -> dict[str, object]:
+        return self._agent_cleanup.run_cleanup(phase=phase)
 
     def _attach_cleanup_report(
         self,

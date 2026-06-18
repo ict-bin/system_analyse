@@ -186,9 +186,11 @@ class AgentCleanupService:
             level = "critical" if surviving_process_count >= _CRITICAL_SURVIVOR_THRESHOLD else "error"
         return {
             "cleanup_phase": phase,
+            "cleanup_scope": "pod_all_pi",
             "runner_instance_id": WORKER_INSTANCE_ID,
             "scanned_process_count": scanned_process_count,
             "killed_process_count": killed_process_count,
+            "killed_pgid_count": len(terminated_groups),
             "failed_process_count": failed_process_count,
             "surviving_process_count": surviving_process_count,
             "cleanup_failed": cleanup_failed,

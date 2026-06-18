@@ -1211,6 +1211,7 @@ class TaskService:
         self._runner_registry = init_runner_registry_service(
             get_db=get_db,
             get_running_tasks_count=lambda: len(_running_tasks),
+            cleanup_idle_runtime=lambda: self._runner.force_cleanup_all_agents(phase="idle_reaper"),
         )
         self._runner = TaskRunner(
             deps=TaskRunnerDependencies(

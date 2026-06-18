@@ -38,6 +38,10 @@ def test_build_agent_runtime_aggregate_counts_unknown_and_residual_processes() -
     assert runtime["summary"]["total_processes"] == 3
     assert runtime["summary"]["residual_processes"] == 1
     assert runtime["summary"]["unknown_processes"] == 1
+    assert runtime["summary"]["total_pi_process_count"] == 3
+    assert runtime["summary"]["residual_pi_process_count"] == 1
+    assert runtime["summary"]["unknown_pi_process_count"] == 1
+    assert runtime["summary"]["residual_pi_detected"] is True
     assert runtime["summary"]["killable_unknown_processes"] == 1
     assert runtime["summary"]["aggregate_partial"] is True
     assert runtime["summary"]["aggregate_sources"] == 3
@@ -149,6 +153,56 @@ def test_agent_snapshot_marks_non_running_task_with_runtime_evidence_as_lease_dr
     assert process["owner_kind"] == "tracked"
     assert process["kill_allowed"] is False
     assert process["owner_reason"] == "active_task_with_runtime_evidence"
+
+
+def test_agent_snapshot_exposes_idle_reaper_fields(monkeypatch) -> None:
+    monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{
+        "pid": 501,
+        "ppid": 1,
+        "pgid": 501,
+        "command": "node /usr/bin/pi",
+        "cwd": "/tmp/sa-residual",
+        "rss_bytes": 4096,
+        "runtime_kind": "pi",
+        "session_arg_path": None,
+        "open_paths": [],
+        "started_at_ts": 1,
+    }])
+    monkeypatch.setattr(
+        agent_observability,
+        "build_worker_slot_cluster_snapshot",
+        lambda _db, project_id=None: SimpleNamespace(workers=[]),
+    )
+    monkeypatch.setattr(
+        agent_observability,
+        "get_runner_registry_service",
+        lambda: SimpleNamespace(
+            idle_pi_reaper_status=lambda: {
+                "last_idle_pi_reaper_at": 123.0,
+                "last_idle_pi_reaper_killed_count": 5,
+            }
+        ),
+    )
+
+    class _TaskQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return []
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskQuery()
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot(_Db(), project_id="p1")
+
+    assert snapshot["summary"]["total_pi_process_count"] == 1
+    assert snapshot["summary"]["residual_pi_detected"] is True
+    assert snapshot["summary"]["last_idle_pi_reaper_at"] == 123.0
+    assert snapshot["summary"]["last_idle_pi_reaper_killed_count"] == 5
+    assert snapshot["pods"][0]["residual_pi_detected"] is True
 
 
 def test_agent_snapshot_uses_session_descriptor_for_subagent_metadata(monkeypatch) -> None:
@@ -341,3 +395,45 @@ def test_runner_registry_prefers_sa_pod_ip(monkeypatch) -> None:
     payload = db.added[0].config_json
     assert payload["pod_name"] == "sa-runner-1"
     assert payload["pod_ip"] == "10.0.0.9"
+
+
+def test_runner_registry_idle_reaper_runs_only_when_worker_idle() -> None:
+    cleanup_calls = []
+
+    class _TaskCountQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def count(self):
+            return 0
+
+    class _Db:
+        def query(self, model):
+            del model
+            return _TaskCountQuery()
+
+    def _db_gen():
+        yield _Db()
+
+    service = runner_registry_service.RunnerRegistryService(
+        get_db=_db_gen,
+        get_running_tasks_count=lambda: 0,
+        cleanup_idle_runtime=lambda: cleanup_calls.append("cleanup") or {"killed_process_count": 2},
+    )
+    service._running = True
+
+    wait_calls = {"count": 0}
+
+    class _StopEvent:
+        def wait(self, seconds):
+            del seconds
+            wait_calls["count"] += 1
+            return wait_calls["count"] > 1
+
+    service._stop_event = _StopEvent()
+    service._idle_pi_reaper_loop()
+
+    assert cleanup_calls == ["cleanup"]
+    status = service.idle_pi_reaper_status()
+    assert status["last_idle_pi_reaper_killed_count"] == 2
+    assert status["idle_pi_reaper_runs_total"] == 1

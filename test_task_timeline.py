@@ -11,6 +11,21 @@ from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunn
 from app.service.task_service import TaskService
 
 
+def _fake_runner_snapshot(task_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        task_id=task_id,
+        project_id="p1",
+        prompt_content="analyse",
+        input_path="/tmp/input",
+        output_path="/tmp/output",
+        analysis_mode="binary",
+        task_origin_type="manual",
+        task_config_json={},
+        result_json=None,
+        stages_json=None,
+    )
+
+
 class _FakeTaskQuery:
     def __init__(self, rows):
         self._rows = rows
@@ -349,7 +364,7 @@ class _FakeOrchestrator:
         del config
         self._on_event = on_event
 
-    async def execute(self, task_id):
+    def execute(self, task_id):
         self._on_event(SwarmEvent(type="stage", task_id=task_id, data={"stage": "1", "module": "auth"}))
         self._on_event(SwarmEvent(type="stage_result", task_id=task_id, data={"stage": "1", "module": "auth"}))
         result = TaskResult(task_id=task_id, task="analyse", status=TaskStatus.PASSED, total_duration_ms=1234)
@@ -363,8 +378,7 @@ def _fake_get_db():
     yield _FakeDb()
 
 
-@pytest.mark.asyncio
-async def test_task_runner_records_task_and_stage_timeline(monkeypatch):
+def test_task_runner_records_task_and_stage_timeline(monkeypatch):
     recorded = []
     repo = _FakeRepo()
 
@@ -393,12 +407,20 @@ async def test_task_runner_records_task_and_stage_timeline(monkeypatch):
     )
     runner = TaskRunner(deps=deps, settings=settings)
 
-    monkeypatch.setattr("app.service.task_runner.build_task_config", lambda svc, prompt, cwd: SimpleNamespace(model_dump=lambda mode="json": {}))
     monkeypatch.setattr("app.service.task_runner.Orchestrator", _FakeOrchestrator)
     monkeypatch.setattr("app.service.task_runner.append_events", lambda path, events: True)
     monkeypatch.setattr("app.service.task_runner.write_final", lambda path, events: True)
     monkeypatch.setattr("app.service.task_runner.events_path", lambda output_path, task_id: Path("/tmp/events.jsonl"))
     monkeypatch.setattr("app.service.task_runner.WORKER_INSTANCE_ID", "runner-1")
+    monkeypatch.setattr(
+        "app.service.task_runner.TaskGuard",
+        lambda *args, **kwargs: SimpleNamespace(start=lambda: None, done=lambda status: None),
+    )
+    monkeypatch.setattr(
+        TaskRunner,
+        "_prepare_task_execution",
+        lambda self, task_id, lease_epoch, on_event: (_fake_runner_snapshot(task_id), SimpleNamespace()),
+    )
     monkeypatch.setattr(
         runner._agent_cleanup,
         "run_cleanup",
@@ -416,13 +438,12 @@ async def test_task_runner_records_task_and_stage_timeline(monkeypatch):
         },
     )
 
-    async def _fake_supervise(self, task_id, lease_epoch, orch):
-        del task_id, lease_epoch, orch
-        await asyncio.sleep(0)
+    def _fake_supervise(self, task_id, lease_epoch, orch):
+        del self, task_id, lease_epoch, orch
 
     monkeypatch.setattr(TaskRunner, "_supervise_running_task", _fake_supervise)
 
-    await runner.execute_task("sat_runner_1", 2)
+    runner.execute_task("sat_runner_1", 2)
 
     event_types = [item["event_type"] for item in recorded]
     assert "task_started" in event_types
@@ -435,8 +456,7 @@ async def test_task_runner_records_task_and_stage_timeline(monkeypatch):
     assert "agent_cleanup_completed" in event_types
 
 
-@pytest.mark.asyncio
-async def test_task_runner_records_task_error(monkeypatch):
+def test_task_runner_records_task_error(monkeypatch):
     recorded = []
     repo = _FakeRepo()
 
@@ -465,13 +485,12 @@ async def test_task_runner_records_task_error(monkeypatch):
     )
     runner = TaskRunner(deps=deps, settings=settings)
 
-    monkeypatch.setattr("app.service.task_runner.build_task_config", lambda svc, prompt, cwd: SimpleNamespace(model_dump=lambda mode="json": {}))
-
     class _ErrorOrchestrator:
         def __init__(self, config, on_event):
             del config, on_event
 
-        async def execute(self, task_id):
+        def execute(self, task_id):
+            del task_id
             raise RuntimeError("boom")
 
         def stop(self):
@@ -481,21 +500,44 @@ async def test_task_runner_records_task_error(monkeypatch):
     monkeypatch.setattr("app.service.task_runner.append_events", lambda path, events: True)
     monkeypatch.setattr("app.service.task_runner.write_final", lambda path, events: True)
     monkeypatch.setattr("app.service.task_runner.events_path", lambda output_path, task_id: Path("/tmp/events.jsonl"))
+    monkeypatch.setattr(
+        "app.service.task_runner.TaskGuard",
+        lambda *args, **kwargs: SimpleNamespace(start=lambda: None, done=lambda status: None),
+    )
+    monkeypatch.setattr(
+        TaskRunner,
+        "_prepare_task_execution",
+        lambda self, task_id, lease_epoch, on_event: (_fake_runner_snapshot(task_id), SimpleNamespace()),
+    )
 
-    async def _fake_supervise(self, task_id, lease_epoch, orch):
-        del task_id, lease_epoch, orch
-        await asyncio.sleep(0)
+    def _fake_supervise(self, task_id, lease_epoch, orch):
+        del self, task_id, lease_epoch, orch
 
     monkeypatch.setattr(TaskRunner, "_supervise_running_task", _fake_supervise)
+    monkeypatch.setattr(
+        runner._agent_cleanup,
+        "run_cleanup",
+        lambda phase: {
+            "cleanup_phase": phase,
+            "runner_instance_id": "runner-1",
+            "scanned_process_count": 0,
+            "killed_process_count": 0,
+            "failed_process_count": 0,
+            "surviving_process_count": 0,
+            "cleanup_failed": False,
+            "level": "info",
+            "task_continued": phase == "pre_task",
+            "items": [],
+        },
+    )
 
-    await runner.execute_task("sat_runner_2", 2)
+    runner.execute_task("sat_runner_2", 2)
 
     assert any(item["event_type"] == "task_error" for item in recorded)
     assert repo.finalize_error_calls
 
 
-@pytest.mark.asyncio
-async def test_task_runner_continues_when_pre_cleanup_fails(monkeypatch):
+def test_task_runner_continues_when_pre_cleanup_fails(monkeypatch):
     recorded = []
     repo = _FakeRepo()
 
@@ -524,16 +566,23 @@ async def test_task_runner_continues_when_pre_cleanup_fails(monkeypatch):
     )
     runner = TaskRunner(deps=deps, settings=settings)
 
-    monkeypatch.setattr("app.service.task_runner.build_task_config", lambda svc, prompt, cwd: SimpleNamespace(model_dump=lambda mode="json": {}))
     monkeypatch.setattr("app.service.task_runner.Orchestrator", _FakeOrchestrator)
     monkeypatch.setattr("app.service.task_runner.append_events", lambda path, events: True)
     monkeypatch.setattr("app.service.task_runner.write_final", lambda path, events: True)
     monkeypatch.setattr("app.service.task_runner.events_path", lambda output_path, task_id: Path("/tmp/events.jsonl"))
     monkeypatch.setattr("app.service.task_runner.WORKER_INSTANCE_ID", "runner-1")
+    monkeypatch.setattr(
+        "app.service.task_runner.TaskGuard",
+        lambda *args, **kwargs: SimpleNamespace(start=lambda: None, done=lambda status: None),
+    )
+    monkeypatch.setattr(
+        TaskRunner,
+        "_prepare_task_execution",
+        lambda self, task_id, lease_epoch, on_event: (_fake_runner_snapshot(task_id), SimpleNamespace()),
+    )
 
-    async def _fake_supervise(self, task_id, lease_epoch, orch):
-        del task_id, lease_epoch, orch
-        await asyncio.sleep(0)
+    def _fake_supervise(self, task_id, lease_epoch, orch):
+        del self, task_id, lease_epoch, orch
 
     monkeypatch.setattr(TaskRunner, "_supervise_running_task", _fake_supervise)
     monkeypatch.setattr(
@@ -553,7 +602,7 @@ async def test_task_runner_continues_when_pre_cleanup_fails(monkeypatch):
         },
     )
 
-    await runner.execute_task("sat_runner_3", 2)
+    runner.execute_task("sat_runner_3", 2)
 
     event_types = [item["event_type"] for item in recorded]
     assert "agent_cleanup_failed" in event_types

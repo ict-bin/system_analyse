@@ -19,6 +19,7 @@ from app.service.agent_runtime_registry import build_runtime_registration_key, g
 from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
 from app.service.event_log import events_path, read_events
 from app.service.session_index import build_session_catalog
+from app.service.runner_registry_service import get_runner_registry_service
 
 POD_NAME = (
     os.environ.get("SA_POD_NAME")
@@ -648,6 +649,9 @@ class AgentObservabilityService:
         tracked_process_count = len([item for item in processes if item.get("owner_kind") == "tracked"])
         residual_process_count = len([item for item in processes if item.get("owner_kind") == "residual"])
         unknown_process_count = len([item for item in processes if item.get("owner_kind") == "unknown"])
+        total_pi_process_count = len(processes)
+        residual_pi_detected = total_pi_process_count > tracked_process_count
+        idle_reaper_state = dict(get_runner_registry_service().idle_pi_reaper_status() or {})
         scanned_at = time.time()
         return {
             "summary": {
@@ -655,8 +659,14 @@ class AgentObservabilityService:
                 "active_processes": tracked_process_count,
                 "residual_processes": residual_process_count,
                 "unknown_processes": unknown_process_count,
+                "total_pi_process_count": total_pi_process_count,
+                "residual_pi_process_count": residual_process_count,
+                "unknown_pi_process_count": unknown_process_count,
+                "residual_pi_detected": residual_pi_detected,
                 "killable_residual_processes": len([item for item in processes if item.get("owner_kind") == "residual" and item.get("kill_allowed")]),
                 "killable_unknown_processes": len([item for item in processes if item.get("owner_kind") == "unknown" and item.get("kill_allowed")]),
+                "last_idle_pi_reaper_at": idle_reaper_state.get("last_idle_pi_reaper_at"),
+                "last_idle_pi_reaper_killed_count": int(idle_reaper_state.get("last_idle_pi_reaper_killed_count") or 0),
                 "scanned_at": scanned_at,
                 "scan_errors": 0,
             },
@@ -670,9 +680,15 @@ class AgentObservabilityService:
                 "tracked_process_count": tracked_process_count,
                 "residual_process_count": residual_process_count,
                 "unknown_process_count": unknown_process_count,
+                "total_pi_process_count": total_pi_process_count,
+                "residual_pi_process_count": residual_process_count,
+                "unknown_pi_process_count": unknown_process_count,
+                "residual_pi_detected": residual_pi_detected,
                 "task_count": len(tasks),
                 "running_task_count": len([item for item in tasks if str(item.get("ownership_status") or "") == "tracked"]),
                 "residual_task_count": len([item for item in tasks if str(item.get("ownership_status") or "") == "residual"]),
+                "last_idle_pi_reaper_at": idle_reaper_state.get("last_idle_pi_reaper_at"),
+                "last_idle_pi_reaper_killed_count": int(idle_reaper_state.get("last_idle_pi_reaper_killed_count") or 0),
                 "last_scanned_at": scanned_at,
                 "scan_errors": 0,
                 "processes": processes,

@@ -494,9 +494,15 @@ class AgentPodSnapshotResponse(BaseModel):
     tracked_process_count: int = 0
     residual_process_count: int = 0
     unknown_process_count: int = 0
+    total_pi_process_count: int = 0
+    residual_pi_process_count: int = 0
+    unknown_pi_process_count: int = 0
+    residual_pi_detected: bool = False
     task_count: int = 0
     running_task_count: int = 0
     residual_task_count: int = 0
+    last_idle_pi_reaper_at: Optional[float] = None
+    last_idle_pi_reaper_killed_count: int = 0
     last_scanned_at: Optional[float] = None
     scan_errors: int = 0
     processes: list[AgentProcessSnapshotResponse] = Field(default_factory=list)
@@ -508,8 +514,14 @@ class AgentObservabilitySummaryResponse(BaseModel):
     active_processes: int = 0
     residual_processes: int = 0
     unknown_processes: int = 0
+    total_pi_process_count: int = 0
+    residual_pi_process_count: int = 0
+    unknown_pi_process_count: int = 0
+    residual_pi_detected: bool = False
     killable_residual_processes: int = 0
     killable_unknown_processes: int = 0
+    last_idle_pi_reaper_at: Optional[float] = None
+    last_idle_pi_reaper_killed_count: int = 0
     scanned_at: Optional[float] = None
     scan_errors: int = 0
     aggregate_mode: Optional[str] = None
@@ -533,6 +545,10 @@ class AgentRuntimeAggregateSummaryResponse(BaseModel):
     tracked_processes: int = 0
     residual_processes: int = 0
     unknown_processes: int = 0
+    total_pi_process_count: int = 0
+    residual_pi_process_count: int = 0
+    unknown_pi_process_count: int = 0
+    residual_pi_detected: bool = False
     killable_residual_processes: int = 0
     killable_unknown_processes: int = 0
     aggregate_partial: bool = False
@@ -864,6 +880,10 @@ def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, Any]:
         "active_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "tracked"]),
         "residual_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "residual"]),
         "unknown_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "unknown"]),
+        "total_pi_process_count": len(merged_processes),
+        "residual_pi_process_count": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "residual"]),
+        "unknown_pi_process_count": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "unknown"]),
+        "residual_pi_detected": len(merged_processes) > len([item for item in merged_processes if str(item.get("owner_kind") or "") == "tracked"]),
         "killable_residual_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "residual" and bool(item.get("kill_allowed"))]),
         "killable_unknown_processes": len([item for item in merged_processes if str(item.get("owner_kind") or "") == "unknown" and bool(item.get("kill_allowed"))]),
         "scanned_at": time.time(),
@@ -1061,6 +1081,10 @@ def _build_agent_runtime_aggregate(snapshot: dict[str, Any]) -> dict[str, Any]:
             "tracked_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "tracked"]),
             "residual_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "residual"]),
             "unknown_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown"]),
+            "total_pi_process_count": len(processes),
+            "residual_pi_process_count": len([item for item in processes if str(item.get("owner_kind") or "") == "residual"]),
+            "unknown_pi_process_count": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown"]),
+            "residual_pi_detected": len(processes) > len([item for item in processes if str(item.get("owner_kind") or "") == "tracked"]),
             "killable_residual_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "residual" and bool(item.get("kill_allowed"))]),
             "killable_unknown_processes": len([item for item in processes if str(item.get("owner_kind") or "") == "unknown" and bool(item.get("kill_allowed"))]),
             "aggregate_partial": bool(summary.get("aggregate_partial")),
