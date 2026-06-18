@@ -17,6 +17,7 @@ logger = logging.getLogger("sa.llm_sync")
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
 _DEFAULT_CONTEXT_WINDOW = 128000
 _REQUIRED_MODEL_FIELDS = ("contextWindow", "contextLength")
+_DEFAULT_THINKING_LEVEL_MAP = {"disabled": "disabled"}
 
 
 def _env_var_name(provider_key: str) -> str:
@@ -71,6 +72,11 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         entry.setdefault("id", model_id)
         entry.setdefault("name", entry.get("id") or model_id)
         entry.setdefault("reasoning", False)
+        thinking_level_map = entry.get("thinkingLevelMap")
+        if not isinstance(thinking_level_map, dict):
+            thinking_level_map = {}
+        thinking_level_map.setdefault("disabled", "disabled")
+        entry["thinkingLevelMap"] = thinking_level_map
         entry.setdefault("input", ["text"])
         entry.setdefault("contextWindow", context_window)
         entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
