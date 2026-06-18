@@ -369,19 +369,18 @@ def _elf_summ(files, target_dir):
     return "\n".join(lines)
 
 def _src_summ(files, target_dir):
-    src_exts = {".c",".h",".cpp",".cc",".cxx",".hpp",".hh",".hxx",".inc",".inl",".S",".s",".asm"}
-    func_re = re.compile(
-        r'^\s*(?:static\s+)?(?:inline\s+)?(?:virtual\s+)?(?:const\s+)?'
-        r'(?:\w+(?:\s*::\s*)?)+(?:\s*\*)?\s+(\w{3,})\s*\(', re.MULTILINE)
+    # 函数名提取：C/C++ 用 tree-sitter，sh/py 用安全线性正则（按语言分派）。
+    # 彻底替代原来 (?:\w+(?:\s*::\s*)?)+ 的灵难性回溯正则。
+    from .func_extract import extract_function_names, _CPP_EXTS, _SH_EXTS, _PY_EXTS
+    supported = _CPP_EXTS | _SH_EXTS | _PY_EXTS
     lines = []
     for rp in files:
-        if Path(rp).suffix.lower() not in src_exts: continue
+        if Path(rp).suffix.lower() not in supported: continue
         try:
             with open(str(Path(target_dir)/rp), "r", encoding="utf-8", errors="replace") as f:
                 content = f.read(64*1024)
         except (OSError, UnicodeDecodeError): continue
-        funcs = [m.group(1) for m in func_re.finditer(content)
-                 if m.group(1) not in ("if","for","while","switch","return","sizeof","else","case","break","continue")]
+        funcs = extract_function_names(rp, content, limit=200)
         if funcs:
             lines.append(f"**{rp}**: {', '.join(funcs[:20])}")
             if len(funcs) > 20: lines[-1] += f" ... (共{len(funcs)}个)"

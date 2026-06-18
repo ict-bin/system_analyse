@@ -137,7 +137,9 @@ def _extract_python_info(full_path: str, rel_path: str, ftype: str) -> dict:
 
         # C/C++ 源码：提取函数定义、函数调用、include 依赖
         if ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"):
-            fns = list(dict.fromkeys(_C_FUNC_RE.findall(content)))[:80]
+            # 函数名提取改用 tree-sitter（线性、不回溯），替代灵难性回溯的 _C_FUNC_RE
+            from .func_extract import extract_cpp_functions
+            fns = list(dict.fromkeys(f["name"] for f in extract_cpp_functions(content)))[:80]
             includes = list(dict.fromkeys(_C_INCLUDE_RE.findall(content)))[:80]
             include_keys = [Path(item).stem for item in includes if Path(item).stem]
             calls_raw = _C_CALL_RE.findall(content)

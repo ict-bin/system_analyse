@@ -9,3 +9,5 @@ sqlalchemy
 pymysql
 cryptography
 aiohttp
+tree-sitter>=0.23,<0.26
+tree-sitter-cpp>=0.23,<0.24
