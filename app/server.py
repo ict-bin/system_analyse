@@ -161,22 +161,22 @@ async def lifespan(app: FastAPI):
     if not _external_probe_process_enabled():
         _ensure_probe_server_started()
     get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
-    # 挂载调度器内部 API (lazy init: 首次请求时从 TaskService 获取)
-    from .service.scheduler import create_scheduler_router
+    # 挂载调度器内部 API
+    from .service.scheduler import create_scheduler_router, set_scheduler
     app.include_router(create_scheduler_router())
-    # 确保 scheduler 注册 (TaskService 可能在 bootstrap 线程中初始化)
+    # 直接启动调度器和 worker loop (绕过 bootstrap 线程问题)
     import threading
-    def _register_scheduler():
-        import time; time.sleep(5)
+    def _start_scheduler():
+        import time; time.sleep(3)
         try:
             from .service.task_service import get_task_service
-            from .service.scheduler import set_scheduler
             ts = get_task_service()
-            if hasattr(ts, '_scheduler'):
-                set_scheduler(ts._scheduler)
-        except Exception:
-            pass
-    threading.Thread(target=_register_scheduler, daemon=True).start()
+            set_scheduler(ts._scheduler)
+            ts.start_worker_loop()
+        except Exception as e:
+            import traceback, logging
+            logging.getLogger("sa.server").warning("scheduler start fallback: %s", e)
+    threading.Thread(target=_start_scheduler, daemon=True).start()
 
     yield
 
