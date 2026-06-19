@@ -314,6 +314,7 @@ def _probe_payload() -> dict[str, object]:
                 "ok": bool(base.get("worker_ok")),
                 "claim_paused": bool(base.get("worker_claim_paused")),
                 "fresh": bool(base.get("worker_loop_fresh", True)),
+                "scheduler_stall_detected": bool(base.get("scheduler_stall_detected")),
             },
         },
     }

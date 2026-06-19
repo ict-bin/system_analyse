@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import os as _os
 import signal
 import subprocess
 import threading
@@ -57,6 +58,17 @@ HEARTBEAT_INTERVAL = float(os.environ.get("SA_SCHEDULER_HEARTBEAT_INTERVAL", "15
 POD_STALE_TIMEOUT = max(60, int(os.environ.get("SA_SCHEDULER_POD_STALE_TIMEOUT", "120")))
 TASK_CONCURRENCY = int(os.environ.get("SA_SCHEDULER_TASK_CONCURRENCY", "1"))
 OVERLOAD_COOLDOWN = float(os.environ.get("SA_SCHEDULER_OVERLOAD_COOLDOWN", "30"))
+STALL_WARN_SECONDS = max(
+    10.0,
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHEDULER_STALL_WARN_SECONDS", str(max(POLL_INTERVAL * 4, 15.0)))),
+)
+STALL_EXIT_SECONDS = max(
+    STALL_WARN_SECONDS,
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHEDULER_STALL_EXIT_SECONDS", str(max(STALL_WARN_SECONDS * 2, 45.0)))),
+)
+STALL_EXIT_ENABLED = str(
+    os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHEDULER_STALE_EXIT_ENABLED", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # DB 协调语义（租约时长 / 全局并发 / 全局锁 / 僵死扫描）统一取自 worker_dispatcher，
 # 让调度器派发、runner 领取、supervisor 续租三方使用同一套 lease 时序，避免取消/回收时序错乱。
@@ -159,9 +171,14 @@ class SchedulerService:
 
         # 运行时状态
         self._last_tick = 0.0
+        self._last_success = 0.0
         self._last_stale_recovery = 0.0
         self._last_error: str | None = None
         self._recovered_task_ids: set[str] = set()
+        self._stall_detected = False
+        self._stall_since = 0.0
+        self._last_stall_reason: str | None = None
+        self._watchdog_thread: threading.Thread | None = None
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
 
@@ -172,6 +189,12 @@ class SchedulerService:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="sa_scheduler", daemon=True)
         self._thread.start()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="sa_scheduler_watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
         logger.info("scheduler started (poll=%ss heartbeat=%ss lease=%ss max_global=%s)",
                      POLL_INTERVAL, HEARTBEAT_INTERVAL, LEASE_TIMEOUT,
                      MAX_GLOBAL_TASKS or "unlimited")
@@ -181,6 +204,8 @@ class SchedulerService:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=2)
 
     # ── 主循环 ────────────────────────────────────────────────────────────
 
@@ -190,7 +215,12 @@ class SchedulerService:
                 # 同步更新 worker_dispatcher 运行时状态，让 manager 探针/可观测性反映新调度器 tick 活性。
                 _wd_runtime_state.last_tick_ts = _time.time()
                 self._tick()
-                _wd_runtime_state.last_success_ts = _time.time()
+                success_now = _time.time()
+                self._last_success = success_now
+                self._stall_detected = False
+                self._stall_since = 0.0
+                self._last_stall_reason = None
+                _wd_runtime_state.last_success_ts = success_now
                 _wd_runtime_state.last_error = None
                 self._last_error = None
             except Exception as exc:
@@ -198,6 +228,51 @@ class SchedulerService:
                 _wd_runtime_state.last_error = str(exc)
                 logger.exception("scheduler tick: %s", exc)
             self._stop.wait(timeout=POLL_INTERVAL)
+
+    def _watchdog_loop(self) -> None:
+        while self._running and not self._stop.wait(timeout=max(1.0, min(POLL_INTERVAL, 5.0))):
+            try:
+                self._watchdog_once()
+            except Exception:
+                logger.exception("scheduler watchdog failed")
+
+    def _watchdog_once(self) -> None:
+        if not self._running:
+            return
+        now = _time.time()
+        last_tick = float(self._last_tick or 0.0)
+        if last_tick <= 0.0:
+            return
+        age = max(0.0, now - last_tick)
+        if age <= STALL_WARN_SECONDS:
+            if self._stall_detected:
+                logger.info(
+                    "scheduler stall recovered (age=%.3fs last_error=%s)",
+                    age,
+                    self._last_error,
+                )
+            self._stall_detected = False
+            self._stall_since = 0.0
+            self._last_stall_reason = None
+            return
+        if not self._stall_detected:
+            self._stall_detected = True
+            self._stall_since = now
+            self._last_stall_reason = f"scheduler tick stalled for {age:.3f}s"
+            logger.error(
+                "scheduler_stall_detected age=%.3fs last_success=%.3fs last_error=%s",
+                age,
+                max(0.0, now - float(self._last_success or 0.0)) if self._last_success else -1.0,
+                self._last_error,
+            )
+        if STALL_EXIT_ENABLED and age >= STALL_EXIT_SECONDS:
+            logger.critical(
+                "scheduler_stall_exit_triggered age=%.3fs threshold=%.3fs pid=%s",
+                age,
+                STALL_EXIT_SECONDS,
+                _os.getpid(),
+            )
+            _os._exit(70)
 
     def _init_db_if_needed(self) -> None:
         try:
@@ -287,7 +362,7 @@ class SchedulerService:
             logger.warning("pod %s marked stale", pid)
 
     def _reap_stale_tasks(self, db: Session, now: float) -> None:
-        """回收过期任务, 使用 TaskRepository 现有方法."""
+        """回收过期任务, 使用纯 DB 级判定，禁止在调度热路径触发重 IO 观测。"""
         now_dt = now_local()
         should_recover = self._build_should_recover(db) if self._build_should_recover else None
         rows = self._task_repo.recover_stale_running_tasks(
@@ -477,7 +552,11 @@ class SchedulerService:
             "pods": len(self._pods),
             "tasks": len(self._tasks),
             "last_tick": self._last_tick,
+            "last_success": self._last_success,
             "last_error": self._last_error,
+            "stall_detected": self._stall_detected,
+            "stall_since": self._stall_since or None,
+            "stall_reason": self._last_stall_reason,
             "control": {
                 "claim_enabled": self._control.claim_enabled,
                 "drain_mode": self._control.drain_mode,

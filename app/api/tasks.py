@@ -719,7 +719,11 @@ def _get_agent_observability_snapshot_impl(
     del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    return get_agent_observability_service().build_snapshot(db, project_id=None)
+    return get_agent_observability_service().build_snapshot_degraded(
+        db,
+        project_id=None,
+        degraded_reason="nfs_io_unavailable",
+    )
 
 
 def _cleanup_task_owner_runner_agent_processes(*, db: Session, token: str, task_id: str, phase: str) -> dict[str, Any]:
@@ -791,7 +795,11 @@ def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, Any]:
         return cached["snapshot"]
 
     started = time.perf_counter()
-    local = get_agent_observability_service().build_snapshot(db, project_id=None)
+    local = get_agent_observability_service().build_snapshot_degraded(
+        db,
+        project_id=None,
+        degraded_reason="nfs_io_unavailable",
+    )
     cluster_snapshot = build_worker_slot_cluster_snapshot(db, project_id=None)
     workers = [worker for worker in cluster_snapshot.workers if worker.healthy and (_resolve_worker_targets(pod_ip=worker.pod_ip, pod_name=worker.pod_name))]
     total_target_pods = len(workers)
@@ -950,7 +958,13 @@ def _build_agent_aggregate_summary(token: str, db: Session) -> dict[str, Any]:
     from app.service.agent_observability import get_agent_observability_service
     from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
 
-    local_summary = dict(get_agent_observability_service().build_snapshot(db, project_id=None)["summary"])
+    local_summary = dict(
+        get_agent_observability_service().build_snapshot_degraded(
+            db,
+            project_id=None,
+            degraded_reason="nfs_io_unavailable",
+        )["summary"]
+    )
     cluster_snapshot = build_worker_slot_cluster_snapshot(db, project_id=None)
     workers = [worker for worker in cluster_snapshot.workers if worker.healthy and (_resolve_worker_targets(pod_ip=worker.pod_ip, pod_name=worker.pod_name))]
 
@@ -1323,7 +1337,11 @@ def get_agent_observability_summary(
     del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    return get_agent_observability_service().build_snapshot(db, project_id=None)["summary"]
+    return get_agent_observability_service().build_snapshot_degraded(
+        db,
+        project_id=None,
+        degraded_reason="nfs_io_unavailable",
+    )["summary"]
 
 
 @internal_observability_router.get("/agent-observability/summary", response_model=AgentObservabilitySummaryResponse, include_in_schema=False)
@@ -1334,7 +1352,11 @@ def get_internal_agent_observability_summary(
     del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    return get_agent_observability_service().build_snapshot(db, project_id=None)["summary"]
+    return get_agent_observability_service().build_snapshot_degraded(
+        db,
+        project_id=None,
+        degraded_reason="nfs_io_unavailable",
+    )["summary"]
 
 
 @router.get("/agent-observability/processes", response_model=list[AgentProcessSnapshotResponse])
@@ -1352,7 +1374,13 @@ def list_agent_processes(
     del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    rows = list(get_agent_observability_service().build_snapshot(db, project_id=None)["processes"])
+    rows = list(
+        get_agent_observability_service().build_snapshot_degraded(
+            db,
+            project_id=None,
+            degraded_reason="nfs_io_unavailable",
+        )["processes"]
+    )
     if pod:
         rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
     if task_id:
@@ -1414,7 +1442,11 @@ def list_agent_tasks(
     del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    return get_agent_observability_service().build_snapshot(db, project_id=None)["tasks"]
+    return get_agent_observability_service().build_snapshot_degraded(
+        db,
+        project_id=None,
+        degraded_reason="nfs_io_unavailable",
+    )["tasks"]
 
 
 @internal_observability_router.get("/agent-observability/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse], include_in_schema=False)
@@ -1433,7 +1465,11 @@ def list_agent_pods(
     del user_and_token
     from app.service.agent_observability import get_agent_observability_service
 
-    return get_agent_observability_service().build_snapshot(db, project_id=None)["pods"]
+    return get_agent_observability_service().build_snapshot_degraded(
+        db,
+        project_id=None,
+        degraded_reason="nfs_io_unavailable",
+    )["pods"]
 
 
 @internal_observability_router.get("/agent-observability/pods", response_model=list[AgentPodSnapshotResponse], include_in_schema=False)

@@ -11,6 +11,7 @@ import signal
 import time
 from dataclasses import dataclass
 from typing import Any
+import logging
 
 from sqlalchemy.orm import Session
 
@@ -20,6 +21,8 @@ from app.service.worker_slot_snapshot import build_worker_slot_cluster_snapshot
 from app.service.event_log import events_path, read_events
 from app.service.session_index import build_session_catalog
 from app.service.runner_registry_service import get_runner_registry_service
+
+logger = logging.getLogger("sa.agent_observability")
 
 POD_NAME = (
     os.environ.get("SA_POD_NAME")
@@ -497,6 +500,66 @@ class AgentObservabilityService:
 
     def build_snapshot(self, db: Session, *, project_id: str | None = None) -> dict[str, Any]:
         return self._build_snapshot_from_processes(db, list(_iter_agent_processes()), project_id=project_id)
+
+    def build_snapshot_degraded(
+        self,
+        db: Session,
+        *,
+        project_id: str | None = None,
+        degraded_reason: str = "snapshot_unavailable",
+    ) -> dict[str, Any]:
+        try:
+            return self.build_snapshot(db, project_id=project_id)
+        except Exception as exc:
+            logger.warning("agent observability snapshot degraded: %s", exc, exc_info=True)
+            return {
+                "summary": {
+                    "pod_name": POD_NAME,
+                    "active_processes": 0,
+                    "residual_processes": 0,
+                    "unknown_processes": 0,
+                    "total_pi_process_count": 0,
+                    "residual_pi_process_count": 0,
+                    "unknown_pi_process_count": 0,
+                    "residual_pi_detected": False,
+                    "killable_residual_processes": 0,
+                    "killable_unknown_processes": 0,
+                    "last_idle_pi_reaper_at": None,
+                    "last_idle_pi_reaper_killed_count": 0,
+                    "scanned_at": time.time(),
+                    "scan_errors": 1,
+                    "degraded": True,
+                    "degraded_reason": degraded_reason,
+                    "error_message": str(exc),
+                },
+                "processes": [],
+                "tasks": [],
+                "pods": [{
+                    "pod_name": POD_NAME,
+                    "worker_id": POD_NAME,
+                    "healthy": True,
+                    "process_count": 0,
+                    "tracked_process_count": 0,
+                    "residual_process_count": 0,
+                    "unknown_process_count": 0,
+                    "total_pi_process_count": 0,
+                    "residual_pi_process_count": 0,
+                    "unknown_pi_process_count": 0,
+                    "residual_pi_detected": False,
+                    "task_count": 0,
+                    "running_task_count": 0,
+                    "residual_task_count": 0,
+                    "last_idle_pi_reaper_at": None,
+                    "last_idle_pi_reaper_killed_count": 0,
+                    "last_scanned_at": time.time(),
+                    "scan_errors": 1,
+                    "degraded": True,
+                    "degraded_reason": degraded_reason,
+                    "error_message": str(exc),
+                    "processes": [],
+                    "tasks": [],
+                }],
+            }
 
     def _build_snapshot_from_processes(
         self,

@@ -125,6 +125,7 @@ class RunnerAssignmentRuntimeState:
 
 
 _runner_assignment_runtime_state = RunnerAssignmentRuntimeState()
+_RUNTIME_EVIDENCE_MODE = "cache_only"
 
 ANALYSIS_MODE_BINARY = "binary"
 ANALYSIS_MODE_SOURCE = "source"
@@ -361,11 +362,23 @@ def get_worker_runtime_health() -> dict:
     if is_runner_role() and not is_manager_role():
         return {
             "worker_running_tasks": len(_running_tasks),
+            "runtime_evidence_mode": _RUNTIME_EVIDENCE_MODE,
             **_runner_assignment_runtime_state.snapshot(),
         }
     health = _get_dispatcher_runtime_health(len(_running_tasks))
     if is_runner_role():
         health.update(_runner_assignment_runtime_state.snapshot())
+    scheduler = get_scheduler()
+    if scheduler is not None:
+        scheduler_health = scheduler.health()
+        health.update(
+            {
+                "scheduler_last_tick_at": scheduler_health.get("last_tick"),
+                "scheduler_last_success_at": scheduler_health.get("last_success"),
+                "scheduler_stall_detected": bool(scheduler_health.get("stall_detected")),
+            }
+        )
+    health["runtime_evidence_mode"] = _RUNTIME_EVIDENCE_MODE
     return health
 
 
@@ -1938,42 +1951,11 @@ class TaskService:
         return get_runtime_control_service().get_runtime_control(db)
 
     def _build_should_recover(self, db: Session):
-        """构建僵死回收判定: 若 owner runner 仍有运行证据则不回收 (rollout/重启防误杀)。
+        """构建纯 DB 级僵死回收判定。
 
-        返回一个 predicate(stale_row)->bool; 返回 None 表示无法判定时按默认全部回收。
+        调度热路径禁止同步触发任何 /data NFS 观测或 runtime snapshot 构建。
         """
-        try:
-            from app.service.agent_observability import AgentObservabilityService
-            snapshot = AgentObservabilityService().build_snapshot(db, project_id=None)
-        except Exception:
-            return None
-        processes_by_task_id = {
-            str(item.get("task_id") or ""): item
-            for item in snapshot.get("processes", [])
-            if str(item.get("task_id") or "").strip()
-        }
-
         def _should_recover(stale) -> bool:
-            linked = processes_by_task_id.get(str(stale.task_id))
-            runtime_evidence = (
-                linked.get("runtime_evidence")
-                if isinstance(linked, dict) and isinstance(linked.get("runtime_evidence"), dict)
-                else {}
-            )
-            owner_kind = str((linked or {}).get("owner_kind") or "")
-            if owner_kind in {"tracked", "lease_drifted_active"} or bool(runtime_evidence.get("live_runtime_evidence")):
-                self._record_timeline_event(
-                    task_id=stale.task_id,
-                    project_id=getattr(stale, "project_id", None),
-                    event_type="task_lease_drift_preserved_due_to_runtime_evidence",
-                    message="任务租约漂移，但仍检测到智能体运行证据，暂不回收",
-                    level="warning",
-                    payload={
-                        "owner_kind": owner_kind or "lease_drifted_active",
-                        "runtime_evidence": runtime_evidence,
-                    },
-                )
-                return False
             return True
 
         return _should_recover

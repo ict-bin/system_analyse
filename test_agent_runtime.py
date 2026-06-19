@@ -205,6 +205,29 @@ def test_agent_snapshot_exposes_idle_reaper_fields(monkeypatch) -> None:
     assert snapshot["pods"][0]["residual_pi_detected"] is True
 
 
+def test_agent_snapshot_degraded_returns_minimal_payload(monkeypatch) -> None:
+    class _Db:
+        pass
+
+    monkeypatch.setattr(
+        agent_observability.AgentObservabilityService,
+        "build_snapshot",
+        lambda self, db, project_id=None: (_ for _ in ()).throw(OSError("nfs blocked")),
+    )
+
+    snapshot = agent_observability.AgentObservabilityService().build_snapshot_degraded(
+        _Db(),
+        project_id="p1",
+        degraded_reason="nfs_io_unavailable",
+    )
+
+    assert snapshot["summary"]["degraded"] is True
+    assert snapshot["summary"]["degraded_reason"] == "nfs_io_unavailable"
+    assert snapshot["summary"]["scan_errors"] == 1
+    assert snapshot["processes"] == []
+    assert snapshot["tasks"] == []
+
+
 def test_agent_snapshot_uses_session_descriptor_for_subagent_metadata(monkeypatch) -> None:
     session_path = "/tmp/ws/task-1/run/sessions/analyse/mod-a.jsonl"
     monkeypatch.setattr(agent_observability, "_iter_agent_processes", lambda: [{

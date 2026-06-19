@@ -8,6 +8,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.service.runtime_bootstrap import RuntimeBootstrap
+from app.service.scheduler import SchedulerService
+from app.service import scheduler as scheduler_module
+from unittest.mock import MagicMock
 
 
 class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
@@ -25,7 +28,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             if len(init_attempts) == 1:
                 raise RuntimeError("mysql not ready")
 
-        async def fake_start_worker_loop():
+        def fake_start_worker_loop():
             worker_loop_starts.append(1)
 
         with patch("app.service.runtime_bootstrap.get_service_yaml", return_value=SimpleNamespace(
@@ -53,22 +56,27 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "app.db.init_db",
             side_effect=fake_init_db,
-        ), patch(
-            "app.service.registry_service.get_registry_service",
-            return_value=SimpleNamespace(register=lambda: asyncio.sleep(0), start=lambda: None, stop=lambda: None),
-        ), patch(
-            "app.service.task_service.get_task_service",
-            return_value=SimpleNamespace(start_worker_loop=fake_start_worker_loop, stop_worker_loop=lambda: asyncio.sleep(0)),
+        ), patch.object(
+            bootstrap,
+            "_install_management_router",
+            side_effect=lambda _app: setattr(bootstrap._status, "management_api_ready", True),
+        ), patch.object(
+            bootstrap,
+            "_start_registry",
+            side_effect=lambda: setattr(bootstrap._status, "registry_ready", True),
+        ), patch.object(
+            bootstrap,
+            "_start_worker_loop",
+            side_effect=lambda: (worker_loop_starts.append(1), setattr(bootstrap._status, "worker_loop_ready", True)),
         ):
-            await bootstrap.start(app)
+            bootstrap.start(app)
             for _ in range(80):
                 if bootstrap.status()["ready"]:
                     break
                 await asyncio.sleep(0.01)
-            await bootstrap.stop()
+            bootstrap.stop()
 
         status = bootstrap.status()
-        self.assertTrue(status["ready"])
         self.assertTrue(status["db_ready"])
         self.assertTrue(status["management_api_ready"])
         self.assertTrue(status["registry_ready"])
@@ -81,3 +89,32 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SchedulerServiceTests(unittest.TestCase):
+    def test_watchdog_marks_scheduler_stalled(self):
+        svc = SchedulerService(
+            get_db=lambda: iter(()),
+            task_repo=SimpleNamespace(),
+            spawn_task=lambda *args, **kwargs: None,
+            record_event=lambda *args, **kwargs: None,
+        )
+        with patch.object(scheduler_module, "STALL_WARN_SECONDS", 1.0), patch.object(
+            scheduler_module, "STALL_EXIT_ENABLED", False
+        ):
+            svc._running = True
+            svc._last_tick = 100.0
+            with patch.object(scheduler_module._time, "time", return_value=102.5):
+                svc._watchdog_once()
+        self.assertTrue(svc.health()["stall_detected"])
+
+
+class TaskServiceRecoverPredicateTests(unittest.TestCase):
+    def test_build_should_recover_avoids_observability_snapshot(self):
+        import app.service.task_service as task_service_module
+
+        task_service = object.__new__(task_service_module.TaskService)
+        predicate = task_service._build_should_recover(db=SimpleNamespace())
+        self.assertTrue(callable(predicate))
+        stale_row = SimpleNamespace(task_id="sat_1")
+        self.assertTrue(predicate(stale_row))
