@@ -297,13 +297,38 @@ class SchedulerV3:
                                f"worker {wid} 任务 {task_id} 状态={state}", "info",
                                {"worker_id": wid, "task_id": task_id, "state": state, "error": err})
         if finished:
-            try:
-                self._finalize(task_id, state, err, result)
-            except Exception:
-                logger.exception("finalize task failed: %s", task_id)
-            with self._lock:
-                self._running.pop(task_id, None)
-                self._dirty = True
+            # 瞬时派发拒绝(worker_busy/spawn_failed/no_spawner) → 重排重派(非真失败)，带重试上限。
+            # rollout/worker 重连期调度器视图与 worker 实际态短暂不一致会导致派给忙 worker。
+            transient = (state == proto.STATE_FAILED and isinstance(err, str)
+                         and any(k in err for k in ("worker_busy", "spawn_failed", "no_spawner")))
+            requeued = False
+            if transient:
+                cnt = self._requeue_counts.get(task_id, 0) + 1
+                if cnt <= MAX_WORKER_LOST_REQUEUE:
+                    self._requeue_counts[task_id] = cnt
+                    ok = False
+                    try:
+                        ok = bool(self._requeue_task(task_id))
+                    except Exception:
+                        logger.exception("requeue(transient) failed: %s", task_id)
+                    if ok:
+                        with self._lock:
+                            self._running.pop(task_id, None)
+                            if task_id not in self._queue:
+                                self._queue.append(task_id)
+                            self._dirty = True
+                        self._record_event_for(task_id, "task_requeued",
+                                               f"worker 瞬时拒绝({err})，任务重排", "warning", {"task_id": task_id})
+                        requeued = True
+            if not requeued:
+                try:
+                    self._finalize(task_id, state, err, result)
+                except Exception:
+                    logger.exception("finalize task failed: %s", task_id)
+                with self._lock:
+                    self._running.pop(task_id, None)
+                    self._requeue_counts.pop(task_id, None)
+                    self._dirty = True
 
     def _on_worker_disconnect(self, wid: str) -> None:
         with self._lock:
