@@ -1,174 +1,205 @@
-"""scheduler_v3.py — V3.0 调度器（manager 上的 TCP server，单一权威派发）。
+"""scheduler_v3.py — V3.0 调度器（manager 上的纯 TCP/内存 控制面，无 DB 实时依赖）。
 
-设计见 docs/scheduler_v3_design.md。核心：
-  - TCP server 接受 worker 控制进程的持久连接；内存维护 worker 实时表（能力/在跑任务/心跳）。
-  - 顺序 push 派发：从 DB 取 pending(FIFO) → 选空闲 worker → 写 DB lease → 发 RUN 命令。
-  - 一个 worker 同一时刻最多 1 个任务（worker 端也强制单任务）。
-  - TCP 断联 / 心跳超时 = worker 死 → 其在跑任务进入"待回收"。
-  - 对账回收：DB 仍为任务账本；running 任务 owner 失联超宽限 → 置 pending 重排（rollout 安全）。
-  - cancel/restart：API 调调度器 → 向 owner worker 发 CANCEL/RESTART 命令。
+设计见 docs/scheduler_v3_design.md。按"纯 TCP、去掉 DB 实时依赖"实现：
 
-DB 仅用于任务记录/终态持久化，不再承担实时派发/心跳（实时控制面在 TCP/内存）。
+  控制面（实时，纯内存 + TCP，不碰 DB）:
+    - 任务队列 deque + 运行中 dict{task_id: RunRecord} + worker 连接表
+    - 顺序 push 派发（非抢占，FIFO）；一个 worker 同时最多 1 个任务
+    - worker 心跳/状态全走 TCP；TCP 断联/超时 = worker 死
+    - cancel/restart 命令 push 给 owner worker
+    - 状态持久化到 JSON 文件（NFS，跨 manager 重启），不写 DB
+  持久化边界:
+    - DB 仅用于「任务记录/前端展示与终态落库」(创建时写一行，完成时回写终态)，控制面不读/不写它
+    - 实时派发/心跳/回收/状态 全在内存 + 文件，无 DB 实时依赖
+    - rollout: manager 重启→加载文件队列+运行中→worker 重连对账→未恢复任务重排
+
+内部 HTTP (供 API pod / 前端 调用，非 DB):
+    POST /api/internal/sched/submit   {task_id}            API 创建任务后通知调度器入队
+    POST /api/internal/sched/cancel    {task_id}            取消
+    POST /api/internal/sched/restart   {task_id}            重启
+    GET  /api/internal/sched/task_status?task_id=           前端实时状态
+    GET  /api/internal/sched/cluster_status                集群 worker/队列总览
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
 import threading
-import time
 import time as _time
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Any, Callable
-
-from sqlalchemy.orm import Session
 
 from app.service import sched_proto as proto
 from app.time_utils import now_local
 
 logger = logging.getLogger("sa.scheduler_v3")
 
-# ── 配置（环境变量）──────────────────────────────────────────────────────────
+# ── 配置 ───────────────────────────────────────────────────────────────────
 SCHED_BIND = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_BIND", "0.0.0.0")
 SCHED_PORT = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PORT", "8090"))
-DISPATCH_POLL_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_POLL", "3"))
+DISPATCH_POLL_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_POLL", "2"))
 WORKER_HEARTBEAT_TIMEOUT = max(10.0, float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_HB_TIMEOUT", "30")))
-WORKER_RECOVER_GRACE = max(WORKER_HEARTBEAT_TIMEOUT, float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_RECOVER_GRACE", "60")))
-RECOVER_SWEEP_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_RECOVER_SWEEP", "15"))
+RECONCILE_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_RECONCILE", "5"))
+STATE_FILE = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_STATE_FILE", "/data/sa_scheduler_state.json")
+PERSIST_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PERSIST", "3"))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Worker 连接表（内存实时状态）
-# ═══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class RunRecord:
+    task_id: str
+    worker_id: str
+    started_ts: float
+    state: str = proto.STATE_RUNNING
+    error: str | None = None
+    finished_ts: float | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
 
 @dataclass
 class WorkerConn:
     worker_id: str
     ip: str = ""
     max_tasks: int = 1
-    current_task: str | None = None          # 该 worker 正在跑的 task_id（仅 1 个）
+    current_task: str | None = None
     last_heartbeat: float = 0.0
     online: bool = True
     sock: socket.socket | None = None
-    writer_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def is_idle(self) -> bool:
         return self.online and self.current_task is None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SchedulerV3
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class SchedulerV3:
-    """V3.0 调度器：TCP server + 顺序派发 + worker 监督 + 对账回收。"""
-
     def __init__(
         self,
         *,
-        get_db: Callable[[], Any],
-        task_repo: object,
-        record_event: Callable[..., None],
-        claim_task_lease: Callable[[Session, Any, str], int | None],
-        load_runtime_control: Callable[[Session], dict],
-        build_should_recover: Callable[[Session], Callable] | None = None,
-        clear_task_lock: Callable | None = None,
-        cleanup_resume: Callable | None = None,
+        finalize_task: Callable[[str, str, "str | None", Any], None] | None = None,
+        record_event: Callable[..., None] | None = None,
         bind: str = SCHED_BIND,
         port: int = SCHED_PORT,
+        state_file: str = STATE_FILE,
     ) -> None:
-        self._get_db = get_db
-        self._task_repo = task_repo
-        self._record_event = record_event
-        self._claim_task_lease = claim_task_lease
-        self._load_control = load_runtime_control
-        self._build_should_recover = build_should_recover
-        self._clear_lock = clear_task_lock or (lambda *a, **kw: None)
-        self._cleanup_resume = cleanup_resume or (lambda *a, **kw: None)
+        self._finalize = finalize_task or (lambda tid, state, err, result: None)
+        self._record = record_event or (lambda *a, **kw: None)
         self._bind = bind
         self._port = port
+        self._state_file = Path(state_file)
 
+        self._queue: deque[str] = deque()
+        self._running: dict[str, RunRecord] = {}
         self._workers: dict[str, WorkerConn] = {}
-        self._lock = threading.Lock()              # 保护 _workers 表
+        self._lock = threading.RLock()
 
-        self._running = False
+        self._running_flag = False
         self._stop = threading.Event()
         self._server_sock: socket.socket | None = None
-        self._accept_thread: threading.Thread | None = None
-        self._dispatch_thread: threading.Thread | None = None
-        self._recovery_thread: threading.Thread | None = None
-
-        self._last_tick = 0.0
-        self._last_recover = 0.0
-        self._last_error: str | None = None
-        # claim_enabled/drain/pause 运行时总闸
-        self._claim_enabled = True
-        self._drain_mode = False
-        self._pause_until = 0.0
+        self._threads: list[threading.Thread] = []
+        self._dirty = False
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        if self._running:
+        if self._running_flag:
             return
-        self._running = True
+        self._running_flag = True
         self._stop.clear()
+        self._load_state()
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind((self._bind, self._port))
         self._server_sock.listen(64)
-        self._accept_thread = threading.Thread(target=self._accept_loop, name="sa_v3_accept", daemon=True)
-        self._accept_thread.start()
-        self._dispatch_thread = threading.Thread(target=self._dispatch_loop, name="sa_v3_dispatch", daemon=True)
-        self._dispatch_thread.start()
-        self._recovery_thread = threading.Thread(target=self._recovery_loop, name="sa_v3_recover", daemon=True)
-        self._recovery_thread.start()
-        logger.info("SchedulerV3 started: tcp=%s:%s poll=%ss hb_timeout=%ss", self._bind, self._port, DISPATCH_POLL_INTERVAL, WORKER_HEARTBEAT_TIMEOUT)
+        for name, tgt in (("accept", self._accept_loop), ("dispatch", self._dispatch_loop),
+                          ("reconcile", self._reconcile_loop), ("persist", self._persist_loop)):
+            t = threading.Thread(target=tgt, name=f"sa_v3_{name}", daemon=True)
+            t.start()
+            self._threads.append(t)
+        logger.info("SchedulerV3(pure-tcp) started: %s:%s queue=%d running=%d",
+                    self._bind, self._port, len(self._queue), len(self._running))
 
     def stop(self) -> None:
-        self._running = False
+        self._running_flag = False
         self._stop.set()
         s, self._server_sock = self._server_sock, None
         if s is not None:
-            try:
-                s.close()
-            except OSError:
-                pass
+            try: s.close()
+            except OSError: pass
         with self._lock:
-            for w in self._workers.values():
+            for w in list(self._workers.values()):
                 self._close_worker(w)
             self._workers.clear()
-        for t in (self._accept_thread, self._dispatch_thread, self._recovery_thread):
-            if t:
-                t.join(timeout=3)
+        self._save_state()
+        for t in self._threads:
+            t.join(timeout=3)
+
+    # ── 状态持久化（文件，非 DB）─────────────────────────────────────────────
+
+    def _load_state(self) -> None:
+        try:
+            if not self._state_file.exists():
+                return
+            data = json.loads(self._state_file.read_text("utf-8"))
+            with self._lock:
+                for tid in data.get("queue", []):
+                    if tid not in self._queue and tid not in self._running:
+                        self._queue.append(tid)
+                for rec in data.get("running", []):
+                    r = RunRecord(task_id=rec["task_id"], worker_id=rec["worker_id"],
+                                  started_ts=rec.get("started_ts", _time.time()),
+                                  state=rec.get("state", proto.STATE_RUNNING),
+                                  error=rec.get("error"), finished_ts=rec.get("finished_ts"))
+                    self._running[r.task_id] = r
+            logger.info("SchedulerV3 loaded state: queue=%d running=%d", len(self._queue), len(self._running))
+        except Exception as exc:
+            logger.warning("load scheduler state failed: %s", exc)
+
+    def _save_state(self) -> None:
+        with self._lock:
+            payload = {"queue": list(self._queue),
+                       "running": [r.to_dict() for r in self._running.values()],
+                       "saved_at": now_local().isoformat()}
+        try:
+            tmp = self._state_file.with_suffix(self._state_file.suffix + ".tmp")
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
+            tmp.replace(self._state_file)
+            self._dirty = False
+        except Exception as exc:
+            logger.warning("save scheduler state failed: %s", exc)
+
+    def _persist_loop(self) -> None:
+        while self._running_flag and not self._stop.wait(timeout=PERSIST_INTERVAL):
+            if self._dirty:
+                self._save_state()
 
     # ── TCP accept + worker 消息循环 ─────────────────────────────────────────
 
     def _accept_loop(self) -> None:
-        while self._running and self._server_sock is not None:
+        while self._running_flag and self._server_sock is not None:
             try:
-                conn, addr = self._server_sock.accept()
+                conn, _addr = self._server_sock.accept()
             except OSError:
-                if self._running:
-                    logger.exception("accept failed")
                 break
-            t = threading.Thread(target=self._serve_worker, args=(conn, addr), name="sa_v3_worker", daemon=True)
-            t.start()
+            threading.Thread(target=self._serve_worker, args=(conn,), name="sa_v3_worker", daemon=True).start()
 
-    def _serve_worker(self, conn: socket.socket, addr) -> None:
-        conn.settimeout(None)
+    def _serve_worker(self, conn: socket.socket) -> None:
         worker_id: str | None = None
         try:
             reader = conn.makefile("rb")
-            while self._running:
+            while self._running_flag:
                 msg = proto.read_frame(reader)
                 if msg is None:
-                    break  # 连接关闭
+                    break
                 try:
-                    handled_id = self._handle_worker_msg(conn, msg)
-                    if handled_id:
-                        worker_id = handled_id
+                    wid = self._handle_worker_msg(conn, msg)
+                    if wid:
+                        worker_id = wid
                 except Exception:
                     logger.exception("handle worker msg failed: %s", msg)
                     break
@@ -177,10 +208,8 @@ class SchedulerV3:
         finally:
             if worker_id:
                 self._on_worker_disconnect(worker_id)
-            try:
-                conn.close()
-            except OSError:
-                pass
+            try: conn.close()
+            except OSError: pass
 
     def _handle_worker_msg(self, conn: socket.socket, msg: dict) -> str | None:
         mtype = msg.get("type")
@@ -189,9 +218,9 @@ class SchedulerV3:
             if not wid:
                 self._send(conn, proto.msg_error("hello missing worker_id"))
                 return None
-            w = self._register_worker(wid, conn, ip=str(msg.get("ip") or ""), max_tasks=int(msg.get("max_tasks") or 1))
+            self._register_worker(wid, conn, ip=str(msg.get("ip") or ""), max_tasks=int(msg.get("max_tasks") or 1))
             self._send(conn, proto.msg_ok(worker_id=wid))
-            self._record_event(None, None, "worker_connected", f"worker {wid} 已连接", "info", {"worker_id": wid})
+            self._record("worker_connected", f"worker {wid} 已连接", "info", {"worker_id": wid})
             return wid
         wid = str(msg.get("worker_id") or "").strip()
         if not wid:
@@ -202,16 +231,14 @@ class SchedulerV3:
             self._on_task_state(wid, msg)
         return wid
 
-    def _register_worker(self, wid: str, conn: socket.socket, ip: str, max_tasks: int) -> WorkerConn:
+    def _register_worker(self, wid: str, conn: socket.socket, ip: str, max_tasks: int) -> None:
         with self._lock:
             old = self._workers.get(wid)
             if old is not None and old.sock is not None and old.sock is not conn:
-                # 同一 worker 重连：关闭旧连接
                 self._close_worker(old)
-            w = WorkerConn(worker_id=wid, ip=ip, max_tasks=max(1, max_tasks),
-                           last_heartbeat=_time.time(), online=True, sock=conn)
-            self._workers[wid] = w
-            return w
+            self._workers[wid] = WorkerConn(worker_id=wid, ip=ip, max_tasks=max(1, max_tasks),
+                                            last_heartbeat=_time.time(), online=True, sock=conn)
+            self._dirty = True
 
     def _on_heartbeat(self, wid: str, msg: dict) -> None:
         with self._lock:
@@ -223,19 +250,36 @@ class SchedulerV3:
             w.current_task = msg.get("task_id") or None
 
     def _on_task_state(self, wid: str, msg: dict) -> None:
-        """worker 上报任务状态变更：更新内存表 + 记事件。终态(DB)由 worker 侧执行 finalize 时写。"""
         task_id = str(msg.get("task_id") or "")
         state = str(msg.get("state") or "")
+        err = msg.get("error")
+        result = msg.get("result")
+        finished = False
         with self._lock:
             w = self._workers.get(wid)
-            if w is not None:
+            if w is not None and w.current_task == task_id and state in (
+                    proto.STATE_FINISHED, proto.STATE_FAILED, proto.STATE_CANCELLED):
+                w.current_task = None
+            rec = self._running.get(task_id)
+            if rec is not None:
+                rec.state = state
+                if err:
+                    rec.error = str(err)
                 if state in (proto.STATE_FINISHED, proto.STATE_FAILED, proto.STATE_CANCELLED):
-                    if w.current_task == task_id:
-                        w.current_task = None
-        self._record_event(task_id, None, "worker_task_state",
-                           f"worker {wid} 报告任务 {task_id} 状态={state}", "info",
-                           {"worker_id": wid, "task_id": task_id, "state": state,
-                            "error": msg.get("error"), "result": msg.get("result")})
+                    rec.finished_ts = _time.time()
+                    finished = True
+            self._dirty = True
+        self._record_event_for(task_id, "worker_task_state",
+                               f"worker {wid} 任务 {task_id} 状态={state}", "info",
+                               {"worker_id": wid, "task_id": task_id, "state": state, "error": err})
+        if finished:
+            try:
+                self._finalize(task_id, state, err, result)
+            except Exception:
+                logger.exception("finalize task failed: %s", task_id)
+            with self._lock:
+                self._running.pop(task_id, None)
+                self._dirty = True
 
     def _on_worker_disconnect(self, wid: str) -> None:
         with self._lock:
@@ -244,219 +288,236 @@ class SchedulerV3:
                 return
             w.online = False
             w.sock = None
-            # 注意：不立即清 current_task —— 留给 recovery 用 DB lease 对账；
-            # 若 worker 只是短暂断联并重连，current_task 会被 hello/heartbeat 更正。
-        self._record_event(None, None, "worker_disconnected", f"worker {wid} 断联", "warning", {"worker_id": wid})
+            self._dirty = True
+        self._record("worker_disconnected", f"worker {wid} 断联", "warning", {"worker_id": wid})
 
     def _close_worker(self, w: WorkerConn) -> None:
         w.online = False
         s, w.sock = w.sock, None
         if s is not None:
-            try:
-                s.close()
-            except OSError:
-                pass
+            try: s.close()
+            except OSError: pass
 
     def _send(self, conn: socket.socket, msg: dict) -> bool:
         try:
-            data = proto.encode(msg)
-            with _lock_for_conn(conn):
-                conn.sendall(data)
+            conn.sendall(proto.encode(msg))
             return True
         except OSError:
             return False
 
-    # ── 派发主循环（顺序 push，非抢占）──────────────────────────────────────
+    # ── 派发主循环（顺序 push，非抢占，纯内存）──────────────────────────────
 
     def _dispatch_loop(self) -> None:
-        while self._running and not self._stop.wait(timeout=DISPATCH_POLL_INTERVAL):
+        while self._running_flag and not self._stop.wait(timeout=DISPATCH_POLL_INTERVAL):
             try:
                 self._dispatch_once()
-                self._last_tick = _time.time()
             except Exception as exc:
-                self._last_error = str(exc)
                 logger.exception("dispatch loop: %s", exc)
 
     def _dispatch_once(self) -> None:
-        db_gen = self._get_db()
-        db: Session = next(db_gen)
-        try:
-            # 运行时控制总闸
-            self._apply_control(self._load_control(db))
-            if not self._claim_enabled or self._drain_mode or self._pause_until > _time.time():
-                return
-            # 选一个空闲 worker
-            wid = self._pick_idle_worker()
-            if not wid:
-                return
-            # 取一个 pending 任务（FIFO）
-            rows = self._task_repo.list_pending_tasks(db, 1)
-            if not rows:
-                return
-            row = rows[0]
-            lease_epoch = self._claim_task_lease(db, row, wid)
-            if not lease_epoch:
-                return  # 被别人抢了（多 manager 安全）/状态已变
-            # 标记该 worker 正在跑该任务（占用槽位）
-            with self._lock:
-                w = self._workers.get(wid)
-                if w is not None:
-                    w.current_task = row.task_id
-                    w.last_heartbeat = _time.time()
-            # 下发 RUN 命令
-            conn = self._get_conn(wid)
-            sent = self._send(conn, proto.msg_run(row.task_id, lease_epoch)) if conn is not None else False
-            self._record_event(row.task_id, getattr(row, "project_id", None),
-                               "task_dispatched", f"任务已下发 worker={wid}", "info",
-                               {"worker_id": wid, "lease_epoch": lease_epoch})
-            if not sent:
-                # 下发失败（worker 刚断联）→ 释放占用，靠 recovery 把它回收重排
-                with self._lock:
-                    w = self._workers.get(wid)
-                    if w is not None and w.current_task == row.task_id:
-                        w.current_task = None
-                logger.warning("RUN 下发失败 task=%s worker=%s，留给 recovery 回收", row.task_id, wid)
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-
-    def _pick_idle_worker(self) -> str | None:
         with self._lock:
+            if not self._queue:
+                return
             idle = [w for w in self._workers.values() if w.is_idle]
-        if not idle:
-            return None
-        # 选最久未派发（last_heartbeat 最早）的空闲 worker，简单轮询均衡
-        idle.sort(key=lambda w: (w.last_heartbeat, w.worker_id))
-        return idle[0].worker_id
+            if not idle:
+                return
+            idle.sort(key=lambda w: (w.last_heartbeat, w.worker_id))
+            w = idle[0]
+            task_id = self._queue.popleft()
+            w.current_task = task_id
+            w.last_heartbeat = _time.time()
+            self._running[task_id] = RunRecord(task_id=task_id, worker_id=w.worker_id, started_ts=_time.time())
+            conn = w.sock
+            self._dirty = True
+        sent = self._send(conn, proto.msg_run(task_id, lease_epoch=0)) if conn is not None else False
+        self._record_event_for(task_id, "task_dispatched", f"任务已下发 worker={w.worker_id}", "info",
+                               {"worker_id": w.worker_id})
+        if not sent:
+            with self._lock:
+                self._running.pop(task_id, None)
+                if task_id not in self._queue:
+                    self._queue.appendleft(task_id)
+                ww = self._workers.get(w.worker_id)
+                if ww is not None and ww.current_task == task_id:
+                    ww.current_task = None
+                self._dirty = True
 
-    def _get_conn(self, wid: str) -> socket.socket | None:
-        with self._lock:
-            w = self._workers.get(wid)
-            return w.sock if (w is not None and w.online) else None
+    # ── 对账循环（worker 死亡 → 任务重排；清理失联 worker）──────────────────
 
-    # ── 回收 / 对账循环（rollout 安全）──────────────────────────────────────
-
-    def _recovery_loop(self) -> None:
-        while self._running and not self._stop.wait(timeout=RECOVER_SWEEP_INTERVAL):
+    def _reconcile_loop(self) -> None:
+        while self._running_flag and not self._stop.wait(timeout=RECONCILE_INTERVAL):
             try:
-                self._recovery_once()
-                self._last_recover = _time.time()
+                self._reconcile_once()
             except Exception as exc:
-                logger.exception("recovery loop: %s", exc)
+                logger.exception("reconcile loop: %s", exc)
 
-    def _recovery_once(self) -> None:
-        """对账：把"已死 worker 仍占着的 running 任务"回收重排；清理内存中失联 worker。"""
+    def _reconcile_once(self) -> None:
         now = _time.time()
-        # 1. 内存表：心跳超时的 worker 标 offline
+        requeue: list[str] = []
         with self._lock:
             for w in self._workers.values():
                 if w.online and now - w.last_heartbeat > WORKER_HEARTBEAT_TIMEOUT:
                     w.online = False
-                    self._record_event(None, None, "worker_heartbeat_timeout",
-                                       f"worker {w.worker_id} 心跳超时", "warning", {"worker_id": w.worker_id})
-            # 移除长期失联且无任务的 worker 条目
+                    self._record("worker_heartbeat_timeout", f"worker {w.worker_id} 心跳超时", "warning", {"worker_id": w.worker_id})
+            for tid, rec in list(self._running.items()):
+                w = self._workers.get(rec.worker_id)
+                owner_alive = (w is not None and w.online and w.current_task == tid)
+                if not owner_alive:
+                    rec.state = proto.STATE_FAILED
+                    rec.error = "worker_lost"
+                    requeue.append(tid)
+            for tid in requeue:
+                self._running.pop(tid, None)
+                if tid not in self._queue:
+                    self._queue.append(tid)
             dead = [wid for wid, w in self._workers.items()
                     if not w.online and w.current_task is None and now - w.last_heartbeat > WORKER_HEARTBEAT_TIMEOUT * 4]
             for wid in dead:
                 self._workers.pop(wid, None)
-        # 2. DB 对账：running 任务的 owner 若失联超宽限 → 回收重排
-        db_gen = self._get_db()
-        db: Session = next(db_gen)
-        try:
-            should_recover = self._build_should_recover(db) if self._build_should_recover else None
-
-            def _stale_owner_recover(stale_row) -> bool:
-                owner = str(getattr(stale_row, "dispatcher_instance_id", "") or "")
-                # owner worker 仍在线且有该任务在跑 → 不回收
-                with self._lock:
-                    w = self._workers.get(owner)
-                    if w is not None and w.online and w.current_task == stale_row.task_id:
-                        return False
-                # owner 离线，但宽限期内 → 不回收（给重连机会）
-                lease_exp = getattr(stale_row, "lease_expires_at", None)
-                if lease_exp is not None and lease_exp > now_local():
-                    return False
-                return True
-
-            rows = self._task_repo.recover_stale_running_tasks(
-                db, now=now_local(), lease_timeout_seconds=int(WORKER_RECOVER_GRACE),
-                clear_task_execution_lock=self._clear_lock,
-                cleanup_resume_files=self._cleanup_resume,
-                should_recover=should_recover if should_recover is not None else _stale_owner_recover,
-            )
-            for row in rows:
-                self._record_event(row.task_id, getattr(row, "project_id", None),
-                                   "task_lease_recovered", "任务租约过期/worker 失联，已回收重排",
-                                   "warning", {"lease_epoch": getattr(row, "lease_epoch", 0)})
-        finally:
+            if requeue or dead:
+                self._dirty = True
+        for tid in requeue:
+            self._record_event_for(tid, "task_requeued", "worker 失联，任务重新排队", "warning", {"task_id": tid})
             try:
-                next(db_gen)
-            except StopIteration:
-                pass
+                self._finalize(tid, proto.STATE_FAILED, "worker_lost", None)
+            except Exception:
+                logger.exception("finalize(worker_lost) failed: %s", tid)
 
-    # ── 控制命令（API → 调度器 → worker）─────────────────────────────────────
+    # ── 内部 API（HTTP → 内存控制面；无 DB）──────────────────────────────────
 
-    def cancel_task(self, task_id: str, owner_worker_id: str) -> dict:
-        """API cancel：向 owner worker 发 CANCEL 命令（worker 杀任务进程+代归档+清理pod）。"""
-        conn = self._get_conn(owner_worker_id)
-        if conn is None:
-            return {"status": "worker_offline", "task_id": task_id, "worker_id": owner_worker_id}
-        ok = self._send(conn, proto.msg_cancel(task_id))
-        self._record_event(task_id, None, "task_cancel_commanded", f"已向 worker {owner_worker_id} 发送取消命令", "info",
-                           {"worker_id": owner_worker_id})
-        return {"status": "ok" if ok else "send_failed", "task_id": task_id, "worker_id": owner_worker_id}
+    def submit(self, task_id: str) -> dict:
+        with self._lock:
+            if task_id in self._queue or task_id in self._running:
+                return {"status": "already_queued", "task_id": task_id}
+            self._queue.append(task_id)
+            self._dirty = True
+        self._record_event_for(task_id, "task_submitted", "任务已入调度队列", "info", {"task_id": task_id})
+        return {"status": "queued", "task_id": task_id, "queue_len": len(self._queue)}
 
-    def restart_task(self, task_id: str, owner_worker_id: str, lease_epoch: int) -> dict:
-        conn = self._get_conn(owner_worker_id)
-        if conn is None:
-            return {"status": "worker_offline"}
-        ok = self._send(conn, proto.msg_restart(task_id, lease_epoch))
-        return {"status": "ok" if ok else "send_failed"}
+    def cancel(self, task_id: str) -> dict:
+        with self._lock:
+            if task_id in self._queue:
+                try: self._queue.remove(task_id)
+                except ValueError: pass
+                self._dirty = True
+                self._record_event_for(task_id, "task_cancelled", "任务从队列取消", "warning", {"task_id": task_id})
+                try: self._finalize(task_id, proto.STATE_CANCELLED, "cancelled", None)
+                except Exception: logger.exception("finalize cancel(queued) failed: %s", task_id)
+                return {"status": "cancelled_from_queue", "task_id": task_id}
+            rec = self._running.get(task_id)
+            if rec is None:
+                return {"status": "not_found", "task_id": task_id}
+            w = self._workers.get(rec.worker_id)
+            conn = w.sock if (w is not None and w.online) else None
+            worker_id = rec.worker_id
+        sent = self._send(conn, proto.msg_cancel(task_id)) if conn is not None else False
+        self._record_event_for(task_id, "task_cancel_commanded", f"已向 worker {worker_id} 发送取消命令", "info",
+                               {"worker_id": worker_id})
+        return {"status": "cancel_commanded" if sent else "worker_offline", "task_id": task_id, "worker_id": worker_id}
 
-    # ── 辅助 ────────────────────────────────────────────────────────────────
+    def restart(self, task_id: str) -> dict:
+        with self._lock:
+            rec = self._running.pop(task_id, None)
+            conn = None
+            if rec is not None:
+                w = self._workers.get(rec.worker_id)
+                conn = w.sock if (w is not None and w.online) else None
+            try: self._queue.remove(task_id)
+            except ValueError: pass
+            if task_id not in self._queue:
+                self._queue.append(task_id)
+            self._dirty = True
+        if conn is not None:
+            self._send(conn, proto.msg_cancel(task_id))
+        self._record_event_for(task_id, "task_restart_queued", "任务重新入队", "info", {"task_id": task_id})
+        return {"status": "requeued", "task_id": task_id, "queue_len": len(self._queue)}
 
-    def _apply_control(self, payload: dict) -> None:
-        p = payload or {}
-        self._claim_enabled = bool(p.get("claim_enabled", True))
-        self._drain_mode = bool(p.get("drain_mode", False))
-        try:
-            self._pause_until = max(0.0, float(p.get("pause_claim_until_ts", 0) or 0))
-        except (TypeError, ValueError):
-            self._pause_until = 0.0
+    def task_status(self, task_id: str) -> dict:
+        with self._lock:
+            if task_id in self._queue:
+                return {"task_id": task_id, "status": "pending", "queue_pos": list(self._queue).index(task_id)}
+            rec = self._running.get(task_id)
+            if rec is not None:
+                return {"task_id": task_id, "status": rec.state, "worker_id": rec.worker_id,
+                        "started_ts": rec.started_ts, "error": rec.error}
+        return {"task_id": task_id, "status": "unknown"}
+
+    def cluster_status(self) -> dict:
+        with self._lock:
+            workers = [{"worker_id": w.worker_id, "online": w.online, "task": w.current_task,
+                        "hb_age": round(_time.time() - w.last_heartbeat, 1)} for w in self._workers.values()]
+            return {"queue_len": len(self._queue), "running": len(self._running),
+                    "idle_workers": sum(1 for w in self._workers.values() if w.is_idle),
+                    "workers": workers,
+                    "running_tasks": [r.to_dict() for r in self._running.values()]}
 
     def health(self) -> dict:
         with self._lock:
-            workers = [
-                {"worker_id": w.worker_id, "online": w.online, "task": w.current_task,
-                 "hb_age": round(_time.time() - w.last_heartbeat, 1)}
-                for w in self._workers.values()
-            ]
-            idle = sum(1 for w in self._workers.values() if w.is_idle)
-        return {
-            "status": "ok" if self._running else "stopped",
-            "version": "v3",
-            "tcp": f"{self._bind}:{self._port}",
-            "workers": workers,
-            "idle_workers": idle,
-            "last_tick": self._last_tick,
-            "last_recover": self._last_recover,
-            "last_error": self._last_error,
-            "control": {"claim_enabled": self._claim_enabled, "drain_mode": self._drain_mode, "pause_until": self._pause_until},
-        }
+            return {"status": "ok" if self._running_flag else "stopped", "version": "v3-pure-tcp",
+                    "tcp": f"{self._bind}:{self._port}",
+                    "queue": len(self._queue), "running": len(self._running), "workers": len(self._workers)}
+
+    # record_event 适配：允许 (task_id, event_type, msg, level, payload) 或 (event_type, msg, level, payload)
+    def _record_event_for(self, task_id: str | None, event_type: str, msg: str, level: str = "info", payload: dict | None = None) -> None:
+        try:
+            self._record(task_id, event_type, msg, level, payload)
+        except TypeError:
+            self._record(event_type=event_type, message=msg, level=level, payload=payload, task_id=task_id)
 
 
-# 一个 per-socket 的写锁注册表（避免多线程向同一 socket 并发 sendall 帧交错）
-_CONN_LOCKS: "dict[int, threading.Lock]" = {}
-_CONN_LOCKS_GUARD = threading.Lock()
+# ═══════════════════════════════════════════════════════════════════════════════
+# 单例 + 内部 HTTP Router（manager pod 暴露给 API pod / 前端）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_scheduler_instance: SchedulerV3 | None = None
 
 
-def _lock_for_conn(conn: socket.socket) -> threading.Lock:
-    key = id(conn)
-    with _CONN_LOCKS_GUARD:
-        lk = _CONN_LOCKS.get(key)
-        if lk is None:
-            lk = threading.Lock()
-            _CONN_LOCKS[key] = lk
-        return lk
+def set_scheduler(s: SchedulerV3) -> None:
+    global _scheduler_instance
+    _scheduler_instance = s
+
+
+def get_scheduler() -> SchedulerV3 | None:
+    return _scheduler_instance
+
+
+def create_sched_router():
+    from fastapi import APIRouter
+    from pydantic import BaseModel
+
+    router = APIRouter(prefix="/api/internal/sched")
+
+    class TaskReq(BaseModel):
+        task_id: str
+
+    @router.post("/submit")
+    def submit(req: TaskReq):
+        s = get_scheduler()
+        return s.submit(req.task_id) if s else {"status": "no_scheduler"}
+
+    @router.post("/cancel")
+    def cancel(req: TaskReq):
+        s = get_scheduler()
+        return s.cancel(req.task_id) if s else {"status": "no_scheduler"}
+
+    @router.post("/restart")
+    def restart(req: TaskReq):
+        s = get_scheduler()
+        return s.restart(req.task_id) if s else {"status": "no_scheduler"}
+
+    @router.get("/task_status")
+    def task_status(task_id: str):
+        s = get_scheduler()
+        return s.task_status(task_id) if s else {"status": "no_scheduler", "task_id": task_id}
+
+    @router.get("/cluster_status")
+    def cluster_status():
+        s = get_scheduler()
+        return s.cluster_status() if s else {"status": "no_scheduler"}
+
+    @router.get("/health")
+    def health():
+        s = get_scheduler()
+        return s.health() if s else {"status": "no_scheduler"}
+
+    return router
