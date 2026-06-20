@@ -214,7 +214,10 @@ class RuntimeBootstrap:
 
     def _start_worker_loop(self) -> None:
         from app.service.task_service import get_task_service
-
+        # V3 纯 TCP 调度器: server.py lifespan 已调用 start_v3_manager/worker；跳过 V2 避免双分发
+        import os as _os
+        if str(_os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_V3", "1")).strip().lower() in {"1", "true", "yes", "on"}:
+            return
         get_task_service().start_worker_loop()
         self._status.worker_loop_ready = True
 
