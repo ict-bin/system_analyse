@@ -66,7 +66,8 @@ class WorkerConn:
     worker_id: str
     ip: str = ""
     max_tasks: int = 1
-    current_task: str | None = None
+    current_task: str | None = None          # 调度器派发权威：派发时设，task_state 终态时清
+    reported_task: str | None = None         # worker 心跳上报的实际在跑任务（用于重连对账）
     last_heartbeat: float = 0.0
     online: bool = True
     sock: socket.socket | None = None
@@ -241,8 +242,15 @@ class SchedulerV3:
             old = self._workers.get(wid)
             if old is not None and old.sock is not None and old.sock is not conn:
                 self._close_worker(old)
-            self._workers[wid] = WorkerConn(worker_id=wid, ip=ip, max_tasks=max(1, max_tasks),
-                                            last_heartbeat=_time.time(), online=True, sock=conn)
+            w = WorkerConn(worker_id=wid, ip=ip, max_tasks=max(1, max_tasks),
+                           last_heartbeat=_time.time(), online=True, sock=conn)
+            # 重连对账：若 _running 中有归属该 worker 的任务（manager 重启后从文件加载），
+            # 恢复其 current_task，避免被误判空闲而重复派发。
+            for tid, rec in self._running.items():
+                if rec.worker_id == wid:
+                    w.current_task = tid
+                    break
+            self._workers[wid] = w
             self._dirty = True
 
     def _on_heartbeat(self, wid: str, msg: dict) -> None:
@@ -252,7 +260,8 @@ class SchedulerV3:
                 return
             w.last_heartbeat = _time.time()
             w.online = True
-            w.current_task = msg.get("task_id") or None
+            # 心跳只更新存活 + worker 上报的实际任务；不覆盖调度器派发权威的 current_task
+            w.reported_task = msg.get("task_id") or None
 
     def _on_task_state(self, wid: str, msg: dict) -> None:
         task_id = str(msg.get("task_id") or "")
@@ -376,8 +385,15 @@ class SchedulerV3:
                     w.online = False
                     self._record("worker_heartbeat_timeout", f"worker {w.worker_id} 心跳超时", "warning", {"worker_id": w.worker_id})
             for tid, rec in list(self._running.items()):
+                # 派发→运行宽限期：刚派发的任务给 worker 拉起/上报的时间，不误判
+                if now - rec.started_ts < WORKER_HEARTBEAT_TIMEOUT:
+                    continue
                 w = self._workers.get(rec.worker_id)
-                owner_alive = (w is not None and w.online and w.current_task == tid)
+                if w is None or not w.online:
+                    owner_alive = False
+                else:
+                    # worker 在线：以其心跳上报的 reported_task 为准判断是否真在跑该任务
+                    owner_alive = (w.reported_task == tid)
                 if not owner_alive:
                     rec.state = proto.STATE_FAILED
                     rec.error = "worker_lost"
