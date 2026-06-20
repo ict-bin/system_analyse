@@ -498,31 +498,27 @@ def get_scheduler() -> SchedulerV3 | None:
 
 
 def create_sched_router():
-    from fastapi import APIRouter
-    from pydantic import BaseModel
+    from fastapi import APIRouter, Query
 
     router = APIRouter(prefix="/api/internal/sched")
 
-    class TaskReq(BaseModel):
-        task_id: str
-
     @router.post("/submit")
-    def submit(req: TaskReq):
+    def submit(task_id: str = Query(...)):
         s = get_scheduler()
-        return s.submit(req.task_id) if s else {"status": "no_scheduler"}
+        return s.submit(task_id) if s else {"status": "no_scheduler"}
 
     @router.post("/cancel")
-    def cancel(req: TaskReq):
+    def cancel(task_id: str = Query(...)):
         s = get_scheduler()
-        return s.cancel(req.task_id) if s else {"status": "no_scheduler"}
+        return s.cancel(task_id) if s else {"status": "no_scheduler"}
 
     @router.post("/restart")
-    def restart(req: TaskReq):
+    def restart(task_id: str = Query(...)):
         s = get_scheduler()
-        return s.restart(req.task_id) if s else {"status": "no_scheduler"}
+        return s.restart(task_id) if s else {"status": "no_scheduler"}
 
     @router.get("/task_status")
-    def task_status(task_id: str):
+    def task_status(task_id: str = Query(...)):
         s = get_scheduler()
         return s.task_status(task_id) if s else {"status": "no_scheduler", "task_id": task_id}
 
