@@ -68,6 +68,7 @@ from app.service.scheduler import (
     SchedulerService, ExecutorAgent, TaskGuard,
     set_scheduler, INSTANCE_ID as SCHEDULER_INSTANCE_ID,
 )
+from app.service.scheduler_v3 import get_scheduler as get_v3_scheduler
 from app.time_utils import isoformat_local, now_local
 
 logger = logging.getLogger("sa.task_service")
@@ -417,7 +418,7 @@ def get_worker_runtime_health() -> dict:
     health = _get_dispatcher_runtime_health(_running_tasks_count())
     if is_runner_role():
         health.update(_runner_assignment_runtime_state.snapshot())
-    scheduler = get_scheduler()
+    scheduler = get_v3_scheduler()
     if scheduler is not None:
         scheduler_health = scheduler.health()
         health.update(

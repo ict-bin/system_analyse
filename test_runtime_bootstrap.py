@@ -167,3 +167,43 @@ class TaskServiceRecoverPredicateTests(unittest.TestCase):
         self.assertTrue(callable(predicate))
         stale_row = SimpleNamespace(task_id="sat_1")
         self.assertTrue(predicate(stale_row))
+
+
+class TaskServiceRuntimeHealthTests(unittest.TestCase):
+    def test_get_worker_runtime_health_without_scheduler_instance(self):
+        import app.service.task_service as task_service_module
+
+        with patch.object(task_service_module, "is_runner_role", return_value=False), patch.object(
+            task_service_module, "is_manager_role", return_value=True
+        ), patch.object(
+            task_service_module, "_get_dispatcher_runtime_health", return_value={"worker_loop_fresh": True}
+        ), patch.object(
+            task_service_module, "get_v3_scheduler", return_value=None
+        ):
+            health = task_service_module.get_worker_runtime_health()
+
+        self.assertEqual(True, health["worker_loop_fresh"])
+        self.assertEqual(task_service_module._RUNTIME_EVIDENCE_MODE, health["runtime_evidence_mode"])
+        self.assertNotIn("scheduler_last_tick_at", health)
+
+    def test_get_worker_runtime_health_includes_v3_scheduler_fields(self):
+        import app.service.task_service as task_service_module
+
+        scheduler = MagicMock()
+        scheduler.health.return_value = {
+            "last_tick": 123.0,
+            "last_success": 122.5,
+            "stall_detected": True,
+        }
+        with patch.object(task_service_module, "is_runner_role", return_value=False), patch.object(
+            task_service_module, "is_manager_role", return_value=True
+        ), patch.object(
+            task_service_module, "_get_dispatcher_runtime_health", return_value={"worker_loop_fresh": True}
+        ), patch.object(
+            task_service_module, "get_v3_scheduler", return_value=scheduler
+        ):
+            health = task_service_module.get_worker_runtime_health()
+
+        self.assertEqual(123.0, health["scheduler_last_tick_at"])
+        self.assertEqual(122.5, health["scheduler_last_success_at"])
+        self.assertTrue(health["scheduler_stall_detected"])
