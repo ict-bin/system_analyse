@@ -752,7 +752,8 @@ def _v3_notify_scheduler(action: str, task_id: str) -> dict | None:
     url = f"http://{host}:{port}/api/internal/sched/{action}"
     try:
         with httpx.Client(timeout=10) as c:
-            r = c.post(url, json={"task_id": task_id})
+            # 调度器内部端点用 Query(...) 读 task_id → 必须作为查询参数传（不是 json body，否则 422）。
+            r = c.post(url, params={"task_id": task_id})
             return r.json() if r.status_code < 500 else None
     except Exception:
         logger.warning("v3 notify scheduler (%s %s) via HTTP failed", action, task_id)
