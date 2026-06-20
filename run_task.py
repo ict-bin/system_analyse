@@ -25,6 +25,16 @@ def main() -> int:
     configure_container_logging("01-system_analyse")
     logger = logging.getLogger("sa.run_task")
 
+    # 诊断：对卡死子进程 `kill -USR1 <pid>` 可把当前 Python 栈转储到 stderr（无需 ptrace）。
+    # 用于定位 NFS 卡死等挂起点。
+    try:
+        import faulthandler, signal
+        faulthandler.enable()
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except Exception:
+        pass
+
     try:
         # 任务子进程是全新进程，必须先初始化 DB engine（server 进程才在启动时 init_db）
         from app.config import get_service_yaml
