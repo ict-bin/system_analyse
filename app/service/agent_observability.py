@@ -485,13 +485,22 @@ def _match_task(proc: dict[str, Any], task_rows: list[AppSaTask], task_roots_by_
 
 
 class AgentObservabilityService:
-    def build_snapshot_for_processes(self, processes_source: list[dict[str, Any]]) -> dict[str, Any]:
+    def build_snapshot_for_processes(
+        self,
+        processes_source: list[dict[str, Any]],
+        *,
+        include_session_descriptors: bool = True,
+    ) -> dict[str, Any]:
         from app.db import get_db
 
         db_gen = get_db()
         db: Session = next(db_gen)
         try:
-            return self._build_snapshot_from_processes(db, processes_source)
+            return self._build_snapshot_from_processes(
+                db,
+                processes_source,
+                include_session_descriptors=include_session_descriptors,
+            )
         finally:
             try:
                 next(db_gen)
@@ -567,6 +576,7 @@ class AgentObservabilityService:
         processes_source: list[dict[str, Any]],
         *,
         project_id: str | None = None,
+        include_session_descriptors: bool = True,
     ) -> dict[str, Any]:
         from app.service.task_service import get_runtime_tracking_snapshot
 
@@ -576,10 +586,18 @@ class AgentObservabilityService:
         task_rows = query.all()
         task_by_id = {row.task_id: row for row in task_rows}
         task_roots_by_id = {row.task_id: _task_roots(row) for row in task_rows}
-        session_descriptors_by_task_id = {
-            row.task_id: _session_descriptor_map(row)
-            for row in task_rows
-        }
+        # session_descriptors 需要读取每个任务的 NFS session 文件（run/sessions/...）。
+        # 在任务热路径（pre/post_task agent 清理）中，跨几十个历史任务逐个 read_text
+        # 会在某个残留/死任务的卡死 NFS inode 上永久阻塞（nfs_wait_bit_killable）。
+        # 清理决策（owner_kind/kill_allowed）不依赖 session_descriptor，进程→任务匹配
+        # 走 task_roots_by_id（纯路径计算，无 NFS 读），故清理路径可安全跳过。
+        if include_session_descriptors:
+            session_descriptors_by_task_id = {
+                row.task_id: _session_descriptor_map(row)
+                for row in task_rows
+            }
+        else:
+            session_descriptors_by_task_id = {}
         runtime_tracking = get_runtime_tracking_snapshot()
         try:
             build_worker_slot_cluster_snapshot(db, project_id=project_id)

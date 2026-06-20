@@ -99,7 +99,10 @@ class AgentCleanupService:
         self._observability = AgentObservabilityService()
 
     def _scan(self) -> list[dict[str, Any]]:
-        snapshot = self._observability.build_snapshot_for_processes(_iter_agent_processes_for_cleanup())
+        snapshot = self._observability.build_snapshot_for_processes(
+            _iter_agent_processes_for_cleanup(),
+            include_session_descriptors=False,
+        )
         rows: list[dict[str, Any]] = []
         for item in snapshot.get("processes", []):
             rows.append(
