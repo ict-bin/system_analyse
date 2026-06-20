@@ -2004,6 +2004,154 @@ class TaskService:
             self._stop_runner_assignment_loop()
             self._runner_registry.stop()
 
+    # ════════════════════════ V3.0 纯 TCP 调度器启动/回调 ════════════════════════
+    #
+    # V3: manager 起 SchedulerV3(纯内存+TCP)，runner 起 WorkerControl(任务子进程)。
+    # DB 仅用于任务记录/终态回写(供前端)，控制面无 DB 实时依赖。
+
+    def start_v3_manager(self) -> None:
+        from app.service.scheduler_v3 import SchedulerV3, set_scheduler as set_v3
+        sched = SchedulerV3(
+            finalize_task=self._v3_finalize,
+            record_event=self._v3_record_event,
+            claim_task=self._v3_claim_task,
+        )
+        set_v3(sched)
+        self._v3_scheduler = sched
+        sched.start()
+
+    def stop_v3_manager(self) -> None:
+        s = getattr(self, "_v3_scheduler", None)
+        if s is not None:
+            s.stop()
+            self._v3_scheduler = None
+
+    def start_v3_worker(self) -> None:
+        from app.service.worker_control import WorkerControl
+        wc = WorkerControl(
+            spawn_task_subprocess=self._v3_spawn,
+            archive_task=self._v3_archive,
+        )
+        self._v3_worker_control = wc
+        wc.start()
+
+    def stop_v3_worker(self) -> None:
+        wc = getattr(self, "_v3_worker_control", None)
+        if wc is not None:
+            wc.stop()
+            self._v3_worker_control = None
+
+    # —— 调度器回调：终态回写 DB 行（供前端；任务子进程正常完成时已自己写，此处幂等/仅补救）——
+    def _v3_finalize(self, task_id: str, state: str, error, result) -> None:
+        # 状态映射：worker_lost/failed→failed；cancelled→cancelled；finished→passed
+        mapping = {
+            "finished": "passed", "failed": "failed", "cancelled": "cancelled",
+            "worker_lost": "failed",
+        }
+        db_status = mapping.get(str(state), str(state))
+        try:
+            db_gen = None
+            from app.db import get_db as _get_db
+            db_gen = _get_db()
+            db = next(db_gen)
+            try:
+                row = self._task_repository.get_task(db, task_id)
+                if row is not None and row.status not in ("passed", "failed", "error", "cancelled"):
+                    row.status = db_status
+                    row.finished_at = now_local()
+                    if error:
+                        row.error = str(error)[:65535]
+                    db.commit()
+            finally:
+                try: next(db_gen)
+                except StopIteration: pass
+        except Exception:
+            logger.exception("v3_finalize DB 回写失败: %s", task_id)
+
+    def _v3_record_event(self, task_id, event_type, message, level="info", payload=None):
+        # SchedulerV3 调用：(task_id, event_type, message, level, payload)
+        try:
+            self._record_timeline_event(task_id=task_id, event_type=event_type, message=message, level=level, payload=payload)
+        except Exception:
+            pass
+
+    # —— WorkerControl 回调：spawn 任务子进程 ——
+    def _v3_claim_task(self, task_id: str, worker_id: str):
+        """一次性 DB 认领：pending→running、写 dispatcher/lease_epoch/lease_expires。
+        返回 lease_epoch(int)或 None。仅分发时调用一次，不是实时依赖。"""
+        try:
+            from app.db import get_db as _get_db
+            db_gen = _get_db()
+            db = next(db_gen)
+            try:
+                row = self._task_repository.get_task(db, task_id)
+                if row is None:
+                    return None
+                return self._claim_task_lease(db, row, worker_id)
+            finally:
+                try: next(db_gen)
+                except StopIteration: pass
+        except Exception:
+            logger.exception("v3_claim_task failed: %s", task_id)
+            return None
+
+    def _v3_spawn(self, task_id: str, lease_epoch: int):
+        import subprocess, sys as _sys
+        run_task_py = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "run_task.py")
+        # /app/app/service/task_service.py → /app/run_task.py
+        run_task_py = "/app/run_task.py"
+        return subprocess.Popen(
+            [_sys.executable, run_task_py, task_id, str(int(lease_epoch or 0))],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    # —— WorkerControl 回调：任务被杀时代归档（把 workspace 产物搬到 output/）——
+    def _v3_archive(self, task_id: str, normal: bool) -> None:
+        if normal:
+            return  # 正常完成时任务子进程自己已归档
+        try:
+            db_gen = None
+            from app.db import get_db as _get_db
+            db_gen = _get_db()
+            db = next(db_gen)
+            try:
+                row = self._task_repository.get_task(db, task_id)
+                if not row or not row.output_path:
+                    return
+                from pathlib import Path
+                import shutil
+                root = Path(row.output_path) / task_id
+                ws = root / "run" / "workspace"
+                out = root / "output"
+                if not ws.exists():
+                    return
+                out.mkdir(parents=True, exist_ok=True)
+                # modules
+                mods_root = ws / "modules"
+                if mods_root.exists() and not (out / "modules").exists():
+                    out_mods = out / "modules"
+                    out_mods.mkdir(parents=True, exist_ok=True)
+                    for m in [d for d in mods_root.iterdir() if d.is_dir()]:
+                        dst = out_mods / m.name
+                        if not dst.exists():
+                            shutil.copytree(str(m), str(dst))
+                # final_report.md
+                rep = ws / "final_report.md"
+                if rep.exists() and not (out / "final_report.md").exists():
+                    shutil.copy2(str(rep), str(out / "final_report.md"))
+                # modules.list
+                out_mods = out / "modules"
+                if out_mods.exists() and not (out / "modules.list").exists():
+                    from app.pipeline.helpers import generate_modules_list
+                    generate_modules_list(out_mods, out / "modules.list")
+            finally:
+                try: next(db_gen)
+                except StopIteration: pass
+        except Exception:
+            logger.exception("v3_archive 代归档失败: %s", task_id)
+
+
     def _on_task_claimed(self, task_id: str, lease_epoch: int, dispatch_target: str) -> None:
         if dispatch_target != WORKER_INSTANCE_ID:
             return

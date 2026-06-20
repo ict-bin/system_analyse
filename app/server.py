@@ -162,8 +162,31 @@ async def lifespan(app: FastAPI):
         _ensure_probe_server_started()
     get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
     # 挂载调度器内部 API
-    from .service.scheduler import create_scheduler_router
+    from .service.scheduler import create_scheduler_router, set_scheduler
     app.include_router(create_scheduler_router())
+    # V3.0 纯 TCP 调度面 内部 HTTP（submit/cancel/restart/task_status/cluster_status）
+    from .service.scheduler_v3 import create_sched_router as _create_v3_router
+    app.include_router(_create_v3_router())
+    # 启动调度器/worker (V3 纯 TCP 为默认；SECFLOW_SYSTEM_ANALYSE_SCHED_V3=0 回退 V2)
+    import threading
+    _use_v3 = str(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_V3", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    def _start_scheduler():
+        import time; time.sleep(3)
+        try:
+            from .service.task_service import get_task_service
+            ts = get_task_service()
+            if _use_v3:
+                if _is_manager_role():
+                    ts.start_v3_manager()
+                if _is_runner_role():
+                    ts.start_v3_worker()
+            else:
+                set_scheduler(ts._scheduler)
+                ts.start_worker_loop()
+        except Exception as e:
+            import traceback, logging
+            logging.getLogger("sa.server").warning("scheduler start fallback: %s", e)
+    threading.Thread(target=_start_scheduler, daemon=True).start()
 
     yield
 

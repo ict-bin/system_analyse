@@ -726,6 +726,39 @@ def _get_agent_observability_snapshot_impl(
     )
 
 
+def _v3_notify_scheduler(action: str, task_id: str) -> dict | None:
+    """V3: 通知调度器 submit/cancel/restart。
+    本进程内有调度器单例(manager/all 角色)→直接调；否则 HTTP POST 到 manager 服务。
+    """
+    if not task_id:
+        return None
+    # 1) 本进程内调度器单例
+    try:
+        from app.service.scheduler_v3 import get_scheduler as _get_v3
+        s = _get_v3()
+        if s is not None:
+            if action == "submit":
+                return s.submit(task_id)
+            if action == "cancel":
+                return s.cancel(task_id)
+            if action == "restart":
+                return s.restart(task_id)
+    except Exception:
+        pass
+    # 2) HTTP 调 manager pod 的内部 sched API
+    import os
+    host = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_HOST", "secflow-app-system-analyse-worker")
+    port = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_HTTP_PORT", "8080"))
+    url = f"http://{host}:{port}/api/internal/sched/{action}"
+    try:
+        with httpx.Client(timeout=10) as c:
+            r = c.post(url, json={"task_id": task_id})
+            return r.json() if r.status_code < 500 else None
+    except Exception:
+        logger.warning("v3 notify scheduler (%s %s) via HTTP failed", action, task_id)
+        return None
+
+
 def _cleanup_task_owner_runner_agent_processes(*, db: Session, token: str, task_id: str, phase: str) -> dict[str, Any]:
     row = db.query(AppSaTask).filter(AppSaTask.task_id == task_id, AppSaTask.is_deleted.is_(False)).first()
     if row is None:
@@ -1163,7 +1196,7 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
             "secret": body.agent_task_key_secret,
             "source": body.agent_task_key_source,
         }
-    return svc.create_task(
+    created = svc.create_task(
         db,
         project_id=body.project_id,
         task_name=body.task_name,
@@ -1182,6 +1215,12 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         parent_stage_item_id=body.parent_stage_item_id,
         parent_stage_item_key=body.parent_stage_item_key,
     )
+    # V3: 通知调度器把新任务入内存队列（纯 TCP 派发）
+    try:
+        _v3_notify_scheduler("submit", created.get("task_id", ""))
+    except Exception:
+        logger.exception("v3 submit notify failed")
+    return created
 
 
 @router.get("/tasks", response_model=TaskListResponse)
@@ -1864,6 +1903,10 @@ def cancel_task(
         import traceback
         traceback.print_exc()
         logger.exception("failed to record aggregate cleanup event for cancelled task")
+    try:
+        _v3_notify_scheduler("cancel", task_id)
+    except Exception:
+        logger.exception("v3 cancel notify failed")
     return result
 
 
@@ -1876,7 +1919,12 @@ def restart_task(
     """Reset and restart an existing task in-place, reusing the same task ID."""
     _, token = user_and_token
     _cleanup_task_owner_runner_agent_processes(db=db, token=token, task_id=task_id, phase="restart_pre_task")
-    return get_task_service().restart_task(db, task_id)
+    result = get_task_service().restart_task(db, task_id)
+    try:
+        _v3_notify_scheduler("restart", task_id)
+    except Exception:
+        logger.exception("v3 restart notify failed")
+    return result
 
 
 @router.post("/tasks/{task_id}/resume", status_code=201)
