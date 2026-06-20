@@ -817,6 +817,102 @@ def _lightweight_result_json(row: AppSaTask, payload: dict | None, result_file: 
     }
 
 
+_DETAIL_STAGE_STEPS = [
+    {"key": "preprocess", "triggers": {"filter", "explore", "prescan"}},
+    {"key": "classify", "triggers": {"classify", "1"}},
+    {"key": "refine", "triggers": {"2", "2-reclassify", "2-redo", "2-sub"}},
+    {"key": "analyse", "triggers": {"3", "3-redo"}},
+    {"key": "report", "triggers": {"4", "4a", "4b", "4b-check"}},
+]
+
+
+def _normalize_stage_step_key(raw_stage: object) -> str | None:
+    text = str(raw_stage or "").strip()
+    if not text:
+        return None
+    for step in _DETAIL_STAGE_STEPS:
+        if text in step["triggers"]:
+            return str(step["key"])
+    return None
+
+
+def _build_lightweight_stages_payload(row: AppSaTask) -> dict[str, object]:
+    stages_payload = read_events(_events_path(row.output_path, row.task_id), row.stages_json) or {}
+    events = stages_payload.get("events") if isinstance(stages_payload, dict) else []
+    final = bool(stages_payload.get("final", False)) if isinstance(stages_payload, dict) else False
+    summary: dict[str, dict[str, object]] = {
+        str(step["key"]): {"start_ts": None, "end_ts": None, "status": "pending"}
+        for step in _DETAIL_STAGE_STEPS
+    }
+    latest_stage_data: dict[str, dict[str, object]] = {}
+    task_end_ts: float | None = None
+    last_event_ts: float | None = None
+    last_seen_index = -1
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        ts = event.get("ts")
+        try:
+            ts_value = float(ts)
+        except (TypeError, ValueError):
+            ts_value = None
+        if ts_value is not None:
+            last_event_ts = ts_value
+        event_type = str(event.get("type") or "").strip()
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        step_key = _normalize_stage_step_key(data.get("stage"))
+        if event_type == "task_end" and ts_value is not None:
+            task_end_ts = ts_value
+        if event_type == "stage" and step_key:
+            step_summary = summary.get(step_key)
+            if step_summary is not None and step_summary.get("start_ts") is None:
+                step_summary["start_ts"] = ts_value
+            for idx, step in enumerate(_DETAIL_STAGE_STEPS):
+                if step["key"] == step_key and idx > last_seen_index:
+                    last_seen_index = idx
+                    break
+        if event_type == "stage_result" and step_key:
+            latest_stage_data[step_key] = dict(data)
+    for idx, step in enumerate(_DETAIL_STAGE_STEPS):
+        step_key = str(step["key"])
+        step_summary = summary[step_key]
+        if step_summary["start_ts"] is None:
+            continue
+        next_start: float | None = task_end_ts
+        for j in range(idx + 1, len(_DETAIL_STAGE_STEPS)):
+            candidate = summary[str(_DETAIL_STAGE_STEPS[j]["key"])]["start_ts"]
+            if candidate is not None:
+                next_start = float(candidate)
+                break
+        step_summary["end_ts"] = next_start
+    task_status = str(row.status or "").strip()
+    if task_status == "passed":
+        for step_summary in summary.values():
+            step_summary["status"] = "completed"
+    elif task_status == "pending":
+        pass
+    elif last_seen_index < 0:
+        if task_status == "running":
+            summary["preprocess"]["status"] = "running"
+        elif task_status in {"failed", "error", "cancelled"}:
+            summary["preprocess"]["status"] = "failed"
+    else:
+        for idx, step in enumerate(_DETAIL_STAGE_STEPS):
+            step_key = str(step["key"])
+            if idx < last_seen_index:
+                summary[step_key]["status"] = "completed"
+            elif idx == last_seen_index:
+                summary[step_key]["status"] = "failed" if task_status in {"failed", "error", "cancelled"} else "running"
+    return {
+        "events": [],
+        "final": final,
+        "event_count": len(events) if isinstance(events, list) else 0,
+        "last_event_ts": last_event_ts,
+        "step_summary": summary,
+        "latest_stage_data": latest_stage_data,
+    }
+
+
 def _normalize_relative_session_path(path: str) -> str:
     parts = [part for part in str(path or "").replace("\\", "/").split("/") if part and part != "."]
     if not parts:
@@ -2801,10 +2897,7 @@ class TaskService:
             "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
             "error": row.error,
             "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
-            "stages_json": read_events(
-                _events_path(row.output_path, row.task_id),
-                row.stages_json,
-            ) if include_heavy else None,
+            "stages_json": _build_lightweight_stages_payload(row) if include_heavy else None,
             "task_config_json": row.task_config_json if include_heavy else None,
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),

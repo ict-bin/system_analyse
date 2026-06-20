@@ -303,6 +303,19 @@ class TaskEvaluationResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class TaskStageEventResponse(BaseModel):
+    ts: float
+    type: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskStageEventsResponse(BaseModel):
+    task_id: str
+    status: str
+    final: bool = False
+    events: list[TaskStageEventResponse] = Field(default_factory=list)
+
+
 class TaskTimelineEventResponse(BaseModel):
     id: str
     task_id: str
@@ -1846,6 +1859,28 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
 @router.get("/tasks/{task_id}/timeline", response_model=TaskTimelineResponse)
 def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_timeline(db, task_id)
+
+
+@router.get("/tasks/{task_id}/stage-events", response_model=TaskStageEventsResponse)
+def get_task_stage_events(task_id: str, db: Session = Depends(get_db)):
+    from app.db.models import AppSaTask
+    from app.service.event_log import events_path, read_events
+    from fastapi import HTTPException
+
+    row = db.query(AppSaTask).filter(
+        AppSaTask.task_id == task_id,
+        AppSaTask.is_deleted.is_(False),
+    ).first()
+    if not row:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    payload = read_events(events_path(row.output_path, task_id), row.stages_json) or {}
+    events = payload.get("events") if isinstance(payload, dict) else []
+    return {
+        "task_id": task_id,
+        "status": row.status,
+        "final": bool(payload.get("final", False)) if isinstance(payload, dict) else False,
+        "events": events if isinstance(events, list) else [],
+    }
 
 
 @router.delete("/tasks/{task_id}/timeline", response_model=TaskActionResponse)
