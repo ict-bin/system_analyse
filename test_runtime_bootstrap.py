@@ -86,6 +86,55 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, len(init_attempts))
         self.assertEqual(1, len(worker_loop_starts))
 
+    async def test_worker_loop_starts_only_once_when_runner_role_is_enabled(self):
+        bootstrap = RuntimeBootstrap(
+            pool_overrides=lambda svc: (1, 1, 1, 1),
+            should_run_migrations=lambda: False,
+        )
+        app = SimpleNamespace(include_router=lambda router: None)
+        worker_loop_starts = []
+
+        with patch("app.service.runtime_bootstrap.get_service_yaml", return_value=SimpleNamespace(
+            database=SimpleNamespace(url="mysql://", host="db", port=3306, name="sa"),
+            configcenter=SimpleNamespace(base_url="http://cc", timeout=1),
+            auth_service=SimpleNamespace(service_machine_token="token"),
+        )), patch(
+            "app.service.runtime_bootstrap.is_api_role",
+            return_value=False,
+        ), patch(
+            "app.service.runtime_bootstrap.is_dispatcher_role",
+            return_value=False,
+        ), patch(
+            "app.service.runtime_bootstrap.is_runner_role",
+            return_value=True,
+        ), patch(
+            "app.service.runtime_bootstrap.service_role",
+            return_value="runner",
+        ), patch(
+            "app.service.runtime_bootstrap.sync_providers_to_pi",
+            return_value=True,
+        ), patch(
+            "app.service.runtime_bootstrap.validate_pi_models_file",
+            return_value={"path": "/tmp/models.json", "provider_count": 1, "model_count": 1},
+        ), patch.object(
+            bootstrap,
+            "_init_db",
+            return_value=False,
+        ), patch.object(
+            bootstrap,
+            "_start_worker_loop",
+            side_effect=lambda: (worker_loop_starts.append(1), setattr(bootstrap._status, "worker_loop_ready", True)),
+        ):
+            bootstrap.start(app)
+            for _ in range(80):
+                if bootstrap.status()["ready"]:
+                    break
+                await asyncio.sleep(0.01)
+            bootstrap.stop()
+
+        self.assertEqual(1, len(worker_loop_starts))
+        self.assertTrue(bootstrap.status()["worker_loop_ready"])
+
 
 if __name__ == "__main__":
     unittest.main()

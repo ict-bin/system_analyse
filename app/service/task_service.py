@@ -91,6 +91,7 @@ RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS = max(
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, object] = {}
 _running_task_epochs: dict[str, int] = {}
+_running_tasks_guard = threading.Lock()
 
 
 @dataclass
@@ -104,6 +105,9 @@ class RunnerAssignmentRuntimeState:
     last_skipped_expired_lease_expires_at: str | None = None
     last_spawned_task_id: str | None = None
     last_spawned_lease_epoch: int | None = None
+    loop_running: bool = False
+    thread_alive: bool = False
+    loop_start_count: int = 0
 
     def snapshot(self) -> dict[str, object]:
         now_ts = _time.time()
@@ -120,6 +124,10 @@ class RunnerAssignmentRuntimeState:
             "runner_assignment_loop_last_skipped_expired_lease_expires_at": self.last_skipped_expired_lease_expires_at,
             "runner_assignment_loop_last_spawned_task_id": self.last_spawned_task_id,
             "runner_assignment_loop_last_spawned_lease_epoch": self.last_spawned_lease_epoch,
+            "runner_assignment_loop_running": self.loop_running,
+            "runner_assignment_thread_alive": self.thread_alive,
+            "runner_assignment_loop_start_count": self.loop_start_count,
+            "running_task_tracking_count": _running_tasks_count(),
             "runner_assignment_poll_interval_seconds": RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS,
         }
 
@@ -361,11 +369,11 @@ def _record_abnormal_reason(row: AppSaTask, reason: dict | None, *, changed: boo
 def get_worker_runtime_health() -> dict:
     if is_runner_role() and not is_manager_role():
         return {
-            "worker_running_tasks": len(_running_tasks),
+            "worker_running_tasks": _running_tasks_count(),
             "runtime_evidence_mode": _RUNTIME_EVIDENCE_MODE,
             **_runner_assignment_runtime_state.snapshot(),
         }
-    health = _get_dispatcher_runtime_health(len(_running_tasks))
+    health = _get_dispatcher_runtime_health(_running_tasks_count())
     if is_runner_role():
         health.update(_runner_assignment_runtime_state.snapshot())
     scheduler = get_scheduler()
@@ -383,11 +391,12 @@ def get_worker_runtime_health() -> dict:
 
 
 def get_runtime_tracking_snapshot() -> dict[str, int]:
-    return {
-        str(task_id): int(epoch)
-        for task_id, epoch in list(_running_task_epochs.items())
-        if str(task_id).strip()
-    }
+    with _running_tasks_guard:
+        return {
+            str(task_id): int(epoch)
+            for task_id, epoch in list(_running_task_epochs.items())
+            if str(task_id).strip()
+        }
 
 
 def get_worker_runtime_settings() -> dict:
@@ -403,6 +412,11 @@ def get_worker_runtime_settings() -> dict:
         "worker_global_claim_lock_key": GLOBAL_CLAIM_LOCK_KEY,
         "worker_global_claim_lock_timeout_seconds": GLOBAL_CLAIM_LOCK_TIMEOUT_SECONDS,
     }
+
+
+def _running_tasks_count() -> int:
+    with _running_tasks_guard:
+        return len(_running_tasks)
 
 
 def _task_execution_lock_path(output_path: str | None, task_id: str) -> Path | None:
@@ -1223,7 +1237,7 @@ class TaskService:
         self._task_repository = TaskRepository()
         self._runner_registry = init_runner_registry_service(
             get_db=get_db,
-            get_running_tasks_count=lambda: len(_running_tasks),
+            get_running_tasks_count=_running_tasks_count,
             cleanup_idle_runtime=lambda: self._runner.force_cleanup_all_agents(phase="idle_reaper"),
         )
         self._runner = TaskRunner(
@@ -1259,7 +1273,7 @@ class TaskService:
             spawn_task=self._on_task_claimed,
             record_timeline_event=self._record_timeline_event,
             select_dispatch_target=self._select_dispatch_target,
-            get_running_tasks_count=lambda: len(_running_tasks),
+            get_running_tasks_count=_running_tasks_count,
             load_runtime_control=self._load_runtime_control,
             task_repository=self._task_repository,
         )
@@ -1274,7 +1288,7 @@ class TaskService:
             cleanup_resume=_cleanup_resume_intermediate_files,
             select_dispatch_target=self._select_dispatch_target,
             claim_task_lease=self._claim_task_lease,
-            get_running_tasks_count=lambda: len(_running_tasks),
+            get_running_tasks_count=_running_tasks_count,
             build_should_recover=self._build_should_recover,
         )
         set_scheduler(self._scheduler)
@@ -2026,46 +2040,133 @@ class TaskService:
                 best_runner = item
         return str(best_runner["instance_id"]) if best_runner else None
 
-    def _run_task_locally(self, task_id: str, lease_epoch: int) -> None:
-        if task_id in _running_tasks:
-            old_epoch = _running_task_epochs.get(task_id)
-            if old_epoch == lease_epoch and _running_tasks[task_id].is_alive():
-                return
-            if old_epoch != lease_epoch:
-                logger.warning(
-                    "task %s lease_epoch changed (%s -> %s), removing stale execution to allow restart",
-                    task_id, old_epoch, lease_epoch,
+    def _run_task_locally(self, task_id: str, lease_epoch: int, project_id: str | None = None) -> None:
+        spawn_source = "scheduler_callback" if lease_epoch == 0 else "runner_assignment_loop"
+        with _running_tasks_guard:
+            existing_thread = _running_tasks.get(task_id)
+            existing_epoch = _running_task_epochs.get(task_id)
+            existing_alive = bool(existing_thread and existing_thread.is_alive())
+            if project_id:
+                self._record_timeline_event(
+                    task_id=task_id,
+                    project_id=project_id,
+                    event_type="task_local_spawn_started",
+                    message="准备在本地拉起任务执行线程",
+                    payload={
+                        "worker_instance_id": WORKER_INSTANCE_ID,
+                        "lease_epoch": lease_epoch,
+                        "thread_name": f"sa_task_{task_id}",
+                        "old_epoch": existing_epoch,
+                        "running_task_known": existing_thread is not None,
+                        "thread_alive": existing_alive,
+                        "source": spawn_source,
+                    },
                 )
+            if existing_thread is not None:
+                if existing_epoch == lease_epoch and existing_alive:
+                    if project_id:
+                        self._record_timeline_event(
+                            task_id=task_id,
+                            project_id=project_id,
+                            event_type="task_local_spawn_skipped_duplicate",
+                            message="检测到相同租约的本地活跃执行线程，跳过重复拉起",
+                            level="warning",
+                            payload={
+                                "worker_instance_id": WORKER_INSTANCE_ID,
+                                "lease_epoch": lease_epoch,
+                                "thread_name": existing_thread.name,
+                                "old_epoch": existing_epoch,
+                                "running_task_known": True,
+                                "thread_alive": True,
+                                "source": spawn_source,
+                            },
+                        )
+                    return
+                if existing_epoch != lease_epoch:
+                    logger.warning(
+                        "task %s lease_epoch changed (%s -> %s), removing stale execution to allow restart",
+                        task_id, existing_epoch, lease_epoch,
+                    )
+                    if project_id:
+                        self._record_timeline_event(
+                            task_id=task_id,
+                            project_id=project_id,
+                            event_type="task_local_spawn_replaced_stale_epoch",
+                            message="检测到本地旧租约记录，已替换为新的执行租约",
+                            level="warning",
+                            payload={
+                                "worker_instance_id": WORKER_INSTANCE_ID,
+                                "lease_epoch": lease_epoch,
+                                "thread_name": existing_thread.name,
+                                "old_epoch": existing_epoch,
+                                "running_task_known": True,
+                                "thread_alive": existing_alive,
+                                "source": spawn_source,
+                            },
+                        )
                 _running_tasks.pop(task_id, None)
                 _running_task_epochs.pop(task_id, None)
-            elif not _running_tasks[task_id].is_alive():
-                _running_tasks.pop(task_id, None)
-                _running_task_epochs.pop(task_id, None)
-        task_thread = threading.Thread(target=self._runner.execute_task, args=(task_id, lease_epoch), name=f"sa_task_{task_id}", daemon=True)
+            task_thread = threading.Thread(
+                target=self._runner.execute_task,
+                args=(task_id, lease_epoch),
+                name=f"sa_task_{task_id}",
+                daemon=True,
+            )
+            _running_tasks[task_id] = task_thread
+            _running_task_epochs[task_id] = lease_epoch
         task_thread.start()
-        _running_tasks[task_id] = task_thread
-        _running_task_epochs[task_id] = lease_epoch
+        if project_id:
+            self._record_timeline_event(
+                task_id=task_id,
+                project_id=project_id,
+                event_type="task_local_spawn_registered",
+                message="本地执行线程已注册并启动",
+                payload={
+                    "worker_instance_id": WORKER_INSTANCE_ID,
+                    "lease_epoch": lease_epoch,
+                    "thread_name": task_thread.name,
+                    "old_epoch": existing_epoch,
+                    "running_task_known": existing_thread is not None,
+                    "thread_alive": bool(existing_thread and existing_thread.is_alive()),
+                    "source": spawn_source,
+                },
+            )
 
     def _start_runner_assignment_loop(self) -> None:
         if self._runner_assignment_task and self._runner_assignment_task.is_alive():
+            _runner_assignment_runtime_state.loop_running = True
+            _runner_assignment_runtime_state.thread_alive = True
+            logger.warning(
+                "runner assignment loop already running: worker_instance_id=%s thread_name=%s",
+                WORKER_INSTANCE_ID,
+                self._runner_assignment_task.name,
+            )
             return
         self._runner_assignment_loop_running = True
-        self._runner_assignment_task = threading.Thread(target=
-            self._runner_assignment_loop(),
+        self._runner_assignment_task = threading.Thread(
+            target=self._runner_assignment_loop,
             name="sa_runner_assignment_loop",
+            daemon=True,
+        )
+        self._runner_assignment_task.start()
+        _runner_assignment_runtime_state.loop_running = True
+        _runner_assignment_runtime_state.thread_alive = True
+        _runner_assignment_runtime_state.loop_start_count += 1
+        logger.info(
+            "runner assignment loop started: worker_instance_id=%s thread_name=%s loop_start_count=%s",
+            WORKER_INSTANCE_ID,
+            self._runner_assignment_task.name,
+            _runner_assignment_runtime_state.loop_start_count,
         )
 
     def _stop_runner_assignment_loop(self) -> None:
         self._runner_assignment_loop_running = False
+        _runner_assignment_runtime_state.loop_running = False
         task = self._runner_assignment_task
         if task and task.is_alive():
-            pass  # thread cannot be cancelled
-            try:
-                task
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                pass
+            _runner_assignment_runtime_state.thread_alive = True
+            task.join(timeout=1.0)
+        _runner_assignment_runtime_state.thread_alive = False
         self._runner_assignment_task = None
 
     def _runner_assignment_loop(self) -> None:
@@ -2079,13 +2180,15 @@ class TaskService:
                 _runner_assignment_runtime_state.last_error = str(exc)
                 logger.warning("runner assignment loop failed: %s", exc, exc_info=True)
             time.sleep(RUNNER_ASSIGNMENT_POLL_INTERVAL_SECONDS)
+        _runner_assignment_runtime_state.loop_running = False
+        _runner_assignment_runtime_state.thread_alive = False
 
     def _poll_runner_assignments_once(self) -> None:
         db_gen = self._runner._deps.get_db()
         db: Session = next(db_gen)
         try:
             current_concurrency = 1
-            available_slots = max(0, current_concurrency - len(_running_tasks))
+            available_slots = max(0, current_concurrency - _running_tasks_count())
             if available_slots <= 0:
                 _runner_assignment_runtime_state.last_rows_seen = 0
                 return
@@ -2130,7 +2233,7 @@ class TaskService:
                     )
                     continue
                 lease_epoch = int(row.lease_epoch or 0)
-                self._run_task_locally(row.task_id, lease_epoch)
+                self._run_task_locally(row.task_id, lease_epoch, row.project_id)
                 _runner_assignment_runtime_state.last_spawned_task_id = row.task_id
                 _runner_assignment_runtime_state.last_spawned_lease_epoch = lease_epoch
         finally:
@@ -2141,8 +2244,9 @@ class TaskService:
 
     @staticmethod
     def _remove_running_task(task_id: str) -> None:
-        _running_tasks.pop(task_id, None)
-        _running_task_epochs.pop(task_id, None)
+        with _running_tasks_guard:
+            _running_tasks.pop(task_id, None)
+            _running_task_epochs.pop(task_id, None)
 
     @staticmethod
     def _acquire_execution_lock(

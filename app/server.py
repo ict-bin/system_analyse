@@ -162,21 +162,8 @@ async def lifespan(app: FastAPI):
         _ensure_probe_server_started()
     get_runtime_bootstrap(_db_pool_overrides, _should_run_db_migrations).start(app)
     # 挂载调度器内部 API
-    from .service.scheduler import create_scheduler_router, set_scheduler
+    from .service.scheduler import create_scheduler_router
     app.include_router(create_scheduler_router())
-    # 直接启动调度器和 worker loop (绕过 bootstrap 线程问题)
-    import threading
-    def _start_scheduler():
-        import time; time.sleep(3)
-        try:
-            from .service.task_service import get_task_service
-            ts = get_task_service()
-            set_scheduler(ts._scheduler)
-            ts.start_worker_loop()
-        except Exception as e:
-            import traceback, logging
-            logging.getLogger("sa.server").warning("scheduler start fallback: %s", e)
-    threading.Thread(target=_start_scheduler, daemon=True).start()
 
     yield
 
