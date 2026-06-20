@@ -26,6 +26,15 @@ def main() -> int:
     logger = logging.getLogger("sa.run_task")
 
     try:
+        # 任务子进程是全新进程，必须先初始化 DB engine（server 进程才在启动时 init_db）
+        from app.config import get_service_yaml
+        from app.db import init_db
+        svc = get_service_yaml()
+        init_db(svc.database.url, pool_size=svc.database.pool_size,
+                max_overflow=svc.database.max_overflow,
+                pool_timeout=svc.database.pool_timeout,
+                pool_recycle=svc.database.pool_recycle,
+                run_migrations=False)
         # 复用 TaskService 的完整依赖装配（DB/锁/配置/事件等）
         from app.service.task_service import get_task_service
         ts = get_task_service()
