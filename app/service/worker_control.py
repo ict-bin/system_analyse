@@ -244,10 +244,14 @@ class WorkerControl:
                 rc = rt.proc.poll()
                 if rc is None:
                     continue  # 仍在跑
-                # 任务子进程已退出
+                # 任务子进程已退出 —— 原子 claim：只有 reaper 抢到 current 才负责
+                # finalize + 上报终态。否则说明 cancel/restart/kill 已接管（它们已锁内
+                # 置 current=None 并会自发 CANCELLED），reaper 必须跳过，避免把用户取消
+                # 误覆盖成 STATE_FAILED，也避免重复 finalize_workspace。
                 with self._task_lock:
-                    if self._current is rt:
-                        self._current = None
+                    if self._current is not rt:
+                        continue
+                    self._current = None
                 normal = (rc == 0)
                 # 无论正常/异常：finalize 都要把本地 run 拷回 NFS + 清本地；
                 # 异常(被杀/崩溃)额外代归档 output/ (req 2)
