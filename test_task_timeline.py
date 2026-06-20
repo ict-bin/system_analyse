@@ -98,6 +98,88 @@ def test_get_timeline_returns_events_in_order():
     assert payload["events"][1]["payload_json"] == {"module_count": 3}
 
 
+def test_get_timeline_flattens_recorder_fields():
+    service = object.__new__(TaskService)
+    service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id)
+
+    rows = [
+        SimpleNamespace(
+            id="e1",
+            task_id="sat_1",
+            project_id="p1",
+            stage_name="1",
+            level="info",
+            event_type="stage_started",
+            message="阶段开始",
+            payload_json={
+                "module_count": 3,
+                "recorder": {
+                    "instance_id": "runner-a",
+                    "hostname": "sa-runner-a-host",
+                    "pod_name": "sa-runner-a",
+                    "node_name": "node-a",
+                    "pod_ip": "10.0.0.9",
+                    "role": "runner",
+                },
+            },
+            created_at=None,
+        ),
+    ]
+
+    payload = TaskService.get_timeline(service, _FakeDb(rows), "sat_1")
+
+    assert payload["events"][0]["recorder_instance_id"] == "runner-a"
+    assert payload["events"][0]["recorder_hostname"] == "sa-runner-a-host"
+    assert payload["events"][0]["recorder_pod_name"] == "sa-runner-a"
+    assert payload["events"][0]["recorder_node_name"] == "node-a"
+    assert payload["events"][0]["recorder_pod_ip"] == "10.0.0.9"
+    assert payload["events"][0]["recorder_role"] == "runner"
+
+
+def test_record_timeline_event_injects_recorder_metadata(monkeypatch):
+    captured = {}
+
+    class _FakeSession:
+        def add(self, event):
+            captured["event"] = event
+
+        def commit(self):
+            captured["committed"] = True
+
+        def rollback(self):
+            captured["rolled_back"] = True
+
+    def _fake_get_db():
+        yield _FakeSession()
+
+    monkeypatch.setattr("app.db.get_db", _fake_get_db, raising=False)
+    monkeypatch.setenv("SECFLOW_SYSTEM_ANALYSE_ROLE", "runner")
+    monkeypatch.setenv("POD_NAME", "sa-runner-1")
+    monkeypatch.setenv("HOSTNAME", "sa-runner-1")
+    monkeypatch.setenv("NODE_NAME", "node-1")
+    monkeypatch.setenv("POD_IP", "10.1.2.3")
+    monkeypatch.setattr("app.service.task_service.WORKER_INSTANCE_ID", "runner-1", raising=False)
+
+    TaskService._record_timeline_event(
+        task_id="sat_1",
+        project_id="p1",
+        event_type="task_started",
+        message="任务开始",
+        payload={"foo": "bar"},
+    )
+
+    event = captured["event"]
+    assert captured["committed"] is True
+    assert event.payload_json["foo"] == "bar"
+    assert event.payload_json["recorder"]["service"] == "system-analysis"
+    assert event.payload_json["recorder"]["instance_id"] == "runner-1"
+    assert event.payload_json["recorder"]["pod_name"] == "sa-runner-1"
+    assert event.payload_json["recorder"]["hostname"] == "sa-runner-1"
+    assert event.payload_json["recorder"]["node_name"] == "node-1"
+    assert event.payload_json["recorder"]["pod_ip"] == "10.1.2.3"
+    assert event.payload_json["recorder"]["role"] == "runner"
+
+
 def test_clear_timeline_deletes_all_events():
     service = object.__new__(TaskService)
     service._get_or_404 = lambda db, task_id: SimpleNamespace(task_id=task_id, project_id="p1")

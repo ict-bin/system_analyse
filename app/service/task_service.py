@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import socket
 import time as _time
 import time
 import uuid
@@ -188,6 +189,50 @@ def _sanitize_timeline_payload(payload: dict | None) -> dict | None:
             continue
         sanitized[str(key)] = _clip_timeline_payload_value(value)
     return sanitized or None
+
+
+def _timeline_runtime_role() -> str:
+    role = str(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ROLE") or "").strip().lower()
+    if role in {"runner", "worker", "scheduler", "api"}:
+        return role
+    if role == "manager":
+        return "worker"
+    return "api"
+
+
+def _build_timeline_recorder_metadata() -> dict[str, object]:
+    hostname = (os.environ.get("HOSTNAME") or socket.gethostname()).strip() or None
+    pod_name = (os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or socket.gethostname()).strip() or None
+    pod_ip = (
+        str(os.environ.get("POD_IP") or "").strip()
+        or str(os.environ.get("SA_POD_IP") or "").strip()
+        or None
+    )
+    instance_id = (
+        str(WORKER_INSTANCE_ID or "").strip()
+        or str(os.environ.get("WORKER_INSTANCE_ID") or "").strip()
+        or pod_name
+        or hostname
+    )
+    return {
+        "service": "system-analysis",
+        "role": _timeline_runtime_role(),
+        "instance_id": instance_id or None,
+        "hostname": hostname,
+        "pod_name": pod_name,
+        "node_name": str(os.environ.get("NODE_NAME") or "").strip() or None,
+        "pod_ip": pod_ip,
+    }
+
+
+def _merge_timeline_recorder_payload(payload: dict | None) -> dict[str, object]:
+    merged = dict(payload or {})
+    recorder = dict(merged.get("recorder") or {}) if isinstance(merged.get("recorder"), dict) else {}
+    for key, value in _build_timeline_recorder_metadata().items():
+        if value is not None:
+            recorder[key] = value
+    merged["recorder"] = recorder
+    return merged
 
 
 def _safe_isoformat(value: object) -> str | None:
@@ -1430,6 +1475,17 @@ class TaskService:
                     "message": event.message,
                     "payload": event.payload_json if isinstance(event.payload_json, dict) else None,
                     "payload_json": event.payload_json if isinstance(event.payload_json, dict) else None,
+                    "recorder_instance_id": event.payload_json.get("recorder", {}).get("instance_id") if isinstance(event.payload_json, dict) else None,
+                    "recorder_hostname": event.payload_json.get("recorder", {}).get("hostname") if isinstance(event.payload_json, dict) else None,
+                    "recorder_pod_name": event.payload_json.get("recorder", {}).get("pod_name") if isinstance(event.payload_json, dict) else None,
+                    "recorder_node_name": event.payload_json.get("recorder", {}).get("node_name") if isinstance(event.payload_json, dict) else None,
+                    "recorder_pod_ip": event.payload_json.get("recorder", {}).get("pod_ip") if isinstance(event.payload_json, dict) else None,
+                    "recorder_role": event.payload_json.get("recorder", {}).get("role") if isinstance(event.payload_json, dict) else None,
+                    "origin_instance_id": event.payload_json.get("event_origin", {}).get("instance_id") if isinstance(event.payload_json, dict) else None,
+                    "origin_hostname": event.payload_json.get("event_origin", {}).get("hostname") if isinstance(event.payload_json, dict) else None,
+                    "origin_pod_name": event.payload_json.get("event_origin", {}).get("pod_name") if isinstance(event.payload_json, dict) else None,
+                    "origin_node_name": event.payload_json.get("event_origin", {}).get("node_name") if isinstance(event.payload_json, dict) else None,
+                    "origin_role": event.payload_json.get("event_origin", {}).get("role") if isinstance(event.payload_json, dict) else None,
                     "created_at": isoformat_local(event.created_at),
                 }
                 for event in events
@@ -2838,6 +2894,7 @@ class TaskService:
         if not task_id or not project_id or not event_type or not message:
             return
         sanitized_payload = _sanitize_timeline_payload(payload)
+        sanitized_payload = _merge_timeline_recorder_payload(sanitized_payload)
         db_gen = None
         db: Session | None = None
         try:
