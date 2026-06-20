@@ -1803,6 +1803,7 @@ class TaskService:
             record_event=self._v3_record_event,
             claim_task=self._v3_claim_task,
             requeue_task=self._v3_requeue_task,
+            db_running_tasks=self._v3_db_running_tasks,
         )
         set_v3(sched)
         self._v3_scheduler = sched
@@ -1921,6 +1922,40 @@ class TaskService:
         except Exception:
             logger.exception("v3_requeue_task failed: %s", task_id)
             return False
+
+    def _v3_db_running_tasks(self) -> list:
+        """供 SchedulerV3 DB 兜底对账：返回所有 status=running 的任务及其派发时长(秒)。"""
+        out: list = []
+        try:
+            from app.db import get_db as _get_db
+            from app.db.models import AppSaTask
+            from app.time_utils import now_local
+            db_gen = _get_db(); db = next(db_gen)
+            try:
+                now = now_local()
+                rows = db.query(AppSaTask).filter(
+                    AppSaTask.is_deleted.is_(False),
+                    AppSaTask.status == "running",
+                ).all()
+                for r in rows:
+                    age = None
+                    ds = getattr(r, "dispatch_started_at", None)
+                    if ds is not None:
+                        try:
+                            age = (now - ds).total_seconds()
+                        except Exception:
+                            age = None
+                    out.append({
+                        "task_id": r.task_id,
+                        "dispatcher_instance_id": r.dispatcher_instance_id,
+                        "dispatch_age_s": age,
+                    })
+            finally:
+                try: next(db_gen)
+                except StopIteration: pass
+        except Exception:
+            logger.exception("v3_db_running_tasks failed")
+        return out
 
     # —— WorkerControl 回调：spawn 任务子进程 ——
     def _v3_claim_task(self, task_id: str, worker_id: str):

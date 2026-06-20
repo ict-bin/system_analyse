@@ -49,6 +49,10 @@ RECONCILE_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_RECONCIL
 MAX_WORKER_LOST_REQUEUE = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_MAX_REQUEUE", "3"))
 STATE_FILE = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_STATE_FILE", "/data/sa_scheduler_state.json")
 PERSIST_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PERSIST", "3"))
+# DB 兜底对账：周期扫描 DB status=running 但调度器内存(_running/_queue)无的"孤儿"任务
+# （上一任 manager 派发、rollout/重启丢失内存态）。有存活 worker 上报则收编，否则按 restart 重排。
+DB_RECONCILE_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_DB_RECONCILE", "30"))
+ORPHAN_GRACE_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ORPHAN_GRACE", "60"))
 
 
 @dataclass
@@ -92,6 +96,8 @@ class SchedulerV3:
         claim_task: Callable[[str, str], "int | None"] | None = None,
         # worker 失联时重置任务 DB 为 pending（以便重新认领重派）。返回是否成功。
         requeue_task: Callable[[str], bool] | None = None,
+        # DB 兜底对账：返回所有 status=running 的任务 [{task_id, dispatcher_instance_id, dispatch_age_s}]。
+        db_running_tasks: Callable[[], list] | None = None,
         bind: str = SCHED_BIND,
         port: int = SCHED_PORT,
         state_file: str = STATE_FILE,
@@ -100,6 +106,7 @@ class SchedulerV3:
         self._record = record_event or (lambda *a, **kw: None)
         self._claim_task = claim_task or (lambda tid, wid: 1)
         self._requeue_task = requeue_task or (lambda tid: True)
+        self._db_running_tasks = db_running_tasks or (lambda: [])
         self._bind = bind
         self._port = port
         self._state_file = Path(state_file)
@@ -129,7 +136,8 @@ class SchedulerV3:
         self._server_sock.bind((self._bind, self._port))
         self._server_sock.listen(64)
         for name, tgt in (("accept", self._accept_loop), ("dispatch", self._dispatch_loop),
-                          ("reconcile", self._reconcile_loop), ("persist", self._persist_loop)):
+                          ("reconcile", self._reconcile_loop), ("db_reconcile", self._db_reconcile_loop),
+                          ("persist", self._persist_loop)):
             t = threading.Thread(target=tgt, name=f"sa_v3_{name}", daemon=True)
             t.start()
             self._threads.append(t)
@@ -476,7 +484,85 @@ class SchedulerV3:
             except Exception:
                 logger.exception("finalize(worker_lost) failed: %s", tid)
 
-    # ── 内部 API（HTTP → 内存控制面；无 DB）──────────────────────────────────
+    # ── DB 兜底对账（孤儿 running 回收/收编；V3 实时 reconcile 只看内存，此处补 DB）──
+
+    def _db_reconcile_loop(self) -> None:
+        # 启动后先等一个心跳超时周期，让幸存 worker 重连并上报 reported_task，
+        # 避免把"内存暂无记录但 worker 仍在跑"的任务误判为孤儿。
+        if self._stop.wait(timeout=WORKER_HEARTBEAT_TIMEOUT):
+            return
+        while self._running_flag and not self._stop.wait(timeout=DB_RECONCILE_INTERVAL):
+            try:
+                self._db_reconcile_once()
+            except Exception as exc:
+                logger.exception("db_reconcile loop: %s", exc)
+
+    def _db_reconcile_once(self) -> None:
+        """对账 DB：status=running 但不在 _running/_queue 的任务。
+        有存活 worker 上报(reported_task) → 收编(adopt)进内存正常跟踪；
+        否则(owner 死/失联且派发已久) → 孤儿，按 restart 语义重排(带重试上限)。"""
+        try:
+            rows = self._db_running_tasks() or []
+        except Exception:
+            logger.exception("db_reconcile: query db_running_tasks failed")
+            return
+        now = _time.time()
+        adopt: list[tuple[str, str]] = []
+        orphan: list[str] = []
+        with self._lock:
+            tracked = set(self._running.keys()) | set(self._queue)
+            reported = {w.reported_task: w.worker_id
+                        for w in self._workers.values() if w.online and w.reported_task}
+            for row in rows:
+                tid = str(row.get("task_id") or "")
+                if not tid or tid in tracked:
+                    continue
+                wid = reported.get(tid)
+                if wid:
+                    adopt.append((tid, wid))
+                else:
+                    age = row.get("dispatch_age_s")
+                    if age is None or age >= ORPHAN_GRACE_SECONDS:
+                        orphan.append(tid)
+            for tid, wid in adopt:
+                self._running[tid] = RunRecord(task_id=tid, worker_id=wid, started_ts=now)
+                w = self._workers.get(wid)
+                if w is not None and w.current_task is None:
+                    w.current_task = tid
+            if adopt:
+                self._dirty = True
+        for tid, wid in adopt:
+            self._record_event_for(tid, "task_adopted",
+                                   f"DB 对账：收编存活 worker {wid} 上的运行任务（内存态缺失）",
+                                   "info", {"task_id": tid, "worker_id": wid})
+        # 锁外：孤儿 → 按 restart 语义重排（_requeue_task 已清空任务目录），带重试上限。
+        for tid in orphan:
+            cnt = self._requeue_counts.get(tid, 0) + 1
+            self._requeue_counts[tid] = cnt
+            if cnt <= MAX_WORKER_LOST_REQUEUE:
+                ok = False
+                try:
+                    ok = bool(self._requeue_task(tid))
+                except Exception:
+                    logger.exception("db_reconcile requeue failed: %s", tid)
+                if ok:
+                    with self._lock:
+                        if tid not in self._queue and tid not in self._running:
+                            self._queue.append(tid)
+                        self._dirty = True
+                    self._record_event_for(tid, "task_requeued",
+                                           f"DB 对账：孤儿运行任务(无内存态/无存活 worker)按 restart 重排(第{cnt}次)",
+                                           "warning", {"task_id": tid})
+            else:
+                self._requeue_counts.pop(tid, None)
+                self._record_event_for(tid, "task_failed",
+                                       "DB 对账：孤儿任务多次重排仍失败", "error", {"task_id": tid})
+                try:
+                    self._finalize(tid, proto.STATE_FAILED, "orphan_requeue_exhausted", None)
+                except Exception:
+                    logger.exception("db_reconcile finalize failed: %s", tid)
+
+    # ── 内部 API（HTTP → 内存控制面；无 DB）───────────────────────────────────
 
     def submit(self, task_id: str) -> dict:
         with self._lock:
