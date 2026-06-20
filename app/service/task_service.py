@@ -2086,9 +2086,16 @@ class TaskService:
         run_task_py = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "run_task.py")
         # /app/app/service/task_service.py → /app/run_task.py
         run_task_py = "/app/run_task.py"
+        # 捕获任务子进程 stdout/stderr 到日志文件以便调试快速失败 (V3 任务早期异常不易定位)
+        try:
+            os.makedirs("/tmp/sa_v3_logs", exist_ok=True)
+        except Exception:
+            pass
+        log_path = f"/tmp/sa_v3_logs/{task_id}.log"
+        log_f = open(log_path, "wb")
         return subprocess.Popen(
             [_sys.executable, run_task_py, task_id, str(int(lease_epoch or 0))],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=log_f, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
 
