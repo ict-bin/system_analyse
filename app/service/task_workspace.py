@@ -69,7 +69,7 @@ def setup_local_workspace(output_path: str, task_id: str) -> dict:
             try: nfs_run.unlink()
             except OSError: pass
         elif nfs_run.exists():
-            # 旧的真实 run 目录（restart/resume 残留）→ 移除（restart 语义已清；resume 另行处理）
+            # 旧的真实 run 目录（restart 残留）→ 移除（resume 已移除，一律从头运行）
             shutil.rmtree(str(nfs_run), ignore_errors=True)
         os.symlink(str(local_run), str(nfs_run))
         logger.info("task %s: NFS run -> local %s (symlink)", task_id, local_run)
@@ -111,8 +111,38 @@ def sync_for_frontend(output_path: str, task_id: str) -> None:
             f = local_run / "workspace" / fname
             if f.exists():
                 _safe_copy(f, nfs_root / "output" / fname)
+        # 智能体会话 + round 评估引用 → 真实 NFS run_live/（供前端跨 pod 读）。
+        # run/ 是指向 owner 本地的软链，API pod 跨 pod 读 run/sessions 是悬空的；
+        # 同步 sessions/*.jsonl + round_*/ 到 NFS run_live/，_task_*_root 执行中会优先用它。
+        live_root = nfs_root / "run_live"
+        sess_src = local_run / "sessions"
+        if sess_src.is_dir():
+            _sync_tree_incremental(sess_src, live_root / "sessions", suffixes=(".jsonl", ".json", ".md"))
+        for rnd in local_run.glob("round_*"):
+            if rnd.is_dir():
+                _sync_tree_incremental(rnd, live_root / rnd.name, suffixes=(".json",))
     except Exception:
         logger.exception("sync_for_frontend failed for %s", task_id)
+
+
+def _sync_tree_incremental(src: Path, dst: Path, *, suffixes: tuple[str, ...] | None = None) -> None:
+    """将 src 树增量复制到 dst（仅复制 dst 不存在或源更新的文件，避免每次全量拷）。"""
+    try:
+        for s in src.rglob("*"):
+            if not s.is_file():
+                continue
+            if suffixes and s.suffix not in suffixes:
+                continue
+            rel = s.relative_to(src)
+            d = dst / rel
+            try:
+                if d.exists() and d.stat().st_mtime >= s.stat().st_mtime and d.stat().st_size == s.stat().st_size:
+                    continue  # 已是最新，跳过
+            except OSError:
+                pass
+            _safe_copy(s, d)
+    except Exception:
+        logger.exception("sync tree failed: %s -> %s", src, dst)
 
 
 # ── finalize：产物回 NFS + 清本地 ─────────────────────────────────────────────
@@ -132,7 +162,7 @@ def finalize_workspace(output_path: str, task_id: str, normal: bool) -> None:
         # 2. 最后同步一次 events + 模块产物
         sync_for_frontend(output_path, task_id)
 
-        # 3. 把本地 run 拷回 NFS 真实 run/（保 .checkpoint/resume/archive），替换软链接
+        # 3. 把本地 run 拷回 NFS 真实 run/（保 archive），替换软链接
         try:
             if nfs_run.is_symlink():
                 nfs_run.unlink()

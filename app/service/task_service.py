@@ -27,10 +27,6 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.copy_utils import safe_copy2
 from app.config import load_service_config
-from app.task_version import (
-    ensure_task_format_version, get_task_root, is_task_format_compatible,
-    read_task_version, TASK_FORMAT_VERSION,
-)
 from app.db.models import AppSaTask, AppSaTaskEvent
 from app.logging_utils import log_event
 from app.service.config_service import get_worker_task_concurrency as _get_worker_task_concurrency_from_db
@@ -508,190 +504,6 @@ def _coerce_lock_text(value: object) -> str:
     return str(value or "").strip()
 
 
-def _cleanup_resume_intermediate_files(output_path: str | None, task_id: str) -> None:
-    """断点续做前清理上次中断留下的中间文件。
-
-    - modules/<mod>/deleted/ 存在 → 从快照恢复 files.list（含所有原始文件），删除 deleted/
-    - modules/<mod>/recover/ 存在 → 同上，删除 recover/
-    - workspace/deleted/（S1 级）→ 直接删除
-    - workspace/recover/（S1 级）→ 直接删除
-
-    快照优先：.s2_snapshots/<mod>.snapshot 包含 Worker 运行前的原始 files.list，
-    从快照恢复即可将 deleted 和 recover 的文件一并还原，无需逐条合并。
-    无快照时降级为手动追加（保证文件不丢失）。
-    """
-    if not output_path:
-        return
-    import shutil as _shutil
-    workspace = Path(output_path) / task_id / "run" / "workspace"
-    if not workspace.exists():
-        return
-    modules_dir = workspace / "modules"
-    snapshots_dir = workspace / ".s2_snapshots"
-
-    def _snapshot_candidates(mod_dir: Path) -> list[Path]:
-        return [
-            mod_dir / ".snapshot",
-            snapshots_dir / f"{mod_dir.name}.snapshot",
-        ]
-
-    # ── S2 级：逐模块清理 deleted/ 和 recover/ ────────────────────────────
-    if modules_dir.exists():
-        for mod_dir in sorted(modules_dir.iterdir()):
-            if not mod_dir.is_dir():
-                continue
-            deleted_dir = mod_dir / "deleted"
-            recover_dir = mod_dir / "recover"
-            if not deleted_dir.exists() and not recover_dir.exists():
-                continue
-            # 快照存在 → 直接恢复原始 files.list（自动覆盖 deleted/recover 内容）
-            restored_from_snapshot = False
-            for snapshot in _snapshot_candidates(mod_dir):
-                if not snapshot.exists() or not snapshot.is_file():
-                    continue
-                try:
-                    safe_copy2(str(snapshot), str(mod_dir / "files.list"))
-                    restored_from_snapshot = True
-                    break
-                except Exception:
-                    import traceback
-                    traceback.print_exc()
-                    pass
-            if not restored_from_snapshot:
-                # 无快照 → 手动将 deleted/ 和 recover/ 中的文件追加回 files.list
-                files_list_path = mod_dir / "files.list"
-                existing: set[str] = set()
-                if files_list_path.exists():
-                    existing = {
-                        ln.strip()
-                        for ln in files_list_path.read_text("utf-8", errors="replace").splitlines()
-                        if ln.strip()
-                    }
-                to_add: list[str] = []
-                for src in [deleted_dir / "files.list", recover_dir / "files.list"]:
-                    if src.exists():
-                        for ln in src.read_text("utf-8", errors="replace").splitlines():
-                            f = ln.strip()
-                            if f and f not in existing:
-                                existing.add(f)
-                                to_add.append(f)
-                if to_add:
-                    with open(str(files_list_path), "a", encoding="utf-8") as _f:
-                        _f.write("\n".join(to_add) + "\n")
-            # 删除中间目录
-            _shutil.rmtree(str(deleted_dir), ignore_errors=True)
-            _shutil.rmtree(str(recover_dir), ignore_errors=True)
-            logger.info(
-                "[resume-cleanup] %s: 清理中间文件 deleted/ recover/，已从快照恢复 files.list",
-                mod_dir.name,
-            )
-
-    # ── S1 级：workspace 根目录下的 deleted/ 和 recover/ ─────────────────
-    for d in [workspace / "deleted", workspace / "recover"]:
-        if d.exists():
-            _shutil.rmtree(str(d), ignore_errors=True)
-            logger.info("[resume-cleanup] S1 workspace/%s 已清理", d.name)
-
-
-def _module_dirs(workspace: Path) -> list[Path]:
-    modules_dir = workspace / "modules"
-    if not modules_dir.exists() or not modules_dir.is_dir():
-        return []
-    return sorted(path for path in modules_dir.iterdir() if path.is_dir() and not path.name.startswith("."))
-
-
-def _nonempty_files_list(path: Path) -> bool:
-    if not path.exists() or not path.is_file():
-        return False
-    try:
-        return any(line.strip() for line in path.read_text("utf-8", errors="replace").splitlines())
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def _inspect_resume_health(row: AppSaTask) -> dict:
-    from app.pipeline.checkpoint import CheckpointManager
-
-    result = {
-        "task_id": row.task_id,
-        "can_resume": False,
-        "reason": "",
-        "workspace": None,
-        "checkpoint_dir": None,
-        "warnings": [],
-        "missing_artifacts": [],
-        "last_completed_stage": None,
-    }
-    if not row.output_path:
-        result["reason"] = "no_output_path"
-        return result
-
-    workspace = Path(row.output_path) / row.task_id / "run" / "workspace"
-    checkpoint_dir = workspace / ".checkpoint"
-    result["workspace"] = str(workspace)
-    result["checkpoint_dir"] = str(checkpoint_dir)
-
-    if not workspace.exists():
-        result["reason"] = "workspace_missing"
-        result["missing_artifacts"].append(str(workspace))
-        return result
-    if not checkpoint_dir.exists():
-        result["reason"] = "no_checkpoint_dir"
-        result["missing_artifacts"].append(str(checkpoint_dir))
-        return result
-
-    cp = CheckpointManager(workspace)
-    summary = cp.load_summary()
-    result["last_completed_stage"] = summary.get("last_completed_stage")
-    if not cp.has_any_checkpoint():
-        result["reason"] = "empty_checkpoint_dir"
-        return result
-
-    filtered_files = workspace / "filtered_files.txt"
-    if not filtered_files.exists():
-        result["missing_artifacts"].append(str(filtered_files))
-
-    module_dirs = _module_dirs(workspace)
-    modules_root = workspace / "modules"
-    if summary["stages"].get("s1_classify", {}).get("done"):
-        if not module_dirs:
-            result["missing_artifacts"].append(str(modules_root))
-
-    if summary["stages"].get("s2_refine", {}).get("done"):
-        if not module_dirs:
-            result["missing_artifacts"].append(str(modules_root))
-        for module_dir in module_dirs:
-            files_list = module_dir / "files.list"
-            if not _nonempty_files_list(files_list):
-                result["missing_artifacts"].append(str(files_list))
-
-    if summary["stages"].get("s3_analyse", {}).get("done"):
-        report_missing = []
-        for module_dir in module_dirs:
-            files_list = module_dir / "files.list"
-            if not _nonempty_files_list(files_list):
-                continue
-            report_path = module_dir / "module_report.md"
-            if not report_path.exists():
-                report_missing.append(str(report_path))
-        result["missing_artifacts"].extend(report_missing)
-
-    if summary["stages"].get("s4_report", {}).get("done"):
-        final_report = Path(row.output_path) / row.task_id / "output" / "final_report.md"
-        if not final_report.exists():
-            result["missing_artifacts"].append(str(final_report))
-
-    if result["missing_artifacts"]:
-        result["reason"] = "missing_artifacts"
-        return result
-
-    result["can_resume"] = True
-    result["reason"] = "ok"
-    return result
-
-
 def _security_filter_log_payload(config: dict | None, *, resolved: bool = False) -> dict:
     cfg = config or {}
     return {
@@ -774,18 +586,35 @@ def _task_root(row: AppSaTask) -> Path | None:
     return Path(row.output_path) / row.task_id
 
 
-def _task_sessions_root(row: AppSaTask) -> Path | None:
+def _effective_run_root(row: AppSaTask) -> Path | None:
+    """返回可读的 run 根。执行中 run/ 是指向 owner 本地的软链（API pod 跨 pod 悬空），
+    此时优先用同步到 NFS 的 run_live/；finalize 后 run/ 是真实目录则用 run/。"""
     root = _task_root(row)
     if not root:
         return None
-    return root / "run" / "sessions"
+    run = root / "run"
+    live = root / "run_live"
+    try:
+        # run 是真实可读目录（finalize 后拷回）→ 最完整
+        if run.exists() and run.is_dir() and not run.is_symlink():
+            return run
+    except OSError:
+        pass
+    try:
+        if live.is_dir():
+            return live  # 执行中：同步副本（前端可见）
+    except OSError:
+        pass
+    return run
+
+
+def _task_sessions_root(row: AppSaTask) -> Path | None:
+    run_root = _effective_run_root(row)
+    return run_root / "sessions" if run_root else None
 
 
 def _task_run_root(row: AppSaTask) -> Path | None:
-    root = _task_root(row)
-    if not root:
-        return None
-    return root / "run"
+    return _effective_run_root(row)
 
 
 def _task_result_path(row: AppSaTask) -> Path | None:
@@ -1313,7 +1142,7 @@ class TaskService:
         self._dispatcher = WorkerDispatcher(
             get_db=get_db,
             clear_task_execution_lock=_clear_task_execution_lock,
-            cleanup_resume_files=_cleanup_resume_intermediate_files,
+            cleanup_resume_files=_remove_task_root_for_restart,
             claim_task_lease=self._claim_task_lease,
             spawn_task=self._on_task_claimed,
             record_timeline_event=self._record_timeline_event,
@@ -1330,7 +1159,7 @@ class TaskService:
             record_event=lambda task_id, project_id, event_type, message, level='info', payload=None: self._record_timeline_event(task_id=task_id, project_id=project_id, event_type=event_type, message=message, level=level, payload=payload),
             load_runtime_control=self._load_runtime_control,
             clear_task_lock=_clear_task_execution_lock,
-            cleanup_resume=_cleanup_resume_intermediate_files,
+            cleanup_resume=_remove_task_root_for_restart,
             select_dispatch_target=self._select_dispatch_target,
             claim_task_lease=self._claim_task_lease,
             get_running_tasks_count=_running_tasks_count,
@@ -1864,104 +1693,6 @@ class TaskService:
                   task_id=task_id, project_id=row.project_id)
         return self._row_to_dict(row)
 
-    def resume_task(self, db: Session, task_id: str) -> dict:
-        """断点续跑：保留已有 workspace 和 .checkpoint/ 目录，系统自动从中断处继续。"""
-        from fastapi import HTTPException
-        row = self._get_or_404(db, task_id)
-        previous_status = str(row.status or "")
-        if row.status in ("pending", "running"):
-            self._record_task_operation_event(
-                task_id=row.task_id,
-                project_id=row.project_id,
-                operation="resume_task",
-                event_type="task_operation_rejected",
-                message="任务续跑被拒绝",
-                level="error",
-                payload={
-                    "reason": "task_active",
-                    "status": previous_status,
-                    "before_status": previous_status,
-                    "after_status": previous_status,
-                    "changed": False,
-                },
-            )
-            raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
-        # ── 任务格式版本校验 ────────────────────────────────────────────────
-        task_root = get_task_root(row.output_path, task_id)
-        if task_root is not None:
-            compatible, existing, required = is_task_format_compatible(task_root)
-            if not compatible:
-                self._record_task_operation_event(
-                    task_id=row.task_id,
-                    project_id=row.project_id,
-                    operation="resume_task",
-                    event_type="task_operation_rejected",
-                    message="任务续跑被拒绝：任务格式版本不兼容",
-                    level="error",
-                    payload={
-                        "reason": "task_version_mismatch",
-                        "existing_version": existing,
-                        "required_version": required,
-                        "status": previous_status,
-                        "before_status": previous_status,
-                        "after_status": previous_status,
-                        "changed": False,
-                    },
-                )
-                raise HTTPException(
-                    400,
-                    f"任务格式版本不兼容（任务版本: {existing or '无'}，当前版本: {required}）。"
-                    f"目录格式已变更（.snapshot 强制规范化为纯文件），请使用 restart 重新创建任务。",
-                )
-        health = _inspect_resume_health(row)
-        if not health["can_resume"]:
-            missing = health.get("missing_artifacts") or []
-            hint = f" 缺失产物: {', '.join(missing[:6])}" if missing else ""
-            self._record_task_operation_event(
-                task_id=row.task_id,
-                project_id=row.project_id,
-                operation="resume_task",
-                event_type="task_operation_rejected",
-                message="任务续跑被拒绝",
-                level="error",
-                payload={
-                    "reason": str(health.get("reason") or "resume_not_allowed"),
-                    "status": previous_status,
-                    "before_status": previous_status,
-                    "after_status": previous_status,
-                    "changed": False,
-                    "missing_artifacts": missing,
-                },
-            )
-            raise HTTPException(400, f"断点不可续跑: {health['reason']}。请使用重启（restart）代替续跑。{hint}")
-        row = self._task_repository.resume_task_in_place(db, row)
-        row.latest_abnormal_reason_json = None
-        flag_modified(row, "latest_abnormal_reason_json")
-        db.commit()
-        db.refresh(row)
-        _clear_task_execution_lock(row.output_path, task_id)
-        _cleanup_resume_intermediate_files(row.output_path, task_id)
-        self._record_task_operation_event(
-            task_id=task_id,
-            project_id=row.project_id,
-            operation="resume_task",
-            event_type="task_resumed",
-            message="任务已续跑",
-            payload={
-                "before_status": previous_status,
-                "after_status": str(row.status or ""),
-                "changed": previous_status != str(row.status or ""),
-                "analysis_mode": _infer_analysis_mode(row),
-            },
-        )
-        log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
-                  task_id=task_id, project_id=row.project_id)
-        return self._row_to_dict(row)
-
-    def get_resume_check(self, db: Session, task_id: str) -> dict:
-        row = self._get_or_404(db, task_id)
-        return _inspect_resume_health(row)
-
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         previous_status = str(row.status or "")
@@ -2149,32 +1880,44 @@ class TaskService:
             pass
 
     def _v3_requeue_task(self, task_id: str) -> bool:
-        """worker 失联(非任务失败) → 重置任务 DB 为 pending（清 dispatcher/finished/error），
-        以便 claim_task_lease(仅认领 pending) 重新认领重派。lease_epoch 保留(下次 claim 自增)。
-        返回是否成功。已终态(passed/cancelled)的不重排。"""
+        """worker 失联/瞬时拒绝 → 以 restart 语义重排（resume 断点续做已彻底移除）。
+        处理：重置 DB 为 pending（清 dispatcher/finished/error/result）+ 彻底清空任务目录
+        (workspace/output/events/.task_version 等)，以保证下一次派发从头运行。
+        rollout/worker_lost 一律走 restart。返回是否成功。已终态(passed/cancelled)的不重排。"""
         try:
             from app.db import get_db as _get_db
             db_gen = _get_db()
             db = next(db_gen)
+            output_path = None
             try:
                 row = self._task_repository.get_task(db, task_id)
                 if row is None:
                     return False
                 if str(row.status or "") in ("passed", "cancelled"):
                     return False
+                output_path = row.output_path
                 row.status = "pending"
                 row.dispatcher_instance_id = None
+                row.dispatch_started_at = None
                 row.finished_at = None
                 row.error = None
+                row.result_json = None
                 try:
                     row.lease_expires_at = None
                 except Exception:
                     pass
                 db.commit()
-                return True
             finally:
                 try: next(db_gen)
                 except StopIteration: pass
+            # restart 语义：彻底清空任务目录(含 events.jsonl/run/output/.task_version)，
+            # 确保重派后从头运行，无任何断点续做残留。
+            try:
+                _remove_task_root_for_restart(output_path, task_id)
+                _clear_task_execution_lock(output_path, task_id)
+            except Exception:
+                logger.exception("v3_requeue_task restart-cleanup failed: %s", task_id)
+            return True
         except Exception:
             logger.exception("v3_requeue_task failed: %s", task_id)
             return False
