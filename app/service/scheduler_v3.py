@@ -82,12 +82,17 @@ class SchedulerV3:
         *,
         finalize_task: Callable[[str, str, "str | None", Any], None] | None = None,
         record_event: Callable[..., None] | None = None,
+        # 分发时一次性 DB 认领（设 status=running/dispatcher/lease_epoch），
+        # 桥接 execute_task 的预期 + 让前端 DB 状态实时；非实时心跳/回收依赖。
+        # 返回认领到的 lease_epoch（int）或 None（失败）。调度器把该 epoch 放入 RUN 命令。
+        claim_task: Callable[[str, str], "int | None"] | None = None,
         bind: str = SCHED_BIND,
         port: int = SCHED_PORT,
         state_file: str = STATE_FILE,
     ) -> None:
         self._finalize = finalize_task or (lambda tid, state, err, result: None)
         self._record = record_event or (lambda *a, **kw: None)
+        self._claim_task = claim_task or (lambda tid, wid: 1)
         self._bind = bind
         self._port = port
         self._state_file = Path(state_file)
@@ -329,7 +334,18 @@ class SchedulerV3:
             self._running[task_id] = RunRecord(task_id=task_id, worker_id=w.worker_id, started_ts=_time.time())
             conn = w.sock
             self._dirty = True
-        sent = self._send(conn, proto.msg_run(task_id, lease_epoch=0)) if conn is not None else False
+        sent = False
+        lease_epoch = self._claim_task(task_id, w.worker_id)
+        if not lease_epoch:
+            # 认领失败（状态已变/并发）→ 不下发
+            with self._lock:
+                self._running.pop(task_id, None)
+                ww = self._workers.get(w.worker_id)
+                if ww is not None and ww.current_task == task_id:
+                    ww.current_task = None
+                self._dirty = True
+            return
+        sent = self._send(conn, proto.msg_run(task_id, lease_epoch=lease_epoch)) if conn is not None else False
         self._record_event_for(task_id, "task_dispatched", f"任务已下发 worker={w.worker_id}", "info",
                                {"worker_id": w.worker_id})
         if not sent:
