@@ -44,6 +44,9 @@ SCHED_PORT = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PORT", "8090"))
 DISPATCH_POLL_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_POLL", "2"))
 WORKER_HEARTBEAT_TIMEOUT = max(10.0, float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WORKER_HB_TIMEOUT", "30")))
 RECONCILE_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_RECONCILE", "5"))
+# worker 失联(非任务失败)时重排上限：rollout/pod 重启/网络抖动 → 重派重跑；
+# 超过上限才判 failed，避免 worker 反复死亡时无限重排。
+MAX_WORKER_LOST_REQUEUE = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_MAX_REQUEUE", "3"))
 STATE_FILE = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_STATE_FILE", "/data/sa_scheduler_state.json")
 PERSIST_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PERSIST", "3"))
 
@@ -87,6 +90,8 @@ class SchedulerV3:
         # 桥接 execute_task 的预期 + 让前端 DB 状态实时；非实时心跳/回收依赖。
         # 返回认领到的 lease_epoch（int）或 None（失败）。调度器把该 epoch 放入 RUN 命令。
         claim_task: Callable[[str, str], "int | None"] | None = None,
+        # worker 失联时重置任务 DB 为 pending（以便重新认领重派）。返回是否成功。
+        requeue_task: Callable[[str], bool] | None = None,
         bind: str = SCHED_BIND,
         port: int = SCHED_PORT,
         state_file: str = STATE_FILE,
@@ -94,6 +99,7 @@ class SchedulerV3:
         self._finalize = finalize_task or (lambda tid, state, err, result: None)
         self._record = record_event or (lambda *a, **kw: None)
         self._claim_task = claim_task or (lambda tid, wid: 1)
+        self._requeue_task = requeue_task or (lambda tid: True)
         self._bind = bind
         self._port = port
         self._state_file = Path(state_file)
@@ -101,6 +107,7 @@ class SchedulerV3:
         self._queue: deque[str] = deque()
         self._running: dict[str, RunRecord] = {}
         self._workers: dict[str, WorkerConn] = {}
+        self._requeue_counts: dict[str, int] = {}
         self._lock = threading.RLock()
 
         self._running_flag = False
@@ -282,6 +289,9 @@ class SchedulerV3:
                 if state in (proto.STATE_FINISHED, proto.STATE_FAILED, proto.STATE_CANCELLED):
                     rec.finished_ts = _time.time()
                     finished = True
+            if state in (proto.STATE_FINISHED, proto.STATE_FAILED, proto.STATE_CANCELLED):
+                # 任务到达终态 → 清除重排计数
+                self._requeue_counts.pop(task_id, None)
             self._dirty = True
         self._record_event_for(task_id, "worker_task_state",
                                f"worker {wid} 任务 {task_id} 状态={state}", "info",
@@ -378,7 +388,7 @@ class SchedulerV3:
 
     def _reconcile_once(self) -> None:
         now = _time.time()
-        requeue: list[str] = []
+        lost: list[tuple[str, str]] = []
         with self._lock:
             for w in self._workers.values():
                 if w.online and now - w.last_heartbeat > WORKER_HEARTBEAT_TIMEOUT:
@@ -395,21 +405,47 @@ class SchedulerV3:
                     # worker 在线：以其心跳上报的 reported_task 为准判断是否真在跑该任务
                     owner_alive = (w.reported_task == tid)
                 if not owner_alive:
-                    rec.state = proto.STATE_FAILED
                     rec.error = "worker_lost"
-                    requeue.append(tid)
-            for tid in requeue:
+                    lost.append((tid, rec.worker_id))
+            to_requeue: list[str] = []
+            to_fail: list[str] = []
+            for tid, wid in lost:
                 self._running.pop(tid, None)
-                if tid not in self._queue:
-                    self._queue.append(tid)
+                ww = self._workers.get(wid)
+                if ww is not None and ww.current_task == tid:
+                    ww.current_task = None
+                cnt = self._requeue_counts.get(tid, 0) + 1
+                self._requeue_counts[tid] = cnt
+                if cnt <= MAX_WORKER_LOST_REQUEUE:
+                    to_requeue.append(tid)
+                else:
+                    to_fail.append(tid)
             dead = [wid for wid, w in self._workers.items()
                     if not w.online and w.current_task is None and now - w.last_heartbeat > WORKER_HEARTBEAT_TIMEOUT * 4]
             for wid in dead:
                 self._workers.pop(wid, None)
-            if requeue or dead:
+            if lost or dead:
                 self._dirty = True
-        for tid in requeue:
-            self._record_event_for(tid, "task_requeued", "worker 失联，任务重新排队", "warning", {"task_id": tid})
+        # 锁外：worker 失联(非任务失败) → 重置 DB 为 pending + 重排重跑；超重试上限才 failed。
+        for tid in to_requeue:
+            ok = False
+            try:
+                ok = bool(self._requeue_task(tid))
+            except Exception:
+                logger.exception("requeue_task(reset pending) failed: %s", tid)
+            if ok:
+                with self._lock:
+                    if tid not in self._queue and tid not in self._running:
+                        self._queue.append(tid)
+                    self._dirty = True
+                self._record_event_for(tid, "task_requeued",
+                                       f"worker 失联，任务重排重跑(第{self._requeue_counts.get(tid, 0)}次)",
+                                       "warning", {"task_id": tid})
+            else:
+                to_fail.append(tid)
+        for tid in to_fail:
+            self._requeue_counts.pop(tid, None)
+            self._record_event_for(tid, "task_failed", "worker 多次失联，任务失败", "error", {"task_id": tid})
             try:
                 self._finalize(tid, proto.STATE_FAILED, "worker_lost", None)
             except Exception:

@@ -2015,6 +2015,7 @@ class TaskService:
             finalize_task=self._v3_finalize,
             record_event=self._v3_record_event,
             claim_task=self._v3_claim_task,
+            requeue_task=self._v3_requeue_task,
         )
         set_v3(sched)
         self._v3_scheduler = sched
@@ -2090,6 +2091,37 @@ class TaskService:
             self._record_timeline_event(task_id=task_id, event_type=event_type, message=message, level=level, payload=payload)
         except Exception:
             pass
+
+    def _v3_requeue_task(self, task_id: str) -> bool:
+        """worker 失联(非任务失败) → 重置任务 DB 为 pending（清 dispatcher/finished/error），
+        以便 claim_task_lease(仅认领 pending) 重新认领重派。lease_epoch 保留(下次 claim 自增)。
+        返回是否成功。已终态(passed/cancelled)的不重排。"""
+        try:
+            from app.db import get_db as _get_db
+            db_gen = _get_db()
+            db = next(db_gen)
+            try:
+                row = self._task_repository.get_task(db, task_id)
+                if row is None:
+                    return False
+                if str(row.status or "") in ("passed", "cancelled"):
+                    return False
+                row.status = "pending"
+                row.dispatcher_instance_id = None
+                row.finished_at = None
+                row.error = None
+                try:
+                    row.lease_expires_at = None
+                except Exception:
+                    pass
+                db.commit()
+                return True
+            finally:
+                try: next(db_gen)
+                except StopIteration: pass
+        except Exception:
+            logger.exception("v3_requeue_task failed: %s", task_id)
+            return False
 
     # —— WorkerControl 回调：spawn 任务子进程 ——
     def _v3_claim_task(self, task_id: str, worker_id: str):

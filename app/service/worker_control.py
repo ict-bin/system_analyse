@@ -204,6 +204,10 @@ class WorkerControl:
         killed_normal = False
         try:
             self._terminate_proc(rt.proc)
+            # 先把 CANCELLED 报给调度器：finalize_workspace 的 copytree 回拷可能很慢(数十秒)，
+            # 若等它做完再上报，期间 worker 心跳已报 task=None，会被 reconcile 误判 worker_lost
+            # → 覆盖成 FAILED。故先报终态(调度器立即从 running map 移除)，再慢慢 finalize。
+            self._send(proto.msg_task_state(self._worker_id, task_id, proto.STATE_CANCELLED))
             # 任务被杀 → 控制进程代归档 + 本地 run 拷回 NFS + 清本地 (req 2)
             if rt.output_path:
                 task_workspace.finalize_workspace(rt.output_path, task_id, normal=False)
@@ -211,7 +215,6 @@ class WorkerControl:
                 self._archive(task_id, normal=False)
         finally:
             self._cleanup_pod(f"cancel:{task_id}")
-        self._send(proto.msg_task_state(self._worker_id, task_id, proto.STATE_CANCELLED))
 
     def _on_restart(self, task_id: str, lease_epoch: int) -> None:
         # 重启 = 杀旧 + 清理 + 重新 spawn（同一 task_id 新 lease_epoch）
@@ -253,6 +256,12 @@ class WorkerControl:
                         continue
                     self._current = None
                 normal = (rc == 0)
+                state = proto.STATE_FINISHED if normal else proto.STATE_FAILED
+                err = None if normal else f"task_subprocess_exit={rc}"
+                # 先上报终态：finalize_workspace 的 copytree 回拷可能很慢，期间 worker 心跳
+                # 已报 task=None，若等 finalize 做完再上报会被 reconcile 误判 worker_lost。
+                # 故先报终态(调度器立即从 running map 移除)，再做 finalize + 任务后清理。
+                self._send(proto.msg_task_state(self._worker_id, rt.task_id, state, error=err))
                 # 无论正常/异常：finalize 都要把本地 run 拷回 NFS + 清本地；
                 # 异常(被杀/崩溃)额外代归档 output/ (req 2)
                 try:
@@ -264,9 +273,6 @@ class WorkerControl:
                     logger.exception("finalize_workspace failed: %s", rt.task_id)
                 # 任务后清理 pod 进程 (req 6)
                 self._cleanup_pod(f"post_task:{rt.task_id}")
-                state = proto.STATE_FINISHED if normal else proto.STATE_FAILED
-                err = None if normal else f"task_subprocess_exit={rc}"
-                self._send(proto.msg_task_state(self._worker_id, rt.task_id, state, error=err))
             except Exception:
                 logger.exception("reaper loop failed")
 
