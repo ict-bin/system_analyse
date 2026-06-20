@@ -456,7 +456,33 @@ class SchedulerV3:
             if rec is not None:
                 return {"task_id": task_id, "status": rec.state, "worker_id": rec.worker_id,
                         "started_ts": rec.started_ts, "error": rec.error}
-        return {"task_id": task_id, "status": "unknown"}
+        # 内存中未找到（已完成/已 cancelled/未知）→ DB 回退，保障前端显示
+        return self._db_task_status(task_id)
+
+    def _db_task_status(self, task_id: str) -> dict:
+        try:
+            from app.db import get_db
+            from app.db.models import AppSaTask
+            from app.time_utils import now_local as _now
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                row = db.query(AppSaTask).filter_by(task_id=task_id).first()
+                if row is None:
+                    return {"task_id": task_id, "status": "unknown"}
+                d = {"task_id": task_id, "status": row.status,
+                     "started_at": row.started_at.isoformat() if row.started_at else None,
+                     "finished_at": row.finished_at.isoformat() if row.finished_at else None}
+                if row.error: d["error"] = row.error
+                if row.result_json and isinstance(row.result_json, dict):
+                    d["module_count"] = row.result_json.get("module_count")
+                return d
+            finally:
+                try: next(db_gen)
+                except StopIteration: pass
+        except Exception as exc:
+            logger.warning("db_task_status fallback failed: %s", exc)
+            return {"task_id": task_id, "status": "unknown"}
 
     def cluster_status(self) -> dict:
         with self._lock:
