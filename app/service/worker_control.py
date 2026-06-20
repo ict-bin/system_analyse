@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.service import sched_proto as proto
+from app.service import task_workspace
 from app.service.scheduler import cleanup_task_processes, _build_protected_set
 
 logger = logging.getLogger("sa.worker_control")
@@ -34,6 +35,7 @@ SCHEDULER_HOST = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_HOST", "secflow-ap
 SCHEDULER_PORT = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PORT", "8090"))
 RECONNECT_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WC_RECONNECT", "5"))
 HEARTBEAT_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WC_HEARTBEAT", "10"))
+SYNC_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WC_SYNC_INTERVAL", "10"))
 TASK_BIN = os.environ.get("SECFLOW_SYSTEM_ANALYSE_TASK_PYTHON", sys.executable)  # 跑任务子进程的解释器
 WORKER_ID = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or f"sa-runner-{os.getpid()}"
 WORKER_IP = os.environ.get("SA_POD_IP") or os.environ.get("POD_IP") or ""
@@ -55,6 +57,7 @@ class WorkerControl:
         *,
         spawn_task_subprocess: Callable[[str, int], subprocess.Popen] | None = None,
         archive_task: Callable[[str, bool], None] | None = None,
+        output_path_getter: Callable[[str], "str | None"] | None = None,
         scheduler_host: str = SCHEDULER_HOST,
         scheduler_port: int = SCHEDULER_PORT,
         worker_id: str = WORKER_ID,
@@ -63,6 +66,7 @@ class WorkerControl:
         # 默认 spawn 实现由 wiring 注入（避免本模块直接依赖 TaskRunner/DB）
         self._spawn = spawn_task_subprocess
         self._archive = archive_task or (lambda task_id, normal: None)
+        self._get_output_path = output_path_getter or (lambda task_id: None)
         self._host = scheduler_host
         self._port = scheduler_port
         self._worker_id = worker_id
@@ -79,6 +83,7 @@ class WorkerControl:
         self._net_thread: threading.Thread | None = None      # 收命令
         self._hb_thread: threading.Thread | None = None       # 上报心跳
         self._reaper_thread: threading.Thread | None = None   # 回收任务子进程
+        self._sync_thread: threading.Thread | None = None     # 执行中定期同步前端文件到 NFS
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
 
@@ -93,6 +98,8 @@ class WorkerControl:
         self._hb_thread.start()
         self._reaper_thread = threading.Thread(target=self._reaper_loop, name="sa_wc_reaper", daemon=True)
         self._reaper_thread.start()
+        self._sync_thread = threading.Thread(target=self._sync_loop, name="sa_wc_sync", daemon=True)
+        self._sync_thread.start()
         logger.info("WorkerControl started: worker_id=%s scheduler=%s:%s", self._worker_id, self._host, self._port)
 
     def stop(self) -> None:
@@ -100,7 +107,7 @@ class WorkerControl:
         self._stop.set()
         self._kill_current_task(reason="worker_control_stop")
         self._close_sock()
-        for t in (self._net_thread, self._hb_thread, self._reaper_thread):
+        for t in (self._net_thread, self._hb_thread, self._reaper_thread, self._sync_thread):
             if t:
                 t.join(timeout=3)
 
@@ -170,13 +177,20 @@ class WorkerControl:
                 return
             # 任务前清理 pod 进程（白名单：探针 + 控制主进程）(req 6)
             self._cleanup_pod(f"pre_task:{task_id}")
+            # NFS→本地软链：任务重 I/O 落本地盘，避 NFS 阻塞 (req 1)
+            output_path = self._get_output_path(task_id)
+            if output_path:
+                try:
+                    task_workspace.setup_local_workspace(output_path, task_id)
+                except Exception:
+                    logger.exception("setup_local_workspace failed: %s", task_id)
             try:
                 proc = self._spawn(task_id, lease_epoch)
             except Exception as exc:
                 logger.exception("spawn task subprocess failed: %s", task_id)
                 self._send(proto.msg_task_state(self._worker_id, task_id, proto.STATE_FAILED, error=f"spawn_failed: {exc}"))
                 return
-            self._current = RunningTask(task_id=task_id, lease_epoch=lease_epoch, proc=proc)
+            self._current = RunningTask(task_id=task_id, lease_epoch=lease_epoch, proc=proc, output_path=output_path)
         self._send(proto.msg_task_state(self._worker_id, task_id, proto.STATE_STARTING))
 
     def _on_cancel(self, task_id: str) -> None:
@@ -190,8 +204,11 @@ class WorkerControl:
         killed_normal = False
         try:
             self._terminate_proc(rt.proc)
-            # 任务被杀 → 控制进程代归档 (req 2)
-            self._archive(task_id, normal=False)
+            # 任务被杀 → 控制进程代归档 + 本地 run 拷回 NFS + 清本地 (req 2)
+            if rt.output_path:
+                task_workspace.finalize_workspace(rt.output_path, task_id, normal=False)
+            else:
+                self._archive(task_id, normal=False)
         finally:
             self._cleanup_pod(f"cancel:{task_id}")
         self._send(proto.msg_task_state(self._worker_id, task_id, proto.STATE_CANCELLED))
@@ -209,6 +226,8 @@ class WorkerControl:
             return
         try:
             self._terminate_proc(rt.proc)
+            if rt.output_path:
+                task_workspace.finalize_workspace(rt.output_path, rt.task_id, normal=False)
         except Exception:
             logger.exception("kill current task failed: %s", rt.task_id)
         finally:
@@ -230,12 +249,15 @@ class WorkerControl:
                     if self._current is rt:
                         self._current = None
                 normal = (rc == 0)
-                # 正常退出 → 任务自己应已归档；非正常(被杀/崩溃) → 控制进程代归档 (req 2)
+                # 无论正常/异常：finalize 都要把本地 run 拷回 NFS + 清本地；
+                # 异常(被杀/崩溃)额外代归档 output/ (req 2)
                 try:
-                    if not normal:
+                    if rt.output_path:
+                        task_workspace.finalize_workspace(rt.output_path, rt.task_id, normal=normal)
+                    elif not normal:
                         self._archive(rt.task_id, normal=False)
                 except Exception:
-                    logger.exception("archive(代) failed: %s", rt.task_id)
+                    logger.exception("finalize_workspace failed: %s", rt.task_id)
                 # 任务后清理 pod 进程 (req 6)
                 self._cleanup_pod(f"post_task:{rt.task_id}")
                 state = proto.STATE_FINISHED if normal else proto.STATE_FAILED
@@ -247,6 +269,17 @@ class WorkerControl:
     def _peek_current(self) -> RunningTask | None:
         with self._task_lock:
             return self._current
+
+    # —— 执行中定期同步前端文件本地→NFS (req 3) ——
+    def _sync_loop(self) -> None:
+        while self._running and not self._stop.wait(timeout=SYNC_INTERVAL):
+            try:
+                with self._task_lock:
+                    rt = self._current
+                if rt is not None and rt.output_path:
+                    task_workspace.sync_for_frontend(rt.output_path, rt.task_id)
+            except Exception:
+                logger.exception("sync_loop failed")
 
     # ── 心跳上报 (req 3) ────────────────────────────────────────────────────
 

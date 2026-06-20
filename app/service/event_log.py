@@ -143,6 +143,16 @@ def read_events(
     if path is not None and path.is_file():
         return _parse_jsonl(path)
 
+    # V3 同步副本回退：run/ 被软链到 runner 本地时，API pod 读 {out_dir}/run/events.jsonl 是悬空软链；
+    # 控制器会把 events 同步到 {out_dir}/events.jsonl（真实 NFS），这里回退读它。
+    if path is not None:
+        try:
+            synced = path.parent.parent / "events.jsonl"   # {out_dir}/run/events.jsonl -> {out_dir}/events.jsonl
+            if synced.is_file():
+                return _parse_jsonl(synced)
+        except (OSError, ValueError):
+            pass
+
     # DB 回退：兼容尚未迁移的旧任务 or output_path 为 None 的任务
     if isinstance(fallback_stages_json, dict):
         return {

@@ -2031,9 +2031,25 @@ class TaskService:
         wc = WorkerControl(
             spawn_task_subprocess=self._v3_spawn,
             archive_task=self._v3_archive,
+            output_path_getter=self._v3_get_output_path,
         )
         self._v3_worker_control = wc
         wc.start()
+
+    def _v3_get_output_path(self, task_id: str):
+        """查 DB 拿任务 output_path（控制器做 NFS↔本地桥接用）。"""
+        try:
+            from app.db import get_db as _get_db
+            db_gen = _get_db(); db = next(db_gen)
+            try:
+                row = self._task_repository.get_task(db, task_id)
+                return row.output_path if row else None
+            finally:
+                try: next(db_gen)
+                except StopIteration: pass
+        except Exception:
+            logger.exception("v3_get_output_path failed: %s", task_id)
+            return None
 
     def stop_v3_worker(self) -> None:
         wc = getattr(self, "_v3_worker_control", None)
