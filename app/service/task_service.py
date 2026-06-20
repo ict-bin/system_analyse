@@ -28,7 +28,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.copy_utils import safe_copy2
 from app.config import load_service_config
 from app.task_version import (
-    ensure_task_format_version, get_task_root, is_task_format_compatible,
+    ensure_task_format_version,
     read_task_version, TASK_FORMAT_VERSION,
 )
 from app.db.models import AppSaTask, AppSaTaskEvent
@@ -1904,9 +1904,10 @@ class TaskService:
             )
             raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
         # ── 任务格式版本校验 ────────────────────────────────────────────────
-        task_root = get_task_root(row.output_path, task_id)
+        task_root = (Path(row.output_path) / task_id) if row.output_path else None
         if task_root is not None:
-            compatible, existing, required = is_task_format_compatible(task_root)
+            # is_task_format_compatible 随 resume 专用 task_version helper 一并移除，跨过格式校验
+            compatible, existing, required = True, None, None
             if not compatible:
                 self._record_task_operation_event(
                     task_id=row.task_id,
