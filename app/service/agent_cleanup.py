@@ -39,6 +39,41 @@ def _iter_agent_processes_for_cleanup() -> list[dict[str, Any]]:
     proc_root = pathlib.Path("/proc")
     current_pid = os.getpid()
     current_pgid = os.getpgrp()
+    # 保护服务自身的关键进程。V3 架构下任务跑在独立的 run_task 子进程，
+    # current_pid 仅代表 run_task，不是承载 worker/probe 的主 uvicorn 进程。
+    # 主进程 comm==python3 会被 is_python_runtime 匹配，若不保护，run_cleanup 会
+    # 无条件 killpg 掉主进程组 → 容器重启 → worker_lost。
+    # 故额外保护：主进程 pid（/tmp/secflow-main.pid）+ 其进程组 + run_task 祖先链。
+    protected_pids: set[int] = {1, current_pid}
+    protected_pgids: set[int] = {current_pgid}
+    try:
+        _main_raw = open(
+            os.environ.get("SECFLOW_MAIN_PID_FILE", "/tmp/secflow-main.pid"),
+            "r", encoding="utf-8",
+        ).read().strip()
+        _main_pid = int(_main_raw)
+        if _main_pid > 0:
+            protected_pids.add(_main_pid)
+            try:
+                protected_pgids.add(os.getpgid(_main_pid))
+            except OSError:
+                pass
+    except (OSError, ValueError):
+        pass
+    # run_task 的祖先链（父→主进程/入口脚本）也须受保护
+    try:
+        _p = os.getppid()
+        _seen: set[int] = set()
+        while _p and _p > 1 and _p not in _seen:
+            _seen.add(_p)
+            protected_pids.add(_p)
+            try:
+                _parts = open(f"/proc/{_p}/stat", "r", encoding="utf-8").read().rsplit(")", 1)[-1].split()
+                _p = int(_parts[1]) if len(_parts) > 1 else 0  # ppid is field 4 (index 1 after the ')')
+            except (OSError, ValueError, IndexError):
+                break
+    except Exception:
+        pass
     for proc_dir in proc_root.iterdir():
         if not proc_dir.name.isdigit():
             continue
@@ -46,7 +81,7 @@ def _iter_agent_processes_for_cleanup() -> list[dict[str, Any]]:
             pid = int(proc_dir.name)
         except ValueError:
             continue
-        if pid in {1, current_pid}:
+        if pid in protected_pids:
             continue
         try:
             comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
@@ -66,9 +101,9 @@ def _iter_agent_processes_for_cleanup() -> list[dict[str, Any]]:
         is_python_runtime = comm.lower() in {"python", "python3"} or exe.lower().startswith("python")
         if not is_pi_runtime and not is_python_runtime:
             continue
-        # Never signal the service's own process group. Python helpers sharing that
-        # group are killed by PID; pi-created sessions retain group cleanup.
-        safe_pgid = pgid if pgid is not None and pgid != current_pgid else None
+        # Never signal the service's own / main process group. Python helpers sharing
+        # a protected group are killed by PID only; pi-created sessions retain group cleanup.
+        safe_pgid = pgid if pgid is not None and pgid not in protected_pgids else None
         session_arg_path = None
         if "--session" in cmdline:
             try:
