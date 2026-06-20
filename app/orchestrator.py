@@ -42,7 +42,6 @@ try:
     from .pipeline.super_fast_mode import build_super_fast_pipeline
 except ImportError:
     build_super_fast_pipeline = None
-from .pipeline.checkpoint import CheckpointManager
 from .task_version import ensure_task_format_version
 from .pipeline.helpers import (
     discover_modules, get_modules_root,
@@ -258,7 +257,6 @@ class Orchestrator:
             tokens=tokens,
             evaluator=evaluator,
             cancel_event=self._cancel_event,
-            checkpoint=CheckpointManager(workspace),
             # ── 预处理阶段目录（在 orchestrator 层统一初始化，保证永不为 None）───────
             details_dir=workspace / "details",
             classify_context_path=workspace / "classify_context.md",

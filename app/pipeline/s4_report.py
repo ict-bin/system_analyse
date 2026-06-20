@@ -162,15 +162,9 @@ class CompletenessCheckStage(BaseStage):
     stage_name = "完整性检查"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        # ── checkpoint 跳过 ──────────────────────────────────────────────────
-        if cp and cp.is_done("s4_completeness"):
-            ctx.emit_event("log", level="info",
-                           msg="[S4a-Completeness] checkpoint已完成，跳过")
-            return
         if not getattr(cfg, "enable_final_check", False):
             ctx.emit_event("stage", stage="4a", skipped=True, reason="disabled")
             return
@@ -225,10 +219,6 @@ class CompletenessCheckStage(BaseStage):
 
         if not s4a_pass and missing_modules:
             self._redo_missing(ctx, missing_modules)
-
-        # ── 写 checkpoint ────────────────────────────────────────────────────────
-        if cp := ctx.checkpoint:
-            cp.mark_done("s4_completeness")
 
     # ── 补做缺失模块的 Stage 2+3 ──────────────────────────────────────────
     def _redo_missing(self, ctx: PipelineContext, missing_modules: list[str]) -> None:
@@ -383,7 +373,6 @@ class FinalReportStage(BaseStage):
     stage_name = "生成报告"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
         final_out_dir = ctx.final_out_dir
@@ -426,17 +415,6 @@ class FinalReportStage(BaseStage):
                 from .helpers import discover_modules as _dm  # noqa
                 return
 
-            # ── checkpoint 跳过（checkpoint + final_report.md 双重确认） ────────────
-            if cp and cp.is_done("s4_report"):
-                report_dst = final_out_dir / "final_report.md"
-                if report_dst.exists():
-                    ctx.final_report_path = str(report_dst)
-                    ctx.emit_event("log", level="info",
-                                   msg="[S4b-Report] checkpoint已完成，跳过")
-                    # 直接进入后处理（并不跳过。级处理将在后面执行）
-                    # 不 return，需要继续进行论文归档等后处理
-                    return
-
             # ── 程序化最终报告合并 ─────────────────────────────────────────────
             # 最终报告不再由 LLM 生成/评审驱动，避免全局 Judge 失败导致所有模块集体重做。
             # 模块级质量问题应在 S3 的 per-module Judge 中解决；这里仅确定性合并
@@ -453,8 +431,6 @@ class FinalReportStage(BaseStage):
             if not (workspace / "final_report.md").exists():
                 raise StageError("Stage 4b 程序化最终报告合并失败，final_report.md 未生成")
             _ensure_report_generation_marker(workspace / "final_report.md", "program")
-            if cp:
-                cp.mark_done("s4_report", generation="program", module_count=len(report_modules))
 
         # ── 组装输出目录 ──────────────────────────────────────────────────────
         final_mods = discover_modules(str(workspace))

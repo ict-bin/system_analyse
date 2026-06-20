@@ -30,13 +30,6 @@ TASK_FORMAT_VERSION = "2.0"
 _VERSION_FILE_NAME = ".task_version"
 
 
-def get_task_root(output_path: str | None, task_id: str) -> Path | None:
-    """从 output_path + task_id 推导任务根目录。"""
-    if not output_path:
-        return None
-    return Path(output_path) / task_id
-
-
 def read_task_version(task_root: Path) -> str | None:
     """读取任务目录中记录的版本号，不存在返回 None。"""
     version_file = task_root / _VERSION_FILE_NAME
@@ -56,21 +49,6 @@ def _major_version(version: str | None) -> int:
         return int(version.strip().lstrip("vV").split(".")[0])
     except (ValueError, IndexError):
         return 0
-
-
-def is_task_format_compatible(task_root: Path) -> tuple[bool, str | None, str | None]:
-    """检查任务目录格式是否与当前版本兼容。
-
-    Returns:
-        (compatible, existing_version, required_version)
-        兼容时返回 (True, version, version)，不兼容返回 (False, existing, required)
-    """
-    existing = read_task_version(task_root)
-    if existing is None:
-        return False, None, TASK_FORMAT_VERSION
-    if _major_version(existing) != _major_version(TASK_FORMAT_VERSION):
-        return False, existing, TASK_FORMAT_VERSION
-    return True, existing, TASK_FORMAT_VERSION
 
 
 def ensure_task_format_version(task_root: Path) -> None:

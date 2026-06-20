@@ -706,7 +706,7 @@ class TaskRunner:
                 svc.security_focus_categories = tcfg["security_focus_categories"]
             if tcfg.get("module_granularity"):
                 svc.module_granularity = tcfg["module_granularity"]
-            # 断点续跑由文件系统 .checkpoint/ 驱动，不再读取 start_stage/resume_workspace
+            # resume(断点续做)已移除：不读取 start_stage/resume_workspace，任务始终从头运行
             if tcfg.get("filter_engine"):
                 svc.filter_engine = tcfg["filter_engine"]
             if "enable_final_check" in tcfg:
@@ -715,7 +715,7 @@ class TaskRunner:
                 svc.continue_on_module_failure = bool(tcfg["continue_on_module_failure"])
             if "super_fast_mode" in tcfg:
                 svc.super_fast_mode = bool(tcfg["super_fast_mode"])
-            # 断点续跑由文件系统 .checkpoint/ 驱动，不再读取 start_stage/resume_workspace
+            # resume(断点续做)已移除：不读取 start_stage/resume_workspace，任务始终从头运行
             if row.output_path:
                 svc.output_dir = row.output_path
                 svc.archive_dir = row.output_path

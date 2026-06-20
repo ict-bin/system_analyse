@@ -330,17 +330,10 @@ class RefineStage(BaseStage):
         return not (mod_dir / ".snapshot").exists()
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         self._reset()
         self._ctx = ctx
         cfg = ctx.cfg
         workspace = ctx.workspace
-
-        if cp and cp.is_done("s2_refine"):
-            ctx.refined_modules = discover_modules(str(workspace))
-            ctx.emit_event("log", level="info",
-                           msg=f"[S2] checkpoint 已完成，跳过({len(ctx.refined_modules)}个模块)")
-            return
 
         all_modules = discover_modules(str(workspace))
         for mod in all_modules:
@@ -380,16 +373,9 @@ class RefineStage(BaseStage):
             raise self._errors[0]
 
         # 全局完整性检查
-        if not (cp and cp.is_done("s2_global_check")):
-            self._global_completeness_check()
-            if cp:
-                cp.mark_done("s2_global_check")
-        else:
-            ctx.emit_event("log", level="info", msg="[S2] 全局检查 checkpoint 已完成，跳过")
+        self._global_completeness_check()
 
         ctx.refined_modules = discover_modules(str(workspace))
-        if cp:
-            cp.mark_done("s2_refine", module_count=len(ctx.refined_modules))
 
     # ── LLM Worker (并行) ──────────────────────────────────────────────────
     def _llm_worker(self) -> None:
@@ -483,10 +469,6 @@ class RefineStage(BaseStage):
                         self._queue.put(nm)
 
                 self._refined.add(mod_name)
-                cp = ctx.checkpoint if ctx else None
-                if cp:
-                    cp.mark_done(f"s2_modules/{mod_name}",
-                                 split=was_split, new_modules=new_ones)
             except Exception as exc:
                 ctx.emit_event("log", level="error",
                                msg=f"[S2] 提交失败 {mod_name}: {exc}")
@@ -497,7 +479,6 @@ class RefineStage(BaseStage):
     # ── 单模块 LLM 处理 ────────────────────────────────────────────────────
     def _refine_one(self, mod_name: str) -> None:
         ctx = self._ctx
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
         s_cfg = cfg.stages.refine
@@ -513,14 +494,6 @@ class RefineStage(BaseStage):
             ctx.emit_event("log", level="warn", msg=f"[跳过] {mod_name} 0 文件，移除空模块")
             shutil.rmtree(str(mod_dir), ignore_errors=True)
             return
-
-        # checkpoint skip
-        if cp and cp.is_done(f"s2_modules/{mod_name}"):
-            if not self._module_refine_artifacts_valid(workspace, mod_name):
-                cp.clear(f"s2_modules/{mod_name}")
-            else:
-                self._refined.add(mod_name)
-                return
 
         refine_session = ctx.session_path("refine", f"{mod_name}.jsonl")
 
@@ -713,8 +686,6 @@ class RefineStage(BaseStage):
                     # 无变动 — 但如果被其他模块 merge 过，仍需走 commit
                     # 已在 _llm_worker finally 中处理
                     self._refined.add(mod_name)
-                    if cp:
-                        cp.mark_done(f"s2_modules/{mod_name}", split=False, new_modules=[])
                 return
 
             if voted_pass:
@@ -743,8 +714,6 @@ class RefineStage(BaseStage):
                     self._commit_queue.put((mod_dir, was_split, new_ones))
                 else:
                     self._refined.add(mod_name)
-                    if cp:
-                        cp.mark_done(f"s2_modules/{mod_name}", split=False, new_modules=[])
                 return
 
         raise StageError(f"Stage 2 模块 {mod_name} 细分未通过，已达最大轮数")

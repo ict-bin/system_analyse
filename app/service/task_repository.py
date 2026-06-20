@@ -180,38 +180,6 @@ class TaskRepository:
         return row
 
     @staticmethod
-    def resume_task_in_place(db: Session, row: AppSaTask) -> AppSaTask:
-        """断点续跑：保留 workspace 和 .checkpoint/，不设置 start_stage/resume_workspace。
-
-        与旧版的区别：
-        - 不清除 started_at（续跑保留原始开始时间）
-        - 不清除 stages_json（续跑保留历史事件流）
-        - 不向 task_config_json 写入 start_stage/resume_workspace
-        - 断点由文件系统 .checkpoint/ 目录驱动，无需 DB 字段控制
-        """
-        clean_config = {
-            k: v for k, v in (row.task_config_json or {}).items()
-            if k not in ("start_stage", "resume_workspace", "resolved_config_snapshot")
-        } or None
-        row.task_config_json = clean_config
-        row.status = "pending"
-        row.finished_at = None
-        row.result_json = None
-        row.error = None
-        row.dispatcher_instance_id = None
-        row.dispatch_started_at = None
-        row.lease_expires_at = None
-        # 保留 started_at 和 stages_json（续跑不重置历史）
-        flag_modified(row, "task_config_json")
-        db.commit()
-        db.refresh(row)
-        _invalidate_slot_summary_for_project(row.project_id)
-        # 续跑保留 events.jsonl（历史日志续写），但删除文件末尾的 __FINAL__ 标记。
-        # 这样新运行的事件就展现为未完成状态，避免 final=True 误报。
-        strip_final_marker(events_path(row.output_path, row.task_id))
-        return row
-
-    @staticmethod
     def cancel_task_in_place(db: Session, row: AppSaTask) -> AppSaTask:
         row.status = "cancelled"
         row.finished_at = now_local()

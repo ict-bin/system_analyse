@@ -28,27 +28,6 @@ from .filter_engine import (
 from .helpers import run_agent_with_stage_guard, load_prompt
 
 
-def _restore_filtered_files(ctx: PipelineContext) -> None:
-    """从磁盘恢复 ctx.filtered_files / ctx.filter_count（checkpoint跳过时使用）。"""
-    workspace = ctx.workspace
-    for fname in ("filtered_files.txt", ".filtered_backup.txt"):
-        p = workspace / fname
-        if p.exists():
-            lines = [l.strip() for l in p.read_text("utf-8", errors="replace").splitlines() if l.strip()]
-            if lines:
-                ctx.filtered_files = lines
-                ctx.filter_count = len(lines)
-                return
-
-
-def _restore_prescan_summary(ctx: PipelineContext) -> None:
-    """从磁盘恢复 ctx.prescan_summary（checkpoint跳过时使用）。"""
-    workspace = ctx.workspace
-    summary_file = workspace / "keyword_summary.txt"
-    if summary_file.exists():
-        ctx.prescan_summary = summary_file.read_text("utf-8", errors="replace")
-
-
 def _count_input_files(target_dir: str) -> int:
     path = Path(target_dir)
     if not path.exists():
@@ -65,23 +44,13 @@ class FilterStage(BaseStage):
     stage_name = "文件过滤"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
         ctx.selected_filter_engine = normalize_filter_engine(getattr(cfg, "filter_engine", "script"))
         ctx.effective_filter_engine = "script"
 
-        # ── checkpoint 跳过 ───────────────────────────────────────────────
-        if cp and cp.is_done("s0_filter"):
-            _restore_filtered_files(ctx)
-            ctx.emit_event("log", level="info",
-                           msg=f"[S0-Filter] checkpoint已完成，跳过（{ctx.filter_count}个文件）")
-            return
-
         filter_script = "/app/scripts/filter_files.sh"
         if not os.path.isfile(filter_script):
-            if cp:
-                cp.mark_done("s0_filter", file_count=0, skipped="no_script")
             return
 
         types_str = " ".join(cfg.analyse_targets)
@@ -192,9 +161,6 @@ class FilterStage(BaseStage):
                        effective_engine=ctx.effective_filter_engine,
                        fallback_reason=ctx.filter_fallback_reason)
 
-        # ── 写 checkpoint ────────────────────────────────────────────────────
-        if cp:
-            cp.mark_done("s0_filter", file_count=ctx.filter_count)
 
 
 class ExploreStage(BaseStage):
@@ -204,19 +170,11 @@ class ExploreStage(BaseStage):
     stage_name = "探索目录"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        # ── checkpoint 跳过 ───────────────────────────────────────────────
-        if cp and cp.is_done("s0_explore"):
-            ctx.emit_event("log", level="info", msg="[S0-Explore] checkpoint已完成，跳过")
-            return
-
         explore_prompt = load_prompt(cfg, "step1_explore", "workers")
         if not explore_prompt:
-            if cp:
-                cp.mark_done("s0_explore", skipped="no_prompt")
             return
 
         explore_model = ctx.wm("explore")
@@ -281,9 +239,6 @@ class ExploreStage(BaseStage):
 
         ctx.emit_event("stage_result", stage="explore")
 
-        # ── 写 checkpoint ────────────────────────────────────────────────────
-        if cp:
-            cp.mark_done("s0_explore")
 
 
 class PrescanStage(BaseStage):
@@ -293,28 +248,17 @@ class PrescanStage(BaseStage):
     stage_name = "预扫描"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
 
-        # ── checkpoint 跳过 ───────────────────────────────────────────────
-        if cp and cp.is_done("s0_prescan"):
-            _restore_prescan_summary(ctx)
-            ctx.emit_event("log", level="info", msg="[S0-Prescan] checkpoint已完成，跳过")
-            return
-
         keywords_file = workspace / "keywords.txt"
         if not keywords_file.exists():
-            if cp:
-                cp.mark_done("s0_prescan", skipped="no_keywords")
             return
 
         prescan_script = "/app/scripts/prescan_files.py"
         if not os.path.isfile(prescan_script):
             prescan_script = "/app/scripts/prescan_files.sh"
         if not os.path.isfile(prescan_script):
-            if cp:
-                cp.mark_done("s0_prescan", skipped="no_script")
             return
 
         ctx.emit_event("stage", stage="prescan")
@@ -337,6 +281,3 @@ class PrescanStage(BaseStage):
 
         ctx.emit_event("stage_result", stage="prescan",
                        summary_lines=ctx.prescan_summary.count("\n"))
-        # ── 写 checkpoint ────────────────────────────────────────────────────
-        if cp:
-            cp.mark_done("s0_prescan")

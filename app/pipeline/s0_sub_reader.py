@@ -313,17 +313,8 @@ class SubReaderStage(BaseStage):
     stage_name = "文件预读"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
-
-        # ── checkpoint 跳过（整体）───────────────────────────────────────
-        # ctx.details_dir 和 ctx.classify_context_path 已由 orchestrator 初始化，无需重赋
-        if cp and cp.is_done("s0_sub_reader"):
-            ctx.emit_event("log", level="info",
-                           msg=f"[S0-SubReader] checkpoint 已完成，跳过"
-                               f"（details 目录: {ctx.details_dir}）")
-            return
 
         # ── details/ 目录始终提前创建（保证目录可见，即使后续 early return）────
         # ctx.details_dir 已由 orchestrator 初始化为正确路径，直接使用
@@ -337,14 +328,10 @@ class SubReaderStage(BaseStage):
         if not ff.exists():
             ctx.emit_event("log", level="warn",
                            msg="[S0-SubReader] filtered_files.txt 不存在，跳过")
-            if cp:
-                cp.mark_done("s0_sub_reader", skipped="no_filtered_files")
             return
 
         files = [l.strip() for l in ff.read_text(encoding="utf-8").splitlines() if l.strip()]
         if not files:
-            if cp:
-                cp.mark_done("s0_sub_reader", skipped="empty_file_list")
             return
 
         ctx.emit_event("stage", stage="sub_reader", file_count=len(files))
@@ -395,10 +382,6 @@ class SubReaderStage(BaseStage):
 
         ctx.emit_event("stage_result", stage="sub_reader",
                        total=len(files), processed=processed, skipped=skipped)
-        if cp:
-            cp.mark_done("s0_sub_reader",
-                         total=len(files),
-                         processed=processed)
 
     def _llm_supplement(
         self,

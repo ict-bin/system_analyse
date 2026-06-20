@@ -64,7 +64,6 @@ class SecurityFocusFilterStage(BaseStage):
     stage_name = "安全维度过滤"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         sec_cats: list[str] = getattr(cfg, "security_focus_categories", ["all"])
 
@@ -76,14 +75,6 @@ class SecurityFocusFilterStage(BaseStage):
         if not do_security_filter and not do_useless_filter:
             ctx.emit_event("log", level="info",
                            msg="[S1.5] 安全过滤=all 且 无用模块过滤=False，跳过")
-            return
-
-        # ── checkpoint 跳过 ───────────────────────────────────────────────────
-        if cp and cp.is_done("s1_security_filter"):
-            ctx.classified_modules = discover_modules(str(ctx.workspace))
-            ctx.emit_event("log", level="info",
-                           msg=f"[S1.5] checkpoint已完成，跳过"
-                               f"（{len(ctx.classified_modules)}个模块保留）")
             return
 
         workspace = ctx.workspace
@@ -392,10 +383,6 @@ class SecurityFocusFilterStage(BaseStage):
                                msg=(f"[安全维度过滤] 完成：保留 {len(kept_modules)} 个，"
                                     f"删除 {removed_count} 个，备份已清理"))
                 ctx.classified_modules = discover_modules(str(workspace))
-                if cp:
-                    cp.mark_done("s1_security_filter",
-                                 kept=len(kept_modules),
-                                 removed=removed_count)
                 return
 
             # ── 未通过：写完整 judge 意见到文件 + 提取结构化修正列表 ────────────

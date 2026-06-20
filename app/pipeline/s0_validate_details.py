@@ -27,25 +27,7 @@ class ValidateDetailsStage(BaseStage):
     stage_name = "详情校验"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         workspace = ctx.workspace
-
-        # ── checkpoint 跳过 ───────────────────────────────────────────────
-        if cp and cp.is_done("s0_validate_details"):
-            report = workspace / "details_validation.json"
-            if report.exists():
-                try:
-                    data = json.loads(report.read_text(encoding="utf-8"))
-                    ctx.invalid_detail_files = data.get("missing", []) + [
-                        e["path"] for e in data.get("invalid", [])
-                    ]
-                except Exception:
-                    import traceback
-                    traceback.print_exc()
-                    pass
-            ctx.emit_event("log", level="info",
-                           msg="[S0-ValidateDetails] checkpoint 已完成，跳过")
-            return
 
         # ── details/ 不存在则跳过 ─────────────────────────────────────────
         # ctx.details_dir 已由 orchestrator 初始化为 workspace/details/，永不为 None
@@ -53,8 +35,6 @@ class ValidateDetailsStage(BaseStage):
         if not details_dir.exists():
             ctx.emit_event("log", level="info",
                            msg="[S0-ValidateDetails] details/ 不存在，跳过")
-            if cp:
-                cp.mark_done("s0_validate_details", skipped="no_details_dir")
             return
 
         validate_script = "/app/scripts/validate_details.py"
@@ -105,9 +85,6 @@ class ValidateDetailsStage(BaseStage):
                 ctx.emit_event("log", level="warn",
                                msg=f"[S0-ValidateDetails] 校验报告解析失败: {e}")
 
-        if cp:
-            cp.mark_done("s0_validate_details",
-                         invalid_count=len(ctx.invalid_detail_files))
 
     def _inline_validate(self, workspace: Path, details_dir: Path) -> None:
         """内联校验（无脚本时的兜底实现）。"""

@@ -1939,24 +1939,6 @@ def restart_task(
     return result
 
 
-@router.post("/tasks/{task_id}/resume", status_code=201)
-def resume_task(
-    task_id: str,
-    db: Session = Depends(get_db),
-    user_and_token=Depends(get_current_user),
-):
-    """Resume a task from Stage 3 (断点续跑), reusing the same task ID."""
-    _, token = user_and_token
-    _cleanup_task_owner_runner_agent_processes(db=db, token=token, task_id=task_id, phase="resume_pre_task")
-    return get_task_service().resume_task(db, task_id)
-
-
-@router.get("/tasks/{task_id}/resume-check")
-def get_task_resume_check(task_id: str, db: Session = Depends(get_db)):
-    """返回任务当前是否适合断点续跑，以及缺失的关键产物。"""
-    return get_task_service().get_resume_check(db, task_id)
-
-
 @router.delete("/tasks/{task_id}", status_code=204)
 def delete_task(
     task_id: str,
@@ -2053,48 +2035,3 @@ def get_task_logs(task_id: str, db: Session = Depends(get_db)):
 def generate_prompt(body: GeneratePromptRequest):
     """Auto-generate a prompt from an input path."""
     return {"prompt": generate_prompt_from_path(body.input_path)}
-
-
-@router.get("/tasks/{task_id}/checkpoint")
-def get_task_checkpoint(task_id: str, db: Session = Depends(get_db)):
-    """返回任务的断点续跑状态摘要。
-
-    用于前端展示各阶段/模块的完成情况。
-    """
-    import os as _os
-    from pathlib import Path as _Path
-    from app.db.models import AppSaTask
-    from app.pipeline.checkpoint import CheckpointManager
-
-    row = db.query(AppSaTask).filter(
-        AppSaTask.task_id == task_id,
-        AppSaTask.is_deleted.is_(False),
-    ).first()
-    if not row:
-        from fastapi import HTTPException
-        raise HTTPException(404, f"任务不存在: {task_id}")
-
-    if not row.output_path:
-        return {"task_id": task_id, "available": False, "reason": "no_output_path"}
-
-    workspace = _Path(row.output_path) / task_id / "run" / "workspace"
-    checkpoint_dir = workspace / ".checkpoint"
-
-    if not checkpoint_dir.exists():
-        return {
-            "task_id": task_id,
-            "available": False,
-            "reason": "no_checkpoint_dir",
-            "workspace": str(workspace),
-        }
-
-    cp = CheckpointManager(workspace)
-    summary = cp.load_summary()
-
-    return {
-        "task_id": task_id,
-        "available": True,
-        "workspace": str(workspace),
-        "checkpoint_dir": str(checkpoint_dir),
-        **summary,
-    }

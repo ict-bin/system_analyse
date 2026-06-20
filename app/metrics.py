@@ -179,9 +179,6 @@ def _render_task_metrics() -> list[str]:
     effectiveness_multi_round_pass_rate_count = 0
     effectiveness_reflection_round_total = 0
     effectiveness_reclassify_total = 0
-    checkpoint_any_tasks = checkpoint_partial_tasks = checkpoint_overall_done_tasks = 0
-    checkpoint_stage_done_total: dict[str, int] = defaultdict(int)
-    checkpoint_module_done_total: dict[str, int] = defaultdict(int)
 
     for row in rows:
         status = str(row.status or "unknown")
@@ -261,18 +258,6 @@ def _render_task_metrics() -> list[str]:
             judge_session_gauge += len(judges)
             total_session_gauge += sum(1 for judge in judges if isinstance(judge, dict) and judge.get("session_file"))
         total_session_gauge += _count_session_files(_task_run_root(row) / "sessions")
-        checkpoint_summary = _load_checkpoint_summary(row)
-        if checkpoint_summary is not None:
-            checkpoint_any_tasks += 1
-            if bool(checkpoint_summary.get("overall_done")):
-                checkpoint_overall_done_tasks += 1
-            else:
-                checkpoint_partial_tasks += 1
-            for stage_name, stage_payload in (checkpoint_summary.get("stages") or {}).items():
-                if isinstance(stage_payload, dict) and stage_payload.get("done"):
-                    checkpoint_stage_done_total[str(stage_name)] += 1
-            checkpoint_module_done_total["s2"] += int(checkpoint_summary.get("s2_done_count") or 0)
-            checkpoint_module_done_total["s3"] += int(checkpoint_summary.get("s3_done_count") or 0)
 
         classification = _classify_failure(row.error, result_json)
         if classification == "timeout":
@@ -444,15 +429,6 @@ def _render_task_metrics() -> list[str]:
         "# HELP secflow_sa_effectiveness_reclassify_total Aggregated reclassify count from evaluation summaries.",
         "# TYPE secflow_sa_effectiveness_reclassify_total counter",
         f"secflow_sa_effectiveness_reclassify_total {effectiveness_reclassify_total}",
-        "# HELP secflow_sa_checkpoint_tasks Aggregated checkpoint task coverage by state.",
-        "# TYPE secflow_sa_checkpoint_tasks gauge",
-        f'secflow_sa_checkpoint_tasks{{state="any"}} {checkpoint_any_tasks}',
-        f'secflow_sa_checkpoint_tasks{{state="partial"}} {checkpoint_partial_tasks}',
-        f'secflow_sa_checkpoint_tasks{{state="overall_done"}} {checkpoint_overall_done_tasks}',
-        "# HELP secflow_sa_checkpoint_stage_done_total Aggregated stage-level completed checkpoint count.",
-        "# TYPE secflow_sa_checkpoint_stage_done_total gauge",
-        "# HELP secflow_sa_checkpoint_module_done_total Aggregated module-level completed checkpoint count.",
-        "# TYPE secflow_sa_checkpoint_module_done_total gauge",
     ])
     for key in sorted(set(stage_rounds) | set(stage_duration) | set(stage_tokens) | set(stage_cost) | set(stage_records_total) | set(stage_vote_pass_total) | set(stage_vote_fail_total) | set(stage_judge_score_sum) | set(stage_review_pass_rate_sum) | set(stage_round_index_sum)):
         stage, stage_status = key
@@ -488,10 +464,6 @@ def _render_task_metrics() -> list[str]:
                 status_counts_by_worker[str(job.status or "unknown")] += 1
             for status, count in sorted(status_counts_by_worker.items()):
                 lines.append(f"secflow_sa_cluster_worker_active_jobs{_labels(worker_id=worker.worker_id, host_name=worker.host_name, status=status)} {count}")
-    for stage_name in sorted(checkpoint_stage_done_total):
-        lines.append(f"secflow_sa_checkpoint_stage_done_total{_labels(stage=stage_name)} {checkpoint_stage_done_total[stage_name]}")
-    for stage_name in sorted(checkpoint_module_done_total):
-        lines.append(f"secflow_sa_checkpoint_module_done_total{_labels(stage=stage_name)} {checkpoint_module_done_total[stage_name]}")
     _append_ai_alias_metrics(
         lines,
         prefix="secflow_sa",
@@ -555,23 +527,6 @@ def _load_stage_records(run_root: Path | None) -> list[dict[str, Any]]:
             if isinstance(payload, dict):
                 records.append(payload)
     return records
-
-
-def _load_checkpoint_summary(row: AppSaTask) -> dict[str, Any] | None:
-    workspace = _task_workspace(row)
-    if workspace is None:
-        return None
-    checkpoint_dir = workspace / ".checkpoint"
-    if not checkpoint_dir.is_dir():
-        return None
-    try:
-        from .pipeline.checkpoint import CheckpointManager
-
-        return CheckpointManager(workspace).load_summary()
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        return None
 
 
 def _count_session_files(path: Path | None) -> int:

@@ -25,38 +25,15 @@ class TypeClassifyStage(BaseStage):
     stage_name = "文件类型分类"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         workspace = ctx.workspace
 
-        # ── checkpoint 跳过 ───────────────────────────────────────────────
         catalog_path = workspace / "file_catalog.json"
-        if cp and cp.is_done("s0_type_classify") and catalog_path.exists():
-            try:
-                ctx.file_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-                unknown_path = workspace / "unknown_files.txt"
-                if unknown_path.exists():
-                    ctx.unknown_files = [
-                        l.strip() for l in unknown_path.read_text(encoding="utf-8").splitlines()
-                        if l.strip()
-                    ]
-                ctx.emit_event("log", level="info",
-                               msg=f"[S0-TypeClassify] checkpoint 已完成，跳过"
-                                   f"（{ctx.file_catalog.get('filtered_count', 0)} 个文件，"
-                                   f"{len(ctx.unknown_files)} 个 UNKNOWN）")
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                cp.clear("s0_type_classify")
-            else:
-                return
 
         # ── filtered_files.txt 必须存在 ──────────────────────────────────
         ff = workspace / "filtered_files.txt"
         if not ff.exists():
             ctx.emit_event("log", level="warn",
                            msg="[S0-TypeClassify] filtered_files.txt 不存在，跳过")
-            if cp:
-                cp.mark_done("s0_type_classify", skipped="no_filtered_files")
             return
 
         classify_script = "/app/scripts/classify_files.py"
@@ -69,8 +46,6 @@ class TypeClassifyStage(BaseStage):
         if not os.path.isfile(classify_script):
             ctx.emit_event("log", level="warn",
                            msg="[S0-TypeClassify] classify_files.py 未找到，跳过")
-            if cp:
-                cp.mark_done("s0_type_classify", skipped="no_script")
             return
 
         ctx.emit_event("stage", stage="type_classify")
@@ -105,7 +80,3 @@ class TypeClassifyStage(BaseStage):
                        unknown=len(ctx.unknown_files),
                        type_summary=ctx.file_catalog.get("type_summary", {}))
 
-        if cp:
-            cp.mark_done("s0_type_classify",
-                         file_count=ctx.file_catalog.get("filtered_count", 0),
-                         unknown_count=len(ctx.unknown_files))

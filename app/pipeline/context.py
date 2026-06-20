@@ -13,7 +13,6 @@ from typing import Callable, TYPE_CHECKING
 if TYPE_CHECKING:
     from ..models import TaskConfig, TokenUsage, SwarmEvent, AgentInstanceConfig
     from .evaluation import EvaluationRecorder
-    from .checkpoint import CheckpointManager
 
 
 logger = logging.getLogger("sa.pipeline")
@@ -39,10 +38,6 @@ class PipelineContext:
 
     # ── 多轮评估记录 ────────────────────────────────────────
     evaluator: "EvaluationRecorder | None" = None
-
-    # ── 断点续跑管理器 ──────────────────────────────
-    checkpoint: "CheckpointManager | None" = None
-    """orchestrator 初始化后注入。None 表示未启用断点续跑。"""
 
     # ── 取消事件 ──────────────────────────────────────────────
     cancel_event: threading.Event = field(default_factory=threading.Event)

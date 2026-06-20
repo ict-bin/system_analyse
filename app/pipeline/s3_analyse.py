@@ -44,19 +44,8 @@ class AnalyseStage(BaseStage):
     stage_name = "分析"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
-
-        # ── checkpoint: 整体已完成 ────────────────────────────────────────────
-        if cp and cp.is_done("s3_analyse"):
-            ctx.analysed_modules = [
-                d.name for d in ctx.modules_root().iterdir()
-                if d.is_dir() and (d / "module_report.md").exists() and module_has_nonempty_files(d)
-            ]
-            ctx.emit_event("log", level="info",
-                           msg=f"[S3] 整体 checkpoint 已完成，跳过({len(ctx.analysed_modules)}个模块)")
-            return
 
         granularity = getattr(cfg, "module_granularity", "fine") or "fine"
         w_sys_prompt = load_granularity_prompt(cfg, "step3_analyse", granularity, "workers")
@@ -133,8 +122,6 @@ class AnalyseStage(BaseStage):
             if d.is_dir() and (d / "module_report.md").exists() and module_has_nonempty_files(d)
         ]
 
-        if cp:
-            cp.mark_done("s3_analyse", module_count=len(ctx.analysed_modules))
     
 
     # ── 单模块分析（W+J 多轮）────────────────────────────────────────────────
@@ -152,7 +139,6 @@ class AnalyseStage(BaseStage):
         s_cfg = cfg.stages.analyse
         j_base = ctx.make_j_base()
 
-        cp = ctx.checkpoint
         mod_dir = get_modules_root(str(workspace)) / mod_name
         analyse_session = ctx.session_path(
             "analyse" if not session_suffix else f"analyse{session_suffix}",
@@ -181,26 +167,8 @@ class AnalyseStage(BaseStage):
             )
             return
 
-        # ── 双重保护 checkpoint 跳过（checkpoint + 报告文件双重确认）──────────
-        # checkpoint 存在 + 报告文件存在 → 安全跳过
-        if cp and cp.is_done(f"s3_modules/{mod_name}") and report_path.exists():
-            try:
-                import json as _json
-                _cp_data = _json.loads(cp._resolve(f"s3_modules/{mod_name}").read_text(encoding="utf-8"))
-                _score = _cp_data.get("extra", {}).get("score")
-                _score_str = f" (score={_score})" if _score is not None else ""
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                _score_str = ""
-            ctx.emit_event("log", level="info",
-                           msg=f"[S3] {mod_name} checkpoint 已完成，跳过{_score_str}")
-            return
-        # checkpoint 存在但报告丢失 → 清除脏 checkpoint 重做
-        if cp and cp.is_done(f"s3_modules/{mod_name}") and not report_path.exists():
-            cp.clear(f"s3_modules/{mod_name}")
-        # 报告存在但无 checkpoint → 旧版本遗留或写到一半 → 删除脏报告重做
-        if report_path.exists() and not (cp and cp.is_done(f"s3_modules/{mod_name}")):
+        # resume 已移除：存在陈旧报告则删除后重新分析（始终重跑）
+        if report_path.exists():
             try:
                 report_path.unlink()
             except OSError:
@@ -443,10 +411,6 @@ class AnalyseStage(BaseStage):
             )
             if voted_pass:
                 if attempt + 1 >= s_cfg.min_rounds:
-                    # ── 写模块级 checkpoint ─────────────────────────────
-                    if cp:
-                        _avg = int(sum(r["score"] for r in judge_results) / max(len(judge_results), 1)) if judge_results else 0
-                        cp.mark_done(f"s3_modules/{mod_name}", score=_avg, attempts=attempt + 1)
                     return
                 else:
                     ctx.emit_event("reflect", stage=3, module=mod_name, round=attempt + 1)
@@ -466,8 +430,6 @@ class AnalyseStage(BaseStage):
                 feedback = f"评审未通过，完整意见请 read {fb_rel} ，阅后修正 modules/{mod_name}/module_report.md"
                 # ★ 不删除报告 — Worker 基于 Judge 反馈直接修改
             if forced_pass:
-                if cp:
-                    cp.mark_done(f"s3_modules/{mod_name}", forced=True)
                 return
 
         raise StageError(f"Stage 3 模块 {mod_name} 分析未通过，已达最大轮数 {s_cfg.max_rounds}")

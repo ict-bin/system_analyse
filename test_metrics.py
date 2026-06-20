@@ -31,15 +31,11 @@ def _install_fake_db(monkeypatch, rows):
     monkeypatch.setattr("app.db.get_db", _fake_get_db)
 
 
-def test_render_metrics_exposes_system_analysis_effectiveness_and_checkpoint(monkeypatch, tmp_path: Path):
+def test_render_metrics_exposes_system_analysis_effectiveness(monkeypatch, tmp_path: Path):
     task_root = tmp_path / "sat_metrics"
     run_root = task_root / "run"
-    workspace = run_root / "workspace"
-    checkpoint_dir = workspace / ".checkpoint"
     (run_root / "round_001").mkdir(parents=True)
     (run_root / "round_002").mkdir(parents=True)
-    (checkpoint_dir / "s2_modules").mkdir(parents=True)
-    (checkpoint_dir / "s3_modules").mkdir(parents=True)
 
     (run_root / "evaluation_summary.json").write_text(
         json.dumps(
@@ -99,9 +95,6 @@ def test_render_metrics_exposes_system_analysis_effectiveness_and_checkpoint(mon
         ),
         encoding="utf-8",
     )
-    (checkpoint_dir / "s2_refine.done").write_text(json.dumps({"completed_at": "2026-01-01T00:00:00+00:00"}), encoding="utf-8")
-    (checkpoint_dir / "s2_modules" / "auth.done").write_text(json.dumps({"completed_at": "2026-01-01T00:00:01+00:00"}), encoding="utf-8")
-    (checkpoint_dir / "s3_modules" / "auth.done").write_text(json.dumps({"completed_at": "2026-01-01T00:00:02+00:00"}), encoding="utf-8")
 
     row = SimpleNamespace(
         task_id="sat_metrics",
@@ -137,10 +130,6 @@ def test_render_metrics_exposes_system_analysis_effectiveness_and_checkpoint(mon
     assert 'secflow_sa_stage_vote_fail_total{stage="refine",status="failed"} 1' in rendered
     assert 'secflow_sa_stage_judge_score_sum{stage="classify",status="passed"} 88.500000' in rendered
     assert 'secflow_sa_stage_round_index_sum{stage="refine",status="failed"} 2.000000' in rendered
-    assert 'secflow_sa_checkpoint_tasks{state="any"} 1' in rendered
-    assert 'secflow_sa_checkpoint_tasks{state="partial"} 1' in rendered
-    assert 'secflow_sa_checkpoint_module_done_total{stage="s2"} 1' in rendered
-    assert 'secflow_sa_checkpoint_module_done_total{stage="s3"} 1' in rendered
 
 
 def test_render_metrics_exposes_real_worker_runtime_snapshot(monkeypatch, tmp_path: Path):

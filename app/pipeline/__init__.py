@@ -1,7 +1,6 @@
 """
 pipeline/__init__.py
 """
-from .checkpoint import CheckpointManager
 from .context import PipelineContext
 from .base import BaseStage, Pipeline
 from .helpers import (
@@ -35,7 +34,6 @@ from .module_dependency import build_module_dependency_graph
 from .evaluation import EvaluationRecorder
 
 __all__ = [
-    "CheckpointManager",
     # 上下文与基类
     "PipelineContext", "BaseStage", "Pipeline",
     "EvaluationRecorder",

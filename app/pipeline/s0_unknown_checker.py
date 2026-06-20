@@ -28,7 +28,6 @@ class UnknownCheckerStage(BaseStage):
     stage_name = "未知文件类型识别"
 
     def execute(self, ctx: PipelineContext) -> None:
-        cp = ctx.checkpoint
         cfg = ctx.cfg
         workspace = ctx.workspace
 
@@ -37,8 +36,6 @@ class UnknownCheckerStage(BaseStage):
         if not enable:
             ctx.emit_event("log", level="info",
                            msg="[S0-UnknownChecker] enable_unknown_checker=False，跳过")
-            if cp:
-                cp.mark_done("s0_unknown_checker", skipped="disabled")
             return
 
         # ── 从 ctx 或磁盘获取 unknown 文件列表 ───────────────────────────
@@ -54,23 +51,12 @@ class UnknownCheckerStage(BaseStage):
         if not unknown_files:
             ctx.emit_event("log", level="info",
                            msg="[S0-UnknownChecker] 无 UNKNOWN 文件，跳过")
-            if cp:
-                cp.mark_done("s0_unknown_checker", skipped="no_unknown_files")
-            return
-
-        # ── checkpoint 跳过 ───────────────────────────────────────────────
-        if cp and cp.is_done("s0_unknown_checker"):
-            ctx.emit_event("log", level="info",
-                           msg=f"[S0-UnknownChecker] checkpoint 已完成，跳过"
-                               f"（{len(unknown_files)} 个 UNKNOWN 文件）")
             return
 
         checker_prompt = load_prompt(cfg, "step0_unknown_checker", "workers")
         if not checker_prompt:
             ctx.emit_event("log", level="warn",
                            msg="[S0-UnknownChecker] prompt 未找到，跳过")
-            if cp:
-                cp.mark_done("s0_unknown_checker", skipped="no_prompt")
             return
 
         ctx.emit_event("stage", stage="unknown_checker",
@@ -177,7 +163,3 @@ class UnknownCheckerStage(BaseStage):
         ctx.emit_event("stage_result", stage="unknown_checker",
                        resolved=len(resolved),
                        remaining_unknown=ctx.file_catalog.get("unknown_count", 0))
-        if cp:
-            cp.mark_done("s0_unknown_checker",
-                         resolved=len(resolved),
-                         remaining_unknown=ctx.file_catalog.get("unknown_count", 0))

@@ -224,29 +224,6 @@ class ClassifyStage(BaseStage):
         workspace = ctx.workspace
         task_id = ctx.task_id
         s_cfg = cfg.stages.classify
-        cp = ctx.checkpoint
-
-        # ── Checkpoint 检查：已完成则跳过 ──────────────────────────────────────
-        # 防御性规则：若 s1_classify 已标记完成，或后续阶段（s1_security_filter /
-        # s2_refine）已完成（意味着 S1 必然成功过），则直接跳过本阶段。
-        # 这避免了 resume 时因 s1_classify.done 缺失而重跑分类、覆盖 S2 成果。
-        _downstream_done = cp and (
-            cp.is_done("s1_security_filter")
-            or cp.is_done("s2_refine")
-            or cp.is_done("s3_analyse")
-        )
-        if (cp and cp.is_done("s1_classify")) or _downstream_done:
-            reason = "s1_classify.done" if (cp and cp.is_done("s1_classify")) else "downstream_stage_done"
-            ctx.emit_event("log", level="info",
-                           msg=f"[S1-classify] checkpoint 已存在（{reason}），跳过分类重新执行，直接恢复模块列表")
-            ctx.classified_modules = discover_modules(str(workspace))
-            # 若 downstream 完成但 s1_classify.done 缺失，补写以防下次 resume 再次跳过
-            if cp and not cp.is_done("s1_classify"):
-                cp.mark_done("s1_classify", extra={"note": f"backfilled_by_resume_{reason}",
-                                                    "module_count": len(ctx.classified_modules)})
-                ctx.emit_event("log", level="info",
-                               msg=f"[S1-classify] 已补写 s1_classify.done（{len(ctx.classified_modules)} 个模块）")
-            return
 
         if normalize_filter_engine(getattr(cfg, "filter_engine", "script")) == "agent":
             modules = discover_modules(str(workspace))
@@ -556,15 +533,10 @@ class ClassifyStage(BaseStage):
                     ctx.emit_event("log", level="info",
                                    msg=f"[S1] archived {archived} proposed-deleted files")
                 ctx.classified_modules = modules
-                if cp:
-                    cp.mark_done("s1_classify", extra={"module_count": len(modules), "modules": modules[:50]})
                 return
             if forced_pass:
                 _archive_s1_deleted(workspace)
                 ctx.classified_modules = modules
-                if cp:
-                    cp.mark_done("s1_classify", extra={"module_count": len(modules), "modules": modules[:50],
-                                                        "forced": True})
                 return
 
             if voted_pass:
