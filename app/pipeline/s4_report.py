@@ -421,16 +421,29 @@ class FinalReportStage(BaseStage):
             # 已存在的 module_report.md。
             report_modules = discover_modules(str(workspace))
             if not report_modules:
-                raise StageError("Stage 4b: modules/ 为空，无法生成报告（不应到达此处）")
-            if _write_fallback_final_report(workspace, report_modules):
-                ctx.emit_event(
-                    "log",
-                    level="info",
-                    msg="[S4b] 已由程序根据各模块 module_report.md 合并生成最终报告，跳过最终报告 LLM/Judge",
+                # 过滤后无可分析模块（如输入仅含元数据/配置/无用文件，被 S0 或 S1.5
+                # 全部过滤；security=['all'] 时不会命中上面的安全维度快速路径）。
+                # 这是合法结果而非错误：写说明报告并正常组装输出（任务 passed），不再崩溃。
+                _no_mod_report = (
+                    "# 分析任务已完成（过滤后无可分析模块）\n\n"
+                    "经文件过滤与 Stage 1/1.5 处理后，目标中没有可供安全分析的模块"
+                    "（输入可能仅包含元数据、配置或无用文件，已被过滤）。\n\n"
+                    "## 结论\n\n"
+                    "未发现可分析的二进制/源码模块，无威胁分析结果。\n"
                 )
-            if not (workspace / "final_report.md").exists():
-                raise StageError("Stage 4b 程序化最终报告合并失败，final_report.md 未生成")
-            _ensure_report_generation_marker(workspace / "final_report.md", "program")
+                (workspace / "final_report.md").write_text(_no_mod_report, encoding="utf-8")
+                ctx.emit_event("log", level="info",
+                               msg="[S4b] modules/ 为空（过滤后无可分析模块），已写说明报告，正常结束")
+            else:
+                if _write_fallback_final_report(workspace, report_modules):
+                    ctx.emit_event(
+                        "log",
+                        level="info",
+                        msg="[S4b] 已由程序根据各模块 module_report.md 合并生成最终报告，跳过最终报告 LLM/Judge",
+                    )
+                if not (workspace / "final_report.md").exists():
+                    raise StageError("Stage 4b 程序化最终报告合并失败，final_report.md 未生成")
+                _ensure_report_generation_marker(workspace / "final_report.md", "program")
 
         # ── 组装输出目录 ──────────────────────────────────────────────────────
         final_mods = discover_modules(str(workspace))
