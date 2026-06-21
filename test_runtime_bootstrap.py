@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.service.runtime_bootstrap import RuntimeBootstrap
 from app.service.scheduler import SchedulerService
 from app.service import scheduler as scheduler_module
+from app.service.scheduler_v3 import SchedulerV3
+from app.service.task_service import TaskService
 from unittest.mock import MagicMock
 
 
@@ -207,3 +210,107 @@ class TaskServiceRuntimeHealthTests(unittest.TestCase):
         self.assertEqual(123.0, health["scheduler_last_tick_at"])
         self.assertEqual(122.5, health["scheduler_last_success_at"])
         self.assertTrue(health["scheduler_stall_detected"])
+
+
+class SchedulerV3PendingRepairTests(unittest.TestCase):
+    def test_db_reconcile_requeues_pending_task_missing_from_scheduler_queue(self):
+        events = []
+        scheduler = SchedulerV3(
+            finalize_task=lambda *args, **kwargs: None,
+            record_event=lambda task_id, event_type, message, level="info", payload=None: events.append(
+                {
+                    "task_id": task_id,
+                    "event_type": event_type,
+                    "message": message,
+                    "level": level,
+                    "payload": payload or {},
+                }
+            ),
+        )
+        scheduler._pending_tasks_missing_from_scheduler = lambda: [
+            {"task_id": "sat_pending_1", "project_id": "p1", "status": "pending"}
+        ]
+
+        scheduler._repair_pending_unqueued_tasks()
+
+        self.assertEqual(["sat_pending_1"], list(scheduler._queue))
+        self.assertTrue(scheduler._dirty)
+        self.assertEqual("task_requeued", events[-1]["event_type"])
+        self.assertEqual(
+            "pending_task_missing_from_scheduler_queue",
+            events[-1]["payload"]["reason"],
+        )
+        self.assertEqual(
+            "scheduler_db_reconcile",
+            events[-1]["payload"]["repair_source"],
+        )
+
+    def test_task_status_marks_pending_row_missing_from_queue(self):
+        scheduler = SchedulerV3(finalize_task=lambda *args, **kwargs: None)
+
+        class _Row:
+            task_id = "sat_pending_2"
+            status = "pending"
+            started_at = None
+            finished_at = None
+            dispatcher_instance_id = None
+            dispatch_started_at = None
+            error = None
+            result_json = None
+
+        class _Query:
+            def filter_by(self, **kwargs):
+                return self
+
+            def first(self):
+                return _Row()
+
+        class _Db:
+            def query(self, model):
+                del model
+                return _Query()
+
+        def _fake_get_db():
+            yield _Db()
+
+        with patch("app.db.get_db", _fake_get_db):
+            status = scheduler.task_status("sat_pending_2")
+
+        self.assertEqual("pending", status["status"])
+        self.assertEqual("missing_from_queue", status["scheduler_state"])
+
+
+class TaskServiceRuntimeOverviewTests(unittest.TestCase):
+    def test_runtime_overview_includes_pending_unqueued_count(self):
+        service = object.__new__(TaskService)
+        stale_pending = SimpleNamespace(
+            task_id="sat_pending_3",
+            project_id="p1",
+            task_name="demo",
+            analysis_mode="source",
+            created_at=datetime(2026, 6, 21, 10, 0, 0),
+        )
+        service._task_repository = SimpleNamespace(
+            get_status_counts=lambda db: {"pending": 2, "running": 1},
+            get_oldest_pending_created_at=lambda db: datetime(2026, 6, 21, 9, 0, 0),
+            list_running_tasks=lambda db, limit=20: [],
+            list_pending_tasks_for_scheduler_repair=lambda db, created_before=None, limit=500: [stale_pending],
+        )
+
+        with patch("app.service.task_service.get_worker_runtime_health", return_value={"worker_ok": True}), patch(
+            "app.service.task_service.get_runtime_control_service",
+            return_value=SimpleNamespace(get_runtime_control=lambda db: {"enabled": True}),
+        ), patch(
+            "app.service.task_service.get_runner_registry_service",
+            return_value=SimpleNamespace(list_active_runners=lambda db: []),
+        ), patch(
+            "app.service.task_service.get_pending_scheduler_repair_grace_seconds",
+            return_value=20.0,
+        ), patch(
+            "app.service.task_service.now_local",
+            return_value=datetime(2026, 6, 21, 10, 1, 0),
+        ):
+            payload = TaskService.get_runtime_overview(service, object())
+
+        self.assertEqual(1, payload["queue"]["pending_unqueued_count"])
+        self.assertEqual("sat_pending_3", payload["pending_unqueued_tasks"][0]["task_id"])

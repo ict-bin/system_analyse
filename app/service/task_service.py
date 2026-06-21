@@ -16,7 +16,7 @@ import time as _time
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -430,6 +430,10 @@ def get_worker_runtime_health() -> dict:
         )
     health["runtime_evidence_mode"] = _RUNTIME_EVIDENCE_MODE
     return health
+
+
+def get_pending_scheduler_repair_grace_seconds() -> float:
+    return max(0.0, float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_PENDING_SUBMIT_GRACE_SECONDS", "20")))
 
 
 def get_runtime_tracking_snapshot() -> dict[str, int]:
@@ -1601,6 +1605,12 @@ class TaskService:
         worker_health = get_worker_runtime_health()
         runtime_control = get_runtime_control_service().get_runtime_control(db)
         active_runners = get_runner_registry_service().list_active_runners(db)
+        pending_repair_cutoff = now_local() - timedelta(seconds=get_pending_scheduler_repair_grace_seconds())
+        pending_repair_candidates = self._task_repository.list_pending_tasks_for_scheduler_repair(
+            db,
+            created_before=pending_repair_cutoff,
+            limit=500,
+        )
         return {
             "queue": {
                 "status_counts": status_counts,
@@ -1611,6 +1621,7 @@ class TaskService:
                     for status in ("passed", "failed", "error", "cancelled")
                 ),
                 "oldest_pending_created_at": isoformat_local(oldest_pending_created_at),
+                "pending_unqueued_count": len(pending_repair_candidates),
             },
             "worker_settings": get_worker_runtime_settings(),
             "worker_health": worker_health,
@@ -1640,6 +1651,16 @@ class TaskService:
                     "created_at": isoformat_local(row.created_at),
                 }
                 for row in running_rows
+            ],
+            "pending_unqueued_tasks": [
+                {
+                    "task_id": row.task_id,
+                    "project_id": row.project_id,
+                    "task_name": row.task_name,
+                    "analysis_mode": _infer_analysis_mode(row),
+                    "created_at": isoformat_local(row.created_at),
+                }
+                for row in pending_repair_candidates[:20]
             ],
         }
 

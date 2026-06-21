@@ -53,6 +53,10 @@ PERSIST_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PERSIST", 
 # （上一任 manager 派发、rollout/重启丢失内存态）。有存活 worker 上报则收编，否则按 restart 重排。
 DB_RECONCILE_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_DB_RECONCILE", "30"))
 ORPHAN_GRACE_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ORPHAN_GRACE", "60"))
+PENDING_SUBMIT_GRACE_SECONDS = max(
+    0.0,
+    float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_PENDING_SUBMIT_GRACE_SECONDS", "20")),
+)
 
 
 @dataclass
@@ -141,6 +145,7 @@ class SchedulerV3:
             t = threading.Thread(target=tgt, name=f"sa_v3_{name}", daemon=True)
             t.start()
             self._threads.append(t)
+        self._load_pending_tasks_from_db(reason="startup_pending_recovery")
         logger.info("SchedulerV3(pure-tcp) started: %s:%s queue=%d running=%d",
                     self._bind, self._port, len(self._queue), len(self._running))
 
@@ -561,6 +566,87 @@ class SchedulerV3:
                     self._finalize(tid, proto.STATE_FAILED, "orphan_requeue_exhausted", None)
                 except Exception:
                     logger.exception("db_reconcile finalize failed: %s", tid)
+        self._repair_pending_unqueued_tasks()
+
+    def _pending_tasks_missing_from_scheduler(self) -> list[dict]:
+        from datetime import timedelta
+
+        from app.db import get_db
+        from app.service.task_repository import TaskRepository
+        from app.time_utils import now_local
+
+        db_gen = get_db()
+        db = next(db_gen)
+        try:
+            cutoff = now_local() - timedelta(seconds=PENDING_SUBMIT_GRACE_SECONDS)
+            rows = TaskRepository.list_pending_tasks_for_scheduler_repair(
+                db,
+                created_before=cutoff,
+                limit=500,
+            )
+            with self._lock:
+                tracked = set(self._queue) | set(self._running)
+            return [
+                {
+                    "task_id": row.task_id,
+                    "project_id": row.project_id,
+                    "status": row.status,
+                }
+                for row in rows
+                if row.task_id not in tracked
+            ]
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    def _enqueue_pending_repair_rows(self, rows: list[dict], *, reason: str) -> None:
+        if not rows:
+            return
+        enqueued: list[dict] = []
+        with self._lock:
+            tracked = set(self._queue) | set(self._running)
+            for row in rows:
+                task_id = str(row.get("task_id") or "").strip()
+                if not task_id or task_id in tracked:
+                    continue
+                self._queue.append(task_id)
+                tracked.add(task_id)
+                enqueued.append(row)
+            if enqueued:
+                self._dirty = True
+        for row in enqueued:
+            task_id = str(row.get("task_id") or "").strip()
+            self._record_event_for(
+                task_id,
+                "task_requeued",
+                "DB 对账：检测到 pending 任务脱离调度队列，已重新入队",
+                "warning",
+                {
+                    "task_id": task_id,
+                    "project_id": str(row.get("project_id") or "").strip() or None,
+                    "task_status": row.get("status") or "pending",
+                    "reason": "pending_task_missing_from_scheduler_queue",
+                    "repair_source": reason,
+                },
+            )
+
+    def _load_pending_tasks_from_db(self, *, reason: str) -> None:
+        try:
+            repaired = self._pending_tasks_missing_from_scheduler()
+        except Exception:
+            logger.exception("load pending tasks from db failed")
+            return
+        self._enqueue_pending_repair_rows(repaired, reason=reason)
+
+    def _repair_pending_unqueued_tasks(self) -> None:
+        try:
+            repaired = self._pending_tasks_missing_from_scheduler()
+        except Exception:
+            logger.exception("repair pending unqueued tasks failed")
+            return
+        self._enqueue_pending_repair_rows(repaired, reason="scheduler_db_reconcile")
 
     # ── 内部 API（HTTP → 内存控制面；无 DB）───────────────────────────────────
 
@@ -614,11 +700,16 @@ class SchedulerV3:
     def task_status(self, task_id: str) -> dict:
         with self._lock:
             if task_id in self._queue:
-                return {"task_id": task_id, "status": "pending", "queue_pos": list(self._queue).index(task_id)}
+                return {
+                    "task_id": task_id,
+                    "status": "pending",
+                    "queue_pos": list(self._queue).index(task_id),
+                    "scheduler_state": "pending_in_queue",
+                }
             rec = self._running.get(task_id)
             if rec is not None:
                 return {"task_id": task_id, "status": rec.state, "worker_id": rec.worker_id,
-                        "started_ts": rec.started_ts, "error": rec.error}
+                        "started_ts": rec.started_ts, "error": rec.error, "scheduler_state": "running_in_memory"}
         # 内存中未找到（已完成/已 cancelled/未知）→ DB 回退，保障前端显示
         return self._db_task_status(task_id)
 
@@ -636,6 +727,8 @@ class SchedulerV3:
                 d = {"task_id": task_id, "status": row.status,
                      "started_at": row.started_at.isoformat() if row.started_at else None,
                      "finished_at": row.finished_at.isoformat() if row.finished_at else None}
+                if str(row.status or "") == "pending" and not row.dispatcher_instance_id and not row.dispatch_started_at:
+                    d["scheduler_state"] = "missing_from_queue"
                 if row.error: d["error"] = row.error
                 if row.result_json and isinstance(row.result_json, dict):
                     d["module_count"] = row.result_json.get("module_count")
@@ -648,19 +741,31 @@ class SchedulerV3:
             return {"task_id": task_id, "status": "unknown"}
 
     def cluster_status(self) -> dict:
+        pending_unqueued_count = 0
+        try:
+            pending_unqueued_count = len(self._pending_tasks_missing_from_scheduler())
+        except Exception:
+            logger.exception("cluster_status pending_unqueued_count failed")
         with self._lock:
             workers = [{"worker_id": w.worker_id, "online": w.online, "task": w.current_task,
                         "hb_age": round(_time.time() - w.last_heartbeat, 1)} for w in self._workers.values()]
             return {"queue_len": len(self._queue), "running": len(self._running),
                     "idle_workers": sum(1 for w in self._workers.values() if w.is_idle),
                     "workers": workers,
-                    "running_tasks": [r.to_dict() for r in self._running.values()]}
+                    "running_tasks": [r.to_dict() for r in self._running.values()],
+                    "pending_unqueued_count": pending_unqueued_count}
 
     def health(self) -> dict:
+        pending_unqueued_count = 0
+        try:
+            pending_unqueued_count = len(self._pending_tasks_missing_from_scheduler())
+        except Exception:
+            logger.exception("health pending_unqueued_count failed")
         with self._lock:
             return {"status": "ok" if self._running_flag else "stopped", "version": "v3-pure-tcp",
                     "tcp": f"{self._bind}:{self._port}",
-                    "queue": len(self._queue), "running": len(self._running), "workers": len(self._workers)}
+                    "queue": len(self._queue), "running": len(self._running), "workers": len(self._workers),
+                    "pending_unqueued_count": pending_unqueued_count}
 
     # record_event 适配：允许 (task_id, event_type, msg, level, payload) 或 (event_type, msg, level, payload)
     def _record_event_for(self, task_id: str | None, event_type: str, msg: str, level: str = "info", payload: dict | None = None) -> None:

@@ -1241,10 +1241,49 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         parent_stage_item_key=body.parent_stage_item_key,
     )
     # V3: 通知调度器把新任务入内存队列（纯 TCP 派发）
+    task_id = str(created.get("task_id", "") or "").strip()
+    submit_result = None
     try:
-        _v3_notify_scheduler("submit", created.get("task_id", ""))
-    except Exception:
+        submit_result = _v3_notify_scheduler("submit", task_id)
+    except Exception as exc:
         logger.exception("v3 submit notify failed")
+        submit_result = {"status": "submit_failed", "error": str(exc)}
+    if submit_result and str(submit_result.get("status") or "") in {"queued", "already_queued"}:
+        get_task_service()._record_task_operation_event(
+            task_id=task_id,
+            project_id=body.project_id,
+            operation="create_task",
+            event_type="task_submitted",
+            message="任务已入调度队列",
+            payload={
+                "scheduler_submit_result": submit_result,
+                "submit_action": "submitted",
+            },
+        )
+    else:
+        logger.warning(
+            "scheduler submit deferred for newly created task",
+            extra={
+                "task_id": task_id,
+                "project_id": body.project_id,
+                "submit_action": "deferred_repair",
+                "scheduler_submit_result": submit_result,
+            },
+        )
+        get_task_service()._record_task_operation_event(
+            task_id=task_id,
+            project_id=body.project_id,
+            operation="create_task",
+            event_type="scheduler_submit_deferred",
+            message="任务创建成功，但调度器入队延后到自动修复",
+            level="warning",
+            payload={
+                "task_id": task_id,
+                "reason": "scheduler_submit_failed_or_no_ack",
+                "submit_action": "deferred_repair",
+                "scheduler_submit_result": submit_result,
+            },
+        )
     return created
 
 

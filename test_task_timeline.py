@@ -689,3 +689,54 @@ def test_task_runner_continues_when_pre_cleanup_fails(monkeypatch):
     event_types = [item["event_type"] for item in recorded]
     assert "agent_cleanup_failed" in event_types
     assert "task_started" in event_types
+
+
+def test_create_task_submit_deferred_records_warning_timeline(monkeypatch):
+    from app.api import tasks as tasks_api
+
+    body = tasks_api.TaskCreateRequest(
+        project_id="p1",
+        task_name="demo",
+        input_path="/tmp/input",
+        prompt_content="analyse",
+    )
+    created = {"task_id": "sat_pending_4", "status": "pending"}
+    recorded = []
+
+    monkeypatch.setattr(tasks_api, "get_task_service", lambda: SimpleNamespace(
+        create_task=lambda *args, **kwargs: created,
+        _record_task_operation_event=lambda **kwargs: recorded.append(kwargs),
+    ))
+    monkeypatch.setattr(tasks_api, "_v3_notify_scheduler", lambda action, task_id: None)
+
+    payload = tasks_api.create_task(body, object())
+
+    assert payload["task_id"] == "sat_pending_4"
+    assert recorded[-1]["event_type"] == "scheduler_submit_deferred"
+    assert recorded[-1]["payload"]["submit_action"] == "deferred_repair"
+    assert recorded[-1]["level"] == "warning"
+
+
+def test_create_task_submit_success_records_task_submitted_timeline(monkeypatch):
+    from app.api import tasks as tasks_api
+
+    body = tasks_api.TaskCreateRequest(
+        project_id="p1",
+        task_name="demo",
+        input_path="/tmp/input",
+        prompt_content="analyse",
+    )
+    created = {"task_id": "sat_pending_5", "status": "pending"}
+    recorded = []
+
+    monkeypatch.setattr(tasks_api, "get_task_service", lambda: SimpleNamespace(
+        create_task=lambda *args, **kwargs: created,
+        _record_task_operation_event=lambda **kwargs: recorded.append(kwargs),
+    ))
+    monkeypatch.setattr(tasks_api, "_v3_notify_scheduler", lambda action, task_id: {"status": "queued", "task_id": task_id})
+
+    payload = tasks_api.create_task(body, object())
+
+    assert payload["task_id"] == "sat_pending_5"
+    assert recorded[-1]["event_type"] == "task_submitted"
+    assert recorded[-1]["payload"]["submit_action"] == "submitted"

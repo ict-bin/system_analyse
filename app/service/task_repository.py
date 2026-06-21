@@ -156,6 +156,23 @@ class TaskRepository:
         ).order_by(AppSaTask.created_at.asc()).limit(limit).all()
 
     @staticmethod
+    def list_pending_tasks_for_scheduler_repair(
+        db: Session,
+        *,
+        created_before: datetime | None = None,
+        limit: int = 200,
+    ) -> list[AppSaTask]:
+        query = db.query(AppSaTask).filter(
+            AppSaTask.is_deleted.is_(False),
+            AppSaTask.status == "pending",
+            AppSaTask.dispatcher_instance_id.is_(None),
+            AppSaTask.dispatch_started_at.is_(None),
+        )
+        if created_before is not None:
+            query = query.filter(AppSaTask.created_at < created_before)
+        return query.order_by(AppSaTask.created_at.asc()).limit(max(1, limit)).all()
+
+    @staticmethod
     def restart_task_in_place(db: Session, row: AppSaTask) -> AppSaTask:
         clean_config = {
             k: v for k, v in (row.task_config_json or {}).items()
