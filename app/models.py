@@ -464,8 +464,6 @@ class ServiceConfig(BaseModel):
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
-    start_stage: int = Field(default=0, description="从指定阶段开始（0=全流程，3=跳过S0/S1/S2直接S3）")
-    resume_workspace: str = Field(default="", description="已有的 workspace 路径，start_stage>0 时使用")
     skip_path_patterns: list[str] = Field(
         default=[],
         description=(
@@ -557,10 +555,6 @@ class TaskConfig(BaseModel):
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
-    # 恢复运行：跳过前 N-1 阶段，直接从第 start_stage 阶段开始
-    # start_stage=3 时必须同时指定 resume_workspace 指向已有 workspace 路径
-    start_stage: int = Field(default=0, description="从指定阶段开始（0=全流程，3=跳过S0/S1/S2直接S3）")
-    resume_workspace: str = Field(default="", description="已有的 workspace 路径，start_stage>0 时使用")
     skip_path_patterns: list[str] = Field(
         default=[],
         description="S0过滤阶段额外跳过的路径模式列表",

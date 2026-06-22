@@ -4,7 +4,7 @@ orchestrator.py — 薄层流水线编排器 v3
 职责：
   1. 目录初始化（out_dir / run_dir / workspace / sess_dir / task_tmp）
   2. 构建 PipelineContext
-  3. 组装 Pipeline 并运行（支持 resume start_stage）
+  3. 组装 Pipeline 并运行
   4. 错误处理：生成 failure report，写 flag=0/1
   5. 归档 run_dir → archive.zip
 """
@@ -127,8 +127,6 @@ class Orchestrator:
             f"task_id                    = {task_id}",
             f"target_dir                 = {cfg.target_dir}",
             f"output_dir                 = {cfg.output_dir}",
-            f"start_stage                = {cfg.start_stage}",
-            f"resume_workspace           = {cfg.resume_workspace or '（无）'}",
             f"analyse_targets            = {cfg.analyse_targets}",
             f"binary_arch                = {cfg.binary_arch}",
             f"security_focus_categories  = {cfg.security_focus_categories}",
@@ -209,25 +207,6 @@ class Orchestrator:
         sess_dir.mkdir(exist_ok=True)
         workspace = run_dir / "workspace"
         workspace.mkdir(exist_ok=True)
-        # ── 强制清空工作区，杜绝隐式续跑（resume 已移除）──────────────────
-        # 清空上次中断/失败/重派遗留的残留（.snapshot / .s2_snapshots / deleted/ / recover/ /
-        # 半成品 modules / 旧 sessions / 旧 output），避免 S2 快照比对误判“缺/多文件”导致
-        # re-run 失败。每次运行都从干净工作区开始 = 真正的 restart 语义。
-        for _cdir in (workspace, sess_dir, final_out_dir):
-            try:
-                if _cdir.exists():
-                    for _c in _cdir.iterdir():
-                        try:
-                            if _c.is_symlink():
-                                _c.unlink()
-                            elif _c.is_dir():
-                                shutil.rmtree(str(_c), ignore_errors=True)
-                            else:
-                                _c.unlink()
-                        except OSError:
-                            pass
-            except OSError:
-                pass
         task_tmp = workspace / "tmp"
         task_tmp.mkdir(exist_ok=True)
         target_link = workspace / "target"

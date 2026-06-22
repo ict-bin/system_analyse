@@ -169,21 +169,33 @@ def finalize_workspace(output_path: str, task_id: str, normal: bool) -> None:
         # 2. 最后同步一次 events + 模块产物
         sync_for_frontend(output_path, task_id)
 
-        # 3. 把本地 run 拷回 NFS 真实 run/（保 archive），替换软链接
-        try:
-            if nfs_run.is_symlink():
-                nfs_run.unlink()
-            elif nfs_run.exists():
-                shutil.rmtree(str(nfs_run), ignore_errors=True)
-            shutil.copytree(str(local_run), str(nfs_run))
-            logger.info("task %s: local run -> NFS run (copied back, %d items)",
-                        task_id, sum(1 for _ in nfs_run.rglob("*")))
-        except Exception:
-            logger.exception("copy local run back to NFS failed for %s", task_id)
-            # 拷回失败也要保证软链接被清掉，避免悬空
+        # 3. 仅正常完成(normal=True)才把本地 run 拷回 NFS 真实 run/（供归档/会话查阅）。
+        #    异常/被杀(normal=False)不保留残缺工作区：resume 已删除，保留只会被下次
+        #    派发的 setup/requeue 清掉，且是隐式续跑的根源；前端产物已由上面 surrogate+sync 处理。
+        if normal:
             try:
                 if nfs_run.is_symlink():
                     nfs_run.unlink()
+                elif nfs_run.exists():
+                    shutil.rmtree(str(nfs_run), ignore_errors=True)
+                shutil.copytree(str(local_run), str(nfs_run))
+                logger.info("task %s: local run -> NFS run (copied back, %d items)",
+                            task_id, sum(1 for _ in nfs_run.rglob("*")))
+            except Exception:
+                logger.exception("copy local run back to NFS failed for %s", task_id)
+                # 拷回失败也要保证软链接被清掉，避免悬空
+                try:
+                    if nfs_run.is_symlink():
+                        nfs_run.unlink()
+                except OSError:
+                    pass
+        else:
+            # 不保留残缺工作区（杜绝隐式续跑）：清掉可能悬空的软链接，不拷回。
+            try:
+                if nfs_run.is_symlink():
+                    nfs_run.unlink()
+                elif nfs_run.exists():
+                    shutil.rmtree(str(nfs_run), ignore_errors=True)
             except OSError:
                 pass
 

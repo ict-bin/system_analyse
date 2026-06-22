@@ -13,7 +13,7 @@ class BaseStage(ABC):
     @property
     @abstractmethod
     def stage_num(self) -> int:
-        """阶段编号（0-4），用于 start_stage 跳过判断。"""
+        """阶段编号（0-4），决定执行顺序。"""
 
     @property
     @abstractmethod
