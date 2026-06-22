@@ -209,6 +209,25 @@ class Orchestrator:
         sess_dir.mkdir(exist_ok=True)
         workspace = run_dir / "workspace"
         workspace.mkdir(exist_ok=True)
+        # ── 强制清空工作区，杜绝隐式续跑（resume 已移除）──────────────────
+        # 清空上次中断/失败/重派遗留的残留（.snapshot / .s2_snapshots / deleted/ / recover/ /
+        # 半成品 modules / 旧 sessions / 旧 output），避免 S2 快照比对误判“缺/多文件”导致
+        # re-run 失败。每次运行都从干净工作区开始 = 真正的 restart 语义。
+        for _cdir in (workspace, sess_dir, final_out_dir):
+            try:
+                if _cdir.exists():
+                    for _c in _cdir.iterdir():
+                        try:
+                            if _c.is_symlink():
+                                _c.unlink()
+                            elif _c.is_dir():
+                                shutil.rmtree(str(_c), ignore_errors=True)
+                            else:
+                                _c.unlink()
+                        except OSError:
+                            pass
+            except OSError:
+                pass
         task_tmp = workspace / "tmp"
         task_tmp.mkdir(exist_ok=True)
         target_link = workspace / "target"

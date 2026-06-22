@@ -52,6 +52,13 @@ def setup_local_workspace(output_path: str, task_id: str) -> dict:
         nfs_run = nfs_root / "run"
         local_run = _local_run(task_id)
 
+        # 0. 清空本地残留（杜绝隐式续跑：上次中断/同 pod 重派遗留的 .snapshot/半成品工作区）。
+        #    resume 已移除，每次派发都从干净本地工作区开始。
+        try:
+            shutil.rmtree(str(Path(LOCAL_BASE) / task_id), ignore_errors=True)
+        except Exception:
+            pass
+
         # 1. 本地 run（含子目录）
         (local_run / "workspace").mkdir(parents=True, exist_ok=True)
         (local_run / "sessions").mkdir(parents=True, exist_ok=True)
