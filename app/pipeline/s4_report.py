@@ -44,6 +44,45 @@ def _extract_first(pattern: str, text: str, default: str = "") -> str:
     return match.group(1).strip() if match else default
 
 
+def _rmtree_nfs(path: Path, attempts: int = 6) -> None:
+    """NFS 目录删除重试：与 sync_loop 并发写 output/modules 会触发 [Errno 39] ENOTEMPTY，
+    NFS silly-rename(.nfsXXXX) 也会瞬时残留。重试 + 短暂退避通常可成功；最后一次尽力删除。"""
+    for i in range(attempts):
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(str(path))
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if i == attempts - 1:
+                shutil.rmtree(str(path), ignore_errors=True)
+                return
+            time.sleep(0.4 * (i + 1))
+
+
+def _copytree_nfs(src: Path, dst: Path, attempts: int = 4) -> None:
+    """copytree 到 NFS：dst 存在先删(重试)；对瞬时 NFS 错误重试；最后一次用 dirs_exist_ok 合并覆盖。"""
+    for i in range(attempts):
+        try:
+            if dst.exists():
+                _rmtree_nfs(dst)
+            shutil.copytree(str(src), str(dst))
+            return
+        except FileExistsError:
+            _rmtree_nfs(dst)
+        except OSError:
+            if i == attempts - 1:
+                try:
+                    shutil.copytree(str(src), str(dst), dirs_exist_ok=True)
+                except Exception:
+                    pass
+                return
+            time.sleep(0.4 * (i + 1))
+
+
 def _ensure_report_generation_marker(report_path: Path, generation_type: str) -> None:
     if not report_path.exists():
         return
@@ -449,15 +488,22 @@ class FinalReportStage(BaseStage):
         final_mods = discover_modules(str(workspace))
 
         # modules/ — 分类后的模块文件夹（files.list + module_report.md）
+        # 不做整目录 rmtree：会与 WorkerControl 的 sync_loop(每10s写 output/modules) 在 NFS 上撞车
+        # 触发 [Errno 39] Directory not empty。改为逐模块对账：删陈旧 + 覆盖最终，均带 NFS 重试。
         modules_out = final_out_dir / "modules"
-        if modules_out.exists():
-            shutil.rmtree(str(modules_out))
         modules_out.mkdir(parents=True, exist_ok=True)
+        _final_set = set(final_mods)
+        try:
+            for _existing in list(modules_out.iterdir()):
+                if _existing.name not in _final_set:
+                    _rmtree_nfs(_existing)
+        except OSError:
+            pass
         for mod in final_mods:
             src = get_modules_root(str(workspace)) / mod
             dst = modules_out / mod
             if src.is_dir():
-                shutil.copytree(str(src), str(dst))
+                _copytree_nfs(src, dst)
 
         # module dependency graph — 依赖图持久化为 SQLite + JSON，供后端查询和前端渲染
         try:
