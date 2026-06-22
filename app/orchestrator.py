@@ -54,6 +54,29 @@ def make_id() -> str:
     return f"task-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
 
+def _source_is_empty(target_dir: str) -> bool:
+    """熔断判定：源码目录为空 / 不存在 / 仅含系统清单(task-metadata.json) → True。
+
+    上游可能未交付源码（input 仅含 manifest，或目录缺失）。早退优化：遇到第一个
+    可分析文件即返回 False，避免遍历大目录。出错时保守返回 False（不熔断，交由后续处理）。
+    """
+    try:
+        p = Path(target_dir)
+        if not p.exists():
+            return True
+        if p.is_file():
+            return p.name == "task-metadata.json"
+        for item in p.rglob("*"):
+            try:
+                if item.is_file() and item.name != "task-metadata.json":
+                    return False
+            except OSError:
+                continue
+        return True
+    except OSError:
+        return False
+
+
 class Orchestrator:
     """
     薄层编排器：初始化目录，构建 PipelineContext，运行 Pipeline。
@@ -227,6 +250,39 @@ class Orchestrator:
         )
 
         self._emit("task_start", task_id, task=cfg.task)
+
+        # 熔断：源码目录为空/不存在/仅含系统清单 → 直接 PASS（项目为空，无需分析）。
+        # 上游可能未交付源码（input 仅含 manifest，或目录缺失），跳过整条流水线。
+        if _source_is_empty(cfg.target_dir):
+            self._emit("circuit_break_empty_source", task_id, target_dir=cfg.target_dir)
+            _log.info("[熔断] 源码目录为空/不存在，项目为空无需分析，直接 PASS: %s", cfg.target_dir)
+            _empty_report = (
+                "# 分析任务已完成（项目为空，无需分析）\n\n"
+                f"源码目录为空或不存在：`{cfg.target_dir}`\n\n"
+                "目标中没有可供分析的源码/二进制文件（上游可能未交付源码，或仅包含"
+                "元数据/清单文件）。已跳过全部分析阶段。\n\n"
+                "## 结论\n\n项目为空，无需分析。\n"
+            )
+            try:
+                (final_out_dir / "final_report.md").write_text(_empty_report, encoding="utf-8")
+            except OSError:
+                pass
+            result.status = TaskStatus.PASSED
+            result.total_tokens = TokenUsage()
+            result.total_duration_ms = (time.time() - start) * 1000
+            try:
+                flag_path.write_text("1", encoding="utf-8")
+            except OSError:
+                pass
+            try:
+                (run_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
+                shutil.make_archive(str(run_dir / "archive"), "zip", str(run_dir.parent), run_dir.name)
+            except Exception:
+                _log.warning("[熔断] 归档失败（非致命）", exc_info=True)
+            self._emit("task_end", task_id, status=result.status.value,
+                       report=str(final_out_dir / "final_report.md"), modules="",
+                       archive=str(run_dir / "archive") + ".zip")
+            return result
 
         # ── 打印运行配置 ──────────────────────────────────────────────────────
         self._print_task_config(cfg, task_id)
