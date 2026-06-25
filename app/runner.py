@@ -748,7 +748,7 @@ def _run_compact_command(
             )
             proc = handle.proc
             if session_file:
-                register_agent_runtime(session_file=session_file, cwd=cwd, command=" ".join(args))
+                register_agent_runtime(session_file=session_file, cwd=cwd, pid=int(proc.pid), command=" ".join(args))
                 registered = True
             stdout_reader = _StdoutReader(proc.stdout)
             stdout_reader.start()
