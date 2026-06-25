@@ -626,7 +626,7 @@ class TaskRunner:
                 if not persisted:
                     self._deps.flush_stages(task_id, event_buffer)
                 last_stage_flush_count = len(event_buffer)
-            orch = Orchestrator(config=cfg, on_event=on_event)
+            orch = Orchestrator(config=cfg, on_event=on_event, skip_provider_sync=True)
             task_supervisor = threading.Thread(
                 target=self._supervise_running_task,
                 args=(task_id, lease_epoch, orch),

@@ -86,10 +86,15 @@ class Orchestrator:
         self,
         config: TaskConfig,
         on_event: Callable[[SwarmEvent], None] | None = None,
+        *,
+        skip_provider_sync: bool = False,
     ):
         self.cfg = config
         self._on_event = on_event
         self._cancel_event: threading.Event | None = None
+        # TaskRunner 已在 _prepare_task_execution 写好 models.json（手动=模型配置中心 sk /
+        # 下发=网关+wsk 替换），此处跳过 configcenter 同步以免覆盖已替换的 wsk。
+        self._skip_provider_sync = skip_provider_sync
 
     def _emit(self, event_type: str, task_id: str, **data) -> None:
         if self._on_event:
@@ -167,14 +172,16 @@ class Orchestrator:
         self._cancel_event = threading.Event()
 
         # ── 同步配置中心的 LLM Provider → pi models.json ─────────────────────
+        # TaskRunner 已准备 models.json 时跳过（避免覆盖已替换的 wsk / 手动 sk）
         svc = get_service_yaml()
-        sync_ok = sync_providers_to_pi(
-            base_url=svc.configcenter.base_url,
-            token=svc.auth_service.service_machine_token,
-            timeout=svc.configcenter.timeout,
-        )
-        if not sync_ok:
-            raise RuntimeError("LLM Provider 从配置中心同步失败，拒绝继续使用旧 models.json")
+        if not self._skip_provider_sync:
+            sync_ok = sync_providers_to_pi(
+                base_url=svc.configcenter.base_url,
+                token=svc.auth_service.service_machine_token,
+                timeout=svc.configcenter.timeout,
+            )
+            if not sync_ok:
+                raise RuntimeError("LLM Provider 从配置中心同步失败，拒绝继续使用旧 models.json")
         validation = validate_pi_models_file()
         import logging as _log
         _logger = _log.getLogger("sa.orchestrator")
