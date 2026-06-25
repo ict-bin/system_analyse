@@ -55,11 +55,17 @@ _DEFAULT_PI_STUCK_MAX_ACTIVATIONS: int = max(
 _DEFAULT_CONTEXT_WINDOW = 128_000
 _SINGLE_INPUT_CONTEXT_RATIO = 0.75
 _PROMPT_TOKEN_OVERHEAD = 128
-_COMPACTION_TRIGGER_PROMPT = (
-    "请立即触发一次当前会话的自动压缩（compaction），"
-    "仅保留后续继续执行任务所需的关键结论、约束和待办。"
-    "不要继续业务分析，只回复 COMPACTION_OK。"
+# pi 原生 compact RPC 命令的自定义指令（压缩时聚焦保留什么）。
+# 注意：压缩通过 pi 的 `{"type":"compact"}` RPC 命令触发，
+# 绝不能用 prompt 帧伪装——否则模型只会回一句"COMPACTION_OK"，
+# pi 的原生压缩机制不会执行，上下文不降反升，导致无限循环。
+_COMPACT_CUSTOM_INSTRUCTIONS = (
+    "仅保留后续继续执行任务所需的关键结论、约束和待办，丢弃已完成步骤的细节。"
 )
+# 单次 compact 子进程的最大等待时长（压缩本身要调一次 LLM 做摘要）
+_COMPACT_TIMEOUT = max(60.0, float(os.environ.get("SECFLOW_SA_COMPACT_TIMEOUT", "300")))
+# 上下文溢出后 compact+retry 的最大轮数，超过即判失败，杜绝无限循环
+_MAX_OVERFLOW_COMPACT_ATTEMPTS = max(1, int(os.environ.get("SECFLOW_SA_MAX_OVERFLOW_COMPACT_ATTEMPTS", "3")))
 _CONTEXT_WINDOW_BY_MODEL = {
     "gpt-5.4": 128_000,
     "gpt-5.4-mini": 128_000,
@@ -700,6 +706,144 @@ def run_agent(
                 pass
 
 
+def _run_compact_command(
+    *,
+    pi_cmd: list[str],
+    model: str,
+    tools: list[str],
+    thinking_level: str,
+    session_file: str,
+    cwd: str,
+    env: dict[str, str] | None,
+    cancel_event: threading.Event | None,
+    max_retries: int,
+    retry_delay: float,
+    pi_max_retries: int,
+    pi_retry_delay: float,
+) -> dict:
+    """通过 pi RPC `compact` 命令触发原生上下文压缩。
+
+    spawn `pi --mode rpc --session <file>` → stdin 发 `{"type":"compact",...}` →
+    读 stdout 直到 `response`(command=compact) 或 compaction_end 事件 → 解析 success。
+    这是 pi 的原生压缩（调 LLM 摘要旧消息 + 截断会话），
+    不是发 prompt 让模型"回复 COMPACTION_OK"。
+
+    返回 {success, tokens_before, estimated_tokens_after, error}。
+    """
+    import uuid as _uuid
+    args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+    pi_crash_count = 0
+    while True:
+        if cancel_event and cancel_event.is_set():
+            return {"success": False, "tokens_before": None,
+                    "estimated_tokens_after": None, "error": "cancelled"}
+        handle = None
+        proc = None
+        registered = False
+        try:
+            handle = AgentProcessHandle.spawn(
+                *args, cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE,
+                logger=_log_warn, label="system-agent-compact",
+            )
+            proc = handle.proc
+            if session_file:
+                register_agent_runtime(session_file=session_file, cwd=cwd, command=" ".join(args))
+                registered = True
+            stdout_reader = _StdoutReader(proc.stdout)
+            stdout_reader.start()
+            stderr_reader = _StderrReader(proc.stderr)
+            stderr_reader.start()
+
+            req_id = _uuid.uuid4().hex[:12]
+            cmd = json.dumps(
+                {"type": "compact", "id": req_id,
+                 "customInstructions": _COMPACT_CUSTOM_INSTRUCTIONS},
+                ensure_ascii=False,
+            ) + chr(10)
+            proc.stdin.write(cmd.encode("utf-8"))
+            proc.stdin.flush()
+
+            deadline = time.monotonic() + _COMPACT_TIMEOUT
+            compact_resp = None
+            while True:
+                if cancel_event and cancel_event.is_set():
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                line = stdout_reader.read_line(timeout=min(2.0, remaining))
+                if line is None:
+                    if stdout_reader.done.is_set() and stdout_reader.line_queue.empty():
+                        break
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                etype = ev.get("type")
+                if etype == "compaction_start":
+                    _log_info(f"pi compaction 开始: reason={ev.get('reason')}")
+                elif etype == "compaction_end":
+                    res = ev.get("result") or {}
+                    _log_info(
+                        f"pi compaction 完成: tokensBefore={res.get('tokensBefore')} "
+                        f"estimatedAfter={res.get('estimatedTokensAfter')} "
+                        f"aborted={ev.get('aborted')} willRetry={ev.get('willRetry')}"
+                    )
+                elif etype == "response" and ev.get("command") == "compact":
+                    compact_resp = ev
+                    break
+                elif etype == "extension_error":
+                    _log_warn(f"pi compaction extension error: {ev.get('error')}")
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=15.0)
+            except subprocess.TimeoutExpired:
+                handle.terminate_tree(reason="compact_exit_timeout")
+            if compact_resp is not None:
+                data = compact_resp.get("data") or {}
+                return {
+                    "success": bool(compact_resp.get("success")),
+                    "tokens_before": data.get("tokensBefore"),
+                    "estimated_tokens_after": data.get("estimatedTokensAfter"),
+                    "error": compact_resp.get("error"),
+                }
+            # 没收到 response —— 多半是 pi 进程崩溃或致命错误
+            stderr_text = stderr_reader.get(timeout=5.0).decode("utf-8", errors="replace").strip()
+            err_msg = stderr_text or "compact: no response from pi"
+            pi_crash_count += 1
+            if not _should_retry(pi_crash_count, pi_max_retries, cancel_event):
+                return {"success": False, "tokens_before": None,
+                        "estimated_tokens_after": None, "error": err_msg}
+            delay = _backoff(pi_retry_delay, pi_crash_count)
+            _log_warn(f"compact pi 进程异常 [{pi_crash_count}], {delay:.0f}s 后重试: {err_msg[:200]}")
+            time.sleep(delay)
+        except Exception as e:
+            pi_crash_count += 1
+            if not _should_retry(pi_crash_count, pi_max_retries, cancel_event):
+                return {"success": False, "tokens_before": None,
+                        "estimated_tokens_after": None, "error": f"compact exception: {e}"}
+            delay = _backoff(pi_retry_delay, pi_crash_count)
+            _log_warn(f"compact 异常 [{pi_crash_count}], {delay:.0f}s 后重试: {e}")
+            time.sleep(delay)
+        finally:
+            if handle is not None:
+                if registered:
+                    unregister_agent_runtime(session_file=session_file, cwd=cwd, command=" ".join(args))
+                handle.terminate_tree(reason="compact_finally", term_timeout=2.0, kill_timeout=2.0)
+            if proc is not None:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    try:
+                        if pipe:
+                            pipe.close()
+                    except Exception:
+                        pass
+
+
 def _run_with_context_overflow_recovery(
     *,
     pi_cmd: list[str],
@@ -752,15 +896,53 @@ def _run_with_context_overflow_recovery(
                 preflight_result.context_overflow_failed_after_compaction = True
                 return preflight_result
             overflow_attempts += 1
-            compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
-            _run_with_pi_retry(
-                args=compaction_args, cwd=cwd, env=env,
-                prompt=_COMPACTION_TRIGGER_PROMPT,
-                cancel_event=cancel_event, on_stream=None,
+            if overflow_attempts > _MAX_OVERFLOW_COMPACT_ATTEMPTS:
+                preflight_result = AgentResult()
+                preflight_result.agent_role = agent_role or None
+                preflight_result.runtime_dir = runtime_dir
+                preflight_result.context_window = current_context_window
+                preflight_result.proxy_reserved_tokens = 4096
+                preflight_result.context_budget_exceeded_preflight = True
+                preflight_result.context_overflow_failed_after_compaction = True
+                preflight_result.error = _format_context_overflow_failure(
+                    "preflight_compaction_exhausted",
+                    context_window=current_context_window,
+                    single_input_tokens=preflight_tokens,
+                    single_input_limit=preflight_limit,
+                    compaction_attempted=True,
+                    proxy_reserved_tokens=4096,
+                )
+                return preflight_result
+            msg = f"单次输入超出上下文预算，触发 pi 原生 compact [{overflow_attempts}/{_MAX_OVERFLOW_COMPACT_ATTEMPTS}]"
+            _log_warn(msg)
+            if on_stream:
+                on_stream(f"\n⚠️ {msg}\n")
+            compact = _run_compact_command(
+                pi_cmd=pi_cmd, model=model, tools=tools, thinking_level=thinking_level,
+                session_file=session_file, cwd=cwd, env=env, cancel_event=cancel_event,
                 max_retries=max_retries, retry_delay=retry_delay,
                 pi_max_retries=pi_max_retries, pi_retry_delay=pi_retry_delay,
-                timeout_seconds=None,
             )
+            if not compact.get("success"):
+                preflight_result = AgentResult()
+                preflight_result.agent_role = agent_role or None
+                preflight_result.runtime_dir = runtime_dir
+                preflight_result.context_window = current_context_window
+                preflight_result.proxy_reserved_tokens = 4096
+                preflight_result.context_budget_exceeded_preflight = True
+                preflight_result.context_overflow_failed_after_compaction = True
+                preflight_result.error = _format_context_overflow_failure(
+                    "preflight_compaction_failed",
+                    context_window=current_context_window,
+                    single_input_tokens=preflight_tokens,
+                    single_input_limit=preflight_limit,
+                    compaction_attempted=True,
+                    proxy_reserved_tokens=4096,
+                )
+                preflight_result.error = (preflight_result.error or "") + (
+                    f" [compact failed: {compact.get('error')}]"
+                )
+                return preflight_result
             continue
         result = _run_with_pi_retry(
             args=args, cwd=cwd, env=env, prompt=prompt,
@@ -788,26 +970,41 @@ def _run_with_context_overflow_recovery(
             return result
         overflow_attempts += 1
         result.compaction_requested = True
-        msg = "检测到智能体单次请求触发上下文超限，先触发一次会话自动压缩，随后进入无限重试。"
+        msg = (
+            f"检测到智能体单次请求触发上下文超限，触发 pi 原生 compact "
+            f"[{overflow_attempts}/{_MAX_OVERFLOW_COMPACT_ATTEMPTS}]"
+        )
         _log_warn(msg)
         if on_stream:
             on_stream(f"\n⚠️ {msg}\n")
-        compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
-        _run_with_pi_retry(
-            args=compaction_args, cwd=cwd, env=env,
-            prompt=_COMPACTION_TRIGGER_PROMPT,
-            cancel_event=cancel_event, on_stream=None,
+        if overflow_attempts > _MAX_OVERFLOW_COMPACT_ATTEMPTS:
+            result.context_overflow_failed_after_compaction = True
+            result.error = (
+                (result.error or "")
+                + f" [compaction recovery 已达上限 {_MAX_OVERFLOW_COMPACT_ATTEMPTS} 次仍溢出]"
+            )
+            return result
+        compact = _run_compact_command(
+            pi_cmd=pi_cmd, model=model, tools=tools, thinking_level=thinking_level,
+            session_file=session_file, cwd=cwd, env=env, cancel_event=cancel_event,
             max_retries=max_retries, retry_delay=retry_delay,
             pi_max_retries=pi_max_retries, pi_retry_delay=pi_retry_delay,
-            timeout_seconds=None,
         )
-        result.compaction_completed = True
+        result.compaction_completed = bool(compact.get("success"))
         result.context_overflow_retrying = True
         result.context_overflow_retry_count = overflow_attempts
         result.context_overflow_retry_event_due = _should_emit_infinite_retry_event(overflow_attempts)
+        if not compact.get("success"):
+            result.context_overflow_failed_after_compaction = True
+            result.error = (
+                (result.error or "")
+                + f" [compact failed: {compact.get('error')}]"
+            )
+            return result
         if result.context_overflow_retry_event_due:
             _log_warn(
-                f"overflow 无限压缩重试 [{overflow_attempts}], 继续重试: "
+                f"overflow 压缩后重试 [{overflow_attempts}], "
+                f"estimated_after={compact.get('estimated_tokens_after')}: "
                 f"{(result.error or '')[:200]}"
             )
         continue
