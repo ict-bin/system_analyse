@@ -361,6 +361,18 @@ _KEY_AUTH_PATTERNS = [
     ("invalid_api_key",),
 ]
 
+# 无可用模型/部署不可用错误（网关 cooldown、no deployments available）。
+# 这类错误是持续性的（部署不会在几秒内恢复），直接失败不重试。
+_NO_MODEL_AVAILABLE_PATTERNS = [
+    "no deployments available",
+    "cooldown_list",
+    "no models available",
+    "no available model",
+    "model not available",
+    "no model available",
+    "no deployments",
+]
+
 _RETRYABLE_API_PATTERNS = [
     "connection", "timeout", "timed out",
     "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND",
@@ -454,6 +466,18 @@ def _is_key_auth_error(result: AgentResult) -> bool:
     error_text = (result.error or "").lower()
     for pattern in _KEY_AUTH_PATTERNS:
         if all(p in error_text for p in pattern):
+            return True
+    return False
+
+
+def _is_no_model_available_error(result: AgentResult) -> bool:
+    """无可用模型/部署不可用（网关 cooldown、no deployments available）。
+    持续性错误，直接失败不重试。"""
+    if result.exit_code == 0 and not result.error:
+        return False
+    error_text = (result.error or "").lower()
+    for pattern in _NO_MODEL_AVAILABLE_PATTERNS:
+        if pattern in error_text:
             return True
     return False
 
@@ -1083,6 +1107,10 @@ def _run_with_pi_retry(
                 # API key 认证失败是终端错误（无效 key 不会自愈），不进入 fatal 无限重试
                 return result
 
+            if _is_no_model_available_error(result):
+                # 无可用模型/部署不可用是终端错误（不会自愈），不进入 fatal 无限重试
+                return result
+
             if _is_fatal_error(result) or result.fatal:
                 fatal_retry_count += 1
                 reason = str(result.error or "").strip() or "fatal error"
@@ -1481,6 +1509,16 @@ def _run_with_api_retry(
                 (result.error or "")
                 + f" [API key 认证连续失败 {key_auth_failures} 次，已达上限，任务终止]"
             )
+            return result
+
+        # 无可用模型/部署不可用（网关 cooldown、no deployments available）：持续性错误，直接失败不重试
+        if _is_no_model_available_error(result):
+            result.fatal = True
+            result.error = (
+                (result.error or "")
+                + " [无可用模型/部署不可用，直接失败不重试]"
+            )
+            _log_error(f"无可用模型，任务直接失败: {(result.error or '')[:200]}")
             return result
 
         if _is_retryable_query_engine_401_error(result):
