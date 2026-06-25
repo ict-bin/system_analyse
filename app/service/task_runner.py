@@ -159,26 +159,72 @@ def _build_role_models_json(
 
 def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None, cfg: Any) -> tuple[dict[str, str], str]:
     role_dirs: dict[str, str] = {}
-    # A Runner pod processes one task at a time — no isolation needed.
-    # When agent_task_key provides custom credentials, write auth.json
-    # to the global pi dir; pi config is always at $PI_CODING_AGENT_DIR.
+    # 废弃 auth.json：wsk 不再写 auth.json（pi 的 auth.json 覆盖机制不可靠）。
+    # 调度下发场景的 wsk 由 _substitute_wsk_into_models_json 直接替换进 models.json 的 apiKey。
+    # pi 只读 models.json，key 确定无歧义。
     if not task_root:
         return role_dirs, "global"
     global_pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
-    secret = str((agent_task_key or {}).get("secret") or "").strip()
-    if secret:
-        auth_payload = {
-            "agent_task_key_id": str((agent_task_key or {}).get("id") or "").strip() or None,
-            "agent_task_key_name": str((agent_task_key or {}).get("name") or "").strip() or None,
-            "agent_task_key_prefix": str((agent_task_key or {}).get("prefix") or "").strip() or None,
-            "agent_task_key_secret": secret,
-            "agent_task_key_source": str((agent_task_key or {}).get("source") or "").strip() or None,
-        }
-        (global_pi_dir / "auth.json").write_text(
-            json.dumps(auth_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+    # 清理可能残留的旧 auth.json，避免 pi 误用
+    try:
+        auth_path = global_pi_dir / "auth.json"
+        if auth_path.exists():
+            auth_path.unlink()
+    except OSError:
+        pass
     return role_dirs, "global"
+
+
+def _substitute_wsk_into_models_json(
+    agent_task_key: dict | None,
+    selected_models: dict | None,
+) -> bool:
+    """调度下发场景：把 wsk secret 直接替换进 models.json 的 apiKey。
+
+    废弃 auth.json 后，pi 只读 models.json。本函数按 selected_models 解析出
+    用到的 provider（形如 "gaiasec/auto" → provider=gaiasec），把这些 provider 的
+    apiKey 替换为 wsk secret。这样 pi 发出的就是 wsk，确定无歧义。
+    返回是否替换成功。
+    """
+    secret = str((agent_task_key or {}).get("secret") or "").strip()
+    if not secret:
+        return False
+    if not isinstance(selected_models, dict) or not selected_models:
+        return False
+    # 收集 selected_models 引用到的 provider
+    providers_used: set[str] = set()
+    for role in ("worker", "reader", "judge"):
+        val = str((selected_models or {}).get(role) or "").strip()
+        if "/" in val:
+            providers_used.add(val.split("/", 1)[0])
+    if not providers_used:
+        return False
+    try:
+        pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
+        models_path = pi_dir / "models.json"
+        if not models_path.is_file():
+            return False
+        data = json.loads(models_path.read_text(encoding="utf-8"))
+        providers = data.get("providers") if isinstance(data, dict) else None
+        if not isinstance(providers, dict):
+            return False
+        changed = False
+        for pkey in providers_used:
+            pcfg = providers.get(pkey)
+            if isinstance(pcfg, dict):
+                pcfg["apiKey"] = secret
+                changed = True
+        if not changed:
+            return False
+        models_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(
+            "wsk 已直接替换进 models.json apiKey（providers=%s），废弃 auth.json",
+            sorted(providers_used),
+        )
+        return True
+    except Exception:
+        logger.exception("_substitute_wsk_into_models_json failed")
+        return False
 
 
 def _read_json_file(path: Path | None) -> dict[str, Any] | None:
@@ -863,6 +909,8 @@ class TaskRunner:
             model_source = str(_tcfg.get("model_source") or "").strip()
             if model_source == "gateway":
                 self._deps.write_models_json_from_gateway()
+                # 调度下发场景：把 wsk secret 直接替换进 models.json apiKey（废弃 auth.json）
+                _substitute_wsk_into_models_json(agent_task_key, _tcfg.get("selected_models"))
             else:
                 self._deps.write_models_json_from_db(db)
         finally:
