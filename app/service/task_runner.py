@@ -836,10 +836,17 @@ class TaskRunner:
                 pass
 
         cfg = build_task_config(svc, task_snapshot.prompt_content, cwd=task_snapshot.input_path)
-        # 应用用户/调度器选择的模型（三类角色：worker/reader/judge）
-        _apply_selected_models(cfg, task_snapshot.task_config_json)
+        _tcfg = task_snapshot.task_config_json if isinstance(task_snapshot.task_config_json, dict) else {}
+        agent_task_key = _task_agent_key(_tcfg)
+        has_secret = bool((agent_task_key or {}).get("secret"))
+        # 模型选择：有传入模型用该模型；无传入模型但有 secret(wsk) 默认 auto；
+        # 无 secret 且无模型 → 不覆盖，用参数配置界面的服务默认模型。
+        selected_models = _tcfg.get("selected_models") if isinstance(_tcfg.get("selected_models"), dict) else None
+        if has_secret and not selected_models:
+            selected_models = {"worker": "gaiasec/auto", "reader": "gaiasec/auto", "judge": "gaiasec/auto"}
+        if selected_models:
+            _apply_selected_models(cfg, {"selected_models": selected_models})
         task_root = str(Path(task_snapshot.output_path or "") / task_id) if task_snapshot.output_path else ""
-        agent_task_key = _task_agent_key(task_snapshot.task_config_json)
         task_pi_dirs, agent_runtime_mode = _materialize_task_pi_runtime(
             task_root=task_root,
             agent_task_key=agent_task_key,
@@ -902,15 +909,12 @@ class TaskRunner:
             )
             if not updated:
                 raise RuntimeError("task lease lost when persisting resolved config")
-            # 按 model_source 分发 models.json 来源：
-            #   config_center(手动) → 模型配置中心 DB (sk 内联)
-            #   gateway(上游下发) → 网关配置 configcenter (wsk)
-            _tcfg = task_snapshot.task_config_json if isinstance(task_snapshot.task_config_json, dict) else {}
-            model_source = str(_tcfg.get("model_source") or "").strip()
-            if model_source == "gateway":
+            # models.json 来源路由（按 secret 是否传入，不按 task_origin/model_source）：
+            #   有 secret(wsk) → 网关配置 models.json + 把 secret 直接替换进 apiKey
+            #   无 secret      → 模型配置中心 models.json (sk，手动模式默认 key)
+            if has_secret:
                 self._deps.write_models_json_from_gateway()
-                # 调度下发场景：把 wsk secret 直接替换进 models.json apiKey（废弃 auth.json）
-                _substitute_wsk_into_models_json(agent_task_key, _tcfg.get("selected_models"))
+                _substitute_wsk_into_models_json(agent_task_key, selected_models)
             else:
                 self._deps.write_models_json_from_db(db)
         finally:
