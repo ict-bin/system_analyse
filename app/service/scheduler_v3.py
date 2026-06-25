@@ -681,6 +681,13 @@ class SchedulerV3:
         return {"status": "cancel_commanded" if sent else "worker_offline", "task_id": task_id, "worker_id": worker_id}
 
     def restart(self, task_id: str) -> dict:
+        # 先重置 DB 为 pending + 清空任务目录（restart 语义：从头重跑）。
+        # 否则 _claim_task 要求 status=pending 会拒领，任务卡在队列不派发。
+        requeued_ok = False
+        try:
+            requeued_ok = bool(self._requeue_task(task_id))
+        except Exception:
+            logger.exception("restart: requeue_task failed: %s", task_id)
         with self._lock:
             rec = self._running.pop(task_id, None)
             conn = None
@@ -694,8 +701,10 @@ class SchedulerV3:
             self._dirty = True
         if conn is not None:
             self._send(conn, proto.msg_cancel(task_id))
-        self._record_event_for(task_id, "task_restart_queued", "任务重新入队", "info", {"task_id": task_id})
-        return {"status": "requeued", "task_id": task_id, "queue_len": len(self._queue)}
+        self._record_event_for(task_id, "task_restart_queued", "任务重新入队", "info",
+                               {"task_id": task_id, "db_requeued": requeued_ok})
+        return {"status": "requeued", "task_id": task_id, "queue_len": len(self._queue),
+                "db_requeued": requeued_ok}
 
     def task_status(self, task_id: str) -> dict:
         with self._lock:

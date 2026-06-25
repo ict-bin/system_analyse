@@ -2036,8 +2036,12 @@ class TaskService:
                 row = self._task_repository.get_task(db, task_id)
                 if row is None:
                     return False
-                if str(row.status or "") in ("passed", "cancelled"):
-                    return False
+                if str(row.status or "") == "pending":
+                    # 已 pending（如 restart 幂等重复调用），无需重置 DB
+                    output_path = row.output_path
+                    return True
+                # restart 是显式重跑：允许 failed/cancelled/passed/running 都重置为 pending。
+                # （reconcile/db_reconcile 调用方只查 status=running，不会命中 passed/cancelled）
                 output_path = row.output_path
                 row.status = "pending"
                 row.dispatcher_instance_id = None
