@@ -1079,6 +1079,10 @@ def _run_with_pi_retry(
                 model_stuck_max_activations=model_stuck_max_activations,
             )
 
+            if _is_key_auth_error(result):
+                # API key 认证失败是终端错误（无效 key 不会自愈），不进入 fatal 无限重试
+                return result
+
             if _is_fatal_error(result) or result.fatal:
                 fatal_retry_count += 1
                 reason = str(result.error or "").strip() or "fatal error"
