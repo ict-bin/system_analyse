@@ -61,11 +61,25 @@ def _agent_runtime_payload(row: AppSaTask) -> dict[str, object]:
     secret = str(agent_task_key.get("secret") or "").strip()
     llm_binding_snapshot = task_config.get("llm_binding_snapshot") if isinstance(task_config.get("llm_binding_snapshot"), dict) else {}
     runtime_mode = str(llm_binding_snapshot.get("agent_runtime_mode") or "").strip() or "task_scoped"
+    model_source = str(task_config.get("model_source") or "").strip()
+    selected_models = task_config.get("selected_models") if isinstance(task_config.get("selected_models"), dict) else {}
+    # 当前使用的 key 类型：wsk(上游下发) / sk(模型配置中心, 手动任务)
+    if model_source == "gateway":
+        key_type = "wsk"
+    elif model_source == "config_center":
+        key_type = "sk"
+    elif secret:
+        key_type = "wsk"
+    else:
+        key_type = "sk"
     return {
         "has_agent_task_key": bool(secret),
         "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
         "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
         "agent_runtime_mode": runtime_mode,
+        "model_source": model_source or None,
+        "key_type": key_type,
+        "selected_models": selected_models or None,
     }
 
 

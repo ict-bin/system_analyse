@@ -167,8 +167,11 @@ class RunAgentTests(unittest.TestCase):
         self.assertEqual(captured["prompt_text"], long_prompt)
         self.assertNotIn(long_prompt, captured["args"])
 
-    def test_run_agent_triggers_compaction_then_retries_on_context_overflow(self):
+    def test_run_agent_triggers_compact_rpc_then_retries_on_context_overflow(self):
+        # 修复后：上下文溢出走 pi 原生 `compact` RPC 命令（_run_compact_command），
+        # 不再发伪装成 prompt 的"请回复 COMPACTION_OK"。
         prompts: list[str] = []
+        compact_calls: list[dict] = []
 
         def fake_run_with_pi_retry(**kwargs):
             prompts.append(kwargs["prompt"])
@@ -179,57 +182,95 @@ class RunAgentTests(unittest.TestCase):
             result.exit_code = 0
             return result
 
+        def fake_compact(**kwargs):
+            compact_calls.append(kwargs)
+            return {"success": True, "tokens_before": 147421,
+                    "estimated_tokens_after": 32000, "error": None}
+
         with tempfile.TemporaryDirectory() as cwd:
             with patch.object(runner, "_find_pi_command", return_value=["/usr/bin/pi"]):
                 with patch.object(runner, "_run_with_pi_retry", side_effect=fake_run_with_pi_retry):
-                    result = runner.run_agent(
-                        "analyse module",
-                        model="MiniMax/MiniMax-M2.5",
-                        tools=["read"],
-                        cwd=cwd,
-                        session_file="/tmp/test-session.jsonl",
-                        max_retries=0,
-                        pi_max_retries=0,
-                    )
+                    with patch.object(runner, "_run_compact_command", side_effect=fake_compact):
+                        result = runner.run_agent(
+                            "analyse module",
+                            model="MiniMax/MiniMax-M2.5",
+                            tools=["read"],
+                            cwd=cwd,
+                            session_file="/tmp/test-session.jsonl",
+                            max_retries=0,
+                            pi_max_retries=0,
+                        )
 
         self.assertEqual(result.output, "ok")
-        self.assertEqual(len(prompts), 3)
+        # _run_with_pi_retry 只被调 2 次：初始(溢出) + 压缩后重试(成功)
+        self.assertEqual(len(prompts), 2)
         self.assertEqual(prompts[0], "analyse module")
-        self.assertIn("compaction", prompts[1].lower())
-        self.assertEqual(prompts[2], "analyse module")
+        self.assertEqual(prompts[1], "analyse module")
+        # pi 原生 compact 只调 1 次，且传入的是 session_file（不是假 prompt）
+        self.assertEqual(len(compact_calls), 1)
+        self.assertTrue(compact_calls[0]["session_file"].endswith("test-session.jsonl"))
 
     def test_run_agent_stops_when_single_input_exceeds_seventy_five_percent(self):
-        prompts: list[str] = []
+        # 单次输入本身就超 75% 阈值：压缩会话历史无法缩减"单次输入"，
+        # 故达 _MAX_OVERFLOW_COMPACT_ATTEMPTS 上限后判失败（不再无限循环）。
+        compact_calls: list[dict] = []
 
-        def fake_run_with_pi_retry(**kwargs):
-            prompts.append(kwargs["prompt"])
-            if len(prompts) == 1:
-                return _overflow_result()
-            result = runner.AgentResult()
-            result.output = "COMPACTION_OK"
-            result.exit_code = 0
-            return result
+        def fake_compact(**kwargs):
+            compact_calls.append(kwargs)
+            return {"success": True, "tokens_before": 100000,
+                    "estimated_tokens_after": 50000, "error": None}
 
         oversized_prompt = "中" * 130000
         with tempfile.TemporaryDirectory() as cwd:
             with patch.object(runner, "_find_pi_command", return_value=["/usr/bin/pi"]):
-                with patch.object(runner, "_run_with_pi_retry", side_effect=fake_run_with_pi_retry):
-                    result = runner.run_agent(
-                        oversized_prompt,
-                        model="MiniMax/MiniMax-M2.5",
-                        tools=["read"],
-                        cwd=cwd,
-                        session_file="/tmp/test-session.jsonl",
-                        max_retries=0,
-                        pi_max_retries=0,
-                    )
+                with patch.object(runner, "_run_with_pi_retry") as fake_retry:
+                    with patch.object(runner, "_run_compact_command", side_effect=fake_compact):
+                        result = runner.run_agent(
+                            oversized_prompt,
+                            model="MiniMax/MiniMax-M2.5",
+                            tools=["read"],
+                            cwd=cwd,
+                            session_file="/tmp/test-session.jsonl",
+                            max_retries=0,
+                            pi_max_retries=0,
+                        )
 
-        self.assertEqual(len(prompts), 1)
-        self.assertIn("compaction", prompts[0].lower())
+        self.assertEqual(len(compact_calls), runner._MAX_OVERFLOW_COMPACT_ATTEMPTS)
+        fake_retry.assert_not_called()
         self.assertIn("75%", result.error or "")
         self.assertIn("不再继续重试", result.error or "")
         self.assertTrue(result.context_budget_exceeded_preflight)
         self.assertTrue(result.context_overflow_failed_after_compaction)
+
+    def test_run_agent_overflow_compact_cap_prevents_infinite_loop(self):
+        # compact 每次"成功"但会话仍持续溢出 → 达上限后停止，绝不无限循环（旧 bug 根因）
+        compact_calls: list[dict] = []
+
+        def fake_run_with_pi_retry(**kwargs):
+            return _overflow_result()  # 永远溢出
+
+        def fake_compact(**kwargs):
+            compact_calls.append(kwargs)
+            return {"success": True, "tokens_before": 147421,
+                    "estimated_tokens_after": 120000, "error": None}
+
+        with tempfile.TemporaryDirectory() as cwd:
+            with patch.object(runner, "_find_pi_command", return_value=["/usr/bin/pi"]):
+                with patch.object(runner, "_run_with_pi_retry", side_effect=fake_run_with_pi_retry):
+                    with patch.object(runner, "_run_compact_command", side_effect=fake_compact):
+                        result = runner.run_agent(
+                            "analyse module",
+                            model="MiniMax/MiniMax-M2.5",
+                            tools=["read"],
+                            cwd=cwd,
+                            session_file="/tmp/test-session.jsonl",
+                            max_retries=0,
+                            pi_max_retries=0,
+                        )
+
+        self.assertTrue(result.context_overflow_failed_after_compaction)
+        self.assertEqual(len(compact_calls), runner._MAX_OVERFLOW_COMPACT_ATTEMPTS)
+        self.assertIn("已达上限", result.error or "")
 
     def test_run_agent_preflight_without_session_fails_fast(self):
         oversized_prompt = "中" * 130000

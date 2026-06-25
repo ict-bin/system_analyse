@@ -139,6 +139,13 @@ class TaskCreateRequest(BaseModel):
     agent_task_key_prefix: Optional[str] = None
     agent_task_key_secret: Optional[str] = None
     agent_task_key_source: Optional[str] = None
+    # 手动任务模型选择（三类角色，从模型配置中心选）。仅 manual 任务生效。
+    # worker: explore/classify/refine/analyse/report 阶段模型
+    # reader: sub_read 阶段模型
+    # judge: 评审阶段模型
+    worker_model: Optional[str] = None
+    reader_model: Optional[str] = None
+    judge_model: Optional[str] = None
 
 
 class GeneratePromptRequest(BaseModel):
@@ -1203,6 +1210,9 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
             task_config["enable_final_check"] = bool(body.enable_final_check)
         if body.continue_on_module_failure is not None:
             task_config["continue_on_module_failure"] = bool(body.continue_on_module_failure)
+    # ── 模型来源路由：手动任务→模型配置中心(sk)，上游下发→网关配置(wsk) ──
+    is_manual = str(body.task_origin_type or "").strip() in ("", "manual")
+    task_config = dict(task_config or {})
     if any(
         value is not None
         for value in (
@@ -1213,7 +1223,6 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
             body.agent_task_key_source,
         )
     ):
-        task_config = dict(task_config or {})
         task_config["agent_task_key"] = {
             "id": body.agent_task_key_id,
             "name": body.agent_task_key_name,
@@ -1221,6 +1230,30 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
             "secret": body.agent_task_key_secret,
             "source": body.agent_task_key_source,
         }
+    if is_manual:
+        # 手动任务：只能用模型配置中心(sk)，禁用 wsk
+        task_config["model_source"] = "config_center"
+        task_config.pop("agent_task_key", None)
+        # 用户选择的模型（三类角色），存入 task_config 供执行时覆盖
+        selected = {}
+        if body.worker_model:
+            selected["worker"] = body.worker_model
+        if body.reader_model:
+            selected["reader"] = body.reader_model
+        if body.judge_model:
+            selected["judge"] = body.judge_model
+        if selected:
+            task_config["selected_models"] = selected
+    else:
+        # 上游下发：只能用网关配置(wsk)；未下发模型信息则默认 auto
+        task_config["model_source"] = "gateway"
+        if not task_config.get("agent_task_key", {}).get("secret"):
+            logger.warning(
+                "非手动任务未携带 wsk(agent_task_key.secret)，将使用网关默认 auto 模型"
+            )
+        # 调度器未下发模型信息时默认 auto（执行时若 selected_models 缺失则用 gaiasec/auto）
+        if not task_config.get("selected_models"):
+            task_config["selected_models"] = {"worker": "gaiasec/auto", "reader": "gaiasec/auto", "judge": "gaiasec/auto"}
     created = svc.create_task(
         db,
         project_id=body.project_id,

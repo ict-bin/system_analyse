@@ -1177,7 +1177,10 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
 
 
 def _write_models_json_from_db(db: "Session") -> None:
-    """从数据库读取 models 配置并写入 pi 的配置目录，使 pi 能识别模型。"""
+    """从数据库读取 models 配置并写入 pi 的配置目录，使 pi 能识别模型。
+
+    数据源 = 模型配置中心（AI网关→模型配置中心），内联 apiKey(sk)。
+    供手动任务(model_source=config_center)使用。"""
     try:
         from app.service.config_service import get_model_config_service  # noqa: PLC0415
         import json as _json
@@ -1188,9 +1191,29 @@ def _write_models_json_from_db(db: "Session") -> None:
         dest = os.path.join(pi_dir, "models.json")
         with open(dest, "w", encoding="utf-8") as _f:
             _json.dump(blob, _f, ensure_ascii=False, indent=2)
-        logger.info("models.json written from DB → %s", dest)
+        logger.info("models.json written from DB(模型配置中心) → %s", dest)
     except Exception as _exc:
         logger.warning("_write_models_json_from_db failed: %s", _exc, exc_info=True)
+
+
+def _write_models_json_from_gateway() -> None:
+    """从平台 configcenter 同步网关配置写入 pi 的 models.json。
+
+    数据源 = 网关配置（AI网关→网关配置），配 wsk 认证。
+    供上游下发任务(model_source=gateway)使用。"""
+    try:
+        from app.config import get_service_yaml  # noqa: PLC0415
+        from app.service.llm_provider_sync import sync_providers_to_pi  # noqa: PLC0415
+        svc = get_service_yaml()
+        ok = sync_providers_to_pi(
+            base_url=svc.configcenter.base_url,
+            token=svc.auth_service.service_machine_token,
+            timeout=svc.configcenter.timeout,
+        )
+        if not ok:
+            logger.warning("_write_models_json_from_gateway: 网关同步失败，保留现有 models.json")
+    except Exception as _exc:
+        logger.warning("_write_models_json_from_gateway failed: %s", _exc, exc_info=True)
 
 
 def _merge_result_json(existing: dict | None, patch: dict | None) -> dict | None:
@@ -1225,6 +1248,7 @@ class TaskService:
                 infer_analysis_mode=_infer_analysis_mode,
                 security_filter_log_payload_resolved=lambda payload: _security_filter_log_payload(payload, resolved=True),
                 write_models_json_from_db=_write_models_json_from_db,
+                write_models_json_from_gateway=_write_models_json_from_gateway,
                 write_task_result_json=_write_task_result_json,
                 lightweight_result_json=_lightweight_result_json,
                 remove_running_task=self._remove_running_task,

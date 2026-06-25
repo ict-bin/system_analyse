@@ -43,6 +43,8 @@ logger = logging.getLogger("sa.runner")
 _MAX_BACKOFF = 30
 _BACKOFF_SCHEDULE = (3.0, 5.0, 10.0, 15.0, 30.0)
 _QUERY_ENGINE_401_MAX_RETRIES = 10
+# API key 认证错误（wsk/sk 无效）重试上限：3 次后判 fatal 退出任务，不无限重试
+_KEY_AUTH_MAX_RETRIES = max(1, int(os.environ.get("SECFLOW_SA_KEY_AUTH_MAX_RETRIES", "3")))
 
 _DEFAULT_PI_STUCK_TIMEOUT: float = max(
     30.0,
@@ -347,10 +349,16 @@ _FATAL_PATTERNS = [
     ("unknown model",),
     ("model does not exist",),
     ("unsupported model",),
+]
+
+# API key 认证失败模式（从 _FATAL_PATTERNS 移出，走 3 次重试后 fatal 的专用路径）
+_KEY_AUTH_PATTERNS = [
     ("invalid", "api key"),
     ("invalid", "api_key"),
     ("unauthorized",),
     ("authentication", "failed"),
+    ("401",),
+    ("invalid_api_key",),
 ]
 
 _RETRYABLE_API_PATTERNS = [
@@ -434,6 +442,17 @@ def _is_fatal_error(result: AgentResult) -> bool:
         return False
     error_text = (result.error or "").lower()
     for pattern in _FATAL_PATTERNS:
+        if all(p in error_text for p in pattern):
+            return True
+    return False
+
+
+def _is_key_auth_error(result: AgentResult) -> bool:
+    """API key 认证失败（wsk/sk 无效/401/unauthorized）。走专用 3 次重试路径。"""
+    if result.exit_code == 0 and not result.error:
+        return False
+    error_text = (result.error or "").lower()
+    for pattern in _KEY_AUTH_PATTERNS:
         if all(p in error_text for p in pattern):
             return True
     return False
@@ -1210,6 +1229,7 @@ def _run_with_api_retry(
     api_attempt = 0
     rate_limit_streak = 0
     query_engine_401_failures = 0
+    key_auth_failures = 0
     effective_prompt = prompt
 
     while True:
@@ -1428,6 +1448,35 @@ def _run_with_api_retry(
             return result
 
         if _is_fatal_error(result):
+            return result
+
+        # API key 认证错误（wsk/sk 无效/401/unauthorized）：重试 3 次后判 fatal 退出
+        if _is_key_auth_error(result):
+            key_auth_failures += 1
+            if key_auth_failures <= _KEY_AUTH_MAX_RETRIES:
+                delay = _backoff(retry_delay, key_auth_failures)
+                label = f"{key_auth_failures}/{_KEY_AUTH_MAX_RETRIES}"
+                _log_warn(
+                    f"API key 认证失败 [{label}], {delay:.0f}s 后重试: "
+                    f"{(result.error or '')[:200]}"
+                )
+                if on_stream:
+                    on_stream(
+                        f"\n⚠️ API key 认证失败，{delay:.0f}s 后重试 ({label})...\n"
+                    )
+                if _session_has_assistant_content(session_file):
+                    effective_prompt = "继续完成上次未完成的任务。"
+                time.sleep(delay)
+                continue
+            _log_error(
+                f"API key 认证连续失败 {key_auth_failures} 次，任务终止: "
+                f"{(result.error or '')[:200]}"
+            )
+            result.fatal = True
+            result.error = (
+                (result.error or "")
+                + f" [API key 认证连续失败 {key_auth_failures} 次，已达上限，任务终止]"
+            )
             return result
 
         if _is_retryable_query_engine_401_error(result):

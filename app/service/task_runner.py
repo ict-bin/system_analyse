@@ -51,6 +51,56 @@ def _task_agent_key(task_config_json: dict | None) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
+# Worker 阶段中属于 Reader(sub_read) 的阶段名；其余归 Worker。
+_READER_STAGES = {"sub_read"}
+
+
+def _apply_selected_models(cfg: Any, task_config_json: dict | None) -> None:
+    """按 task_config.selected_models 覆盖三类角色模型。
+
+    selected_models = {worker, reader, judge}
+      worker → workers 的 explore/classify/refine/analyse/report 阶段 + agents[0]
+      reader → workers 的 sub_read 阶段
+      judge  → judges 的所有阶段 + agents[0]
+    未提供的角色保持原配置不动。"""
+    if not isinstance(task_config_json, dict):
+        return
+    selected = task_config_json.get("selected_models")
+    if not isinstance(selected, dict) or not selected:
+        return
+    worker_model = str(selected.get("worker") or "").strip()
+    reader_model = str(selected.get("reader") or "").strip()
+    judge_model = str(selected.get("judge") or "").strip()
+    # Worker 角色（除 sub_read 外的阶段）
+    if worker_model:
+        if getattr(cfg, "workers", None) is not None:
+            cfg.workers.default_model = worker_model
+            if cfg.workers.agents:
+                for a in cfg.workers.agents:
+                    if not a.model or a.model == "gaiasec/auto":
+                        a.model = worker_model
+            sm = dict(cfg.workers.stage_models or {})
+            for stage in ("explore", "classify", "refine", "analyse", "report"):
+                sm[stage] = worker_model
+            cfg.workers.stage_models = sm
+    # Reader 角色（sub_read 阶段）
+    if reader_model and getattr(cfg, "workers", None) is not None:
+        sm = dict(cfg.workers.stage_models or {})
+        sm["sub_read"] = reader_model
+        cfg.workers.stage_models = sm
+    # Judge 角色
+    if judge_model and getattr(cfg, "judges", None) is not None:
+        cfg.judges.default_model = judge_model
+        if cfg.judges.agents:
+            for a in cfg.judges.agents:
+                if not a.model or a.model == "gaiasec/auto":
+                    a.model = judge_model
+        sm = dict(cfg.judges.stage_models or {})
+        for stage in ("classify", "refine", "analyse", "completeness", "report"):
+            sm[stage] = judge_model
+        cfg.judges.stage_models = sm
+
+
 def _merge_pi_settings(base_settings: dict[str, Any] | None) -> dict[str, Any]:
     merged = dict(base_settings or {})
     merged["defaultThinkingLevel"] = _PI_COMPACTION_SETTINGS["defaultThinkingLevel"]
@@ -268,6 +318,7 @@ class TaskRunnerDependencies:
     infer_analysis_mode: Callable[[AppSaTask], str]
     security_filter_log_payload_resolved: Callable[[dict | None], dict]
     write_models_json_from_db: Callable[[Session], None]
+    write_models_json_from_gateway: Callable[[], None]
     write_task_result_json: Callable[[object, dict], str | None]
     lightweight_result_json: Callable[[object, dict | None, str | None], dict | None]
     remove_running_task: Callable[[str], None]
@@ -739,6 +790,8 @@ class TaskRunner:
                 pass
 
         cfg = build_task_config(svc, task_snapshot.prompt_content, cwd=task_snapshot.input_path)
+        # 应用用户/调度器选择的模型（三类角色：worker/reader/judge）
+        _apply_selected_models(cfg, task_snapshot.task_config_json)
         task_root = str(Path(task_snapshot.output_path or "") / task_id) if task_snapshot.output_path else ""
         agent_task_key = _task_agent_key(task_snapshot.task_config_json)
         task_pi_dirs, agent_runtime_mode = _materialize_task_pi_runtime(
@@ -803,7 +856,15 @@ class TaskRunner:
             )
             if not updated:
                 raise RuntimeError("task lease lost when persisting resolved config")
-            self._deps.write_models_json_from_db(db)
+            # 按 model_source 分发 models.json 来源：
+            #   config_center(手动) → 模型配置中心 DB (sk 内联)
+            #   gateway(上游下发) → 网关配置 configcenter (wsk)
+            _tcfg = task_snapshot.task_config_json if isinstance(task_snapshot.task_config_json, dict) else {}
+            model_source = str(_tcfg.get("model_source") or "").strip()
+            if model_source == "gateway":
+                self._deps.write_models_json_from_gateway()
+            else:
+                self._deps.write_models_json_from_db(db)
         finally:
             try:
                 next(db_gen)
