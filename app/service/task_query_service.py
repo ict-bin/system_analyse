@@ -55,6 +55,56 @@ def _resolve_enable_final_check(row: AppSaTask) -> bool | None:
     return None
 
 
+def _resolve_sk_keys(selected_models: dict | None) -> list[dict]:
+    """从模型配置中心(DB)解析手动任务实际使用的 sk apiKey。
+
+    selected_models={worker,reader,judge} 每个值形如 "provider/model_id"。
+    返回 [{provider, api_key, model}] 去重后的列表。
+    """
+    if not isinstance(selected_models, dict) or not selected_models:
+        return []
+    try:
+        from app.db import get_db  # noqa: PLC0415
+        from app.service.config_service import get_model_config_service  # noqa: PLC0415
+    except Exception:
+        return []
+    providers_used: dict[str, list[str]] = {}
+    for role in ("worker", "reader", "judge"):
+        val = str((selected_models or {}).get(role) or "").strip()
+        if "/" in val:
+            pkey, mid = val.split("/", 1)
+            providers_used.setdefault(pkey, []).append(mid)
+    if not providers_used:
+        return []
+    try:
+        db_gen = get_db()
+        db = next(db_gen)
+        try:
+            cfg = get_model_config_service().get_models_config(db)
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+    except Exception:
+        return []
+    all_providers = cfg.get("providers") if isinstance(cfg, dict) else {}
+    if not isinstance(all_providers, dict):
+        return []
+    out: list[dict] = []
+    for pkey, models in providers_used.items():
+        pcfg = all_providers.get(pkey)
+        if not isinstance(pcfg, dict):
+            continue
+        out.append({
+            "provider": pkey,
+            "api_key": str(pcfg.get("apiKey") or ""),
+            "base_url": str(pcfg.get("baseUrl") or ""),
+            "models": list(dict.fromkeys(models)),
+        })
+    return out
+
+
 def _agent_runtime_payload(row: AppSaTask) -> dict[str, object]:
     task_config = row.task_config_json if isinstance(row.task_config_json, dict) else {}
     agent_task_key = task_config.get("agent_task_key") if isinstance(task_config.get("agent_task_key"), dict) else {}
@@ -72,6 +122,18 @@ def _agent_runtime_payload(row: AppSaTask) -> dict[str, object]:
         key_type = "wsk"
     else:
         key_type = "sk"
+    # 完整 key 信息：wsk 任务用 agent_task_key；sk 任务从模型配置中心解析实际 apiKey
+    key_info: dict[str, object] = {"type": key_type}
+    if key_type == "wsk":
+        key_info.update({
+            "id": str(agent_task_key.get("id") or "").strip() or None,
+            "name": str(agent_task_key.get("name") or "").strip() or None,
+            "prefix": str(agent_task_key.get("prefix") or "").strip() or None,
+            "secret": secret or None,
+            "source": str(agent_task_key.get("source") or "").strip() or None,
+        })
+    else:
+        key_info["sk_keys"] = _resolve_sk_keys(selected_models)
     return {
         "has_agent_task_key": bool(secret),
         "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
@@ -79,6 +141,7 @@ def _agent_runtime_payload(row: AppSaTask) -> dict[str, object]:
         "agent_runtime_mode": runtime_mode,
         "model_source": model_source or None,
         "key_type": key_type,
+        "key_info": key_info,
         "selected_models": selected_models or None,
     }
 
