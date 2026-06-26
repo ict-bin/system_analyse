@@ -175,29 +175,15 @@ def _materialize_task_pi_runtime(*, task_root: str, agent_task_key: dict | None,
     return role_dirs, "global"
 
 
-def _substitute_wsk_into_models_json(
-    agent_task_key: dict | None,
-    selected_models: dict | None,
-) -> bool:
-    """调度下发场景：把 wsk secret 直接替换进 models.json 的 apiKey。
+def _substitute_wsk_into_models_json(agent_task_key: dict | None) -> bool:
+    """有 secret(wsk) 时，把 models.json 里所有 provider 的 apiKey 替换为 wsk secret。
 
-    废弃 auth.json 后，pi 只读 models.json。本函数按 selected_models 解析出
-    用到的 provider（形如 "gaiasec/auto" → provider=gaiasec），把这些 provider 的
-    apiKey 替换为 wsk secret。这样 pi 发出的就是 wsk，确定无歧义。
-    返回是否替换成功。
+    wsk 是网关通用 key，对所有 provider 生效。废弃 auth.json 后，pi 只读 models.json，
+    故直接把全部 provider 的 apiKey 换成 wsk，pi 发出的就是 wsk，确定无歧义。
+    没有 secret 时不调用本函数（保持 DB 合并出的 apiKey 不变）。
     """
     secret = str((agent_task_key or {}).get("secret") or "").strip()
     if not secret:
-        return False
-    if not isinstance(selected_models, dict) or not selected_models:
-        return False
-    # 收集 selected_models 引用到的 provider
-    providers_used: set[str] = set()
-    for role in ("worker", "reader", "judge"):
-        val = str((selected_models or {}).get(role) or "").strip()
-        if "/" in val:
-            providers_used.add(val.split("/", 1)[0])
-    if not providers_used:
         return False
     try:
         pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
@@ -206,11 +192,10 @@ def _substitute_wsk_into_models_json(
             return False
         data = json.loads(models_path.read_text(encoding="utf-8"))
         providers = data.get("providers") if isinstance(data, dict) else None
-        if not isinstance(providers, dict):
+        if not isinstance(providers, dict) or not providers:
             return False
         changed = False
-        for pkey in providers_used:
-            pcfg = providers.get(pkey)
+        for pkey, pcfg in providers.items():
             if isinstance(pcfg, dict):
                 pcfg["apiKey"] = secret
                 changed = True
@@ -218,8 +203,8 @@ def _substitute_wsk_into_models_json(
             return False
         models_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.info(
-            "wsk 已直接替换进 models.json apiKey（providers=%s），废弃 auth.json",
-            sorted(providers_used),
+            "wsk 已替换 models.json 全部 provider apiKey（providers=%s），废弃 auth.json",
+            sorted(providers.keys()),
         )
         return True
     except Exception:
@@ -914,7 +899,7 @@ class TaskRunner:
             # 无 secret 用 sk(DB 配置里的默认 apiKey)。
             self._deps.write_models_json_from_db(db)
             if has_secret:
-                _substitute_wsk_into_models_json(agent_task_key, selected_models)
+                _substitute_wsk_into_models_json(agent_task_key)
         finally:
             try:
                 next(db_gen)
