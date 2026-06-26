@@ -1256,8 +1256,24 @@ def _write_models_json_from_db(db: "Session") -> None:
                 pcfg["models"] = [_enrich_model_entry(m) for m in pcfg["models"] if isinstance(m, dict)]
         # 来源2：网关配置 (secflow_config_provider_llm)
         src2_providers = _gateway_providers_from_db(db)
-        # 合并：来源2 为底，来源1 覆盖（对接的优先）
-        merged = {**src2_providers, **src1_providers}
+        # 合并（非覆盖）：所有 provider 保留，重叠的合并 models（按 id 去重）
+        merged: dict = {}
+        for pkey in set(src1_providers) | set(src2_providers):
+            p1 = src1_providers.get(pkey) or {}
+            p2 = src2_providers.get(pkey) or {}
+            if not isinstance(p1, dict): p1 = {}
+            if not isinstance(p2, dict): p2 = {}
+            # models 合并（来源2 + 来源1，按 id 去重）
+            models_by_id: dict = {}
+            for m in (p2.get("models") or []) + (p1.get("models") or []):
+                if isinstance(m, dict) and m.get("id") and m["id"] not in models_by_id:
+                    models_by_id[m["id"]] = _enrich_model_entry(m)
+            merged[pkey] = {
+                "baseUrl": p1.get("baseUrl") or p2.get("baseUrl") or "",
+                "api": p1.get("api") or p2.get("api") or "openai-completions",
+                "apiKey": p1.get("apiKey") or p2.get("apiKey") or "",
+                "models": list(models_by_id.values()),
+            }
         blob = {"providers": merged}
         dest = os.path.join(pi_dir, "models.json")
         with open(dest, "w", encoding="utf-8") as _f:
