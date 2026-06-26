@@ -349,7 +349,6 @@ class TaskRunnerDependencies:
     infer_analysis_mode: Callable[[AppSaTask], str]
     security_filter_log_payload_resolved: Callable[[dict | None], dict]
     write_models_json_from_db: Callable[[Session], None]
-    write_models_json_from_gateway: Callable[[], None]
     write_task_result_json: Callable[[object, dict], str | None]
     lightweight_result_json: Callable[[object, dict | None, str | None], dict | None]
     remove_running_task: Callable[[str], None]

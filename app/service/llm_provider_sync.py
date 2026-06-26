@@ -1,5 +1,13 @@
 """
-llm_provider_sync.py — 从平台配置中心同步 LLM Provider，生成 pi 的 models.json
+llm_provider_sync.py — 从两个来源同步 LLM 模型信息，生成 pi 的 models.json
+
+来源 1: 配置中心 /service/llm/providers (模型配置中心)
+  - 直连 Provider (local_minimax, local_codex 等)
+  - gaiasec Provider (网关入口, model=auto)
+
+来源 2: AIGW MySQL gaiasec_llm_gateway.model_aliases (网关配置)
+  - 网关可路由的模型别名 (auto, max, pro 等)
+  - 合并到 gaiasec provider 的 models 列表
 """
 from __future__ import annotations
 
@@ -7,23 +15,14 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import httpx
 
 logger = logging.getLogger("sa.llm_sync")
 
-# pi 的 models.json 写入目录（与 Dockerfile 中 PI_CODING_AGENT_DIR 一致）
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
 _DEFAULT_CONTEXT_WINDOW = 128000
-_REQUIRED_MODEL_FIELDS = ("contextWindow", "contextLength")
-_DEFAULT_THINKING_LEVEL_MAP = {"disabled": "disabled"}
-
-
-def _env_var_name(provider_key: str) -> str:
-    """将 provider_key 转换为安全的环境变量名。"""
-    safe = provider_key.upper().replace("-", "_").replace(".", "_").replace("/", "_")
-    return f"SA_LLM_{safe}_KEY"
 
 
 def _provider_api(provider_type: str) -> str:
@@ -56,10 +55,6 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         or extra_config.get("contextLength"),
         _DEFAULT_CONTEXT_WINDOW,
     )
-    max_tokens = _as_positive_int(
-        provider.get("max_tokens") or extra_config.get("max_tokens"),
-        0,
-    )
     pi_models = extra_config.get("pi_models")
     raw_models = pi_models if isinstance(pi_models, list) else (
         [{"id": model_id, "reasoning": False}] if model_id else []
@@ -69,40 +64,25 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         entry = dict(raw)
+        # Strip any maxTokens restriction to allow unlimited LLM output
+        for _k in list(entry.keys()):
+            if _k.lower() in ("maxtokens", "max_tokens", "max_output_tokens", "maxoutputtokens"):
+                entry.pop(_k, None)
         entry.setdefault("id", model_id)
         entry.setdefault("name", entry.get("id") or model_id)
         entry.setdefault("reasoning", False)
-        thinking_level_map = entry.get("thinkingLevelMap")
-        if not isinstance(thinking_level_map, dict):
-            thinking_level_map = {}
-        thinking_level_map.setdefault("disabled", "disabled")
-        entry["thinkingLevelMap"] = thinking_level_map
         entry.setdefault("input", ["text"])
         entry.setdefault("contextWindow", context_window)
         entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
-        # Keep contextLength for compatibility, but pi examples use contextWindow.
-        entry.setdefault("contextLength", entry["contextWindow"])
         models.append(entry)
     return models
 
 
-def build_models_json(providers: list[dict[str, Any]]) -> dict:
+def build_models_json(providers: list[dict[str, Any]], gateway_model_aliases: list[dict[str, Any]] | None = None) -> dict:
     """
-    将配置中心的 LlmProviderSummary 列表转换为 pi 的 models.json 格式。
-
-    pi models.json 格式：
-    {
-        "providers": {
-            "<provider_key>": {
-                "baseUrl": "...",
-                "api": "openai-completions",
-                "apiKey": "<ENV_VAR_NAME>",
-                "models": [{"id": "<model_id>", "contextWindow": 128000}]
-            }
-        }
-    }
-    apiKey 字段是环境变量名，pi 运行时会从 os.environ 中读取实际密钥。
-    contextWindow 控制 pi 的上下文自动压缩阈值；若配置中心未提供则默认 128000。
+    将配置中心的 LlmProviderSummary 列表 + AIGW model_aliases 转换为 pi 的 models.json。
+    
+    gateway_model_aliases 中的别名会合并到 gaiasec provider 的 models 列表。
     """
     result: dict[str, Any] = {"providers": {}}
     for p in providers:
@@ -111,107 +91,65 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict:
         key = p.get("provider_key", "").strip()
         if not key:
             continue
-        api_key_raw = p.get("api_key", "").strip()
-
+        models = _model_entries(p)
+        # Source 2: AIGW model aliases → 合并到 gaiasec provider
+        if key == "gaiasec" and gateway_model_aliases:
+            alias_models: list[dict[str, Any]] = []
+            for a in gateway_model_aliases:
+                if not a.get("enabled"):
+                    continue
+                alias_name = str(a.get("alias_name") or "").strip()
+                if not alias_name:
+                    continue
+                alias_models.append({
+                    "id": alias_name,
+                    "name": alias_name,
+                    "reasoning": False,
+                    "input": ["text"],
+                    "contextWindow": _as_positive_int(a.get("max_tokens_default"), _DEFAULT_CONTEXT_WINDOW),
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                })
+            if alias_models:
+                models = alias_models
         result["providers"][key] = {
             "baseUrl": p.get("api_base", ""),
             "api": _provider_api(str(p.get("provider_type") or "")),
-            "apiKey": api_key_raw,
-            "models": _model_entries(p),
+            "apiKey": p.get("api_key", ""),
+            "models": models,
         }
     return result
 
 
-def get_pi_models_path() -> Path:
-    return Path(_PI_DIR) / "models.json"
-
-
-def write_pi_models_file(models_json: dict[str, Any], *, source: str) -> dict[str, Any]:
-    pi_dir = Path(_PI_DIR)
-    pi_dir.mkdir(parents=True, exist_ok=True)
-    models_path = get_pi_models_path()
-
-    # 若原来是 symlink（entrypoint.sh 创建），先移除，确保后续写入真实运行时文件
-    if models_path.is_symlink():
-        models_path.unlink()
-
-    models_path.write_text(
-        json.dumps(models_json, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    validation = validate_pi_models_file(models_path)
-    logger.info(
-        "已写入 pi runtime models.json: source=%s path=%s providers=%s models=%s",
-        source,
-        validation["path"],
-        validation["provider_count"],
-        validation["model_count"],
-    )
-    for model_summary in validation["models"]:
-        logger.info(
-            "LLM Provider %s/%s contextWindow=%s contextLength=%s",
-            model_summary["provider_key"],
-            model_summary["model_id"],
-            model_summary["contextWindow"],
-            model_summary["contextLength"],
-        )
-    return validation
-
-
-def validate_pi_models_file(
-    path: Path | None = None,
-    *,
-    required_fields: Iterable[str] = _REQUIRED_MODEL_FIELDS,
-) -> dict[str, Any]:
-    models_path = path or get_pi_models_path()
-    if not models_path.exists():
-        raise RuntimeError(f"pi models.json 不存在: {models_path}")
-    if models_path.is_symlink():
-        raise RuntimeError(f"pi models.json 仍是符号链接，未切换到运行时文件: {models_path}")
-
+def _fetch_gateway_model_aliases() -> list[dict[str, Any]]:
+    """从 AIGW MySQL 数据库拉取网关配置的 model aliases (来源 2)。
+    
+    环境变量:
+      AIGW_DB_HOST (默认 gaiasec-llm-gateway-mysql)
+      AIGW_DB_PORT (默认 3306)
+      AIGW_DB_USER (默认 sa)
+      AIGW_DB_PASSWORD
+      AIGW_DB_NAME (默认 gaiasec_llm_gateway)
+    """
+    host = os.environ.get("AIGW_DB_HOST", "gaiasec-llm-gateway-mysql")
+    port = int(os.environ.get("AIGW_DB_PORT", "3306"))
+    user = os.environ.get("AIGW_DB_USER", "sa")
+    password = os.environ.get("AIGW_DB_PASSWORD", "")
+    db_name = os.environ.get("AIGW_DB_NAME", "gaiasec_llm_gateway")
+    if not password:
+        logger.warning("AIGW_DB_PASSWORD 未设置，跳过网关模型别名同步")
+        return []
     try:
-        payload = json.loads(models_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"pi models.json 读取失败: {models_path}: {exc}") from exc
-
-    providers = payload.get("providers")
-    if not isinstance(providers, dict) or not providers:
-        raise RuntimeError(f"pi models.json provider 配置为空: {models_path}")
-
-    required = tuple(required_fields)
-    provider_count = 0
-    model_count = 0
-    summaries: list[dict[str, Any]] = []
-    for provider_key, provider_cfg in providers.items():
-        if not isinstance(provider_cfg, dict):
-            raise RuntimeError(f"provider 配置格式非法: {provider_key}")
-        models = provider_cfg.get("models")
-        if not isinstance(models, list) or not models:
-            raise RuntimeError(f"provider 未配置 models: {provider_key}")
-        provider_count += 1
-        for model in models:
-            if not isinstance(model, dict):
-                raise RuntimeError(f"model 配置格式非法: {provider_key}")
-            missing = [field for field in required if not model.get(field)]
-            if missing:
-                raise RuntimeError(
-                    f"provider {provider_key}/{model.get('id') or '<unknown>'} 缺少字段: {', '.join(missing)}"
-                )
-            summaries.append(
-                {
-                    "provider_key": provider_key,
-                    "model_id": model.get("id"),
-                    "contextWindow": model.get("contextWindow"),
-                    "contextLength": model.get("contextLength"),
-                }
-            )
-            model_count += 1
-    return {
-        "path": str(models_path),
-        "provider_count": provider_count,
-        "model_count": model_count,
-        "models": summaries,
-    }
+        import pymysql
+        conn = pymysql.connect(host=host, port=port, user=user, password=password, database=db_name, connect_timeout=5)
+        c = conn.cursor(pymysql.cursors.DictCursor)
+        c.execute("SELECT alias_name, max_tokens_default, temperature_default, enabled, description FROM model_aliases")
+        rows = c.fetchall()
+        conn.close()
+        logger.info("从 AIGW DB 同步 %d 个 model aliases", len(rows))
+        return rows
+    except Exception as e:
+        logger.warning("AIGW DB model aliases 同步失败: %s", e)
+        return []
 
 
 def sync_providers_to_pi(
@@ -222,8 +160,7 @@ def sync_providers_to_pi(
     """
     从配置中心拉取所有 LLM Provider，写入 pi 的 models.json。
 
-    - 如果 models.json 原来是一个符号链接（指向 /data/config/models.json），
-      先删除符号链接再写入真实文件，避免覆盖 ConfigMap 挂载文件。
+    - 如果 models.json 原来是符号链接，先删除再写入真实文件。
     - 失败时保留现有 models.json，返回 False。
     """
     url = f"{base_url.rstrip('/')}/service/llm/providers"
@@ -232,31 +169,48 @@ def sync_providers_to_pi(
         headers["Authorization"] = f"Bearer {token}"
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(timeout)) as client:
-            resp = client.get(
-                url,
-                headers=headers,
-            )
-            if resp.status_code != 200:
-                logger.warning("配置中心返回 HTTP %s，跳过 Provider 同步", resp.status_code)
-                return False
-            data = resp.json()
+        resp = httpx.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            logger.warning("配置中心返回 HTTP %s，跳过 Provider 同步", resp.status_code)
+            return False
 
+        data = resp.json()
         items: list[dict] = data.get("items", [])
         if not items:
             logger.warning("配置中心返回空 Provider 列表，跳过同步")
             return False
 
-        models_json = build_models_json(items)
-        write_pi_models_file(models_json, source="configcenter")
+        models_json = build_models_json(items, gateway_model_aliases=_fetch_gateway_model_aliases())
+        enabled_count = len(models_json["providers"])
+
+        pi_dir = Path(_PI_DIR)
+        pi_dir.mkdir(parents=True, exist_ok=True)
+        models_path = pi_dir / "models.json"
+
+        # 若原来是 symlink（entrypoint.sh 创建），先移除
+        if models_path.is_symlink():
+            models_path.unlink()
+
+        models_path.write_text(
+            json.dumps(models_json, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info(
+            "已从配置中心同步 %d 个 Provider 到 %s", enabled_count, models_path
+        )
+        for provider_key, provider_cfg in models_json["providers"].items():
+            for model in provider_cfg.get("models", []):
+                logger.info(
+                    "LLM Provider %s/%s contextWindow=%s maxTokens=%s",
+                    provider_key,
+                    model.get("id"),
+                    model.get("contextWindow"),
+                    model.get("maxTokens"),
+                )
         return True
 
-    except httpx.HTTPError as e:
+    except httpx.RequestError as e:
         logger.error("连接配置中心失败，跳过同步: %s", e)
     except Exception as e:
         logger.exception("同步 LLM Provider 时发生未知错误: %s", e)
     return False
-
-
-def apply_models_config_to_pi(models_json: dict[str, Any], *, source: str = "api") -> dict[str, Any]:
-    return write_pi_models_file(models_json, source=source)
