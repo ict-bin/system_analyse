@@ -1249,11 +1249,20 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         task_config["model_source"] = "gateway"
         if not task_config.get("agent_task_key", {}).get("secret"):
             logger.warning(
-                "非手动任务未携带 wsk(agent_task_key.secret)，将使用网关默认 auto 模型"
+                "非手动任务未携带 wsk(agent_task_key.secret)，将使用默认 auto 模型"
             )
-        # 调度器未下发模型信息时默认 auto（执行时若 selected_models 缺失则用 gaiasec/auto）
+        # 有传模型用该模型（worker_model/reader_model/judge_model），没传默认 auto
         if not task_config.get("selected_models"):
-            task_config["selected_models"] = {"worker": "gaiasec/auto", "reader": "gaiasec/auto", "judge": "gaiasec/auto"}
+            selected = {}
+            if body.worker_model:
+                selected["worker"] = body.worker_model
+            if body.reader_model:
+                selected["reader"] = body.reader_model
+            if body.judge_model:
+                selected["judge"] = body.judge_model
+            task_config["selected_models"] = selected or {
+                "worker": "gaiasec/auto", "reader": "gaiasec/auto", "judge": "gaiasec/auto"
+            }
     created = svc.create_task(
         db,
         project_id=body.project_id,

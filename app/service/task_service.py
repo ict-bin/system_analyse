@@ -1180,7 +1180,9 @@ def _write_models_json_from_db(db: "Session") -> None:
     """从数据库读取 models 配置并写入 pi 的配置目录，使 pi 能识别模型。
 
     数据源 = 模型配置中心（AI网关→模型配置中心），内联 apiKey(sk)。
-    供手动任务(model_source=config_center)使用。"""
+    两类任务统一用此函数生成 models.json（每次任务启动）。
+    DB 配置页存的是简化格式，这里补全 pi 必需字段（contextWindow/
+    contextLength/thinkingLevelMap 等），否则 pi validate_pi_models_file 报错。"""
     try:
         from app.service.config_service import get_model_config_service  # noqa: PLC0415
         import json as _json
@@ -1188,6 +1190,35 @@ def _write_models_json_from_db(db: "Session") -> None:
         os.makedirs(pi_dir, exist_ok=True)
         models_cfg = get_model_config_service().get_models_config(db)
         blob = {k: v for k, v in models_cfg.items() if k != "updated_at"}
+        # 补全 pi 必需字段（DB 简化格式 → pi 完整格式）
+        providers = blob.get("providers") if isinstance(blob.get("providers"), dict) else {}
+        for pkey, pcfg in providers.items():
+            if not isinstance(pcfg, dict):
+                continue
+            models = pcfg.get("models")
+            if not isinstance(models, list):
+                continue
+            enriched = []
+            for m in models:
+                if not isinstance(m, dict):
+                    continue
+                entry = dict(m)
+                entry.setdefault("id", m.get("id") or "")
+                entry.setdefault("name", entry.get("id") or "")
+                entry.setdefault("reasoning", bool(entry.get("reasoning", False)))
+                cw = entry.get("contextWindow") or entry.get("contextLength") or 128000
+                entry.setdefault("contextWindow", cw)
+                entry.setdefault("contextLength", cw)
+                tlm = entry.get("thinkingLevelMap")
+                if not isinstance(tlm, dict):
+                    tlm = {}
+                tlm.setdefault("disabled", "disabled")
+                entry["thinkingLevelMap"] = tlm
+                entry.setdefault("input", ["text"])
+                entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
+                enriched.append(entry)
+            pcfg["models"] = enriched
+        blob["providers"] = providers
         dest = os.path.join(pi_dir, "models.json")
         with open(dest, "w", encoding="utf-8") as _f:
             _json.dump(blob, _f, ensure_ascii=False, indent=2)
