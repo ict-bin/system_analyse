@@ -1176,53 +1176,96 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
         logger.warning("_flush_stages failed: %s", _exc, exc_info=True)
 
 
-def _write_models_json_from_db(db: "Session") -> None:
-    """从数据库读取 models 配置并写入 pi 的配置目录，使 pi 能识别模型。
+def _enrich_model_entry(m: dict, default_ctx: int = 128000) -> dict:
+    """补全 pi models.json 必需字段（DB 简化格式 → pi 完整格式）。"""
+    entry = dict(m)
+    entry.setdefault("id", m.get("id") or "")
+    entry.setdefault("name", entry.get("id") or "")
+    entry.setdefault("reasoning", bool(entry.get("reasoning", False)))
+    cw = entry.get("contextWindow") or entry.get("contextLength") or default_ctx
+    entry.setdefault("contextWindow", cw)
+    entry.setdefault("contextLength", cw)
+    tlm = entry.get("thinkingLevelMap")
+    if not isinstance(tlm, dict):
+        tlm = {}
+    tlm.setdefault("disabled", "disabled")
+    entry["thinkingLevelMap"] = tlm
+    entry.setdefault("input", ["text"])
+    entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
+    return entry
 
-    数据源 = 模型配置中心（AI网关→模型配置中心），内联 apiKey(sk)。
-    两类任务统一用此函数生成 models.json（每次任务启动）。
-    DB 配置页存的是简化格式，这里补全 pi 必需字段（contextWindow/
-    contextLength/thinkingLevelMap 等），否则 pi validate_pi_models_file 报错。"""
+
+def _gateway_providers_from_db(db: "Session") -> dict:
+    """来源2：网关配置（secflow_config_provider_llm 表）→ pi models.json providers dict。
+
+    含未对接的模型（如 gaiasec）。只查 enabled=1。"""
+    try:
+        from app.service.llm_provider_sync import build_models_json  # noqa: PLC0415
+        import json as _json
+        from sqlalchemy import text
+        rows = db.execute(text(
+            "SELECT provider_key, model, api_base, api_key, provider_type, "
+            "model_context_window, enabled, extra_config "
+            "FROM secflow_config_provider_llm WHERE enabled=1"
+        )).all()
+        provider_list = []
+        for r in rows:
+            ec = r[7]
+            extra = _json.loads(ec) if isinstance(ec, str) and ec else (ec if isinstance(ec, dict) else {})
+            provider_list.append({
+                "enabled": bool(r[6]),
+                "provider_key": r[0],
+                "model": r[1],
+                "api_base": r[2],
+                "api_key": r[3],
+                "provider_type": r[4],
+                "model_context_window": r[5],
+                "extra_config": extra,
+            })
+        built = build_models_json(provider_list)
+        providers = built.get("providers") if isinstance(built, dict) else {}
+        # build_models_json 已补字段，额外保险补一次
+        for pcfg in providers.values():
+            if isinstance(pcfg, dict) and isinstance(pcfg.get("models"), list):
+                pcfg["models"] = [_enrich_model_entry(m) for m in pcfg["models"] if isinstance(m, dict)]
+        return providers
+    except Exception as _exc:
+        logger.warning("_gateway_providers_from_db failed: %s", _exc, exc_info=True)
+        return {}
+
+
+def _write_models_json_from_db(db: "Session") -> None:
+    """任务启动时从两个来源合并生成 models.json（每次任务启动拉最新）。
+
+    来源1 = 模型配置中心（secflow_app_sa_models_config）：手动配置可见/当前对接的，apiKey=sk。
+    来源2 = 网关配置（secflow_config_provider_llm）：含未对接的模型（如 gaiasec）。
+    合并：来源2 为底，来源1 覆盖（对接的优先，sk 生效）；未对接的(仅来源2)用网关 apiKey。
+    手动配置界面只展示来源1；models.json 含两者，供任意任务选用。
+    """
     try:
         from app.service.config_service import get_model_config_service  # noqa: PLC0415
         import json as _json
         pi_dir = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
         os.makedirs(pi_dir, exist_ok=True)
+        # 来源1：模型配置中心 (DB models_config)
         models_cfg = get_model_config_service().get_models_config(db)
-        blob = {k: v for k, v in models_cfg.items() if k != "updated_at"}
-        # 补全 pi 必需字段（DB 简化格式 → pi 完整格式）
-        providers = blob.get("providers") if isinstance(blob.get("providers"), dict) else {}
-        for pkey, pcfg in providers.items():
-            if not isinstance(pcfg, dict):
-                continue
-            models = pcfg.get("models")
-            if not isinstance(models, list):
-                continue
-            enriched = []
-            for m in models:
-                if not isinstance(m, dict):
-                    continue
-                entry = dict(m)
-                entry.setdefault("id", m.get("id") or "")
-                entry.setdefault("name", entry.get("id") or "")
-                entry.setdefault("reasoning", bool(entry.get("reasoning", False)))
-                cw = entry.get("contextWindow") or entry.get("contextLength") or 128000
-                entry.setdefault("contextWindow", cw)
-                entry.setdefault("contextLength", cw)
-                tlm = entry.get("thinkingLevelMap")
-                if not isinstance(tlm, dict):
-                    tlm = {}
-                tlm.setdefault("disabled", "disabled")
-                entry["thinkingLevelMap"] = tlm
-                entry.setdefault("input", ["text"])
-                entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
-                enriched.append(entry)
-            pcfg["models"] = enriched
-        blob["providers"] = providers
+        blob1 = {k: v for k, v in models_cfg.items() if k != "updated_at"}
+        src1_providers = blob1.get("providers") if isinstance(blob1.get("providers"), dict) else {}
+        for pcfg in src1_providers.values():
+            if isinstance(pcfg, dict) and isinstance(pcfg.get("models"), list):
+                pcfg["models"] = [_enrich_model_entry(m) for m in pcfg["models"] if isinstance(m, dict)]
+        # 来源2：网关配置 (secflow_config_provider_llm)
+        src2_providers = _gateway_providers_from_db(db)
+        # 合并：来源2 为底，来源1 覆盖（对接的优先）
+        merged = {**src2_providers, **src1_providers}
+        blob = {"providers": merged}
         dest = os.path.join(pi_dir, "models.json")
         with open(dest, "w", encoding="utf-8") as _f:
             _json.dump(blob, _f, ensure_ascii=False, indent=2)
-        logger.info("models.json written from DB(模型配置中心) → %s", dest)
+        logger.info(
+            "models.json 合并生成(来源1模型配置中心+来源2网关配置) → %s providers=%s",
+            dest, list(merged.keys()),
+        )
     except Exception as _exc:
         logger.warning("_write_models_json_from_db failed: %s", _exc, exc_info=True)
 
