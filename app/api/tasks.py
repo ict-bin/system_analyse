@@ -2061,8 +2061,16 @@ def delete_task(
     delete_files: bool = True,
     db: Session = Depends(get_db),
 ):
-    """删除任务记录（软删除），并可选同步删除输出目录下的任务文件。"""
-    get_task_service().delete_task(db, task_id, delete_files=delete_files)
+    """删除任务记录（软删除），并可选同步删除输出目录下的任务文件。
+    运行中/排队中的任务会先自动取消（并通知调度器 kill 执行进程）再删除。"""
+    result = get_task_service().delete_task(db, task_id, delete_files=delete_files)
+    # 若删除前自动取消了运行中任务，通知调度器终止实际执行进程
+    if isinstance(result, dict) and result.get("cancelled_first"):
+        try:
+            _v3_notify_scheduler("cancel", task_id)
+        except Exception:
+            logger.exception("v3 cancel notify (on delete) failed")
+    return None
 
 
 @router.get("/tasks/{task_id}/reflection")

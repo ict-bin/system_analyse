@@ -1820,13 +1820,14 @@ class TaskService:
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         previous_status = str(row.status or "")
+        # 已完成/终态任务不能被取消
         if row.status in ("passed", "failed", "error", "cancelled"):
             self._record_task_operation_event(
                 task_id=row.task_id,
                 project_id=row.project_id,
                 operation="cancel_task",
-                event_type="task_cancel_requested_noop",
-                message="任务取消请求未改变状态",
+                event_type="task_operation_rejected",
+                message="已完成的任务不能取消",
                 level="warning",
                 payload={
                     "before_status": previous_status,
@@ -1836,7 +1837,8 @@ class TaskService:
                     "status": previous_status,
                 },
             )
-            return self._row_to_dict(row)
+            from fastapi import HTTPException
+            raise HTTPException(status_code=409, detail="已完成的任务不能取消")
         at = _running_tasks.get(task_id)
         if at and at.is_alive():
             pass  # thread cannot be cancelled
@@ -2591,33 +2593,40 @@ class TaskService:
             return lock_path
         raise RuntimeError(f"failed to acquire task execution lock after stale-lock cleanup retry: {lock_path}")
 
-    def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
-        """软删除任务记录，并可选删除输出目录下的任务文件。运行中任务不允许删除。"""
+    def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
+        """无条件删除任务（软删除）。运行中/排队中的任务先自动取消再删除。
+
+        返回 {cancelled_first: bool, files_deleted: bool}，供调用方（API 层）
+        在 cancelled_first=True 时通知调度器 kill 实际执行进程。
+        """
         import shutil as _shutil
-        from fastapi import HTTPException
         row = self._get_or_404(db, task_id)
         previous_status = str(row.status or "")
         task_dir = os.path.join(row.output_path, task_id) if row.output_path else ""
         files_deleted = False
-        # 运行中的任务必须先取消，不允许直接删除
-        if row.status == "running":
-            self._record_task_operation_event(
-                task_id=row.task_id,
-                project_id=row.project_id,
-                operation="delete_task",
-                event_type="task_operation_rejected",
-                message="任务删除被拒绝",
-                level="error",
-                payload={
-                    "reason": "task_running",
-                    "status": previous_status,
-                    "before_status": previous_status,
-                    "after_status": previous_status,
-                    "changed": False,
-                    "delete_files": delete_files,
-                },
-            )
-            raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+        cancelled_first = False
+        # 运行中/排队中：先自动取消（DB 置 cancelled + 清 lease），再删除。
+        # 实际执行进程的 kill 由 API 层收到 cancelled_first 后通知调度器完成。
+        if row.status in ("running", "pending"):
+            try:
+                self._task_repository.cancel_task_in_place(db, row)
+                cancelled_first = True
+                self._record_task_operation_event(
+                    task_id=row.task_id,
+                    project_id=row.project_id,
+                    operation="delete_task",
+                    event_type="task_auto_cancelled_before_delete",
+                    message=f"删除触发自动取消（原状态 {previous_status}）",
+                    level="warning",
+                    payload={
+                        "before_status": previous_status,
+                        "after_status": "cancelled",
+                        "changed": True,
+                        "reason": "auto_cancel_on_delete",
+                    },
+                )
+            except Exception:
+                logger.exception("delete_task: auto-cancel failed for %s", task_id)
         # 删除输出文件
         if delete_files and row.output_path:
             if os.path.isdir(task_dir):
@@ -2646,8 +2655,10 @@ class TaskService:
                 "task_dir": task_dir or None,
                 "files_deleted": files_deleted,
                 "status_before_delete": previous_status,
+                "cancelled_first": cancelled_first,
             },
         )
+        return {"cancelled_first": cancelled_first, "files_deleted": files_deleted}
 
     def _execute_task(self, task_id: str) -> None:
         from app.db import get_db
