@@ -31,7 +31,7 @@ from app.service.scheduler import cleanup_task_processes, _build_protected_set
 
 logger = logging.getLogger("sa.worker_control")
 
-SCHEDULER_HOST = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_HOST", "secflow-app-system-analyse-worker")
+SCHEDULER_HOST = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_HOST", "secflow-app-system-analyse-scheduler")
 SCHEDULER_PORT = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PORT", "8090"))
 RECONNECT_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WC_RECONNECT", "5"))
 HEARTBEAT_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_WC_HEARTBEAT", "10"))

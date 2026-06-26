@@ -776,9 +776,9 @@ def _v3_notify_scheduler(action: str, task_id: str) -> dict | None:
                 return s.restart(task_id)
     except Exception:
         pass
-    # 2) HTTP 调 manager pod 的内部 sched API
+    # 2) HTTP 调 scheduler pod 的内部 sched API
     import os
-    host = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_HOST", "secflow-app-system-analyse-worker")
+    host = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_HOST", "secflow-app-system-analyse-scheduler")
     port = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_HTTP_PORT", "8080"))
     url = f"http://{host}:{port}/api/internal/sched/{action}"
     try:
