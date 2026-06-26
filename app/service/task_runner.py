@@ -909,14 +909,12 @@ class TaskRunner:
             )
             if not updated:
                 raise RuntimeError("task lease lost when persisting resolved config")
-            # models.json 来源路由（按 secret 是否传入，不按 task_origin/model_source）：
-            #   有 secret(wsk) → 网关配置 models.json + 把 secret 直接替换进 apiKey
-            #   无 secret      → 模型配置中心 models.json (sk，手动模式默认 key)
+            # models.json 始终来自模型配置中心(DB)，每次任务启动生成（两类任务统一）。
+            # key 与模型来源正交：有 secret(wsk) 替换进对应 provider 的 apiKey；
+            # 无 secret 用 sk(DB 配置里的默认 apiKey)。
+            self._deps.write_models_json_from_db(db)
             if has_secret:
-                self._deps.write_models_json_from_gateway()
                 _substitute_wsk_into_models_json(agent_task_key, selected_models)
-            else:
-                self._deps.write_models_json_from_db(db)
         finally:
             try:
                 next(db_gen)
