@@ -211,6 +211,58 @@ class TaskServiceRuntimeHealthTests(unittest.TestCase):
         self.assertEqual(122.5, health["scheduler_last_success_at"])
         self.assertTrue(health["scheduler_stall_detected"])
 
+    def test_v3_requeue_task_skips_parent_orchestrated_binary_security_restart(self):
+        import app.service.task_service as task_service_module
+
+        row = SimpleNamespace(
+            task_id="sat_parent_1",
+            project_id="p1",
+            status="running",
+            output_path="/tmp/sa-out",
+            task_origin_type="binary_security",
+            parent_task_id="parent-1",
+            parent_stage_item_id="item-1",
+            parent_project_id="p1",
+            parent_task_type="source",
+            parent_stage_name="system_analysis",
+            parent_stage_item_key="item-key-1",
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at="started",
+            lease_expires_at="lease",
+            error=None,
+            result_json={"status": "running"},
+        )
+
+        events = []
+        service = object.__new__(task_service_module.TaskService)
+        service._task_repository = SimpleNamespace(get_task=lambda db, task_id: row if task_id == "sat_parent_1" else None)
+        service._record_timeline_event = lambda **kwargs: events.append(kwargs)
+
+        class _Db:
+            def commit(self):
+                return None
+
+        def _fake_get_db():
+            yield _Db()
+
+        with patch("app.db.get_db", _fake_get_db), patch.object(
+            task_service_module,
+            "_remove_task_root_for_restart",
+            side_effect=AssertionError("should not clean restart parent-orchestrated task"),
+        ), patch.object(
+            task_service_module,
+            "_clear_task_execution_lock",
+            side_effect=AssertionError("should not clear execution lock for restart"),
+        ):
+            self.assertTrue(service._v3_requeue_task("sat_parent_1"))
+
+        self.assertEqual("running", row.status)
+        self.assertIsNone(row.dispatcher_instance_id)
+        self.assertIsNone(row.dispatch_started_at)
+        self.assertIsNone(row.lease_expires_at)
+        self.assertTrue(events)
+        self.assertEqual("task_waiting_parent_observe", events[-1]["event_type"])
+
 
 class SchedulerV3PendingRepairTests(unittest.TestCase):
     def test_db_reconcile_requeues_pending_task_missing_from_scheduler_queue(self):
