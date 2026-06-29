@@ -484,36 +484,18 @@ class FinalReportStage(BaseStage):
                     raise StageError("Stage 4b 程序化最终报告合并失败，final_report.md 未生成")
                 _ensure_report_generation_marker(workspace / "final_report.md", "program")
 
-        # ── 组装输出目录 ──────────────────────────────────────────────────────
-        # 注意：output/modules 在执行期间会与 WorkerControl 的 sync_loop(每10s) 并发写，
-        # 这里是 best-effort（供前端看进度）；最终权威写入由任务结束后 finalize_workspace
-        # 在 sync_loop 停止后单写者完成，避免竞态。此处任何异常都不中断任务。
+        # ── 组装输出（只写本地 workspace，不写 NFS output/）──────────────────
+        # S4 不写 NFS：output/ 由 sync_loop(执行期进度) + finalize_workspace(结束后权威) 写。
+        # 避免 S4(task子进程) 与 sync_loop(控制进程) 并发写 NFS output/ 的竞态。
         final_mods = discover_modules(str(workspace))
-        modules_out = final_out_dir / "modules"
-        try:
-            modules_out.mkdir(parents=True, exist_ok=True)
-            _final_set = set(final_mods)
-            try:
-                for _existing in list(modules_out.iterdir()):
-                    if _existing.name not in _final_set:
-                        _rmtree_nfs(_existing)
-            except OSError:
-                pass
-            for mod in final_mods:
-                src = get_modules_root(str(workspace)) / mod
-                dst = modules_out / mod
-                if src.is_dir():
-                    _copytree_nfs(src, dst)
-        except Exception:
-            logger.warning("[S4] output/modules 执行期组装 best-effort 失败，将由 finalize_workspace 最终权威写入", exc_info=True)
 
-        # module dependency graph — 依赖图持久化为 SQLite + JSON，供后端查询和前端渲染
+        # module dependency graph — 写本地 workspace（finalize 拷回 NFS）
         try:
             graph = build_module_dependency_graph(
                 workspace=workspace,
                 details_dir=ctx.details_dir,
-                sqlite_path=final_out_dir / "module_dependency_graph.sqlite",
-                json_path=final_out_dir / "module_dependency_graph.json",
+                sqlite_path=workspace / "module_dependency_graph.sqlite",
+                json_path=workspace / "module_dependency_graph.json",
             )
             ctx.emit_event(
                 "stage_result",
@@ -524,17 +506,19 @@ class FinalReportStage(BaseStage):
         except Exception as exc:
             ctx.emit_event("log", level="warn", msg=f"[依赖图] 生成失败: {exc}")
 
-        # final_report.md
-        report_src = workspace / "final_report.md"
-        report_dst = final_out_dir / "final_report.md"
-        if report_src.exists():
-            safe_copy2(str(report_src), str(report_dst))
-        ctx.final_report_path = str(report_dst)
+        # final_report.md：已写在 workspace/final_report.md（本地）；
+        # NFS output/final_report.md 由 sync_loop 同步 + finalize 权威写。
+        # ctx.final_report_path 指向 NFS 路径供 API/前端读（sync_loop 已同步）。
+        ctx.final_report_path = str(final_out_dir / "final_report.md")
 
-        # modules.list — 按风险等级排序
-        generate_modules_list(modules_out, final_out_dir / "modules.list")
-
-        # 路径清洗 — 去除容器内绝对路径前缀
-        strip_target_prefix(modules_out, cfg.target_dir)
-        if report_dst.exists():
-            strip_target_prefix(report_dst.parent, cfg.target_dir)
+        # modules.list — 从本地 workspace/modules 生成，写本地（sync_loop 同步）
+        try:
+            ws_mods_root = get_modules_root(str(workspace))
+            generate_modules_list(ws_mods_root, workspace / "modules.list")
+            # 路径清洗 — 去除容器内绝对路径前缀（本地）
+            strip_target_prefix(ws_mods_root, cfg.target_dir)
+            report_src = workspace / "final_report.md"
+            if report_src.exists():
+                strip_target_prefix(report_src.parent, cfg.target_dir)
+        except Exception:
+            logger.warning("[S4] modules.list/strip 本地生成失败", exc_info=True)

@@ -270,6 +270,12 @@ def _assemble_final_output_modules(nfs_root: Path, local_run: Path) -> None:
             strip_target_prefix(out_mods, str(local_run / "workspace" / "target"))
         except Exception:
             logger.warning("finalize: modules.list/strip_target_prefix failed for %s", nfs_root.name, exc_info=True)
+        # 拷回依赖图 / final_report / modules.list 到 NFS output（sync_loop 不同步依赖图）
+        ws = local_run / "workspace"
+        for _f in ("module_dependency_graph.sqlite", "module_dependency_graph.json", "modules.list", "final_report.md"):
+            _src = ws / _f
+            if _src.is_file():
+                _safe_copy(_src, nfs_root / "output" / _f)
         logger.info("finalize: 最终权威写入 output/modules (%d modules) for %s",
                     sum(1 for _ in out_mods.iterdir() if _.is_dir()), nfs_root.name)
     except Exception:

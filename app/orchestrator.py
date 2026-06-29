@@ -400,11 +400,11 @@ class Orchestrator:
 
         result.total_duration_ms = (time.time() - start) * 1000
 
-        # ── 写模块依赖图 ─────────────────────────────────────────────────
+        # ── 写模块依赖图（写本地 workspace，finalize 拷回 NFS）─────────────────
         try:
             if ctx.module_dependency_graph:
                 import json as _json
-                (final_out_dir / "module_dependency_graph.json").write_text(
+                (workspace / "module_dependency_graph.json").write_text(
                     _json.dumps(ctx.module_dependency_graph, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
@@ -437,16 +437,19 @@ class Orchestrator:
                 modules_root=str(get_modules_root(str(workspace))),
             )
 
-        # modules.list（如尚未生成）
-        modules_out = final_out_dir / "modules"
-        if modules_out.exists() and not (final_out_dir / "modules.list").exists():
-            generate_modules_list(modules_out, final_out_dir / "modules.list")
-
-        # 路径清洗（确保幂等）
-        if modules_out.exists():
-            strip_target_prefix(modules_out, cfg.target_dir)
-        if report_dst.exists():
-            strip_target_prefix(report_dst.parent, cfg.target_dir)
+        # modules.list + 路径清洗：只处理本地 workspace（不写 NFS output/，避免与 sync_loop 竞态）。
+        # NFS output/modules.list 由 sync_loop 同步 + finalize_workspace 权威写。
+        try:
+            ws_mods = get_modules_root(str(workspace))
+            if ws_mods.exists() and not (workspace / "modules.list").exists():
+                generate_modules_list(ws_mods, workspace / "modules.list")
+            if ws_mods.exists():
+                strip_target_prefix(ws_mods, cfg.target_dir)
+            _report_ws = workspace / "final_report.md"
+            if _report_ws.exists():
+                strip_target_prefix(_report_ws.parent, cfg.target_dir)
+        except Exception:
+            _log.warning("orchestrator: workspace modules.list/strip failed", exc_info=True)
 
         # 归档 run_dir
         (run_dir / "result.json").write_text(
