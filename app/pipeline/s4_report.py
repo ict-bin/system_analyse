@@ -485,25 +485,27 @@ class FinalReportStage(BaseStage):
                 _ensure_report_generation_marker(workspace / "final_report.md", "program")
 
         # ── 组装输出目录 ──────────────────────────────────────────────────────
+        # 注意：output/modules 在执行期间会与 WorkerControl 的 sync_loop(每10s) 并发写，
+        # 这里是 best-effort（供前端看进度）；最终权威写入由任务结束后 finalize_workspace
+        # 在 sync_loop 停止后单写者完成，避免竞态。此处任何异常都不中断任务。
         final_mods = discover_modules(str(workspace))
-
-        # modules/ — 分类后的模块文件夹（files.list + module_report.md）
-        # 不做整目录 rmtree：会与 WorkerControl 的 sync_loop(每10s写 output/modules) 在 NFS 上撞车
-        # 触发 [Errno 39] Directory not empty。改为逐模块对账：删陈旧 + 覆盖最终，均带 NFS 重试。
         modules_out = final_out_dir / "modules"
-        modules_out.mkdir(parents=True, exist_ok=True)
-        _final_set = set(final_mods)
         try:
-            for _existing in list(modules_out.iterdir()):
-                if _existing.name not in _final_set:
-                    _rmtree_nfs(_existing)
-        except OSError:
-            pass
-        for mod in final_mods:
-            src = get_modules_root(str(workspace)) / mod
-            dst = modules_out / mod
-            if src.is_dir():
-                _copytree_nfs(src, dst)
+            modules_out.mkdir(parents=True, exist_ok=True)
+            _final_set = set(final_mods)
+            try:
+                for _existing in list(modules_out.iterdir()):
+                    if _existing.name not in _final_set:
+                        _rmtree_nfs(_existing)
+            except OSError:
+                pass
+            for mod in final_mods:
+                src = get_modules_root(str(workspace)) / mod
+                dst = modules_out / mod
+                if src.is_dir():
+                    _copytree_nfs(src, dst)
+        except Exception:
+            logger.warning("[S4] output/modules 执行期组装 best-effort 失败，将由 finalize_workspace 最终权威写入", exc_info=True)
 
         # module dependency graph — 依赖图持久化为 SQLite + JSON，供后端查询和前端渲染
         try:

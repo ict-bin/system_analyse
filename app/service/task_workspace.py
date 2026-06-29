@@ -169,6 +169,11 @@ def finalize_workspace(output_path: str, task_id: str, normal: bool) -> None:
         # 2. 最后同步一次 events + 模块产物
         sync_for_frontend(output_path, task_id)
 
+        # 2.5 最终权威写 output/modules：此时任务已结束、sync_loop 已停（单写者，无竞态）。
+        # 从本地 workspace/modules 完整拷贝到 output/modules，清陈旧 + 生成 modules.list + 路径清洗。
+        # S4 执行期的 output/modules 只是 best-effort 进度副本，以此处为凖。
+        _assemble_final_output_modules(nfs_root, local_run)
+
         # 3. 仅正常完成(normal=True)才把本地 run 拷回 NFS 真实 run/（供归档/会话查阅）。
         #    异常/被杀(normal=False)不保留残缺工作区：resume 已删除，保留只会被下次
         #    派发的 setup/requeue 清掉，且是隐式续跑的根源；前端产物已由上面 surrogate+sync 处理。
@@ -236,6 +241,39 @@ def _surrogate_archive_if_needed(nfs_root: Path, local_run: Path, normal: bool) 
             _safe_copy(ml, out / "modules.list")
     except Exception:
         logger.exception("surrogate archive failed")
+
+
+def _assemble_final_output_modules(nfs_root: Path, local_run: Path) -> None:
+    """任务结束后最终权威写 output/modules（sync_loop 已停，单写者无竞态）。
+
+    从本地 workspace/modules 完整 copytree 到 output/modules，清陈旧模块，
+    生成 modules.list + 路径清洗。S4 执行期的 output/modules 只是进度副本。
+    """
+    try:
+        ws_mods = local_run / "workspace" / "modules"
+        out_mods = nfs_root / "output" / "modules"
+        if not ws_mods.is_dir():
+            return
+        # 清陈旧 + 重建（单写者，无竞态）
+        if out_mods.exists():
+            shutil.rmtree(str(out_mods), ignore_errors=True)
+        out_mods.mkdir(parents=True, exist_ok=True)
+        for mod in [d for d in ws_mods.iterdir() if d.is_dir()]:
+            dst = out_mods / mod.name
+            if not dst.exists():
+                shutil.copytree(str(mod), str(dst))
+        # modules.list
+        try:
+            from app.pipeline.helpers import generate_modules_list, strip_target_prefix  # noqa: PLC0415
+            if not (out_mods.parent / "modules.list").exists():
+                generate_modules_list(out_mods, out_mods.parent / "modules.list")
+            strip_target_prefix(out_mods, str(local_run / "workspace" / "target"))
+        except Exception:
+            logger.warning("finalize: modules.list/strip_target_prefix failed for %s", nfs_root.name, exc_info=True)
+        logger.info("finalize: 最终权威写入 output/modules (%d modules) for %s",
+                    sum(1 for _ in out_mods.iterdir() if _.is_dir()), nfs_root.name)
+    except Exception:
+        logger.exception("finalize: _assemble_final_output_modules failed for %s", nfs_root.name)
 
 
 def _safe_copy(src: Path, dst: Path) -> None:
