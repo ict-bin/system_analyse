@@ -192,8 +192,7 @@ class TaskRepository:
         db.commit()
         db.refresh(row)
         _invalidate_slot_summary_for_project(row.project_id)
-        # 同步清除 events.jsonl（重跑从头）
-        clear_events(events_path(row.output_path, row.task_id))
+        # 事件时间线不清空：保留 events.jsonl 历史，重启后新事件追加（_parse_jsonl 支持跨 __final__ 读全部）
         return row
 
     @staticmethod

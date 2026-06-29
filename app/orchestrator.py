@@ -210,6 +210,15 @@ class Orchestrator:
         run_dir.mkdir(exist_ok=True)
         final_out_dir = out_dir / "output"
         final_out_dir.mkdir(exist_ok=True)
+        # 事件时间线续接：若顶层 {task_id}/events.jsonl 有历史（重启/重跑保留），
+        # seed 到 run/events.jsonl，使新 run 的事件追加到历史后（不清空）。
+        try:
+            top_events = out_dir / "events.jsonl"
+            run_events = run_dir / "events.jsonl"
+            if top_events.is_file() and not run_events.exists():
+                run_events.write_bytes(top_events.read_bytes())
+        except Exception:
+            pass
         sess_dir = run_dir / "sessions"
         sess_dir.mkdir(exist_ok=True)
         workspace = run_dir / "workspace"

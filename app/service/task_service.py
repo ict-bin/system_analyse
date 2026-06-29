@@ -664,6 +664,8 @@ def _remove_task_root_for_restart(output_path: str | None, task_id: str) -> dict
 
     Renaming is fast and prevents the next run from seeing stale checkpoint/workspace
     files even if background deletion on NFS takes longer than expected.
+    事件时间线 events.jsonl 不清空：保留顶层 {task_id}/events.jsonl 历史，
+    供下一次 run 续接（orchestrator 会 seed 到 run/events.jsonl）。
     """
     result: dict[str, object] = {"task_root": None, "renamed_to": None, "removed": False, "existed": False}
     if not output_path:
@@ -673,6 +675,14 @@ def _remove_task_root_for_restart(output_path: str | None, task_id: str) -> dict
     if not task_root.exists():
         return result
     result["existed"] = True
+    # 保留事件时间线历史（顶层 NFS 副本，含历次 run 的事件）
+    preserved_events = b""
+    top_events = task_root / "events.jsonl"
+    try:
+        if top_events.is_file():
+            preserved_events = top_events.read_bytes()
+    except Exception:
+        logger.warning("restart: failed to read preserved events.jsonl: %s", task_id)
     tombstone = task_root.with_name(f".{task_root.name}.restart-delete-{uuid.uuid4().hex}")
     try:
         task_root.rename(tombstone)
@@ -683,6 +693,7 @@ def _remove_task_root_for_restart(output_path: str | None, task_id: str) -> dict
         import shutil as _shutil
         _shutil.rmtree(task_root)
         result["removed"] = True
+        _restore_events(task_root, preserved_events)
         return result
 
     import shutil as _shutil
@@ -691,7 +702,20 @@ def _remove_task_root_for_restart(output_path: str | None, task_id: str) -> dict
         result["removed"] = True
     except OSError as exc:
         logger.warning("restart cleanup tombstone failed path=%s: %s", tombstone, exc)
+    _restore_events(task_root, preserved_events)
     return result
+
+
+def _restore_events(task_root: Path, preserved_events: bytes) -> None:
+    """重建任务根目录并恢复 events.jsonl 历史（供下次 run seed/续接）。"""
+    if not preserved_events:
+        return
+    try:
+        task_root.mkdir(parents=True, exist_ok=True)
+        (task_root / "events.jsonl").write_bytes(preserved_events)
+        logger.info("restart: preserved events.jsonl history (%d bytes) for %s", len(preserved_events), task_root.name)
+    except Exception:
+        logger.warning("restart: failed to restore events.jsonl for %s", task_root.name)
 
 
 def _load_task_result_json(row: AppSaTask) -> dict | None:
