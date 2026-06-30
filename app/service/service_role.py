@@ -19,7 +19,7 @@ def service_role() -> str:
     legacy = {"manager": "scheduler", "runner": "worker"}
     if normalized in legacy:
         return legacy[normalized]
-    return normalized if normalized in {"api", "scheduler", "worker", "all"} else "all"
+    return normalized if normalized in {"api", "scheduler", "worker", "debugger", "all"} else "all"
 
 
 def is_api_role() -> bool:
@@ -32,6 +32,10 @@ def is_scheduler_role() -> bool:
 
 def is_worker_role() -> bool:
     return service_role() in {"worker", "all"}
+
+
+def is_debugger_role() -> bool:
+    return service_role() in {"debugger", "all"}
 
 
 # 兼容旧函数名（调用方未迁移时保留）

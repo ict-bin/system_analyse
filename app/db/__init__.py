@@ -93,6 +93,29 @@ _MIGRATIONS = [
         "  KEY ix_sa_task_event_created_at (created_at)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
     ),
+    # Failure debug reports (added 2026-06) — 任务失败时 LLM 自动调试报告
+    (
+        "CREATE TABLE IF NOT EXISTS secflow_app_sa_failure_debug ("
+        "  id INT NOT NULL AUTO_INCREMENT,"
+        "  task_id VARCHAR(64) NOT NULL,"
+        "  project_id VARCHAR(100) NOT NULL,"
+        "  task_name VARCHAR(255) NOT NULL,"
+        "  status VARCHAR(16) NOT NULL DEFAULT 'pending',"
+        "  error_kind VARCHAR(64) NULL,"
+        "  failing_stage VARCHAR(64) NULL,"
+        "  summary VARCHAR(512) NULL,"
+        "  report_path VARCHAR(1024) NULL,"
+        "  report_json JSON NULL,"
+        "  debug_error TEXT NULL,"
+        "  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+        "  PRIMARY KEY (id),"
+        "  UNIQUE KEY uix_sa_failure_debug_task_id (task_id),"
+        "  KEY ix_sa_failure_debug_project_id (project_id),"
+        "  KEY ix_sa_failure_debug_status (status),"
+        "  KEY ix_sa_failure_debug_created_at (created_at)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    ),
 ]
 
 

@@ -12,7 +12,7 @@ from fastapi import FastAPI
 
 from app.config import get_service_yaml
 from app.service.llm_provider_sync import sync_providers_to_pi, validate_pi_models_file
-from app.service.service_role import is_api_role, is_dispatcher_role, is_runner_role, service_role
+from app.service.service_role import is_api_role, is_debugger_role, is_dispatcher_role, is_runner_role, service_role
 
 logger = logging.getLogger("sa.bootstrap")
 
@@ -25,6 +25,7 @@ class RuntimeBootstrapStatus:
     management_api_ready: bool = False
     registry_ready: bool = False
     worker_loop_ready: bool = False
+    failure_debug_started: bool = False
     ready: bool = False
     phase: str = "booting"
     error: str | None = None
@@ -91,6 +92,13 @@ class RuntimeBootstrap:
                 made_progress = self._attempt_async_component_start(
                     "worker_loop_start",
                     self._start_worker_loop,
+                ) or made_progress
+
+            # debugger 角色：DB 就绪后启动失败调试轮询循环
+            if is_debugger_role() and self._status.db_ready and not self._status.failure_debug_started:
+                made_progress = self._attempt_async_component_start(
+                    "failure_debug_start",
+                    self._start_failure_debug,
                 ) or made_progress
 
                 if self._all_required_components_ready():
@@ -220,6 +228,12 @@ class RuntimeBootstrap:
             return
         get_task_service().start_worker_loop()
         self._status.worker_loop_ready = True
+
+    def _start_failure_debug(self) -> None:
+        from app.service.failure_debug import get_failure_debug_service
+
+        get_failure_debug_service().start()
+        self._status.failure_debug_started = True
 
     def _all_required_components_ready(self) -> bool:
         if not self._status.db_ready:

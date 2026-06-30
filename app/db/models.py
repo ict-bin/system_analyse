@@ -124,3 +124,23 @@ class AppSaModelsConfig(Base):
     config_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True, default="global")
     config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
+
+
+class AppSaFailureDebug(Base):
+    """任务失败时 LLM 自动调试生成的故障定位报告。"""
+    __tablename__ = "secflow_app_sa_failure_debug"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    task_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # status: pending | running | done | error
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    error_kind: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    failing_stage: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    report_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    report_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    debug_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
