@@ -54,11 +54,34 @@ class FailureDebugService:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        # 新 pod 启动：上一实例的 running 行都是悬挂的，重置为 error 可重试
+        self._reset_stale_running_on_startup()
         self._thread = threading.Thread(
             target=self._loop, name="sa_failure_debug", daemon=True
         )
         self._thread.start()
         logger.info("FailureDebugService started (poll=%ss batch=%s)", POLL_INTERVAL, BATCH_SIZE)
+
+    def _reset_stale_running_on_startup(self) -> None:
+        try:
+            if _SessionLocal is None:
+                return
+            db = _SessionLocal()
+            try:
+                n = db.query(AppSaFailureDebug).filter(
+                    AppSaFailureDebug.status == "running"
+                ).update(
+                    {AppSaFailureDebug.status: "error",
+                     AppSaFailureDebug.debug_error: "startup_reset: stale running"},
+                    synchronize_session=False,
+                )
+                db.commit()
+                if n:
+                    logger.info("startup: reset %d stale running failure_debug rows to error", n)
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("startup stale running reset failed")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -81,6 +104,20 @@ class FailureDebugService:
     def _poll_and_debug(self) -> None:
         db = _SessionLocal()
         try:
+            # 重置陈旧的 running 行（debugger pod 重启/崩溃后遗留的悬挂行）→ error 可重试
+            from datetime import datetime, timedelta
+
+            stale_cutoff = datetime.now() - timedelta(seconds=RUN_TIMEOUT + 300)
+            db.query(AppSaFailureDebug).filter(
+                AppSaFailureDebug.status == "running",
+                AppSaFailureDebug.updated_at < stale_cutoff,
+            ).update(
+                {AppSaFailureDebug.status: "error",
+                 AppSaFailureDebug.debug_error: "stale_running_reset"},
+                synchronize_session=False,
+            )
+            db.commit()
+
             # 查失败任务中尚无报告（或报告处于 error 可重试）的
             from sqlalchemy import select
 

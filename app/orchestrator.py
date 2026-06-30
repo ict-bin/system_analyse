@@ -457,6 +457,9 @@ class Orchestrator:
         archive_path = str(run_dir / "archive")
         shutil.make_archive(archive_path, "zip", str(run_dir.parent), run_dir.name)
 
+        # modules 输出路径（NFS，由 finalize_workspace 权威写入）；task_end 事件记录此路径
+        modules_out = final_out_dir / "modules"
+
         # flag: 成功=1，失败/错误=0
         try:
             flag_path.write_text(
