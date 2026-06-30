@@ -94,7 +94,8 @@ class FailureDebugService:
                     AppSaTask.is_deleted == False,  # noqa: E712
                     ~AppSaTask.task_id.in_(existing),
                 )
-                .order_by(AppSaTask.finished_at.desc().nullslast(), AppSaTask.created_at.desc())
+                # MySQL 不支持 NULLS LAST；用 IS NULL 把无 finished_at 的排到最后
+                .order_by(AppSaTask.finished_at.is_(None), AppSaTask.finished_at.desc(), AppSaTask.created_at.desc())
                 .limit(BATCH_SIZE)
                 .all()
             )
