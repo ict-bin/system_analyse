@@ -1001,6 +1001,7 @@ def _run_with_context_overflow_recovery(
             timeout_seconds=timeout_seconds, session_file=session_file,
             model_stuck_timeout=model_stuck_timeout,
             model_stuck_max_activations=model_stuck_max_activations,
+            fatal_max_retries=fatal_max_retries,
         )
         result.agent_role = agent_role or None
         result.runtime_dir = runtime_dir
@@ -1078,6 +1079,7 @@ def _run_with_pi_retry(
     session_file: str | None = None,
     model_stuck_timeout: float | None = None,
     model_stuck_max_activations: int | None = None,
+    fatal_max_retries: int = -1,
 ) -> AgentResult:
     if not os.path.isdir(cwd):
         _log_error(f"cwd 目录不存在（不可重试）: {cwd}")
