@@ -230,20 +230,75 @@ class FailureDebugService:
 
         # 异常原因 JSON
         abnormal = task.latest_abnormal_reason_json or {}
+        err_msg = task.error or ""
+        # 兜底：从错误信息模式匹配 error_kind（早期失败无 error 事件时）
+        if not error_kind:
+            error_kind = self._classify_error_kind(err_msg) or (abnormal.get("error_kind") if isinstance(abnormal, dict) else None)
+        if not failing_stage:
+            failing_stage = (abnormal.get("stage") if isinstance(abnormal, dict) else None) or self._guess_stage_from_error(err_msg)
 
         return {
             "task_id": task.task_id,
             "task_name": task.task_name,
             "project_id": task.project_id,
             "status": task.status,
-            "error_msg": task.error or "",
+            "error_msg": err_msg,
             "analysis_mode": task.analysis_mode or "",
-            "error_kind": error_kind or (abnormal.get("error_kind") if isinstance(abnormal, dict) else None),
-            "failing_stage": failing_stage or (abnormal.get("stage") if isinstance(abnormal, dict) else None),
+            "error_kind": error_kind,
+            "failing_stage": failing_stage,
             "abnormal_reason": json.dumps(abnormal, ensure_ascii=False) if abnormal else "",
             "events_tail": tail,
             "events_total": len(events),
         }
+
+    # ── 错误分类（从错误消息模式匹配）────────────────────────────────────
+    def _classify_error_kind(self, err_msg: str) -> str | None:
+        """从 task.error 文本推断错误类型（早期失败无 error 事件时的兜底）。"""
+        if not err_msg:
+            return None
+        e = err_msg.lower()
+        if "name '" in e and "is not defined" in e:
+            return "NameError"
+        if "[errno 17]" in e or "file exists" in e:
+            return "FileExistsError"
+        if "[errno 39]" in e or "directory not empty" in e:
+            return "DirectoryNotEmptyError"
+        if "[errno" in e:
+            return "OSError"
+        if "提交前校验失败" in err_msg or "pre_submit" in e:
+            return "PreSubmitValidationError"
+        if "task_subprocess_exit" in e:
+            return "SubprocessCrash"
+        if "context length" in e or "input tokens" in e:
+            return "ContextOverflow"
+        if "key authentication" in e or "401" in e:
+            return "AuthError"
+        if "no model" in e or "model" in e and "not found" in e:
+            return "NoModelError"
+        if "timeout" in e or "timed out" in e:
+            return "TimeoutError"
+        if "connection" in e and ("refused" in e or "reset" in e or "unreachable" in e):
+            return "ConnectionError"
+        return None
+
+    def _guess_stage_from_error(self, err_msg: str) -> str | None:
+        """从错误消息猜失败阶段。"""
+        if not err_msg:
+            return None
+        e = err_msg.lower()
+        if "s0" in e or "filter" in e:
+            return "S0_filter"
+        if "s1" in e or "classify" in e:
+            return "S1_classify"
+        if "s2" in e or "refine" in e or "提交前校验" in err_msg:
+            return "S2_refine"
+        if "s3" in e or "analyse" in e:
+            return "S3_analyse"
+        if "s4" in e or "report" in e:
+            return "S4_report"
+        if "orchestrat" in e or "modules_out" in e:
+            return "orchestrator"
+        return None
 
     # ── 运行 LLM 调试（分段多轮会话）───────────────────────────────
     def _run_llm_debug(self, task: AppSaTask, context: dict[str, Any]) -> dict[str, Any]:
