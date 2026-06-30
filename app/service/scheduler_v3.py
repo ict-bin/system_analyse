@@ -338,10 +338,46 @@ class SchedulerV3:
                     self._finalize(task_id, state, err, result)
                 except Exception:
                     logger.exception("finalize task failed: %s", task_id)
+                # 真实失败（非瞬时重排、非取消）→ 给 debugger 下发调试任务
+                if state == proto.STATE_FAILED:
+                    threading.Thread(
+                        target=self._dispatch_failure_debug,
+                        args=(task_id,),
+                        name=f"sa_debug_dispatch_{task_id}",
+                        daemon=True,
+                    ).start()
                 with self._lock:
                     self._running.pop(task_id, None)
                     self._requeue_counts.pop(task_id, None)
                     self._dirty = True
+
+    # ── 失败调试下发 ──────────────────────────────────────────────────────
+    _DEBUGGER_HOST = os.environ.get("SA_DEBUGGER_HOST", "secflow-app-system-analyse-debugger")
+    _DEBUGGER_PORT = int(os.environ.get("SA_DEBUGGER_PORT", "8080"))
+
+    def _dispatch_failure_debug(self, task_id: str) -> None:
+        """任务真实失败后，通知 debugger pod 对该任务进行 LLM 调试。
+
+        debugger 不主动轮询任务表，只处理调度器下发的任务。
+        """
+        import urllib.request
+        import urllib.error
+        url = f"http://{self._DEBUGGER_HOST}:{self._DEBUGGER_PORT}/api/app/system-analyse/internal/failure-debug"
+        payload = json.dumps({"task_id": task_id}).encode()
+        for attempt in range(1, 4):
+            try:
+                req = urllib.request.Request(
+                    url, data=payload, method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if 200 <= resp.status < 300:
+                        logger.info("dispatched failure-debug for task %s (attempt %d)", task_id, attempt)
+                        return
+            except Exception as exc:
+                logger.warning("failure-debug dispatch attempt %d for %s failed: %s", attempt, task_id, exc)
+            _time.sleep(5)
+        logger.error("failure-debug dispatch exhausted for task %s (debugger unreachable)", task_id)
 
     def _on_worker_disconnect(self, wid: str) -> None:
         with self._lock:

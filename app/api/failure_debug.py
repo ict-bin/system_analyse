@@ -17,9 +17,49 @@ from sqlalchemy.orm import Session
 
 from app.config import OUTPUT_DIR
 from app.db import get_db
-from app.db.models import AppSaFailureDebug
+from app.db.models import AppSaFailureDebug, AppSaTask
 
 from . import router
+
+
+@router.post("/internal/failure-debug", include_in_schema=False)
+def submit_failure_debug(payload: dict, db: Session = Depends(get_db)):
+    """调度器下发：任务失败后通知 debugger 调试。创建 pending 行 + 唤醒 worker。"""
+    task_id = str((payload or {}).get("task_id") or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="task_id required")
+    # 幂等创建 pending 行（持久化下发意图，debugger 崩溃后启动扫描可恢复）
+    row = db.query(AppSaFailureDebug).filter(AppSaFailureDebug.task_id == task_id).first()
+    created = False
+    if row is None:
+        # 需 task_name/project_id；从 tasks 表取
+        task = db.query(AppSaTask).filter(AppSaTask.task_id == task_id).first()
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        row = AppSaFailureDebug(
+            task_id=task_id,
+            project_id=task.project_id,
+            task_name=task.task_name,
+            status="pending",
+        )
+        db.add(row)
+        db.commit()
+        created = True
+    elif row.status in ("done", "running"):
+        # 已完成或在途，不重复下发
+        return {"task_id": task_id, "status": row.status, "dispatched": False}
+    elif row.status == "error":
+        # 之前失败，重新下发
+        row.status = "pending"
+        row.debug_error = None
+        db.commit()
+    # 唤醒 worker（仅 debugger pod 上 FailureDebugService 已 start；非 debugger pod 是 no-op）
+    try:
+        from app.service.failure_debug import get_failure_debug_service
+        get_failure_debug_service().submit(task_id)
+    except Exception:
+        pass
+    return {"task_id": task_id, "status": row.status, "dispatched": True, "created": created}
 
 
 def _row_to_dict(row: AppSaFailureDebug, *, detail: bool = False) -> dict[str, Any]:

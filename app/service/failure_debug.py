@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -44,23 +45,46 @@ _lock = threading.Lock()
 
 
 class FailureDebugService:
-    """单例：后台轮询失败任务并执行 LLM 调试。"""
+    """单例：被动接收调度器下发的调试任务（不主动轮询任务表）。
+
+    调度器在任务失败时 POST /internal/failure-debug {task_id} → submit()。
+    本服务用内存队列 + worker 线程串行处理。启动时扫一次 pending/
+    stale-running 行（处理重启前已下发但未处理的任务）。
+    """
 
     def __init__(self) -> None:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._queue: "queue.Queue[str]" = queue.Queue()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
-        # 新 pod 启动：上一实例的 running 行都是悬挂的，重置为 error 可重试
         self._reset_stale_running_on_startup()
+        self._enqueue_pending_rows()
         self._thread = threading.Thread(
-            target=self._loop, name="sa_failure_debug", daemon=True
+            target=self._worker_loop, name="sa_failure_debug", daemon=True
         )
         self._thread.start()
-        logger.info("FailureDebugService started (poll=%ss batch=%s)", POLL_INTERVAL, BATCH_SIZE)
+        logger.info("FailureDebugService started (notify-driven, model=%s)", DEBUG_MODEL or "auto")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        try:
+            self._queue.put_nowait("")
+        except Exception:
+            pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        self._thread = None
+
+    def submit(self, task_id: str) -> None:
+        """调度器下发：入队一个调试任务。"""
+        if not task_id:
+            return
+        self._queue.put(task_id)
+        logger.info("failure-debug task submitted: %s", task_id)
 
     def _reset_stale_running_on_startup(self) -> None:
         try:
@@ -83,66 +107,55 @@ class FailureDebugService:
         except Exception:
             logger.exception("startup stale running reset failed")
 
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5.0)
-        self._thread = None
-
-    # ── 主循环 ────────────────────────────────────────────────────────────
-    def _loop(self) -> None:
-        # 启动时等 DB 就绪（runtime_bootstrap 在 DB ready 后才 start，但留个保险）
-        while not self._stop_event.wait(timeout=5.0):
+    def _enqueue_pending_rows(self) -> None:
+        """启动扫描：把已下发(pending)/重试(error)的行入队处理。"""
+        try:
             if _SessionLocal is None:
+                return
+            db = _SessionLocal()
+            try:
+                rows = db.query(AppSaFailureDebug).filter(
+                    AppSaFailureDebug.status.in_(("pending", "error"))
+                ).all()
+                for r in rows:
+                    self._queue.put(r.task_id)
+                if rows:
+                    logger.info("startup: enqueued %d pending/error failure_debug rows", len(rows))
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("startup pending enqueue failed")
+
+    # ── worker 循环（被动消费队列，不轮询任务表）────────────────────────────
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                task_id = self._queue.get(timeout=5.0)
+            except queue.Empty:
+                continue
+            if not task_id:
                 continue
             try:
-                self._poll_and_debug()
+                self._debug_one_by_id(task_id)
             except Exception:
-                logger.exception("failure_debug loop error")
-            self._stop_event.wait(timeout=POLL_INTERVAL)
+                logger.exception("debug failed for task %s", task_id)
+            try:
+                self._queue.task_done()
+            except Exception:
+                pass
 
-    def _poll_and_debug(self) -> None:
+    def _debug_one_by_id(self, task_id: str) -> None:
+        """从 DB 加载任务并调试。"""
+        if _SessionLocal is None:
+            logger.warning("DB not ready, skip debug for %s", task_id)
+            return
         db = _SessionLocal()
         try:
-            # 重置陈旧的 running 行（debugger pod 重启/崩溃后遗留的悬挂行）→ error 可重试
-            from datetime import datetime, timedelta
-
-            stale_cutoff = datetime.now() - timedelta(seconds=RUN_TIMEOUT + 300)
-            db.query(AppSaFailureDebug).filter(
-                AppSaFailureDebug.status == "running",
-                AppSaFailureDebug.updated_at < stale_cutoff,
-            ).update(
-                {AppSaFailureDebug.status: "error",
-                 AppSaFailureDebug.debug_error: "stale_running_reset"},
-                synchronize_session=False,
-            )
-            db.commit()
-
-            # 查失败任务中尚无报告（或报告处于 error 可重试）的
-            from sqlalchemy import select
-
-            existing = select(AppSaFailureDebug.task_id).where(
-                AppSaFailureDebug.status.in_(("pending", "running", "done"))
-            )
-            tasks = (
-                db.query(AppSaTask)
-                .filter(
-                    AppSaTask.status.in_(_FAILED_STATUSES),
-                    AppSaTask.is_deleted == False,  # noqa: E712
-                    ~AppSaTask.task_id.in_(existing),
-                )
-                # MySQL 不支持 NULLS LAST；用 IS NULL 把无 finished_at 的排到最后
-                .order_by(AppSaTask.finished_at.is_(None), AppSaTask.finished_at.desc(), AppSaTask.created_at.desc())
-                .limit(BATCH_SIZE)
-                .all()
-            )
-            for t in tasks:
-                if self._stop_event.is_set():
-                    break
-                try:
-                    self._debug_one(db, t)
-                except Exception:
-                    logger.exception("debug failed for task %s", t.task_id)
+            task = db.query(AppSaTask).filter(AppSaTask.task_id == task_id).first()
+            if task is None:
+                logger.warning("task %s not found in DB, skip debug", task_id)
+                return
+            self._debug_one(db, task)
         finally:
             db.close()
 

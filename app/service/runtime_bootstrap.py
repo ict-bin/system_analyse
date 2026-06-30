@@ -75,7 +75,7 @@ class RuntimeBootstrap:
                 made_progress = self._init_db(svc_yaml)
 
             if self._status.db_ready:
-                if is_api_role() and not self._router_installed:
+                if (is_api_role() or is_debugger_role()) and not self._router_installed:
                     made_progress = self._attempt_component_start(
                         "router_init",
                         lambda: self._install_management_router(app),
@@ -243,6 +243,10 @@ class RuntimeBootstrap:
         if is_api_role() and not self._status.registry_ready:
             return False
         if (is_dispatcher_role() or is_runner_role()) and not self._status.worker_loop_ready:
+            return False
+        if is_debugger_role() and not self._status.management_api_ready:
+            return False
+        if is_debugger_role() and not self._status.failure_debug_started:
             return False
         return True
 
