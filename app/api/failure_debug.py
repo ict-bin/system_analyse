@@ -46,7 +46,7 @@ def submit_failure_debug(payload: dict, db: Session = Depends(get_db)):
         db.add(row)
         db.commit()
         created = True
-    elif row.status in ("done", "running"):
+    elif row.status in ("done", "running", "skipped"):
         # 已完成或在途，不重复下发
         return {"task_id": task_id, "status": row.status, "dispatched": False}
     elif row.status == "error":

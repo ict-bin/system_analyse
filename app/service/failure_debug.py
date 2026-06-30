@@ -182,6 +182,17 @@ class FailureDebugService:
 
         try:
             context = self._collect_context(task)
+            # 外部/基础设施错误（非本微服务代码问题）→ 跳过，不跑 LLM
+            ext = self._external_error_reason(context.get("error_msg") or "")
+            if ext:
+                row.status = "skipped"
+                row.error_kind = context.get("error_kind")
+                row.failing_stage = context.get("failing_stage")
+                row.summary = f"[已跳过] {ext}"
+                row.debug_error = f"external_error_skipped: {ext}"
+                db.commit()
+                logger.info("failure debug skipped for task %s (external: %s)", task.task_id, ext)
+                return
             report = self._run_llm_debug(task, context)
             self._save_report(task, report)
             row.status = "done"
@@ -252,6 +263,30 @@ class FailureDebugService:
         }
 
     # ── 错误分类（从错误消息模式匹配）────────────────────────────────────
+    def _external_error_reason(self, err_msg: str) -> str | None:
+        """识别非本微服务的外部/基础设施错误，返回原因（需跳过 LLM 分析）；None=本服务错误。"""
+        if not err_msg:
+            return None
+        e = err_msg.lower()
+        # 1. 任务源文件丢失
+        if "no such file" in e or "not a directory" in e or "源文件" in err_msg or "input_path" in e \
+                or "does not exist" in e or "找不到" in err_msg or "文件不存在" in err_msg:
+            return "任务源文件丢失"
+        # 2. 模型选择错误
+        if "model" in e and ("not found" in e or "不可用" in e or "no model" in e or "无可用" in err_msg) \
+                or 'model "' in e and 'not found' in e:
+            return "模型选择错误"
+        # 3. key 错误
+        if "401" in e or "unauthorized" in e or "invalid api key" in e or "key authentication" in e \
+                or "api key" in e and ("invalid" in e or "无效" in err_msg) or "认证失败" in err_msg:
+            return "API key 错误"
+        # 4. 模型超时 / 不可达
+        if "timed out" in e or "timeout" in e or "http 000" in e \
+                or "connection refused" in e or "connection reset" in e \
+                or "unreachable" in e or "couldn't connect" in e or "connection error" in e:
+            return "模型超时/不可达"
+        return None
+
     def _classify_error_kind(self, err_msg: str) -> str | None:
         """从 task.error 文本推断错误类型（早期失败无 error 事件时的兜底）。"""
         if not err_msg:
