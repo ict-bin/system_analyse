@@ -1805,8 +1805,10 @@ class TaskService:
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
         cleanup_result = _remove_task_root_for_restart(row.output_path, task_id)
         if row.output_path:
-            task_root = Path(row.output_path) / task_id
-            if task_root.exists():
+            # 真实失败：旧目录存在但既没删也没移走（_restore_events 会重建只含 events.jsonl 的空目录，
+            # 那是预期的，不算失败）
+            if cleanup_result.get("existed") and not cleanup_result.get("removed") and not cleanup_result.get("renamed_to"):
+                task_root = Path(row.output_path) / task_id
                 from fastapi import HTTPException
                 self._record_task_operation_event(
                     task_id=row.task_id,
@@ -1975,6 +1977,11 @@ class TaskService:
 
     def start_v3_worker(self) -> None:
         from app.service.worker_control import WorkerControl
+        # V3 也须启动 runner registry 心跳（供 worker_slot_snapshot 统计可执行槽位）
+        try:
+            self._runner_registry.start()
+        except Exception:
+            logger.exception("runner_registry.start failed in v3_worker")
         wc = WorkerControl(
             spawn_task_subprocess=self._v3_spawn,
             archive_task=self._v3_archive,
