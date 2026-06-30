@@ -338,8 +338,8 @@ class SchedulerV3:
                     self._finalize(task_id, state, err, result)
                 except Exception:
                     logger.exception("finalize task failed: %s", task_id)
-                # 真实失败（非瞬时重排、非取消）→ 给 debugger 下发调试任务
-                if state == proto.STATE_FAILED:
+                # 任务终态（非取消）→ 查 DB 实际状态，失败/错误才给 debugger 下发
+                if state in (proto.STATE_FINISHED, proto.STATE_FAILED):
                     threading.Thread(
                         target=self._dispatch_failure_debug,
                         args=(task_id,),
@@ -356,12 +356,28 @@ class SchedulerV3:
     _DEBUGGER_PORT = int(os.environ.get("SA_DEBUGGER_PORT", "8080"))
 
     def _dispatch_failure_debug(self, task_id: str) -> None:
-        """任务真实失败后，通知 debugger pod 对该任务进行 LLM 调试。
+        """任务终态后，查 DB 实际状态；仅 failed/error 才通知 debugger 调试。
 
-        debugger 不主动轮询任务表，只处理调度器下发的任务。
+        worker 对子进程 rc=0 的失败（orchestrator 内部捕获）报 STATE_FINISHED，
+        故不能只凭协议 state 判断，须以 DB 终态为准。debugger 不主动轮询任务表。
         """
         import urllib.request
         import urllib.error
+        # 先查 DB：只对真实失败/错误下发
+        try:
+            from app.db import _SessionLocal
+            from app.db.models import AppSaTask
+            if _SessionLocal is not None:
+                db = _SessionLocal()
+                try:
+                    t = db.query(AppSaTask).filter(AppSaTask.task_id == task_id).first()
+                    if t is None or t.status not in ("failed", "error"):
+                        return  # passed/cancelled/running → 不调试
+                finally:
+                    db.close()
+        except Exception:
+            logger.exception("failure-debug DB status check failed for %s", task_id)
+            return
         url = f"http://{self._DEBUGGER_HOST}:{self._DEBUGGER_PORT}/api/app/system-analyse/internal/failure-debug"
         payload = json.dumps({"task_id": task_id}).encode()
         for attempt in range(1, 4):
