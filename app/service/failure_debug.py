@@ -16,7 +16,8 @@ import json
 import logging
 import os
 import queue
-import re
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -36,6 +37,7 @@ SOURCE_ROOT = os.environ.get("SA_FAILURE_DEBUG_SOURCE_ROOT", "/app")
 PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
 MAX_EVENT_CONTEXT = int(os.environ.get("SA_FAILURE_DEBUG_MAX_EVENTS", "60"))
 RUN_TIMEOUT = float(os.environ.get("SA_FAILURE_DEBUG_TIMEOUT", "600"))
+SEGMENT_TIMEOUT = float(os.environ.get("SA_FAILURE_DEBUG_SEGMENT_TIMEOUT", "240"))
 
 # 失败状态集合
 _FAILED_STATUSES = ("failed", "error")
@@ -243,7 +245,7 @@ class FailureDebugService:
             "events_total": len(events),
         }
 
-    # ── 运行 LLM 调试 ─────────────────────────────────────────────────────
+    # ── 运行 LLM 调试（分段多轮会话）───────────────────────────────
     def _run_llm_debug(self, task: AppSaTask, context: dict[str, Any]) -> dict[str, Any]:
         from app.runner import run_agent  # 延迟导入避免循环
 
@@ -252,34 +254,91 @@ class FailureDebugService:
             raise RuntimeError("无可用 LLM 模型（models.json 为空或未配置 SA_FAILURE_DEBUG_MODEL）")
 
         events_text = self._format_events(context.get("events_tail") or [])
-        prompt = self._build_prompt(context, events_text)
+        tmp_dir = tempfile.mkdtemp(prefix="sa_fdebug_")
+        session_file = str(Path(tmp_dir) / "debug_session.json")
+        try:
+            common = dict(
+                model=model,
+                tools=["read", "bash", "grep", "glob"],
+                system_prompt=self._system_prompt(),
+                cwd=SOURCE_ROOT,
+                task_pi_dir=PI_DIR,
+                agent_role="failure_debugger",
+                max_retries=2,
+                retry_delay=10.0,
+                timeout_retry_enabled=False,
+                pi_max_retries=1,
+                fatal_max_retries=0,
+            )
+            # Turn 0: 上下文 + 检查源码（本轮不产出报告，只建立会话上下文）
+            ar = run_agent(
+                prompt=self._build_intro_prompt(context, events_text),
+                session_file=session_file,
+                run_timeout_seconds=RUN_TIMEOUT,
+                **common,
+            )
+            self._check_agent_error(ar, "intro")
+            # 分段产出：每段一个 user 消息，格式不对则 user 指出重做
+            sections = [
+                ("phenomenon", "问题现象", "结合错误信息和事件时间线，描述观察到的失败现象"),
+                ("root_cause", "问题根因", "分析为什么会发生此失败，涉及哪个组件/代码逻辑"),
+                ("solution", "解决方法", "给出清晰的修复步骤"),
+                ("code_scene", "代码现场", "定位文件路径:行号，给出相关代码片段（用```包裹）"),
+                ("patch_code", "补丁代码", "给出建议修复补丁（diff 或完整函数代码，用```包裹）"),
+            ]
+            report: dict[str, Any] = {}
+            for key, title, instruction in sections:
+                report[key] = self._produce_segment(run_agent, session_file, common, title, instruction)
+            report["_model"] = model
+            return report
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        ar = run_agent(
-            prompt=prompt,
-            model=model,
-            tools=["read", "bash", "grep", "glob"],
-            system_prompt=self._system_prompt(),
-            cwd=SOURCE_ROOT,
-            task_pi_dir=PI_DIR,
-            agent_role="failure_debugger",
-            max_retries=2,
-            retry_delay=10.0,
-            run_timeout_seconds=RUN_TIMEOUT,
-            timeout_retry_enabled=False,
-            pi_max_retries=1,
-            fatal_max_retries=0,
+    def _produce_segment(
+        self, run_agent, session_file: str, common: dict, title: str, instruction: str,
+    ) -> str:
+        """一轮产出一段；格式问题用 user 指出后重做一次。"""
+        prompt = (
+            f"现在请输出【{title}】：{instruction}\n"
+            f"只输出本段内容，不要重复其他段，不要额外说明。"
         )
+        ar = run_agent(prompt=prompt, session_file=session_file, run_timeout_seconds=SEGMENT_TIMEOUT, **common)
+        self._check_agent_error(ar, title)
+        text = self._clean_segment((ar.output or "").strip())
+        issue = self._validate_segment(title, text)
+        if not issue:
+            return text
+        # 格式问题 → user 指出，重做
+        redo = (
+            f"你上一段【{title}】输出有问题：{issue}。"
+            f"请重新输出【{title}】，只输出本段内容。"
+        )
+        logger.info("segment %s redo (issue=%s)", title, issue)
+        ar = run_agent(prompt=redo, session_file=session_file, run_timeout_seconds=SEGMENT_TIMEOUT, **common)
+        self._check_agent_error(ar, title + " redo")
+        text = self._clean_segment((ar.output or "").strip())
+        return text
 
-        output = (ar.output or "").strip()
-        if not output and ar.error:
-            raise RuntimeError(f"pi 调试无输出，错误: {ar.error}")
+    def _check_agent_error(self, ar, label: str) -> None:
         if ar.fatal:
-            raise RuntimeError(f"pi 致命错误: {ar.error or output[:200]}")
+            raise RuntimeError(f"pi 致命错误[{label}]: {ar.error or (ar.output or '')[:200]}")
+        if not (ar.output or "").strip() and ar.error:
+            raise RuntimeError(f"pi 无输出[{label}]: {ar.error}")
 
-        report = self._parse_report(output)
-        report["_model"] = model
-        report["_raw_output"] = output[:8000]
-        return report
+    def _clean_segment(self, text: str) -> str:
+        """去掉 LLM 可能加的首尾占位文字（如 '好的：'），保留正文。"""
+        text = text.strip()
+        # 去掉常见的“好的/以下是”开头客套
+        for prefix in ("好的。", "好的：", "好的,", "以下是", "好的，"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip()
+        return text.strip()
+
+    def _validate_segment(self, title: str, text: str) -> str | None:
+        """返回问题描述（None=合格）。"""
+        if not text or len(text) < 20:
+            return "内容过短或为空"
+        return None
 
     def _pick_default_model(self) -> str:
         """从 models.json 选第一个可用模型 id。"""
@@ -301,14 +360,13 @@ class FailureDebugService:
     def _system_prompt(self) -> str:
         return (
             "你是系统分析服务（secflow-app-system-analyse）的故障调试专家。\n"
-            "当一个分析任务失败时，你需要：\n"
-            "1. 使用 read/bash/grep/glob 工具检查 /app 下的服务源码（Python）\n"
-            "2. 结合错误信息和事件时间线，定位导致失败的代码位置\n"
-            "3. 给出问题根因分析和修复建议\n"
-            "4. 最终只输出一个 JSON 代码块，严格按指定格式，不要输出其他内容\n"
+            "你可以使用 read/bash/grep/glob 工具检查 /app 下的服务源码（Python）。\n"
+            "本次调试分多轮进行：先检查源码理解失败，随后按用户要求逐段产出报告各部分。\n"
+            "每轮只输出当轮要求的那一段，不要输出其他段，不要输出多余说明。\n"
         )
 
-    def _build_prompt(self, ctx: dict[str, Any], events_text: str) -> str:
+    def _build_intro_prompt(self, ctx: dict[str, Any], events_text: str) -> str:
+        """Turn 0：给上下文 + 要求检查源码（不产出报告）。"""
         return (
             f"# 任务失败调试\n\n"
             f"## 任务信息\n"
@@ -317,24 +375,16 @@ class FailureDebugService:
             f"- 分析模式: {ctx.get('analysis_mode') or '未知'}\n"
             f"- 失败阶段: {ctx.get('failing_stage') or '未知'}\n"
             f"- 错误类型: {ctx.get('error_kind') or '未知'}\n\n"
-            f"## 错误信息\n```\n{ctx.get('error_msg') or '(无)'}\n```\n\n"
-            f"## 异常原因(JSON)\n```\n{ctx.get('abnormal_reason') or '(无)'}\n```\n\n"
+            f"## 错误信息\n`````\n{ctx.get('error_msg') or '(无)'}\n`````\n\n"
+            f"## 异常原因(JSON)\n`````\n{ctx.get('abnormal_reason') or '(无)'}\n`````\n\n"
             f"## 事件时间线(最后{len(ctx.get('events_tail') or [])}条，共{ctx.get('events_total',0)}条)\n"
             f"{events_text}\n\n"
-            f"## 你的任务\n"
+            f"## 本轮任务\n"
             f"服务源码位于 /app（app/pipeline/ 下是各阶段实现，app/runner.py 是 pi 调用，"
             f"app/orchestrator.py 是编排，app/service/ 是服务层）。\n"
-            f"请用 read/bash/grep/glob 工具检查相关源码，定位失败根因，然后输出报告。\n\n"
-            f"## 输出格式（只输出一个 JSON 代码块，不要任何额外文字）\n"
-            f"```json\n"
-            f"{{\n"
-            f'  "phenomenon": "问题现象：观察到的错误现象，结合事件时间线描述",\n'
-            f'  "root_cause": "问题根因：为什么会发生此失败，涉及哪个组件/代码逻辑",\n'
-            f'  "solution": "解决方法：如何修复，步骤清晰",\n'
-            f'  "code_scene": "代码现场：文件路径:行号 + 相关代码片段（用```包裹）",\n'
-            f'  "patch_code": "补丁代码：建议的修复补丁（diff 或完整函数代码，用```包裹）"\n'
-            f"}}\n"
-            f"```\n"
+            f"请用 read/bash/grep/glob 工具检查相关源码，定位导致失败的具体代码位置，"
+            f"在脑中形成完整理解。**本轮不要输出报告**，只需简短确认你已定位到问题代码"
+            f"（给出文件:行号即可）。后续我会逐段让你输出报告。\n"
         )
 
     def _format_events(self, events: list[dict]) -> str:
@@ -351,28 +401,6 @@ class FailureDebugService:
                 msg = json.dumps(msg, ensure_ascii=False)
             lines.append(f"[{ts}] [{level}] {stage}/{etype}: {msg}")
         return "\n".join(lines)
-
-    # ── 解析 pi 输出 ──────────────────────────────────────────────────────
-    def _parse_report(self, output: str) -> dict[str, Any]:
-        # 优先找 ```json ... ``` 代码块
-        m = re.search(r"```json\s*(\{.*?\})\s*```", output, re.DOTALL)
-        if not m:
-            # 回退：找第一个 { ... } 平衡块
-            m = re.search(r"(\{.*\})", output, re.DOTALL)
-        if not m:
-            # 整个输出当 phenomenon
-            return {"phenomenon": output[:4000], "root_cause": "", "solution": "",
-                    "code_scene": "", "patch_code": ""}
-        try:
-            data = json.loads(m.group(1))
-        except json.JSONDecodeError:
-            return {"phenomenon": output[:4000], "root_cause": "", "solution": "",
-                    "code_scene": "", "patch_code": ""}
-        # 补全缺失字段
-        for k in ("phenomenon", "root_cause", "solution", "code_scene", "patch_code"):
-            if k not in data or not isinstance(data[k], str):
-                data[k] = str(data.get(k, "")) if data.get(k) is not None else ""
-        return data
 
     # ── 报告存储 ──────────────────────────────────────────────────────────
     def _report_md_path(self, task: AppSaTask) -> str:
