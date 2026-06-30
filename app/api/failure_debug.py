@@ -3,6 +3,7 @@
 GET  /failure-debug-reports            列表（project_id 过滤、分页）
 GET  /failure-debug-reports/{id}        详情
 GET  /failure-debug-reports/{id}/download  下载 Markdown 报告
+DELETE /failure-debug-reports/{id}     删除报告（标记已处理）
 """
 
 from __future__ import annotations
@@ -147,3 +148,22 @@ def download_failure_debug_report(report_id: int, db: Session = Depends(get_db))
         media_type="text/markdown; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.delete("/failure-debug-reports/{report_id}")
+def delete_failure_debug_report(report_id: int, db: Session = Depends(get_db)):
+    """删除一条调试报告（表示已处理）。同时删除 NFS 上的报告文件。"""
+    row = db.get(AppSaFailureDebug, report_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="report not found")
+    task_id = row.task_id
+    # 删除 NFS 报告文件（best-effort）
+    out_dir = Path(OUTPUT_DIR) / task_id / "output"
+    for fname in ("failure_debug_report.md", "failure_debug_report.json"):
+        try:
+            (out_dir / fname).unlink(missing_ok=True)
+        except Exception:
+            pass
+    db.delete(row)
+    db.commit()
+    return {"report_id": report_id, "deleted": True}
