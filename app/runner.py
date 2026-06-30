@@ -651,9 +651,13 @@ def run_agent(
     pi_retry_delay: float = 10.0,
     model_stuck_timeout: float | None = None,
     model_stuck_max_activations: int | None = None,
+    fatal_max_retries: int = -1,
 ) -> AgentResult:
     """
     运行单个 pi Agent 子进程（双层重试 + 致命错误检测 + per-pi-process stuck 监测）。
+
+    fatal_max_retries: pi 致命错误（非 no-model/key-auth）的重试上限。-1=无限（默认，
+    供 pipeline 自愈）；0=不重试立即返回（供 failure_debug 等一次性调用）。
     """
     try:
         pi_cmd = _find_pi_command()
@@ -704,6 +708,7 @@ def run_agent(
                     timeout_seconds=timeout_seconds,
                     model_stuck_timeout=model_stuck_timeout,
                     model_stuck_max_activations=model_stuck_max_activations,
+                    fatal_max_retries=fatal_max_retries,
                 )
                 return result
             except TimeoutError:
@@ -910,6 +915,7 @@ def _run_with_context_overflow_recovery(
     timeout_seconds: float | None = None,
     model_stuck_timeout: float | None = None,
     model_stuck_max_activations: int | None = None,
+    fatal_max_retries: int = -1,
 ) -> AgentResult:
     runtime_dir = str(task_pi_dir or (env.get("PI_CODING_AGENT_DIR") if env else "")).strip() or None
     overflow_attempts = 0
@@ -1101,6 +1107,7 @@ def _run_with_pi_retry(
                 session_file=session_file, timeout_seconds=timeout_seconds,
                 model_stuck_timeout=model_stuck_timeout,
                 model_stuck_max_activations=model_stuck_max_activations,
+                fatal_max_retries=fatal_max_retries,
             )
 
             if _is_key_auth_error(result):
@@ -1114,9 +1121,12 @@ def _run_with_pi_retry(
             if _is_fatal_error(result) or result.fatal:
                 fatal_retry_count += 1
                 reason = str(result.error or "").strip() or "fatal error"
+                if fatal_max_retries >= 0 and fatal_retry_count > fatal_max_retries:
+                    _log_warn(f"pi 基础设施异常 [{fatal_retry_count}/{_fmt_max(fatal_max_retries)}] 达上限，终止重试: {reason[:200]}")
+                    return result
                 _mark_infinite_retry(result, kind="fatal", count=fatal_retry_count, reason=reason)
                 _log_warn(
-                    f"pi 基础设施异常 [{fatal_retry_count}/∞], 30s 后重试: {reason[:200]}"
+                    f"pi 基础设施异常 [{fatal_retry_count}/{_fmt_max(fatal_max_retries)}], 30s 后重试: {reason[:200]}"
                 )
                 if on_stream:
                     on_stream("\n⚠️ 智能体基础设施异常，30 秒后自动重试...\n")
@@ -1148,8 +1158,11 @@ def _run_with_pi_retry(
                     r = AgentResult()
                     r.error = str(exc)
                     r.exit_code = -1
+                    if fatal_max_retries >= 0 and fatal_retry_count > fatal_max_retries:
+                        _log_warn(f"pi 基础设施异常 [{fatal_retry_count}/{_fmt_max(fatal_max_retries)}] 达上限，终止重试: {exc}")
+                        return r
                     _mark_infinite_retry(r, kind="fatal", count=fatal_retry_count, reason=str(exc))
-                    _log_warn(f"pi 基础设施异常 [{fatal_retry_count}/∞], 30s 后重试: {exc}")
+                    _log_warn(f"pi 基础设施异常 [{fatal_retry_count}/{_fmt_max(fatal_max_retries)}], 30s 后重试: {exc}")
                     if on_stream:
                         on_stream("\n⚠️ 智能体基础设施异常，30 秒后自动重试...\n")
                     time.sleep(30)
@@ -1246,6 +1259,7 @@ def _run_with_api_retry(
     timeout_seconds: float | None = None,
     model_stuck_timeout: float | None = None,
     model_stuck_max_activations: int | None = None,
+    fatal_max_retries: int = -1,
 ) -> AgentResult:
     _stuck_timeout: float = (
         float(model_stuck_timeout) if model_stuck_timeout is not None

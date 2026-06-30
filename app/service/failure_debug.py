@@ -254,6 +254,7 @@ class FailureDebugService:
             run_timeout_seconds=RUN_TIMEOUT,
             timeout_retry_enabled=False,
             pi_max_retries=1,
+            fatal_max_retries=0,
         )
 
         output = (ar.output or "").strip()
