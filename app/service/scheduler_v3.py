@@ -619,9 +619,8 @@ class SchedulerV3:
                                 "cooldown_seconds": int(ORPHAN_COOLDOWN_SECONDS)})
 
     def _db_reconcile_loop(self) -> None:
-        # 启动后先等一个心跳超时周期，让幸存 worker 重连并上报 reported_task，
-        # 避免把"内存暂无记录但 worker 仍在跑"的任务误判为孤儿。
-        if self._stop.wait(timeout=WORKER_HEARTBEAT_TIMEOUT):
+        # 启动后先等一个短周期让 worker 重连上报，但不要太久（stale_in_queue 检测不需要等 worker）
+        if self._stop.wait(timeout=min(WORKER_HEARTBEAT_TIMEOUT, 10.0)):
             return
         while self._running_flag and not self._stop.wait(timeout=DB_RECONCILE_INTERVAL):
             try:
@@ -650,7 +649,16 @@ class SchedulerV3:
                         for w in self._workers.values() if w.online and w.reported_task}
             for row in rows:
                 tid = str(row.get("task_id") or "")
-                if not tid or tid in running_ids:
+                if not tid:
+                    continue
+                row_disp = row.get("dispatcher_instance_id")
+                if tid in running_ids:
+                    # 在 _running 里但 DB dispatcher=None → dispatch 的 claim 没完成
+                    #（_dispatch_once 在锁内加入 _running 后释放锁做 claim，
+                    # claim 失败才放回 _queue；此窗口内 db_reconcile 会看到它在 _running）
+                    # → stale，需要 heal
+                    if not row_disp:
+                        stale_in_queue.append(tid)
                     continue
                 if tid in queue_ids:
                     # DB=running 但在队列里 = stale（worker 被杀没回写终态）→ reset pending
