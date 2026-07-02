@@ -59,6 +59,19 @@ def setup_local_workspace(output_path: str, task_id: str) -> dict:
         except Exception:
             pass
 
+        # 0b. 清空 NFS 上的旧轮残留（output/ + 顶层 events.jsonl）。
+        #    worker 切换/rollout 后新 worker 接手时，NFS output/ 可能留着上一轮（被中断的）产物，
+        #    不清的话新 run 会看到旧结果 → 隐式续跑。事件时间线在 DB(task_event) 保留，与文件无关。
+        try:
+            old_output = nfs_root / "output"
+            if old_output.exists():
+                shutil.rmtree(str(old_output), ignore_errors=True)
+            old_events = nfs_root / "events.jsonl"
+            if old_events.exists() or old_events.is_symlink():
+                old_events.unlink()
+        except Exception:
+            logger.warning("setup_local_workspace: clean NFS output/events failed for %s", task_id, exc_info=True)
+
         # 1. 本地 run（含子目录）
         (local_run / "workspace").mkdir(parents=True, exist_ok=True)
         (local_run / "sessions").mkdir(parents=True, exist_ok=True)
