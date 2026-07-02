@@ -1245,13 +1245,15 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         if selected:
             task_config["selected_models"] = selected
     else:
-        # 上游下发：只能用网关配置(wsk)；未下发模型信息则默认 auto
+        # 上游下发：只能用网关配置(wsk)；模型选择交给执行侧按四场景决定
         task_config["model_source"] = "gateway"
         if not task_config.get("agent_task_key", {}).get("secret"):
             logger.warning(
-                "非手动任务未携带 wsk(agent_task_key.secret)，将使用默认 auto 模型"
+                "非手动任务未携带 wsk(agent_task_key.secret)；无显式模型时将回落到参数配置中心的服务默认模型"
             )
-        # 有传模型用该模型（worker_model/reader_model/judge_model），没传默认 auto
+        # 有传模型用该模型（worker_model/reader_model/judge_model）；
+        # 无显式模型时不预置 auto——执行侧按 has_secret 决定：
+        #   有 wsk + 无模型 → auto（场景1）；无 wsk + 无模型 → 服务配置默认（场景3）
         if not task_config.get("selected_models"):
             selected = {}
             if body.worker_model:
@@ -1260,9 +1262,8 @@ def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
                 selected["reader"] = body.reader_model
             if body.judge_model:
                 selected["judge"] = body.judge_model
-            task_config["selected_models"] = selected or {
-                "worker": "gaiasec/auto", "reader": "gaiasec/auto", "judge": "gaiasec/auto"
-            }
+            if selected:
+                task_config["selected_models"] = selected
     created = svc.create_task(
         db,
         project_id=body.project_id,
