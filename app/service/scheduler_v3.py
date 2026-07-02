@@ -47,6 +47,10 @@ RECONCILE_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_RECONCIL
 # worker 失联(非任务失败)时重排上限：rollout/pod 重启/网络抖动 → 重派重跑；
 # 超过上限才判 failed，避免 worker 反复死亡时无限重排。
 MAX_WORKER_LOST_REQUEUE = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_MAX_REQUEUE", "3"))
+# 连续孤儿/worker失联超 MAX 后不直接判失败，转排队冷却重跑（软重试）；
+# 累计软重试超 ORPHAN_SOFT_RETRY_MAX 才真失败（防死循环）。
+ORPHAN_COOLDOWN_SECONDS = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ORPHAN_COOLDOWN", "300"))
+ORPHAN_SOFT_RETRY_MAX = int(os.environ.get("SECFLOW_SYSTEM_ANALYSE_ORPHAN_SOFT_RETRY_MAX", "5"))
 STATE_FILE = os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_STATE_FILE", "/data/sa_scheduler_state.json")
 PERSIST_INTERVAL = float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_SCHED_PERSIST", "3"))
 # DB 兜底对账：周期扫描 DB status=running 但调度器内存(_running/_queue)无的"孤儿"任务
@@ -119,6 +123,8 @@ class SchedulerV3:
         self._running: dict[str, RunRecord] = {}
         self._workers: dict[str, WorkerConn] = {}
         self._requeue_counts: dict[str, int] = {}
+        self._orphan_cooldown_until: dict[str, float] = {}   # task_id -> 冷却到期时间戳
+        self._orphan_soft_retries: dict[str, int] = {}       # task_id -> 累计软重试次数
         self._lock = threading.RLock()
 
         self._running_flag = False
@@ -286,6 +292,10 @@ class SchedulerV3:
             rtid = w.reported_task
             if rtid and rtid in self._requeue_counts:
                 self._requeue_counts.pop(rtid, None)
+            if rtid and rtid in self._orphan_soft_retries:
+                self._orphan_soft_retries.pop(rtid, None)
+            if rtid and rtid in self._orphan_cooldown_until:
+                self._orphan_cooldown_until.pop(rtid, None)
 
     def _on_task_state(self, wid: str, msg: dict) -> None:
         task_id = str(msg.get("task_id") or "")
@@ -307,11 +317,15 @@ class SchedulerV3:
                     rec.finished_ts = _time.time()
                     finished = True
             if state in (proto.STATE_FINISHED, proto.STATE_FAILED, proto.STATE_CANCELLED):
-                # 任务到达终态 → 清除重排计数
+                # 任务到达终态 → 清除重排计数 + 软重试 + 冷却
                 self._requeue_counts.pop(task_id, None)
+                self._orphan_soft_retries.pop(task_id, None)
+                self._orphan_cooldown_until.pop(task_id, None)
             elif state == proto.STATE_RUNNING:
                 # worker 上报任务在跑 = 已恢复健康，清除历史重排计数，避免累积误杀
                 self._requeue_counts.pop(task_id, None)
+                self._orphan_soft_retries.pop(task_id, None)
+                self._orphan_cooldown_until.pop(task_id, None)
             self._dirty = True
         self._record_event_for(task_id, "worker_task_state",
                                f"worker {wid} 任务 {task_id} 状态={state}", "info",
@@ -444,7 +458,23 @@ class SchedulerV3:
                 return
             idle.sort(key=lambda w: (w.last_heartbeat, w.worker_id))
             w = idle[0]
-            task_id = self._queue.popleft()
+            # 冷却中的任务跳过（连续孤儿后软重试，退避避免立即再撞）
+            now = _time.time()
+            task_id = None
+            skipped = []
+            while self._queue:
+                cand = self._queue.popleft()
+                cd = self._orphan_cooldown_until.get(cand)
+                if cd and cd > now:
+                    skipped.append(cand)   # 冷却未到，放队尾
+                    continue
+                task_id = cand
+                break
+            for s in skipped:
+                self._queue.append(s)
+            if task_id is None:
+                self._dirty = True
+                return
             w.current_task = task_id
             w.last_heartbeat = _time.time()
             self._running[task_id] = RunRecord(task_id=task_id, worker_id=w.worker_id, started_ts=_time.time())
@@ -541,14 +571,47 @@ class SchedulerV3:
             else:
                 to_fail.append(tid)
         for tid in to_fail:
-            self._requeue_counts.pop(tid, None)
-            self._record_event_for(tid, "task_failed", "worker 多次失联，任务失败", "error", {"task_id": tid})
-            try:
-                self._finalize(tid, proto.STATE_FAILED, "worker_lost", None)
-            except Exception:
-                logger.exception("finalize(worker_lost) failed: %s", tid)
+            # 不直接判失败 → 转排队冷却重跑（软重试），多轮仍不行才真失败
+            self._soft_requeue_or_fail(tid, "worker_lost")
 
     # ── DB 兜底对账（孤儿 running 回收/收编；V3 实时 reconcile 只看内存，此处补 DB）──
+
+    # ── 连续孤儿/worker失联耗尽：转排队冷却重跑（软重试），多轮仍不行才真失败 ──
+    def _soft_requeue_or_fail(self, tid: str, reason: str) -> None:
+        """连续重排超上限时不直接判失败：转 pending 冷却重跑，累计软重试超 ORPHAN_SOFT_RETRY_MAX 才真失败。"""
+        soft = self._orphan_soft_retries.get(tid, 0) + 1
+        self._orphan_soft_retries[tid] = soft
+        if soft > ORPHAN_SOFT_RETRY_MAX:
+            # 硬上限：多次软重试仍反复孤儿 → 真失败，避免死循环
+            self._orphan_soft_retries.pop(tid, None)
+            self._orphan_cooldown_until.pop(tid, None)
+            self._requeue_counts.pop(tid, None)
+            self._record_event_for(tid, "task_failed",
+                                   f"连续孤儿/worker失联，软重试 {soft - 1} 次仍失败，任务失败({reason})", "error",
+                                   {"task_id": tid, "reason": reason, "soft_retries": soft - 1})
+            try:
+                self._finalize(tid, proto.STATE_FAILED, reason, None)
+            except Exception:
+                logger.exception("finalize(%s) failed: %s", reason, tid)
+            return
+        # 软重试：reset pending + 入队 + 冷却退避，避免立即再撞同样问题
+        ok = False
+        try:
+            ok = bool(self._requeue_task(tid))
+        except Exception:
+            logger.exception("soft_requeue requeue_task failed: %s", tid)
+        now = _time.time()
+        with self._lock:
+            self._requeue_counts.pop(tid, None)   # 清连续计数，给新一轮机会
+            self._orphan_cooldown_until[tid] = now + ORPHAN_COOLDOWN_SECONDS
+            if ok and tid not in self._queue and tid not in self._running:
+                self._queue.append(tid)
+            self._dirty = True
+        self._record_event_for(tid, "task_requeued",
+                               f"连续孤儿/worker失联({reason})，转排队冷却 {int(ORPHAN_COOLDOWN_SECONDS)}s 后重跑"
+                               f"(软重试第{soft}/{ORPHAN_SOFT_RETRY_MAX}次)", "warning",
+                               {"task_id": tid, "reason": reason, "soft_retries": soft,
+                                "cooldown_seconds": int(ORPHAN_COOLDOWN_SECONDS)})
 
     def _db_reconcile_loop(self) -> None:
         # 启动后先等一个心跳超时周期，让幸存 worker 重连并上报 reported_task，
@@ -595,6 +658,8 @@ class SchedulerV3:
                     w.current_task = tid
                 # 任务被活 worker 收编 = 已恢复健康，清除历史重排计数，避免累积误杀
                 self._requeue_counts.pop(tid, None)
+                self._orphan_soft_retries.pop(tid, None)
+                self._orphan_cooldown_until.pop(tid, None)
             if adopt:
                 self._dirty = True
         for tid, wid in adopt:
@@ -620,13 +685,8 @@ class SchedulerV3:
                                            f"DB 对账：孤儿运行任务(无内存态/无存活 worker)按 restart 重排(第{cnt}次)",
                                            "warning", {"task_id": tid})
             else:
-                self._requeue_counts.pop(tid, None)
-                self._record_event_for(tid, "task_failed",
-                                       "DB 对账：孤儿任务多次重排仍失败", "error", {"task_id": tid})
-                try:
-                    self._finalize(tid, proto.STATE_FAILED, "orphan_requeue_exhausted", None)
-                except Exception:
-                    logger.exception("db_reconcile finalize failed: %s", tid)
+                # 不直接判失败 → 转排队冷却重跑（软重试），多轮仍不行才真失败
+                self._soft_requeue_or_fail(tid, "orphan_requeue_exhausted")
         self._repair_pending_unqueued_tasks()
 
     def _pending_tasks_missing_from_scheduler(self) -> list[dict]:
