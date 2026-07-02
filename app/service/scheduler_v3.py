@@ -282,6 +282,10 @@ class SchedulerV3:
             w.online = True
             # 心跳只更新存活 + worker 上报的实际任务；不覆盖调度器派发权威的 current_task
             w.reported_task = msg.get("task_id") or None
+            # worker 心跳上报在跑某任务 = 该任务已恢复健康，清除其重排计数
+            rtid = w.reported_task
+            if rtid and rtid in self._requeue_counts:
+                self._requeue_counts.pop(rtid, None)
 
     def _on_task_state(self, wid: str, msg: dict) -> None:
         task_id = str(msg.get("task_id") or "")
@@ -304,6 +308,9 @@ class SchedulerV3:
                     finished = True
             if state in (proto.STATE_FINISHED, proto.STATE_FAILED, proto.STATE_CANCELLED):
                 # 任务到达终态 → 清除重排计数
+                self._requeue_counts.pop(task_id, None)
+            elif state == proto.STATE_RUNNING:
+                # worker 上报任务在跑 = 已恢复健康，清除历史重排计数，避免累积误杀
                 self._requeue_counts.pop(task_id, None)
             self._dirty = True
         self._record_event_for(task_id, "worker_task_state",
@@ -586,6 +593,8 @@ class SchedulerV3:
                 w = self._workers.get(wid)
                 if w is not None and w.current_task is None:
                     w.current_task = tid
+                # 任务被活 worker 收编 = 已恢复健康，清除历史重排计数，避免累积误杀
+                self._requeue_counts.pop(tid, None)
             if adopt:
                 self._dirty = True
         for tid, wid in adopt:
