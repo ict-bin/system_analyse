@@ -195,8 +195,8 @@ class SchedulerV3:
     def _reset_all_running_on_startup(self) -> None:
         """启动时把所有 DB=running 的任务 reset 为 pending + 入队。
 
-        调度器重启（rollout/crash）后，所有 worker 都已死，DB=running 全是 stale
-        （没人回写终态）。与其等 db_reconcile 慢慢检测，不如启动时直接全 reset。
+        调度器重启（rollout/crash）后，所有 worker 都已死，DB=running 全是 stale。
+        _requeue_task 现在对所有任务（含 binary_security 来源）一律 reset pending。
         """
         try:
             rows = self._db_running_tasks() or []
@@ -211,12 +211,12 @@ class SchedulerV3:
             if not tid:
                 continue
             try:
-                self._requeue_task(tid)  # reset DB pending + clean dir
+                self._requeue_task(tid)
                 healed += 1
             except Exception:
                 logger.exception("startup: reset running→pending failed: %s", tid)
         with self._lock:
-            self._running.clear()  # 全是 stale（worker 死了）
+            self._running.clear()
             for row in rows:
                 tid = str(row.get("task_id") or "")
                 if tid and tid not in self._queue:

@@ -1084,16 +1084,6 @@ def _origin_payload(row: AppSaTask) -> dict:
     }
 
 
-def _is_parent_orchestrated_binary_security_task(row: AppSaTask | None) -> bool:
-    if row is None:
-        return False
-    if str(getattr(row, "task_origin_type", "") or "").strip() != "binary_security":
-        return False
-    parent_task_id = str(getattr(row, "parent_task_id", "") or "").strip()
-    parent_stage_item_id = str(getattr(row, "parent_stage_item_id", "") or "").strip()
-    return bool(parent_task_id and parent_stage_item_id)
-
-
 def _load_svc_config():
     for p in [SERVICE_CONFIG_PATH, "/opt/system_analyse/config.example.json"]:
         if os.path.isfile(p):
@@ -2039,27 +2029,6 @@ class TaskService:
                 row = self._task_repository.get_task(db, task_id)
                 if row is None:
                     return False
-                if _is_parent_orchestrated_binary_security_task(row):
-                    row.dispatcher_instance_id = None
-                    row.dispatch_started_at = None
-                    try:
-                        row.lease_expires_at = None
-                    except Exception:
-                        pass
-                    db.commit()
-                    self._record_timeline_event(
-                        task_id=task_id,
-                        project_id=row.project_id,
-                        event_type="task_waiting_parent_observe",
-                        message="任务租约失效，等待父任务恢复观测，不自动重跑",
-                        level="warning",
-                        payload={
-                            **_origin_payload(row),
-                            "reason": "lease_lost_waiting_parent_observe",
-                            "previous_status": row.status,
-                        },
-                    )
-                    return True
                 if str(row.status or "") == "pending":
                     # 已 pending（如 restart 幂等重复调用），无需重置 DB
                     output_path = row.output_path
