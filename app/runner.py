@@ -1311,8 +1311,13 @@ def _run_with_api_retry(
 
         def _cancel_monitor():
             if cancel_event:
-                cancel_event.wait()
-                if not cancel_stop.is_set():
+                # 轮询：等取消事件 OR 调用结束(cancel_stop)，任一触发即退出。
+                # 不能直接 cancel_event.wait() 永久阻塞——finally 只 set cancel_stop
+                # 不 set cancel_event，否则 _cancel_monitor 永不退出 → 线程泄漏。
+                while not cancel_stop.is_set():
+                    if cancel_event.wait(timeout=0.5):
+                        break
+                if cancel_event.is_set() and not cancel_stop.is_set():
                     handle.terminate_tree(reason="cancel_event")
 
         cancel_thread = None

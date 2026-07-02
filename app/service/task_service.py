@@ -660,12 +660,11 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 
 
 def _remove_task_root_for_restart(output_path: str | None, task_id: str) -> dict[str, object]:
-    """Move the old task directory out of the canonical path before restart.
+    """Restart 前彻底删除整个任务目录（文件全清空，干净重跑）。
 
-    Renaming is fast and prevents the next run from seeing stale checkpoint/workspace
-    files even if background deletion on NFS takes longer than expected.
-    事件时间线 events.jsonl 不清空：保留顶层 {task_id}/events.jsonl 历史，
-    供下一次 run 续接（orchestrator 会 seed 到 run/events.jsonl）。
+    事件时间线在 DB(secflow_app_sa_task_event) 中持久保留，与本文件无关，
+    删除 events.jsonl 不丢历史。不再保留顶层 events.jsonl（旧“续接”设计已废弃：
+    它导致重启后事件累积、阶段进度显示上一轮残留，误导诊断）。
     """
     result: dict[str, object] = {"task_root": None, "renamed_to": None, "removed": False, "existed": False}
     if not output_path:
@@ -675,14 +674,7 @@ def _remove_task_root_for_restart(output_path: str | None, task_id: str) -> dict
     if not task_root.exists():
         return result
     result["existed"] = True
-    # 保留事件时间线历史（顶层 NFS 副本，含历次 run 的事件）
-    preserved_events = b""
-    top_events = task_root / "events.jsonl"
-    try:
-        if top_events.is_file():
-            preserved_events = top_events.read_bytes()
-    except Exception:
-        logger.warning("restart: failed to read preserved events.jsonl: %s", task_id)
+    # 先重命名到墓碑（NFS 上 rmtree 慢/竞态时，canonical 路径已立刻空），再异步删墓碑
     tombstone = task_root.with_name(f".{task_root.name}.restart-delete-{uuid.uuid4().hex}")
     try:
         task_root.rename(tombstone)
@@ -690,32 +682,20 @@ def _remove_task_root_for_restart(output_path: str | None, task_id: str) -> dict
     except FileNotFoundError:
         return result
     except OSError:
+        # rename 失败（跨文件系统等）→ 直接 rmtree 原地
         import shutil as _shutil
-        _shutil.rmtree(task_root)
+        _shutil.rmtree(task_root, ignore_errors=True)
         result["removed"] = True
-        _restore_events(task_root, preserved_events)
         return result
-
+    # 删墓碑（best-effort，失败也无所谓，下次 restart 再清）
     import shutil as _shutil
     try:
         _shutil.rmtree(tombstone)
         result["removed"] = True
     except OSError as exc:
         logger.warning("restart cleanup tombstone failed path=%s: %s", tombstone, exc)
-    _restore_events(task_root, preserved_events)
     return result
 
-
-def _restore_events(task_root: Path, preserved_events: bytes) -> None:
-    """重建任务根目录并恢复 events.jsonl 历史（供下次 run seed/续接）。"""
-    if not preserved_events:
-        return
-    try:
-        task_root.mkdir(parents=True, exist_ok=True)
-        (task_root / "events.jsonl").write_bytes(preserved_events)
-        logger.info("restart: preserved events.jsonl history (%d bytes) for %s", len(preserved_events), task_root.name)
-    except Exception:
-        logger.warning("restart: failed to restore events.jsonl for %s", task_root.name)
 
 
 def _load_task_result_json(row: AppSaTask) -> dict | None:
@@ -1805,7 +1785,7 @@ class TaskService:
             raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
         cleanup_result = _remove_task_root_for_restart(row.output_path, task_id)
         if row.output_path:
-            # 真实失败：旧目录存在但既没删也没移走（_restore_events 会重建只含 events.jsonl 的空目录，
+            # 真实失败：旧目录存在但既没删也没移走（restart 现在纯删除，不重建目录；
             # 那是预期的，不算失败）
             if cleanup_result.get("existed") and not cleanup_result.get("removed") and not cleanup_result.get("renamed_to"):
                 task_root = Path(row.output_path) / task_id
