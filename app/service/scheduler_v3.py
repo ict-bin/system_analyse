@@ -533,6 +533,12 @@ class SchedulerV3:
         self._record_event_for(task_id, "task_dispatched", f"任务已下发 worker={w.worker_id}", "info",
                                {"worker_id": w.worker_id})
         if not sent:
+            # RUN 发送失败（worker 刚 rollout 还没连上 / sock 断了）→
+            # 必须 reset DB 回 pending，否则 DB 卡 running，下次 claim 永远失败。
+            try:
+                self._requeue_task(task_id)
+            except Exception:
+                logger.exception("dispatch send-fail requeue failed: %s", task_id)
             with self._lock:
                 self._running.pop(task_id, None)
                 if task_id not in self._queue:
