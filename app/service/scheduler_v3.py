@@ -141,6 +141,7 @@ class SchedulerV3:
         self._running_flag = True
         self._stop.clear()
         self._load_state()
+        self._reset_all_running_on_startup()
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind((self._bind, self._port))
@@ -190,6 +191,38 @@ class SchedulerV3:
             logger.info("SchedulerV3 loaded state: queue=%d running=%d", len(self._queue), len(self._running))
         except Exception as exc:
             logger.warning("load scheduler state failed: %s", exc)
+
+    def _reset_all_running_on_startup(self) -> None:
+        """启动时把所有 DB=running 的任务 reset 为 pending + 入队。
+
+        调度器重启（rollout/crash）后，所有 worker 都已死，DB=running 全是 stale
+        （没人回写终态）。与其等 db_reconcile 慢慢检测，不如启动时直接全 reset。
+        """
+        try:
+            rows = self._db_running_tasks() or []
+        except Exception:
+            logger.exception("startup: db_running_tasks query failed")
+            return
+        if not rows:
+            return
+        healed = 0
+        for row in rows:
+            tid = str(row.get("task_id") or "")
+            if not tid:
+                continue
+            try:
+                self._requeue_task(tid)  # reset DB pending + clean dir
+                healed += 1
+            except Exception:
+                logger.exception("startup: reset running→pending failed: %s", tid)
+        with self._lock:
+            self._running.clear()  # 全是 stale（worker 死了）
+            for row in rows:
+                tid = str(row.get("task_id") or "")
+                if tid and tid not in self._queue:
+                    self._queue.append(tid)
+            self._dirty = True
+        logger.info("startup: reset %d DB=running tasks to pending + queued", healed)
 
     def _save_state(self) -> None:
         with self._lock:
