@@ -483,13 +483,18 @@ class SchedulerV3:
         sent = False
         lease_epoch = self._claim_task(task_id, w.worker_id)
         if not lease_epoch:
-            # 认领失败（状态已变/并发）→ 不下发
+            # 认领失败（DB status≠pending，可能 worker 被杀没回写终态→DB 卡 running）。
+            # 不丢弃：放回队头，db_reconcile 会自愈 DB=running→pending，下次 claim 成功。
             with self._lock:
                 self._running.pop(task_id, None)
                 ww = self._workers.get(w.worker_id)
                 if ww is not None and ww.current_task == task_id:
                     ww.current_task = None
+                if task_id not in self._queue:
+                    self._queue.appendleft(task_id)
                 self._dirty = True
+            self._record_event_for(task_id, "task_claim_failed",
+                                   f"认领失败(DB status≠pending)，放回队列等自愈", "warning", {"task_id": task_id})
             return
         sent = self._send(conn, proto.msg_run(task_id, lease_epoch=lease_epoch)) if conn is not None else False
         self._record_event_for(task_id, "task_dispatched", f"任务已下发 worker={w.worker_id}", "info",
@@ -625,9 +630,10 @@ class SchedulerV3:
                 logger.exception("db_reconcile loop: %s", exc)
 
     def _db_reconcile_once(self) -> None:
-        """对账 DB：status=running 但不在 _running/_queue 的任务。
-        有存活 worker 上报(reported_task) → 收编(adopt)进内存正常跟踪；
-        否则(owner 死/失联且派发已久) → 孤儿，按 restart 语义重排(带重试上限)。"""
+        """对账 DB：status=running 但不在 _running 的任务。
+        - 在 _queue 里 → stale（worker 被杀没回写终态）→ reset pending 让 dispatch claim 成功
+        - 有存活 worker 上报(reported_task) → 收编(adopt)进内存正常跟踪
+        - 否则(owner 死/失联且派发已久) → 孤儿，按 restart 语义重排(带重试上限)"""
         try:
             rows = self._db_running_tasks() or []
         except Exception:
@@ -636,13 +642,19 @@ class SchedulerV3:
         now = _time.time()
         adopt: list[tuple[str, str]] = []
         orphan: list[str] = []
+        stale_in_queue: list[str] = []
         with self._lock:
-            tracked = set(self._running.keys()) | set(self._queue)
+            running_ids = set(self._running.keys())
+            queue_ids = set(self._queue)
             reported = {w.reported_task: w.worker_id
                         for w in self._workers.values() if w.online and w.reported_task}
             for row in rows:
                 tid = str(row.get("task_id") or "")
-                if not tid or tid in tracked:
+                if not tid or tid in running_ids:
+                    continue
+                if tid in queue_ids:
+                    # DB=running 但在队列里 = stale（worker 被杀没回写终态）→ reset pending
+                    stale_in_queue.append(tid)
                     continue
                 wid = reported.get(tid)
                 if wid:
@@ -687,6 +699,15 @@ class SchedulerV3:
             else:
                 # 不直接判失败 → 转排队冷却重跑（软重试），多轮仍不行才真失败
                 self._soft_requeue_or_fail(tid, "orphan_requeue_exhausted")
+        # 自愈：DB=running 但在队列里(stale) → reset pending，让 dispatch claim 成功
+        for tid in stale_in_queue:
+            try:
+                self._requeue_task(tid)  # reset DB pending（任务已在 _queue，不重复入队）
+                self._record_event_for(tid, "task_stale_running_healed",
+                                       "DB=running 但在队列里(worker 被杀未回写终态)，已 reset pending", "warning",
+                                       {"task_id": tid})
+            except Exception:
+                logger.exception("db_reconcile: stale_in_queue heal failed: %s", tid)
         self._repair_pending_unqueued_tasks()
 
     def _pending_tasks_missing_from_scheduler(self) -> list[dict]:
