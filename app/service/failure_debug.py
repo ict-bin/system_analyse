@@ -339,7 +339,7 @@ class FailureDebugService:
     def _run_llm_debug(self, task: AppSaTask, context: dict[str, Any]) -> dict[str, Any]:
         from app.runner import run_agent  # 延迟导入避免循环
 
-        model = DEBUG_MODEL or self._pick_default_model()
+        model = self._resolve_debug_model()
         if not model:
             raise RuntimeError("无可用 LLM 模型（models.json 为空或未配置 SA_FAILURE_DEBUG_MODEL）")
 
@@ -445,6 +445,47 @@ class FailureDebugService:
         except Exception:
             logger.exception("pick_default_model failed")
         return ""
+
+    def _resolve_debug_model(self) -> str:
+        """调试模型优先级：DB 配置 > 环境变量 SA_FAILURE_DEBUG_MODEL > models.json 第一个。"""
+        # 1. DB 配置
+        try:
+            if _SessionLocal is not None:
+                from app.service.config_service import get_model_config_service
+                db = _SessionLocal()
+                try:
+                    cfg = get_model_config_service().get_failure_debug_config(db)
+                    m = (cfg or {}).get("model")
+                    if m:
+                        return str(m)
+                finally:
+                    db.close()
+        except Exception:
+            logger.exception("resolve_debug_model DB read failed")
+        # 2. 环境变量
+        if DEBUG_MODEL:
+            return DEBUG_MODEL
+        # 3. models.json 第一个
+        return self._pick_default_model()
+
+    @staticmethod
+    def list_available_models() -> list[dict]:
+        """从 models.json 列出全部可用模型（provider/model_id 格式，供前端下拉）。"""
+        out: list[dict] = []
+        try:
+            models_path = Path(PI_DIR) / "models.json"
+            if not models_path.is_file():
+                return out
+            data = json.loads(models_path.read_text(encoding="utf-8"))
+            for pk, prov in (data.get("providers") or {}).items():
+                for m in prov.get("models") or []:
+                    mid = m.get("id")
+                    if mid:
+                        full = f"{pk}/{mid}"
+                        out.append({"value": full, "label": full})
+        except Exception:
+            logger.exception("list_available_models failed")
+        return out
 
     # ── prompt 构建 ───────────────────────────────────────────────────────
     def _system_prompt(self) -> str:

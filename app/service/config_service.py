@@ -398,6 +398,38 @@ class ModelConfigService:
             logger.error("Failed to save models config: %s", exc)
             db.rollback()
             raise
+
+    # ── 失败调试模型配置 ──────────────────────────────────────────────
+    _FAILURE_DEBUG_KEY = "failure_debug"
+
+    def get_failure_debug_config(self, db: Session) -> dict:
+        try:
+            row = db.query(AppSaModelsConfig).filter_by(config_key=self._FAILURE_DEBUG_KEY).first()
+        except SQLAlchemyError:
+            return {"model": None, "updated_at": None}
+        if row and row.config_json:
+            data = dict(row.config_json)
+        else:
+            data = {"model": None}
+        data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
+        return data
+
+    def save_failure_debug_config(self, db: Session, model: str) -> dict:
+        blob = {"model": (model or "").strip()}
+        try:
+            row = db.query(AppSaModelsConfig).filter_by(config_key=self._FAILURE_DEBUG_KEY).first()
+            if row:
+                row.config_json = blob
+            else:
+                row = AppSaModelsConfig(config_key=self._FAILURE_DEBUG_KEY, config_json=blob)
+                db.add(row)
+            db.commit()
+            db.refresh(row)
+        except SQLAlchemyError as exc:
+            logger.error("Failed to save failure_debug config: %s", exc)
+            db.rollback()
+            raise
+        return blob
         result = dict(blob)
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result

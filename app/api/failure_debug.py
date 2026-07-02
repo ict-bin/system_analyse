@@ -19,8 +19,26 @@ from sqlalchemy.orm import Session
 from app.config import OUTPUT_DIR
 from app.db import get_db
 from app.db.models import AppSaFailureDebug, AppSaTask
+from app.service.config_service import get_model_config_service
+from app.service.failure_debug import FailureDebugService
 
 from . import router
+
+
+@router.get("/failure-debug/config")
+def get_failure_debug_config(db: Session = Depends(get_db)):
+    """获取 debugger 调试模型配置 + 可用模型列表。"""
+    cfg = get_model_config_service().get_failure_debug_config(db)
+    available = FailureDebugService.list_available_models()
+    return {"model": cfg.get("model") or "", "available_models": available, "updated_at": cfg.get("updated_at")}
+
+
+@router.put("/failure-debug/config")
+def save_failure_debug_config(payload: dict, db: Session = Depends(get_db)):
+    """保存 debugger 调试模型配置。"""
+    model = str((payload or {}).get("model") or "").strip()
+    result = get_model_config_service().save_failure_debug_config(db, model)
+    return {"model": result.get("model") or "", "saved": True}
 
 
 @router.post("/internal/failure-debug", include_in_schema=False)
