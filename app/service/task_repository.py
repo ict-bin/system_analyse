@@ -174,9 +174,17 @@ class TaskRepository:
 
     @staticmethod
     def restart_task_in_place(db: Session, row: AppSaTask) -> AppSaTask:
+        # restart 时清除服务级参数的 task_config 覆盖（super_fast_mode/enable_final_check/
+        # continue_on_module_failure/filter_engine），让它们用参数配置页的最新服务配置。
+        # 否则创建时冻结的旧值会覆盖用户后续在参数配置页的修改，导致"配置后重跑任务模式不变"。
+        _STRIP_ON_RESTART = {
+            "start_stage", "resume_workspace", "resolved_config_snapshot",
+            "super_fast_mode", "enable_final_check",
+            "continue_on_module_failure", "filter_engine",
+        }
         clean_config = {
             k: v for k, v in (row.task_config_json or {}).items()
-            if k not in ("start_stage", "resume_workspace", "resolved_config_snapshot")
+            if k not in _STRIP_ON_RESTART
         } or None
         row.task_config_json = clean_config
         row.status = "pending"
