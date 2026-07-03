@@ -26,6 +26,7 @@ from .helpers import (
     enforce_filter_constraint, generate_modules_list, strip_target_prefix,
     max_iter, max_rounds_exceeded_treated_as_passed,
 )
+from .s4_report import _write_fallback_final_report
 from .s0_filter import FilterStage
 
 # ── 动态加载原始 stage 模块, 避免重复定义 ──
@@ -329,21 +330,15 @@ class SuperFastReportStage(BaseStage):
 
     def execute(self, ctx):
         cfg, ws = ctx.cfg, ctx.workspace
-        s_cfg = cfg.stages.final_check
         ctx.emit_event("stage", stage=4, mode="super_fast")
-        w_sys = _hf_load_prompt(cfg, "step4_final_report", "workers")
-        w_model = cfg.workers.model_for("report")
-        w_session = ctx.session_path("report.jsonl")
-        w_base = dict(
-            tools=["read", "bash", "write"], cwd=str(ws), thinking_level="off",
-            session_file=w_session, cancel_event=ctx.cancel_event,
-            max_retries=cfg.agent_max_retries, retry_delay=cfg.agent_retry_delay,
-            pi_max_retries=cfg.pi_max_retries, pi_retry_delay=cfg.pi_retry_delay,
-            task_pi_dir=cfg.role_pi_dir("workers"),
-        )
-        _run_w(ctx, "report", s_cfg, _v_report, (ws / "final_report.md",),
-               ["生成总报告:\n1. ls -d modules/*/\n2. read modules/*/module_report.md\n3. 写 final_report.md"],
-               w_sys, w_model, w_session, w_base)
+        # 极速模式：报告由程序直接汇总生成（不调 LLM），瞬间完成
+        final_mods = discover_modules(str(ws))
+        report_written = _write_fallback_final_report(ws, final_mods)
+        if not report_written:
+            ctx.emit_event("log", level="warn",
+                           msg="[S4] 无模块报告可汇总，跳过最终报告生成")
+        ctx.emit_event("log", level="info",
+                       msg="[S4] 程序汇总报告已生成（未调用 LLM）")
         # ── 组装输出目录（极速模式同样需要把产物搬到 final_out_dir，否则 API/前端读不到结果）──
         final_out_dir = ctx.final_out_dir
         final_mods = discover_modules(str(ws))
