@@ -339,27 +339,10 @@ class SuperFastReportStage(BaseStage):
                            msg="[S4] 无模块报告可汇总，跳过最终报告生成")
         ctx.emit_event("log", level="info",
                        msg="[S4] 程序汇总报告已生成（未调用 LLM）")
-        # ── 组装输出目录（极速模式同样需要把产物搬到 final_out_dir，否则 API/前端读不到结果）──
-        final_out_dir = ctx.final_out_dir
-        final_mods = discover_modules(str(ws))
-        modules_out = final_out_dir / "modules"
-        if modules_out.exists():
-            shutil.rmtree(str(modules_out))
-        modules_out.mkdir(parents=True, exist_ok=True)
-        for mod in final_mods:
-            src = get_modules_root(str(ws)) / mod
-            dst = modules_out / mod
-            if src.is_dir():
-                shutil.copytree(str(src), str(dst))
-        report_src = ws / "final_report.md"
-        report_dst = final_out_dir / "final_report.md"
-        if report_src.exists():
-            shutil.copy2(str(report_src), str(report_dst))
-        ctx.final_report_path = str(report_dst)
-        generate_modules_list(modules_out, final_out_dir / "modules.list")
-        strip_target_prefix(modules_out, cfg.target_dir)
-        if report_dst.exists():
-            strip_target_prefix(report_dst.parent, cfg.target_dir)
+        # 不写 NFS output/（与 sync_loop 竞态 [Errno 39] Directory not empty）。
+        # final_report.md 已写在本地 workspace，NFS output/ 由任务结束后
+        # finalize_workspace 权威写入（同标准模式 S4）。
+        ctx.final_report_path = str(ctx.final_out_dir / "final_report.md")
         ctx.emit_event("stage_result", stage=4)
 
 ###############################################################################
