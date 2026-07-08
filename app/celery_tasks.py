@@ -153,13 +153,9 @@ def run_sa_task(self, task_id: str) -> dict:
     result_stages = None
     result_json = None
     try:
-        from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
-        from app.service.config_service import get_config_service
-
-        deps = TaskRunnerDependencies()
-        settings = TaskRunnerSettings()
-        runner = TaskRunner(deps=deps, settings=settings)
-        runner.execute_task(task_id, claimed.epoch)
+        from app.service.task_service import get_task_service
+        svc = get_task_service()
+        svc._runner.execute_task(task_id, claimed.epoch)
         # success
         result_status = "passed"
     except Exception as exc:
