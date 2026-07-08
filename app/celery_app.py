@@ -26,8 +26,10 @@ app = Celery("sa", broker_url=broker_url, result_backend=result_backend, include
 # 长任务 + 无限 LLM: 不靠 visibility_timeout 回收, 靠 dispatcher stale 扫描
 _VIS_TIMEOUT = int(os.environ.get("SA_CELERY_VISIBILITY_TIMEOUT", str(86400 * 7)))
 app.conf.update(
-    task_acks_late=True,                 # worker 死/rollout → 未 ack 消息回队列重投
-    task_reject_on_worker_lost=True,     # worker 进程丢失 → 消息重投
+    # 不用 acks_late: 我们的 startup_reset + stale_loop 已经处理 worker 死亡/rollout。
+    # acks_late=True 会在 Redis 断连重连时误重投消息 → 双执行 (与 stale_loop 冲突)。
+    task_acks_late=False,
+    task_reject_on_worker_lost=False,
     task_track_started=True,
     broker_transport_options={"visibility_timeout": _VIS_TIMEOUT},
     result_backend_transport_options={"visibility_timeout": _VIS_TIMEOUT},
