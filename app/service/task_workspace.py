@@ -89,8 +89,15 @@ def setup_local_workspace(output_path: str, task_id: str) -> dict:
             try: nfs_run.unlink()
             except OSError: pass
         elif nfs_run.exists():
-            # 旧的真实 run 目录（restart 残留）→ 移除（resume 已移除，一律从头运行）
-            shutil.rmtree(str(nfs_run), ignore_errors=True)
+            # 旧的真实 run 目录 (restart/上轮残留) → rename-to-tombstone (NFS 原子) 再删
+            import uuid as _uuid
+            tombstone = nfs_run.with_name(f".run.tombstone-{_uuid.uuid4().hex[:8]}")
+            try:
+                nfs_run.rename(tombstone)
+                shutil.rmtree(str(tombstone), ignore_errors=True)
+            except OSError:
+                # rename 也失败 → 强制 rmtree (ignore_errors=True)
+                shutil.rmtree(str(nfs_run), ignore_errors=True)
         os.symlink(str(local_run), str(nfs_run))
         logger.info("task %s: NFS run -> local %s (symlink)", task_id, local_run)
         return {"ok": True, "nfs_run": str(nfs_run), "local_run": str(local_run)}

@@ -323,17 +323,22 @@ def _clean_task_artifacts(task_id: str) -> None:
             db.commit()
             task_root = Path(row.output_path or "") / task_id
             if task_root.is_dir():
+                import uuid as _uuid
                 for child_name in ("run", "output"):
                     child = task_root / child_name
-                    if child.exists() or child.is_symlink():
-                        try:
-                            if child.is_symlink():
-                                child.unlink()
-                            else:
-                                shutil.rmtree(str(child))
+                    if not child.exists() and not child.is_symlink():
+                        continue
+                    try:
+                        if child.is_symlink():
+                            child.unlink()
+                        else:
+                            # rename-to-tombstone (NFS 原子), 再异步 rmtree
+                            tombstone = child.with_name(f".{child.name}.clean-{_uuid.uuid4().hex[:8]}")
+                            child.rename(tombstone)
+                            shutil.rmtree(str(tombstone), ignore_errors=True)
                             logger.info("cleaned task artifacts: %s/%s", task_id, child_name)
-                        except Exception as exc:
-                            logger.warning("clean task artifact %s failed: %s", child_name, exc)
+                    except Exception as exc:
+                        logger.warning("clean task artifact %s failed: %s", child_name, exc)
         finally:
             try:
                 next(db_gen)
