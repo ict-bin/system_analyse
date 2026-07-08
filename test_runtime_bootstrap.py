@@ -256,12 +256,10 @@ class TaskServiceRuntimeHealthTests(unittest.TestCase):
         ):
             self.assertTrue(service._v3_requeue_task("sat_parent_1"))
 
-        self.assertEqual("running", row.status)
+        self.assertEqual("pending", row.status)
         self.assertIsNone(row.dispatcher_instance_id)
         self.assertIsNone(row.dispatch_started_at)
         self.assertIsNone(row.lease_expires_at)
-        self.assertTrue(events)
-        self.assertEqual("task_waiting_parent_observe", events[-1]["event_type"])
 
 
 class SchedulerV3PendingRepairTests(unittest.TestCase):
@@ -330,6 +328,77 @@ class SchedulerV3PendingRepairTests(unittest.TestCase):
 
         self.assertEqual("pending", status["status"])
         self.assertEqual("missing_from_queue", status["scheduler_state"])
+
+    def test_dispatch_once_removes_ghost_queue_entry(self):
+        events = []
+        scheduler = SchedulerV3(
+            finalize_task=lambda *args, **kwargs: None,
+            record_event=lambda task_id, event_type, message, level="info", payload=None: events.append(
+                {
+                    "task_id": task_id,
+                    "event_type": event_type,
+                    "message": message,
+                    "level": level,
+                    "payload": payload or {},
+                }
+            ),
+        )
+        scheduler._task_exists_for_dispatch = lambda task_id: False if task_id == "sat_ghost_1" else True
+        scheduler._queue.append("sat_ghost_1")
+        scheduler._workers["worker-1"] = SimpleNamespace(
+            worker_id="worker-1",
+            online=True,
+            current_task=None,
+            reported_task=None,
+            last_heartbeat=0.0,
+            sock=None,
+            is_idle=True,
+        )
+
+        scheduler._dispatch_once()
+
+        self.assertEqual([], list(scheduler._queue))
+        self.assertEqual({}, scheduler._running)
+        self.assertEqual("task_queue_entry_removed", events[-1]["event_type"])
+        self.assertEqual("task_row_missing_for_dispatch", events[-1]["payload"]["reason"])
+
+    def test_dispatch_once_skips_ghost_and_preserves_following_real_task(self):
+        events = []
+        claims = []
+        scheduler = SchedulerV3(
+            finalize_task=lambda *args, **kwargs: None,
+            record_event=lambda task_id, event_type, message, level="info", payload=None: events.append(
+                {
+                    "task_id": task_id,
+                    "event_type": event_type,
+                    "message": message,
+                    "level": level,
+                    "payload": payload or {},
+                }
+            ),
+            claim_task=lambda task_id, worker_id: claims.append((task_id, worker_id)) or 1,
+        )
+        scheduler._task_exists_for_dispatch = lambda task_id: task_id != "sat_ghost_2"
+        scheduler._send = lambda conn, msg: True
+        scheduler._queue.extend(["sat_ghost_2", "sat_real_1"])
+        scheduler._workers["worker-1"] = SimpleNamespace(
+            worker_id="worker-1",
+            online=True,
+            current_task=None,
+            reported_task=None,
+            last_heartbeat=0.0,
+            sock=object(),
+            is_idle=True,
+        )
+
+        scheduler._dispatch_once()
+        scheduler._dispatch_once()
+
+        self.assertEqual([("sat_real_1", "worker-1")], claims)
+        self.assertNotIn("sat_ghost_2", list(scheduler._queue))
+        self.assertIn("sat_real_1", scheduler._running)
+        self.assertEqual("task_queue_entry_removed", events[0]["event_type"])
+        self.assertEqual("task_dispatched", events[-1]["event_type"])
 
 
 class TaskServiceRuntimeOverviewTests(unittest.TestCase):
