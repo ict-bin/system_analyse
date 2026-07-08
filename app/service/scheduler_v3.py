@@ -133,6 +133,40 @@ class SchedulerV3:
         self._threads: list[threading.Thread] = []
         self._dirty = False
 
+    def _task_exists_for_dispatch(self, task_id: str) -> bool:
+        """Best-effort DB existence guard for queue entries.
+
+        The V3 scheduler queue is memory/file backed. If task rows are deleted
+        out-of-band but stale task ids remain in the persisted queue, those ghost
+        entries can permanently block FIFO dispatch. Before trying to claim a
+        queue head, verify the task still exists in DB and drop dead entries.
+        """
+        try:
+            from app.db import get_db
+            from app.db.models import AppSaTask
+
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                row = (
+                    db.query(AppSaTask.task_id)
+                    .filter(
+                        AppSaTask.task_id == task_id,
+                        AppSaTask.is_deleted.is_(False),
+                    )
+                    .first()
+                )
+                return row is not None
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+        except Exception:
+            logger.exception("dispatch existence check failed: %s", task_id)
+            # Fail open on transient DB issues; periodic repair can recover later.
+            return True
+
     # ── 生命周期 ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -508,6 +542,19 @@ class SchedulerV3:
             if task_id is None:
                 self._dirty = True
                 return
+        if not self._task_exists_for_dispatch(task_id):
+            with self._lock:
+                self._running.pop(task_id, None)
+                self._dirty = True
+            self._record_event_for(
+                task_id,
+                "task_queue_entry_removed",
+                "调度队列中的任务已不存在，已清理幽灵队列项",
+                "warning",
+                {"task_id": task_id, "reason": "task_row_missing_for_dispatch"},
+            )
+            return
+        with self._lock:
             w.current_task = task_id
             w.last_heartbeat = _time.time()
             self._running[task_id] = RunRecord(task_id=task_id, worker_id=w.worker_id, started_ts=_time.time())
