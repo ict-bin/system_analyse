@@ -291,22 +291,31 @@ def _dispatch_failure_debug(task_id: str) -> None:
 
 
 def _clean_task_artifacts(task_id: str) -> None:
-    """restart 语义: 清空任务 run/output 产物 + DB stages_json, 保留 input + DB 事件时间线。
+    """restart 语义: 清空任务 run/output 产物 + DB stages_json。
 
-    每次 (重投/restart/首次) 执行前都清: 首次无产物=no-op; 重投时清掉旧
-    run/sessions + output + DB stages_json(前端分析日志回放缓冲),
-    确保从头跑而非续跑, 前端 /logs 也重置。DB task_events 事件时间线保留(审计)。
+    安全检查: 如果任务正在被别的 worker 执行 (lease 有效), 跳过清理,
+    避免删掉正在执行的 workspace (Redis 重连重投场景)。
     """
     import shutil
     from pathlib import Path
     from app.db import get_db
     from app.db.models import AppSaTask
+    from app.time_utils import now_local
     try:
         db_gen = get_db()
         db = next(db_gen)
         try:
             row = db.query(AppSaTask).filter_by(task_id=task_id).first()
             if row is None:
+                return
+            # 安全检查: 如果有活 worker 持有有效 lease, 不清理 (防双执行竞态)
+            if (row.status == "running"
+                and row.execution_owner_id
+                and row.execution_owner_id != WORKER_ID
+                and row.execution_lease_until
+                and row.execution_lease_until > now_local()):
+                logger.warning("skip _clean_task_artifacts: task %s has active lease by %s",
+                               task_id, row.execution_owner_id)
                 return
             row.stages_json = None
             row.result_json = None

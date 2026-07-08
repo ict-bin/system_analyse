@@ -412,6 +412,12 @@ class TaskRepository:
             "dispatcher_instance_id": None,
             "dispatch_started_at": None,
             "lease_expires_at": None,
+            # 同步清 celery 字段 (避免 celery_tasks commit_terminal CAS 失败)
+            "execution_owner_id": None,
+            "execution_lease_until": None,
+            "execution_heartbeat_at": None,
+            "celery_task_id": None,
+            "dispatch_status": None,
         }
         if result_json is not None:
             values["result_json"] = result_json
@@ -453,6 +459,12 @@ class TaskRepository:
         row.dispatcher_instance_id = None
         row.dispatch_started_at = None
         row.lease_expires_at = None
+        # 同步清 celery 字段
+        row.execution_owner_id = None
+        row.execution_lease_until = None
+        row.execution_heartbeat_at = None
+        row.celery_task_id = None
+        row.dispatch_status = None
         if int(row.lease_epoch or 0) != lease_epoch:
             return False
         db.commit()
