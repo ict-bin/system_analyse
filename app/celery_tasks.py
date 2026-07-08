@@ -154,9 +154,7 @@ def run_sa_task(self, task_id: str) -> dict:
     result_json = None
     try:
         from app.service.task_runner import TaskRunner, TaskRunnerDependencies, TaskRunnerSettings
-        from app.service.agent_runtime_registry import AgentRuntimeRegistry
         from app.service.config_service import get_config_service
-        from app.models import ServiceConfig
 
         deps = TaskRunnerDependencies()
         settings = TaskRunnerSettings()
