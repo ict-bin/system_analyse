@@ -18,6 +18,7 @@ import os
 import signal
 import threading
 import time
+import json
 
 from celery import current_task
 from celery.signals import task_revoked
@@ -213,6 +214,17 @@ def run_sa_task(self, task_id: str) -> dict:
         except Exception:
             logger.exception("commit/recover failed for %s", task_id)
 
+        # ── 失败调试派发: 任务 error/failed → POST 给 debugger ──
+        # 旧 scheduler_v3._dispatch_failure_debug 的等价实现。
+        # debugger 不轮询任务表, 由这里主动通知。
+        if result_status in ("error", "failed"):
+            threading.Thread(
+                target=_dispatch_failure_debug,
+                args=(task_id,),
+                name=f"sa_debug_dispatch_{task_id[:12]}",
+                daemon=True,
+            ).start()
+
         with _PGID_LOCK:
             _PGID.pop(celery_id, None)
 
@@ -231,6 +243,51 @@ def _cleanup_pi_processes() -> None:
         subprocess.run(["pkill", "-9", "-f", "node.*pi"], capture_output=True, timeout=5)
     except Exception:
         pass
+
+
+def _dispatch_failure_debug(task_id: str) -> None:
+    """任务终态后, 查 DB 实际状态; 仅 error/failed 才通知 debugger 调试。
+
+    debugger 不主动轮询任务表, 由本函数在任务结束后触发。
+    外部/基础设施错误 (源文件丢失/模型错误/key错误/超时) 不调试, 标记 skipped。
+    """
+    import urllib.request
+    import urllib.error
+    try:
+        from app.db import get_db
+        from app.db.models import AppSaTask
+        db_gen = get_db()
+        db = next(db_gen)
+        try:
+            t = db.query(AppSaTask).filter(AppSaTask.task_id == task_id).first()
+            if t is None or t.status not in ("failed", "error"):
+                return  # passed/cancelled/running → 不调试
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+    except Exception:
+        logger.exception("failure-debug DB status check failed for %s", task_id)
+        return
+    host = os.environ.get("SA_DEBUGGER_HOST", "secflow-app-system-analyse-debugger")
+    port = int(os.environ.get("SA_DEBUGGER_PORT", "8080"))
+    url = f"http://{host}:{port}/api/app/system-analyse/internal/failure-debug"
+    payload = json.dumps({"task_id": task_id}).encode()
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(
+                url, data=payload, method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if 200 <= resp.status < 300:
+                    logger.info("dispatched failure-debug for task %s (attempt %d)", task_id, attempt)
+                    return
+        except Exception as exc:
+            logger.warning("failure-debug dispatch attempt %d for %s failed: %s", attempt, task_id, exc)
+        time.sleep(5)
+    logger.error("failure-debug dispatch exhausted for task %s (debugger unreachable)", task_id)
 
 
 def _clean_task_artifacts(task_id: str) -> None:
