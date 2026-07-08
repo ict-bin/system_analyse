@@ -93,6 +93,22 @@ _MIGRATIONS = [
         "  KEY ix_sa_task_event_created_at (created_at)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
     ),
+    # ── Celery execution fields (v2 scheduler) ──
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN celery_task_id VARCHAR(64) NULL",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN execution_owner_id VARCHAR(128) NULL",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN execution_epoch INT NOT NULL DEFAULT 0",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN execution_lease_until DATETIME NULL",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN execution_heartbeat_at DATETIME NULL",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN control_version INT NOT NULL DEFAULT 0",
+    "ALTER TABLE secflow_app_sa_tasks ADD COLUMN dispatch_status VARCHAR(32) NULL",
+    "CREATE INDEX ix_sa_tasks_celery_task_id ON secflow_app_sa_tasks (celery_task_id)",
+    "CREATE INDEX ix_sa_tasks_exec_owner ON secflow_app_sa_tasks (execution_owner_id)",
+    "CREATE INDEX ix_sa_tasks_exec_lease ON secflow_app_sa_tasks (execution_lease_until)",
+    "CREATE INDEX ix_sa_tasks_dispatch_status ON secflow_app_sa_tasks (dispatch_status)",
+    # 覆盖 dispatcher pump 的 WHERE+ORDER BY: pending + celery_task_id IS NULL + created_at
+    "CREATE INDEX ix_sa_tasks_pump ON secflow_app_sa_tasks (is_deleted, status, celery_task_id, created_at)",
+    # 覆盖 stale_loop 的 WHERE: running + is_deleted
+    "CREATE INDEX ix_sa_tasks_stale ON secflow_app_sa_tasks (is_deleted, status, execution_heartbeat_at)",
     # Failure debug reports (added 2026-06) — 任务失败时 LLM 自动调试报告
     (
         "CREATE TABLE IF NOT EXISTS secflow_app_sa_failure_debug ("

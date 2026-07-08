@@ -71,6 +71,24 @@ from app.service.scheduler import (
 from app.service.scheduler_v3 import get_scheduler as get_v3_scheduler
 from app.time_utils import isoformat_local, now_local
 
+
+def _revoke_celery_task(row) -> None:
+    """Celery cancel/restart: revoke (terminate SIGKILL) worker pod 上的 prefork 子进程。
+
+    best-effort: Redis/worker 不可达时静默 (dispatcher stale 扫描兜底回收)。
+    """
+    cid = getattr(row, "celery_task_id", None)
+    if not cid:
+        return
+    try:
+        from app.celery_app import app as celery_app
+        celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
+        log_event(logger, logging.INFO, "celery revoke sent",
+                  event="task_celery_revoked", task_id=row.task_id, celery_task_id=cid)
+    except Exception as exc:
+        log_event(logger, logging.WARNING, "celery revoke failed (stale scan will recover)",
+                  event="task_celery_revoke_failed", task_id=row.task_id, celery_task_id=cid, error=str(exc))
+
 logger = logging.getLogger("sa.task_service")
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
@@ -1755,24 +1773,20 @@ class TaskService:
     def restart_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         previous_status = str(row.status or "")
+        # 运行中任务: 先 cancel (revoke celery + kill pi) 再 restart
         if row.status in ("pending", "running"):
-            from fastapi import HTTPException
-            self._record_task_operation_event(
-                task_id=row.task_id,
-                project_id=row.project_id,
-                operation="restart_task",
-                event_type="task_operation_rejected",
-                message="任务重启被拒绝",
-                level="error",
-                payload={
-                    "reason": "task_active",
-                    "status": previous_status,
-                    "before_status": previous_status,
-                    "after_status": previous_status,
-                    "changed": False,
-                },
-            )
-            raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
+            _revoke_celery_task(row)
+            row.status = "cancelled"
+            row.finished_at = now_local()
+            row.control_version = int(row.control_version or 0) + 1
+            row.execution_owner_id = None
+            row.execution_epoch = int(row.execution_epoch or 0) + 1
+            row.execution_lease_until = None
+            row.execution_heartbeat_at = None
+            row.dispatch_status = None
+            row.celery_task_id = None
+            db.commit(); db.refresh(row)
+            logger.info("restart: auto-cancelled running task %s before restart", task_id)
         cleanup_result = _remove_task_root_for_restart(row.output_path, task_id)
         if row.output_path:
             # 真实失败：旧目录存在但既没删也没移走（restart 现在纯删除，不重建目录；
@@ -1800,7 +1814,16 @@ class TaskService:
         _clear_task_execution_lock(row.output_path, task_id)
         row = self._task_repository.restart_task_in_place(db, row)
         row.latest_abnormal_reason_json = None
+        # Celery fields: reset for dispatcher pump to re-dispatch
+        row.celery_task_id = None
+        row.execution_owner_id = None
+        row.execution_epoch = int(row.execution_epoch or 0) + 1
+        row.execution_lease_until = None
+        row.execution_heartbeat_at = None
+        row.control_version = int(row.control_version or 0) + 1
+        row.dispatch_status = "pending"
         flag_modified(row, "latest_abnormal_reason_json")
+        flag_modified(row, "task_config_json")
         db.commit()
         db.refresh(row)
         self._record_task_operation_event(
@@ -1846,7 +1869,17 @@ class TaskService:
         at = _running_tasks.get(task_id)
         if at and at.is_alive():
             pass  # thread cannot be cancelled
+        # Celery: revoke kill worker prefork child + pi tree
+        _revoke_celery_task(row)
         row = self._task_repository.cancel_task_in_place(db, row)
+        # Celery fields: invalidate old epoch/cv
+        row.control_version = int(row.control_version or 0) + 1
+        row.execution_owner_id = None
+        row.execution_epoch = int(row.execution_epoch or 0) + 1
+        row.execution_lease_until = None
+        row.execution_heartbeat_at = None
+        row.dispatch_status = None
+        row.celery_task_id = None
         reason, changed = _sync_task_abnormal_reason(row)
         _record_abnormal_reason(row, reason, changed=changed)
         db.commit()

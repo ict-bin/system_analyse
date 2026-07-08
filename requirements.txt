@@ -11,3 +11,5 @@ cryptography
 aiohttp
 tree-sitter>=0.23,<0.26
 tree-sitter-cpp>=0.23,<0.24
+celery[redis]==5.4.0
+redis>=5.0

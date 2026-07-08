@@ -56,10 +56,20 @@ class AppSaTask(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # ── Legacy (kept for backward compat, superseded by celery fields) ──
     dispatcher_instance_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
     dispatch_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     lease_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+
+    # ── Celery execution fields (v2 scheduler) ──
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    execution_owner_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    execution_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    execution_lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    execution_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    control_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dispatch_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     task_config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 

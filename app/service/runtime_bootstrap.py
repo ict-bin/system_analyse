@@ -87,12 +87,9 @@ class RuntimeBootstrap:
                         self._start_registry,
                     ) or made_progress
 
-            # worker loop 不受 db_ready 约束, 内部自行 init_db
-            if (is_dispatcher_role() or is_runner_role()) and not self._status.worker_loop_ready:
-                made_progress = self._attempt_async_component_start(
-                    "worker_loop_start",
-                    self._start_worker_loop,
-                ) or made_progress
+            # Celery: scheduler/worker roles run outside FastAPI (redis/dispatcher/celery CLI)
+            # Old worker_loop deprecated.
+            # debugger role: start failure debug after DB ready
 
             # debugger 角色：DB 就绪后启动失败调试轮询循环
             if is_debugger_role() and self._status.db_ready and not self._status.failure_debug_started:
