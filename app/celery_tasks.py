@@ -51,6 +51,8 @@ def run_sa_task(self, task_id: str) -> dict:
     logger.info("run_sa_task start task=%s celery_id=%s pgid=%s pod=%s", task_id, celery_id, pgid, WORKER_ID)
 
     from app.db import get_db
+    from app.celery_app import _ensure_db
+    _ensure_db()  # 确保 DB 初始化 (celery worker 进程不经 runtime_bootstrap)
     from app.service.execution_coordinator import (
         claim_specific_task,
         begin_execution_if_owner,

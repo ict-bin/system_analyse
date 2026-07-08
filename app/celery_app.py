@@ -60,7 +60,8 @@ def _ensure_db() -> None:
         )
         logger.info("DB initialized for celery/dispatcher process: %s:%s", svc.database.host, svc.database.port)
     except Exception:
-        logger.exception("celery_app: DB init failed (will retry on first DB use)")
+        logger.warning("celery_app: DB init failed (will retry on first DB use)", exc_info=True)
 
 
-_ensure_db()
+# 不在模块级调 _ensure_db(): 避免导入时 DB migration 异常导致 celery app 加载失败。
+# DB 初始化在 run_sa_task / dispatcher.main() 中显式调用。

@@ -144,8 +144,7 @@ def _run_migrations(engine) -> None:
                 conn.commit()
                 logger.info("Migration applied: %s", stmt[:60])
             except Exception:
-                import traceback
-                traceback.print_exc()
+                # 索引/列已存在是预期行为 (多 pod 并发 init), 静默跳过
                 conn.rollback()
 
 
