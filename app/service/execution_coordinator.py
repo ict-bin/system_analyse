@@ -79,6 +79,11 @@ def claim_specific_task(db: Session, owner_id: str, task_id: str) -> ClaimedTask
         AppSaTask.started_at: now,
         AppSaTask.finished_at: None,
         AppSaTask.error: None,
+        # 同步旧字段 (task_runner._prepare_task_execution 检查 dispatcher_instance_id + lease_epoch)
+        AppSaTask.dispatcher_instance_id: owner_id,
+        AppSaTask.lease_epoch: new_epoch,
+        AppSaTask.lease_expires_at: _lease_deadline(),
+        AppSaTask.dispatch_started_at: now,
     }
     if expected_status == "running":
         update_fields[AppSaTask.status] = "pending"
