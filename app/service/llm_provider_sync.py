@@ -23,6 +23,8 @@ logger = logging.getLogger("sa.llm_sync")
 
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
 _DEFAULT_CONTEXT_WINDOW = 128000
+_MIN_CONTEXT_WINDOW = 131072        # 128K 最小值, 低于此值的提供商会被提升到此值
+_MIN_MAX_OUTPUT_TOKENS = 32768      # 32K 最小 max output tokens, 防止网关默认极小值导致模型只输出1个token
 _REQUIRED_MODEL_FIELDS = ("contextWindow", "contextLength")
 
 
@@ -66,15 +68,20 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         entry = dict(raw)
         # Strip any maxTokens restriction to allow unlimited LLM output
+        # 但设置最小 max_output_tokens = 32K, 防止网关默认极小值导致 stopReason="length" 死循环
         for _k in list(entry.keys()):
             if _k.lower() in ("maxtokens", "max_tokens", "max_output_tokens", "maxoutputtokens"):
                 entry.pop(_k, None)
+        entry["maxTokens"] = _MIN_MAX_OUTPUT_TOKENS
         entry.setdefault("id", model_id)
         entry.setdefault("name", entry.get("id") or model_id)
         entry.setdefault("reasoning", False)
         entry.setdefault("input", ["text"])
         entry.setdefault("contextWindow", context_window)
-        entry.setdefault("contextLength", context_window)
+        # 强制 contextWindow 不低于 128K (gaiasec 报 8192 会被提升到 131072)
+        if int(entry.get("contextWindow") or 0) < _MIN_CONTEXT_WINDOW:
+            entry["contextWindow"] = _MIN_CONTEXT_WINDOW
+        entry.setdefault("contextLength", entry["contextWindow"])
         entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
         models.append(entry)
     return models
@@ -103,13 +110,17 @@ def build_models_json(providers: list[dict[str, Any]], gateway_model_aliases: li
                 alias_name = str(a.get("alias_name") or "").strip()
                 if not alias_name:
                     continue
+                _alias_cw = _as_positive_int(a.get("max_tokens_default"), _DEFAULT_CONTEXT_WINDOW)
+                if _alias_cw < _MIN_CONTEXT_WINDOW:
+                    _alias_cw = _MIN_CONTEXT_WINDOW
                 alias_models.append({
                     "id": alias_name,
                     "name": alias_name,
                     "reasoning": False,
                     "input": ["text"],
-                    "contextWindow": _as_positive_int(a.get("max_tokens_default"), _DEFAULT_CONTEXT_WINDOW),
-                    "contextLength": _as_positive_int(a.get("max_tokens_default"), _DEFAULT_CONTEXT_WINDOW),
+                    "contextWindow": _alias_cw,
+                    "contextLength": _alias_cw,
+                    "maxTokens": _MIN_MAX_OUTPUT_TOKENS,
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 })
             if alias_models:
