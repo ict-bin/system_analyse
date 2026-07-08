@@ -174,6 +174,15 @@ def finalize_workspace(output_path: str, task_id: str, normal: bool) -> None:
         nfs_run = nfs_root / "run"
         local_run = _local_run(task_id)
         if not local_run.exists():
+            # 本地 workspace 不存在 (setup_local_workspace 失败或被清):
+            # 仍需清理 NFS run/ 的悬空 symlink (避免下轮 setup 误判)
+            try:
+                if nfs_run.is_symlink():
+                    nfs_run.unlink()
+                elif nfs_run.exists() and not normal:
+                    shutil.rmtree(str(nfs_run), ignore_errors=True)
+            except OSError:
+                pass
             return
 
         # 1. 被杀场景代归档：output/ 若缺产物，从本地 workspace 补

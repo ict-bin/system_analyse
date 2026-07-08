@@ -46,7 +46,12 @@ def append_events(path: Optional[Path], new_events: list[dict]) -> bool:
     if path is None or not new_events:
         return True
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # NFS 上 symlink→目录 的 mkdir(exist_ok=True) 可能报 EEXIST, 跳过
+        if not path.parent.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
         lines = "".join(
             json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n"
             for e in new_events
@@ -69,7 +74,11 @@ def write_final(path: Optional[Path], all_events: list[dict]) -> bool:  # noqa: 
     if path is None:
         return False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.parent.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(_FINAL_MARKER, ensure_ascii=False, separators=(",", ":")) + "\n")
         return True
