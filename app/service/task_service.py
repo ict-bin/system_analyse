@@ -2678,8 +2678,12 @@ class TaskService:
                     logger.info("delete_task: removed task dir %s", task_dir)
                 except Exception as _e:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
-        # 软删除
+        # 软删除任务行
         row.is_deleted = True
+        # 硬删除关联 DB 记录 (事件时间线 + 失败调试报告)
+        from app.db.models import AppSaTaskEvent, AppSaFailureDebug
+        n_events = db.query(AppSaTaskEvent).filter(AppSaTaskEvent.task_id == task_id).delete(synchronize_session=False)
+        n_debug = db.query(AppSaFailureDebug).filter(AppSaFailureDebug.task_id == task_id).delete(synchronize_session=False)
         db.commit()
         _invalidate_slot_summary_cache(row.project_id)
         self._record_task_operation_event(
@@ -2698,6 +2702,8 @@ class TaskService:
                 "files_deleted": files_deleted,
                 "status_before_delete": previous_status,
                 "cancelled_first": cancelled_first,
+                "events_deleted": n_events,
+                "debug_deleted": n_debug,
             },
         )
         return {"cancelled_first": cancelled_first, "files_deleted": files_deleted}
