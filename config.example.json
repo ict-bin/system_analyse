@@ -10,6 +10,13 @@
     "agent_retry_delay": 3,
     "pi_max_retries": -1,
     "pi_retry_delay": 5,
+    "pi_thinking_format": "qwen-chat-template",
+    "pi_chat_template_kwargs": {
+        "thinking": {
+            "$var": "thinking.enabled"
+        }
+    },
+    "pi_supports_reasoning_effort": false,
     "max_rounds_exceeded_action": "treat_as_passed",
     "continue_on_module_failure": true,
     "enable_final_check": false,

@@ -19,6 +19,13 @@ from typing import Any, Iterable
 
 import httpx
 
+from app.models import (
+    DEFAULT_PI_CHAT_TEMPLATE_KWARGS,
+    normalize_bool,
+    normalize_pi_chat_template_kwargs,
+    normalize_pi_thinking_format,
+)
+
 logger = logging.getLogger("sa.llm_sync")
 
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
@@ -43,7 +50,53 @@ def _as_positive_int(value: Any, default: int) -> int:
         return default
 
 
-def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
+def _normalize_thinking_config(thinking_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = thinking_config if isinstance(thinking_config, dict) else {}
+    return {
+        "pi_thinking_format": normalize_pi_thinking_format(raw.get("pi_thinking_format")),
+        "pi_chat_template_kwargs": normalize_pi_chat_template_kwargs(
+            raw.get("pi_chat_template_kwargs", DEFAULT_PI_CHAT_TEMPLATE_KWARGS)
+        ),
+        "pi_supports_reasoning_effort": normalize_bool(
+            raw.get("pi_supports_reasoning_effort"),
+            default=False,
+        ),
+    }
+
+
+def _load_runtime_thinking_config() -> dict[str, Any]:
+    try:
+        from app import db as _dbmod
+
+        if _dbmod._SessionLocal is None:
+            return _normalize_thinking_config()
+        with _dbmod._SessionLocal() as db:
+            from app.service.config_service import get_config_service
+
+            return _normalize_thinking_config(get_config_service().get_config(db))
+    except Exception as exc:
+        logger.warning("failed to load SA thinking config from DB, using defaults: %s", exc)
+        return _normalize_thinking_config()
+
+
+def _apply_reasoning_compat(entry: dict[str, Any], thinking_config: dict[str, Any] | None = None) -> None:
+    normalized = _normalize_thinking_config(thinking_config)
+    entry["reasoning"] = True
+    compat = dict(entry.get("compat") or {})
+    compat["thinkingFormat"] = normalized["pi_thinking_format"]
+    compat["supportsDeveloperRole"] = False
+    if normalized["pi_thinking_format"] == "together":
+        compat["supportsReasoningEffort"] = normalized["pi_supports_reasoning_effort"]
+    else:
+        compat.pop("supportsReasoningEffort", None)
+    if normalized["pi_thinking_format"] == "chat-template":
+        compat["chatTemplateKwargs"] = normalized["pi_chat_template_kwargs"]
+    else:
+        compat.pop("chatTemplateKwargs", None)
+    entry["compat"] = compat
+
+
+def _model_entries(provider: dict[str, Any], thinking_config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     model_id = str(provider.get("model") or "").strip()
     extra_config = provider.get("extra_config") if isinstance(provider.get("extra_config"), dict) else {}
     context_window = _as_positive_int(
@@ -75,7 +128,11 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
         entry["maxTokens"] = _MIN_MAX_OUTPUT_TOKENS
         entry.setdefault("id", model_id)
         entry.setdefault("name", entry.get("id") or model_id)
-        entry.setdefault("reasoning", False)
+        thinking_level_map = entry.get("thinkingLevelMap")
+        if not isinstance(thinking_level_map, dict):
+            thinking_level_map = {}
+        thinking_level_map.setdefault("disabled", "disabled")
+        entry["thinkingLevelMap"] = thinking_level_map
         entry.setdefault("input", ["text"])
         entry.setdefault("contextWindow", context_window)
         # 强制 contextWindow 不低于 128K (gaiasec 报 8192 会被提升到 131072)
@@ -83,24 +140,30 @@ def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
             entry["contextWindow"] = _MIN_CONTEXT_WINDOW
         entry.setdefault("contextLength", entry["contextWindow"])
         entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
+        _apply_reasoning_compat(entry, thinking_config=thinking_config)
         models.append(entry)
     return models
 
 
-def build_models_json(providers: list[dict[str, Any]], gateway_model_aliases: list[dict[str, Any]] | None = None) -> dict:
+def build_models_json(
+    providers: list[dict[str, Any]],
+    gateway_model_aliases: list[dict[str, Any]] | None = None,
+    thinking_config: dict[str, Any] | None = None,
+) -> dict:
     """
     将配置中心的 LlmProviderSummary 列表 + AIGW model_aliases 转换为 pi 的 models.json。
     
     gateway_model_aliases 中的别名会合并到 gaiasec provider 的 models 列表。
     """
     result: dict[str, Any] = {"providers": {}}
+    normalized_thinking_config = _normalize_thinking_config(thinking_config)
     for p in providers:
         if not p.get("enabled"):
             continue
         key = p.get("provider_key", "").strip()
         if not key:
             continue
-        models = _model_entries(p)
+        models = _model_entries(p, thinking_config=normalized_thinking_config)
         # Source 2: AIGW model aliases → 合并到 gaiasec provider
         if key == "gaiasec" and gateway_model_aliases:
             alias_models: list[dict[str, Any]] = []
@@ -116,13 +179,13 @@ def build_models_json(providers: list[dict[str, Any]], gateway_model_aliases: li
                 alias_models.append({
                     "id": alias_name,
                     "name": alias_name,
-                    "reasoning": False,
                     "input": ["text"],
                     "contextWindow": _alias_cw,
                     "contextLength": _alias_cw,
                     "maxTokens": _MIN_MAX_OUTPUT_TOKENS,
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 })
+                _apply_reasoning_compat(alias_models[-1], thinking_config=normalized_thinking_config)
             if alias_models:
                 models = alias_models
         result["providers"][key] = {
@@ -194,7 +257,11 @@ def sync_providers_to_pi(
             logger.warning("配置中心返回空 Provider 列表，跳过同步")
             return False
 
-        models_json = build_models_json(items, gateway_model_aliases=_fetch_gateway_model_aliases())
+        models_json = build_models_json(
+            items,
+            gateway_model_aliases=_fetch_gateway_model_aliases(),
+            thinking_config=_load_runtime_thinking_config(),
+        )
         enabled_count = len(models_json["providers"])
 
         pi_dir = Path(_PI_DIR)

@@ -27,6 +27,9 @@ class _FakeQuery:
     def all(self):
         return list(self._rows)
 
+    def __iter__(self):
+        return iter(self._rows)
+
 
 class _FakeDb:
     def __init__(self, rows):
@@ -34,6 +37,18 @@ class _FakeDb:
 
     def query(self, _model):
         return _FakeQuery(self._rows)
+
+
+class _FakeInspect:
+    def __init__(self, ping=None, active=None):
+        self._ping = ping or {}
+        self._active = active or {}
+
+    def ping(self):
+        return self._ping
+
+    def active(self):
+        return self._active
 
 
 def _row(**kwargs):
@@ -50,11 +65,13 @@ def _row(**kwargs):
         "started_at": now,
         "updated_at": now,
         "dispatch_started_at": now,
-        "dispatcher_instance_id": None,
-        "lease_expires_at": None,
-        "lease_epoch": 1,
         "project_id": "p1",
         "is_deleted": False,
+        "celery_task_id": None,
+        "execution_owner_id": None,
+        "execution_lease_until": None,
+        "execution_epoch": 1,
+        "execution_heartbeat_at": now,
     }
     payload.update(kwargs)
     return SimpleNamespace(**payload)
@@ -65,166 +82,91 @@ class WorkerSlotSnapshotTests(TestCase):
         invalidate_worker_slot_summary_cache()
 
     def test_summary_snapshot_omits_active_jobs(self):
-        now = now_local()
-        rows = [
+        db = _FakeDb([
             _row(
                 task_id="sat_live",
-                dispatcher_instance_id="sa-runner-c:abcd9999",
-                lease_expires_at=now + timedelta(seconds=30),
+                celery_task_id="celery-1",
             )
-        ]
-        db = _FakeDb(rows)
-        with (
-            patch("app.service.worker_slot_snapshot.get_runner_registry_service") as get_registry,
-            patch("app.service.worker_slot_snapshot.get_worker_runtime_settings", return_value={"worker_task_concurrency": 2}),
+        ])
+        inspect = _FakeInspect(
+            ping={"worker@pod-a": {"ok": "pong"}},
+            active={"worker@pod-a": [{"id": "celery-1"}]},
+        )
+        with patch("app.celery_app.app.control.inspect", return_value=inspect), patch(
+            "app.service.worker_slot_snapshot._count_queued_jobs",
+            return_value=0,
         ):
-            get_registry.return_value.list_active_runners.return_value = []
             snapshot = build_worker_slot_cluster_summary(db, project_id="p1")
 
-        self.assertEqual(1, snapshot.worker_count)
-        self.assertEqual([], snapshot.workers[0].active_jobs)
+        assert snapshot.worker_count == 1
+        assert snapshot.workers[0].active_jobs == []
 
     def test_detail_snapshot_includes_active_jobs(self):
-        now = now_local()
-        rows = [
+        db = _FakeDb([
             _row(
                 task_id="sat_live",
-                dispatcher_instance_id="sa-runner-d:abcd8888",
-                lease_expires_at=now + timedelta(seconds=30),
+                celery_task_id="celery-1",
+                execution_owner_id="worker@pod-a",
             )
-        ]
-        db = _FakeDb(rows)
-        with (
-            patch("app.service.worker_slot_snapshot.get_runner_registry_service") as get_registry,
-            patch("app.service.worker_slot_snapshot.get_worker_runtime_settings", return_value={"worker_task_concurrency": 2}),
+        ])
+        inspect = _FakeInspect(
+            ping={"worker@pod-a": {"ok": "pong"}},
+            active={"worker@pod-a": [{"id": "celery-1"}]},
+        )
+        with patch("app.celery_app.app.control.inspect", return_value=inspect), patch(
+            "app.service.worker_slot_snapshot._count_queued_jobs",
+            return_value=0,
         ):
-            get_registry.return_value.list_active_runners.return_value = []
             snapshot = build_worker_slot_cluster_detail(db, project_id="p1")
 
-        self.assertEqual(1, snapshot.worker_count)
-        self.assertEqual(1, len(snapshot.workers[0].active_jobs))
+        assert snapshot.worker_count == 1
+        assert len(snapshot.workers[0].active_jobs) == 1
+        assert snapshot.workers[0].active_jobs[0].task_id == "sat_live"
 
-    def test_dynamic_runner_registry_worker_is_included_without_task(self):
-        db = _FakeDb([])
+    def test_running_db_fallback_keeps_worker_visible_when_inspect_empty(self):
         now = now_local()
-        active_runners = [{
-            "instance_id": "sa-runner-a:abcd1234",
-            "status": "active",
-            "capacity": 3,
-            "running_tasks": 0,
-            "updated_at": now,
-            "age_seconds": 1.0,
-        }]
-        with (
-            patch("app.service.worker_slot_snapshot.get_runner_registry_service") as get_registry,
-            patch("app.service.worker_slot_snapshot.get_worker_runtime_settings", return_value={"worker_task_concurrency": 2}),
-        ):
-            get_registry.return_value.list_active_runners.return_value = active_runners
-            snapshot = build_worker_slot_cluster_snapshot(db, project_id="p1")
-
-        self.assertEqual(1, snapshot.worker_count)
-        self.assertEqual(1, snapshot.healthy_workers)
-        self.assertEqual("sa-runner-a:abcd1234", snapshot.workers[0].worker_id)
-        self.assertEqual(3, snapshot.workers[0].max_concurrent_jobs)
-        self.assertEqual("runner_registry", snapshot.workers[0].source)
-
-    def test_task_lease_fallback_keeps_worker_visible_when_registry_temporarily_missing(self):
-        now = now_local()
-        rows = [
+        db = _FakeDb([
             _row(
                 task_id="sat_live",
-                dispatcher_instance_id="sa-runner-b:efgh5678",
-                lease_expires_at=now + timedelta(seconds=30),
+                execution_owner_id="sa-runner-b",
+                execution_lease_until=now + timedelta(seconds=30),
             )
-        ]
-        db = _FakeDb(rows)
-        with (
-            patch("app.service.worker_slot_snapshot.get_runner_registry_service") as get_registry,
-            patch("app.service.worker_slot_snapshot.get_worker_runtime_settings", return_value={"worker_task_concurrency": 4}),
+        ])
+        inspect = _FakeInspect()
+        with patch("app.celery_app.app.control.inspect", return_value=inspect), patch(
+            "app.service.worker_slot_snapshot._count_queued_jobs",
+            return_value=0,
         ):
-            get_registry.return_value.list_active_runners.return_value = []
             snapshot = build_worker_slot_cluster_snapshot(db, project_id="p1")
 
-        self.assertEqual(1, snapshot.worker_count)
+        assert snapshot.worker_count == 1
         worker = snapshot.workers[0]
-        self.assertTrue(worker.healthy)
-        self.assertEqual("task_lease_fallback", worker.source)
-        self.assertEqual(1, worker.running_jobs)
-        self.assertEqual(3, worker.available_slots)
+        assert worker.source == "db_running_fallback"
+        assert worker.running_jobs == 1
 
-    def test_pending_without_owner_only_counts_as_queue(self):
-        rows = [_row(task_id="sat_pending", status="pending", dispatcher_instance_id=None, lease_expires_at=None)]
-        db = _FakeDb(rows)
-        with (
-            patch("app.service.worker_slot_snapshot.get_runner_registry_service") as get_registry,
-            patch("app.service.worker_slot_snapshot.get_worker_runtime_settings", return_value={"worker_task_concurrency": 2}),
+    def test_pending_queue_is_counted_separately(self):
+        db = _FakeDb([])
+        inspect = _FakeInspect()
+        with patch("app.celery_app.app.control.inspect", return_value=inspect), patch(
+            "app.service.worker_slot_snapshot._count_queued_jobs",
+            return_value=3,
         ):
-            get_registry.return_value.list_active_runners.return_value = []
             snapshot = build_worker_slot_cluster_snapshot(db, project_id="p1")
 
-        self.assertEqual(1, snapshot.queued_jobs)
-        self.assertEqual(0, snapshot.worker_count)
+        assert snapshot.queued_jobs == 3
+        assert snapshot.worker_count == 0
 
-    def test_pending_with_owner_counts_as_busy_slot(self):
-        now = now_local()
-        rows = [
-            _row(
-                task_id="sat_pending_owned",
-                status="pending",
-                dispatcher_instance_id="sa-runner-p:pending1234",
-                lease_expires_at=now + timedelta(seconds=30),
-            )
-        ]
-        db = _FakeDb(rows)
-        with (
-            patch("app.service.worker_slot_snapshot.get_runner_registry_service") as get_registry,
-            patch("app.service.worker_slot_snapshot.get_worker_runtime_settings", return_value={"worker_task_concurrency": 2}),
-            patch("app.service.worker_slot_snapshot._count_queued_jobs", return_value=0),
+    def test_project_cache_invalidation_refreshes_cached_summary(self):
+        inspect = _FakeInspect()
+        with patch("app.celery_app.app.control.inspect", return_value=inspect), patch(
+            "app.service.worker_slot_snapshot._count_queued_jobs",
+            return_value=0,
         ):
-            get_registry.return_value.list_active_runners.return_value = []
-            snapshot = build_worker_slot_cluster_snapshot(db, project_id="p1")
-
-        self.assertEqual(0, snapshot.queued_jobs)
-        self.assertEqual(1, snapshot.busy_slots)
-        self.assertEqual(1, snapshot.worker_count)
-        self.assertEqual(1, snapshot.workers[0].running_jobs)
-        self.assertEqual(1, snapshot.workers[0].available_slots)
-
-    def test_project_cache_invalidation_refreshes_project_and_global_summary(self):
-        now = now_local()
-        initial_db = _FakeDb([
-            _row(
-                task_id="sat_initial",
-                dispatcher_instance_id="sa-runner-cache:1111",
-                lease_expires_at=now + timedelta(seconds=30),
-            )
-        ])
-        refreshed_db = _FakeDb([
-            _row(
-                task_id="sat_refreshed",
-                dispatcher_instance_id="sa-runner-cache:1111",
-                lease_expires_at=now + timedelta(seconds=30),
-            ),
-            _row(
-                task_id="sat_refreshed_2",
-                dispatcher_instance_id="sa-runner-cache:2222",
-                lease_expires_at=now + timedelta(seconds=30),
-            ),
-        ])
-        with (
-            patch("app.service.worker_slot_snapshot.get_runner_registry_service") as get_registry,
-            patch("app.service.worker_slot_snapshot.get_worker_runtime_settings", return_value={"worker_task_concurrency": 2}),
-            patch("app.service.worker_slot_snapshot._count_queued_jobs", return_value=0),
-        ):
-            get_registry.return_value.list_active_runners.return_value = []
-            snapshot_project_initial = build_worker_slot_cluster_summary(initial_db, project_id="p1")
-            snapshot_global_initial = build_worker_slot_cluster_summary(initial_db, project_id=None)
-            self.assertEqual(1, snapshot_project_initial.worker_count)
-            self.assertEqual(1, snapshot_global_initial.worker_count)
-
+            initial = build_worker_slot_cluster_summary(_FakeDb([_row(task_id="sat_a", execution_owner_id="w1")]), project_id="p1")
+            assert initial.worker_count == 1
             invalidate_worker_slot_summary_cache(project_id="p1")
-
-            snapshot_project_refreshed = build_worker_slot_cluster_summary(refreshed_db, project_id="p1")
-            snapshot_global_refreshed = build_worker_slot_cluster_summary(refreshed_db, project_id=None)
-            self.assertEqual(2, snapshot_project_refreshed.worker_count)
-            self.assertEqual(2, snapshot_global_refreshed.worker_count)
+            refreshed = build_worker_slot_cluster_summary(
+                _FakeDb([_row(task_id="sat_a", execution_owner_id="w1"), _row(task_id="sat_b", execution_owner_id="w2")]),
+                project_id="p1",
+            )
+        assert refreshed.worker_count == 2

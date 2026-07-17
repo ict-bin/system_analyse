@@ -17,12 +17,55 @@ MAX_ROUNDS_EXCEEDED_ACTIONS = {
     "treat_as_failed",
 }
 
+PI_THINKING_FORMATS = {
+    "reasoning_effort",
+    "openrouter",
+    "deepseek",
+    "together",
+    "zai",
+    "qwen",
+    "chat-template",
+    "qwen-chat-template",
+}
+
+DEFAULT_PI_CHAT_TEMPLATE_KWARGS = {
+    "thinking": {
+        "$var": "thinking.enabled",
+    },
+}
+
 
 def normalize_max_rounds_exceeded_action(value: str | None) -> str:
     candidate = str(value or "").strip().lower()
     if candidate in MAX_ROUNDS_EXCEEDED_ACTIONS:
         return candidate
     return "treat_as_passed"
+
+
+def normalize_pi_thinking_format(value: object) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in PI_THINKING_FORMATS:
+        return candidate
+    return "qwen-chat-template"
+
+
+def normalize_pi_chat_template_kwargs(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    return dict(DEFAULT_PI_CHAT_TEMPLATE_KWARGS)
+
+
+def normalize_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    candidate = str(value).strip().lower()
+    if candidate in {"1", "true", "yes", "on"}:
+        return True
+    if candidate in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
@@ -452,6 +495,9 @@ class ServiceConfig(BaseModel):
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     agent_timeout_seconds: float = Field(default=0.0, description="已废弃，保留兼容")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
+    pi_thinking_format: str = Field(default="qwen-chat-template", description="pi agent thinking 兼容格式")
+    pi_chat_template_kwargs: dict = Field(default_factory=lambda: dict(DEFAULT_PI_CHAT_TEMPLATE_KWARGS), description="thinkingFormat=chat-template 时写入 compat.chatTemplateKwargs")
+    pi_supports_reasoning_effort: bool = Field(default=False, description="thinkingFormat=together 时是否声明 supportsReasoningEffort")
     model_stuck_timeout: float = Field(default=1800.0, description="单 pi 进程无 token 输出超时（秒），超时发送激活指令；0=禁用")
     model_stuck_max_activations: int = Field(default=5, description="pi 进程激活次数上限，超过后重启 pi 继承 session")
     stages: StagesConfig = Field(default_factory=StagesConfig)
@@ -529,6 +575,9 @@ class TaskConfig(BaseModel):
     pi_max_retries: int = Field(default=-1, description="pi 进程启动/崩溃最大重试次数，-1=无限")
     agent_timeout_seconds: float = Field(default=0.0, description="已废弃，保留兼容")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数")
+    pi_thinking_format: str = Field(default="qwen-chat-template")
+    pi_chat_template_kwargs: dict = Field(default_factory=lambda: dict(DEFAULT_PI_CHAT_TEMPLATE_KWARGS))
+    pi_supports_reasoning_effort: bool = Field(default=False)
     model_stuck_timeout: float = Field(default=1800.0, description="单 pi 进程无 token 输出超时（秒），0=禁用")
     model_stuck_max_activations: int = Field(default=5, description="pi 进程激活次数上限，超过后重启 pi 继承 session")
     analyse_targets: list[str] = Field(default=["all"], description="分析目标类型")

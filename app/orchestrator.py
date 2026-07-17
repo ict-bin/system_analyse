@@ -46,6 +46,8 @@ from .task_version import ensure_task_format_version
 from .pipeline.helpers import (
     discover_modules, get_modules_root,
     write_failure_report, generate_modules_list, strip_target_prefix,
+    parse_eval_md as _parse_eval_md,
+    check_voting as _check_voting,
 )
 from .pipeline.evaluation import EvaluationRecorder
 

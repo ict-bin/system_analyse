@@ -11,7 +11,13 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import build_prompt_override_config, load_prompt_defaults
 from app.db.models import AppSaModelsConfig, AppSaProjectConfig
-from app.models import normalize_max_rounds_exceeded_action
+from app.models import (
+    DEFAULT_PI_CHAT_TEMPLATE_KWARGS,
+    normalize_bool,
+    normalize_max_rounds_exceeded_action,
+    normalize_pi_chat_template_kwargs,
+    normalize_pi_thinking_format,
+)
 
 logger = logging.getLogger("sa.config_service")
 _GLOBAL_CONFIG_PROJECT_ID = "__global__"
@@ -66,6 +72,9 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "pi_max_retries": -1,
     "agent_timeout_seconds": 1800.0,
     "pi_retry_delay": 5,
+    "pi_thinking_format": "qwen-chat-template",
+    "pi_chat_template_kwargs": dict(DEFAULT_PI_CHAT_TEMPLATE_KWARGS),
+    "pi_supports_reasoning_effort": False,
     "model_stuck_timeout": 1800,
     "model_stuck_max_activations": 5,
     "stages": {
@@ -120,6 +129,21 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "max_session_lines": 1000,
     },
 }
+
+
+def _normalize_pi_thinking_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(data)
+    normalized["pi_thinking_format"] = normalize_pi_thinking_format(
+        normalized.get("pi_thinking_format")
+    )
+    normalized["pi_chat_template_kwargs"] = normalize_pi_chat_template_kwargs(
+        normalized.get("pi_chat_template_kwargs", DEFAULT_PI_CHAT_TEMPLATE_KWARGS)
+    )
+    normalized["pi_supports_reasoning_effort"] = normalize_bool(
+        normalized.get("pi_supports_reasoning_effort"),
+        default=False,
+    )
+    return normalized
 
 
 class ConfigService:
@@ -242,6 +266,7 @@ class ConfigService:
         data["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
             data.get("max_rounds_exceeded_action")
         )
+        data = _normalize_pi_thinking_fields(data)
         data["prompt_overrides"] = build_prompt_override_config(
             stored_prompt_overrides,
             worker_prompt_dir=data.get("workers", {}).get("system_prompt_dir"),
@@ -272,6 +297,7 @@ class ConfigService:
         blob["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
             blob.get("max_rounds_exceeded_action")
         )
+        blob = _normalize_pi_thinking_fields(blob)
         prompt_overrides_blob = self._project_prompt_override_blob(blob.get("prompt_overrides"))
         if prompt_overrides_blob:
             blob["prompt_overrides"] = prompt_overrides_blob
@@ -296,6 +322,7 @@ class ConfigService:
         result["max_rounds_exceeded_action"] = normalize_max_rounds_exceeded_action(
             result.get("max_rounds_exceeded_action")
         )
+        result = _normalize_pi_thinking_fields(result)
         result["prompt_overrides"] = build_prompt_override_config(
             prompt_overrides_blob,
             worker_prompt_dir=result.get("workers", {}).get("system_prompt_dir"),

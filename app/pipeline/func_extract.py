@@ -112,11 +112,20 @@ def extract_cpp_functions(content: str, limit: int = 200) -> list[dict]:
         # children 逆序入栈以保持源码出现顺序
         for c in reversed(n.children):
             stack.append(c)
+    if len(out) < limit:
+        for item in _extract_cpp_functions_fallback(content, limit):
+            name = str(item.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(item)
+            if len(out) >= limit:
+                break
     return out
 
 
 # 降级用安全线性正则：要求 `<类型token> <名字>(`，逐行扫描、跳过超长行，无嵌套量词。
-_CPP_FALLBACK_RE = re.compile(r"[A-Za-z_]\w*[ \t\*&>]+([A-Za-z_]\w{2,})[ \t]*\(")
+_CPP_FALLBACK_RE = re.compile(r"[A-Za-z_]\w*[ \t\*&>]+([A-Za-z_]\w*)[ \t]*\(")
 
 
 def _extract_cpp_functions_fallback(content: str, limit: int = 200) -> list[dict]:
