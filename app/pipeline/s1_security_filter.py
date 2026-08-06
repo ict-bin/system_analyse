@@ -103,8 +103,12 @@ class SecurityFocusFilterStage(BaseStage):
         cat_desc = "\n".join(cat_lines)
 
         # ── 读取 Prompt ───────────────────────────────────────────────────────
-        worker_system_prompt = load_prompt(cfg.workers.system_prompt_dir, "step1_security_filter")
-        judge_system_prompt  = load_prompt(cfg.judges.system_prompt_dir, "step1_check_security_filter")
+        worker_system_prompt = load_prompt(
+            cfg.workers.system_prompt_dir, "step1_security_filter", "workers"
+        )
+        judge_system_prompt = load_prompt(
+            cfg.judges.system_prompt_dir, "step1_check_security_filter", "judges"
+        )
 
         filter_model = cfg.workers.model_for("classify")
         judge_model  = (

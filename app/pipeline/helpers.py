@@ -31,6 +31,24 @@ _DEFAULT_AGENT_TIMEOUT_SECONDS = max(
     float(os.environ.get("SECFLOW_SYSTEM_ANALYSE_AGENT_TIMEOUT_SECONDS", "1800")),
 )
 
+_PATH_BOUNDARY_SYSTEM_PROMPT = """
+
+---
+# 强制目录边界
+
+你只能在当前任务的 workspace 和本任务源码目录内操作。源码必须通过 workspace
+中的 `target/` 符号链接访问；禁止访问、扫描或搜索其他目录。
+
+- 只使用相对路径，例如 `modules/`、`details/`、`target/`、`sessions/`。
+- 路径不存在时，只能在当前 workspace、`target/` 或当前模块目录内检查。
+- 禁止执行或变相执行全盘/跨任务扫描，例如 `find /`、`find /data`、`find ..`、
+  `ls -R /`、`grep -R /`。
+- 禁止访问 `/proc`、`/sys`、`/dev`、`/etc`、`/var`、其他任务目录或其他项目目录。
+- 不确定路径时，先使用 `pwd`、`ls target/` 或针对 `target/` 的有限相对路径查询，
+  不得从 `/` 开始搜索。
+""".strip()
+
+
 class StageError(Exception):
     pass
 
@@ -152,6 +170,15 @@ def run_agent_with_stage_guard(
     这里只负责心跳事件。
     """
     heartbeat_every = heartbeat_interval or _DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS
+    prompt = str(kwargs.get("prompt") or "")
+    kwargs["prompt"] = (
+        f"{prompt.rstrip()}\n\n"
+        "# 本任务路径上下文\n\n"
+        f"- 当前任务 workspace: `{ctx.workspace.resolve()}`\n"
+        f"- 本项目源码绝对路径: `{Path(ctx.cfg.target_dir).resolve()}`\n"
+        "- workspace 内源码访问入口: `target/`\n"
+        "- 读取源码请使用 `target/<相对源码路径>`，不得访问或搜索上述范围之外的路径。\n"
+    )
 
     def _payload(heartbeat_index: int) -> dict:
         if callable(heartbeat_payload_factory):
@@ -409,12 +436,21 @@ def check_voting(results: list[dict], pass_mode: str, judge_count: int) -> bool:
 
 # ── prompt 加载 ────────────────────────────────────────────────────────────────
 
+def _with_path_boundary_prompt(prompt: str, role: str | None) -> str:
+    """Append the task-directory policy to every Worker/Judge system prompt."""
+    if role not in {"workers", "judges"}:
+        return prompt.strip()
+    if _PATH_BOUNDARY_SYSTEM_PROMPT in prompt:
+        return prompt.strip()
+    return f"{prompt.rstrip()}\n\n{_PATH_BOUNDARY_SYSTEM_PROMPT}".strip()
+
+
 def load_prompt(source, name: str, role: str | None = None) -> str:
     if role and hasattr(source, "get_prompt"):
         try:
             prompt = source.get_prompt(role, name)
             if isinstance(prompt, str) and prompt.strip():
-                return prompt.strip()
+                return _with_path_boundary_prompt(prompt, role)
         except Exception:
             import traceback
             traceback.print_exc()
@@ -438,8 +474,8 @@ def load_prompt(source, name: str, role: str | None = None) -> str:
     for ext in [".md", ".txt", ""]:
         p = Path(prompt_dir) / f"{name}{ext}"
         if p.exists():
-            return p.read_text(encoding="utf-8").strip()
-    return ""
+            return _with_path_boundary_prompt(p.read_text(encoding="utf-8"), role)
+    return _with_path_boundary_prompt("", role)
 
 
 def load_granularity_prompt(source, base_name: str, granularity: str, role: str | None = None) -> str:

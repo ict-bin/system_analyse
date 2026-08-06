@@ -21,7 +21,7 @@ from app.pipeline import (
     get_modules_root,
     parse_eval_md,
 )
-from app.pipeline.helpers import run_agent_with_stage_guard
+from app.pipeline.helpers import load_prompt, run_agent_with_stage_guard
 from app.runner import AgentResult
 
 
@@ -88,6 +88,44 @@ def test_parse_eval_md_current_semantics():
         "feedback": "## 评分: 85\n## 通过: 是",
     }
     assert parse_eval_md("## 评分: 0\n## 通过: 否")["pass"] is False
+
+
+def test_worker_system_prompt_always_has_task_directory_boundary(tmp_path):
+    prompt_dir = tmp_path / "prompts" / "workers"
+    prompt_dir.mkdir(parents=True)
+    (prompt_dir / "step2_refine.md").write_text("refine instruction", encoding="utf-8")
+
+    prompt = load_prompt(str(prompt_dir), "step2_refine", "workers")
+
+    assert "强制目录边界" in prompt
+    assert "find /" in prompt
+    assert "target/" in prompt
+
+
+def test_stage_guard_injects_workspace_and_source_path_into_user_prompt(tmp_path):
+    ctx = _make_ctx(str(tmp_path))
+    ctx.workspace.mkdir(parents=True)
+    captured: dict[str, str] = {}
+
+    def _run_agent(**kwargs):
+        captured.update(kwargs)
+        return _make_agent_result(output="ok")
+
+    with patch("app.pipeline.helpers.run_agent", side_effect=_run_agent):
+        result = run_agent_with_stage_guard(
+            ctx=ctx,
+            stage="refine",
+            context="path-context-test",
+            prompt="检查模块",
+            model="vllm/glm5",
+            tools=["read"],
+        )
+
+    assert result.output == "ok"
+    assert "检查模块" in captured["prompt"]
+    assert str(ctx.workspace.resolve()) in captured["prompt"]
+    assert str(Path(ctx.cfg.target_dir).resolve()) in captured["prompt"]
+    assert "target/<相对源码路径>" in captured["prompt"]
     assert parse_eval_md("## 评分: 80")["pass"] is True
     assert parse_eval_md("## 评分: 60")["pass"] is False
     assert parse_eval_md("分类合理，文件完整，检查通过，没有问题。")["pass"] is False
